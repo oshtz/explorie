@@ -1,0 +1,294 @@
+.topBar {
+  display: flex;
+  align-items: center;
+  padding: var(--padding-sm) var(--padding-md);
+  gap: var(--padding-md);
+  color: var(--fg-primary);
+  min-height: 40px;
+  min-width: 0;
+}
+
+.appName {
+  font-family: var(--font-mono);
+  font-size: calc(14px * var(--font-scale));
+  font-weight: 600;
+  color: var(--fg-primary);
+  letter-spacing: 0.04em;
+  margin-right: var(--padding-md);
+  user-select: none;
+}
+
+.appIcon {
+  display: inline-block;
+  height: 20px;
+  width: auto;
+  image-rendering: pixelated;
+  margin-right: var(--padding-md);
+}
+
+.upButton {
+  background: none;
+  border: none;
+  color: var(--fg-secondary);
+  font-size: calc(16px * var(--font-scale));
+  /* margin-right: 12px; */ /* Use gap instead */
+  cursor: pointer;
+  opacity: 0.9;
+  width: var(--command-size-md);
+  height: var(--command-size-md);
+  padding: 0;
+  line-height: 1;
+  transition: none;
+  -webkit-app-region: no-drag; /* interactive */
+}
+
+.upButton:hover {
+  color: var(--fg-primary);
+  background: var(--bg-hover);
+}
+
+.upButton:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.folderName {
+  font-weight: 600;
+  font-size: calc(13px * var(--font-scale));
+  color: var(--fg-primary);
+  /* margin-right: 18px; */ /* Use gap */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.spacer {
+  flex: 1;
+  min-width: var(--padding-sm);
+}
+
+.searchContainer {
+  position: relative;
+  flex: 0 1 180px;
+  min-width: 112px;
+}
+
+.searchInput {
+  background: var(--bg-sunken);
+  color: var(--fg-primary);
+  border: 1px solid var(--border-primary);
+  border-radius: 0;
+  min-height: var(--control-height-md);
+  padding: 4px 44px 4px 8px;
+  font-size: calc(12px * var(--font-scale));
+  outline: none;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.searchInput:focus {
+  background: var(--bg-primary);
+  border-color: var(--border-strong);
+  box-shadow: var(--focus-ring);
+}
+
+.searchIcon {
+  position: absolute;
+  right: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--fg-tertiary);
+  font-size: calc(12px * var(--font-scale));
+  pointer-events: none;
+}
+
+/* Hide default search icon when buttons are visible */
+.searchContainer:has(.searchClearButton) .searchIcon {
+  display: none;
+}
+
+.searchClearButton,
+.searchSaveButton {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  background: none;
+  border: none;
+  color: var(--fg-tertiary);
+  font-size: calc(11px * var(--font-scale));
+  cursor: pointer;
+  padding: 2px;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.searchClearButton:hover,
+.searchSaveButton:hover {
+  color: var(--fg-primary);
+}
+
+.searchClearButton {
+  right: 26px;
+}
+
+.searchSaveButton {
+  right: 8px;
+  color: var(--fg-tertiary);
+}
+
+.searchSaveButton:hover {
+  color: var(--accent-primary);
+}
+
+.controlsContainer {
+  display: flex;
+  align-items: center;
+  gap: var(--padding-sm);
+  position: relative;
+  flex: 0 0 auto;
+}
+
+.controlButton {
+  font-size: calc(14px * var(--font-scale));
+  color: var(--fg-secondary);
+  cursor: pointer;
+  background: none;
+  border-radius: 0;
+  width: var(--command-size-md);
+  height: var(--command-size-md);
+  padding: 0;
+  border: 1px solid transparent;
+  line-height: 1;
+}
+
+.controlButton:hover {
+  color: var(--fg-primary);
+  background: var(--bg-hover);
+  border-color: var(--border-secondary);
+}
+
+.controlButtonActive {
+  color: var(--accent-primary);
+  border-color: var(--state-selected-outline);
+  background: var(--bg-selected-soft);
+}
+
+.popover {
+  position: absolute;
+  top: 28px;
+  left: 0;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-primary);
+  border-radius: 0;
+  z-index: 110;
+  min-width: 120px;
+  padding: 0;
+  overflow: hidden;
+  box-shadow: var(--panel-shadow);
+}
+
+.popoverItem {
+  display: flex;
+  align-items: center;
+  gap: var(--padding-sm);
+  min-height: 26px;
+  padding: 4px var(--padding-md);
+  cursor: pointer;
+  color: var(--fg-primary);
+  background: none;
+  font-weight: 400;
+  border: none;
+  font-size: calc(12px * var(--font-scale));
+  white-space: nowrap;
+}
+
+.popoverItem:hover {
+  background: var(--bg-hover);
+}
+
+.popoverItemActive {
+  color: var(--accent-primary);
+  background: var(--bg-selected-soft);
+}
+
+.popoverIcon {
+  font-size: calc(12px * var(--font-scale));
+  width: 1.2em;
+  text-align: center;
+}
+
+.popoverDivider {
+  height: 1px;
+  background: var(--border-primary);
+  margin: 2px 0;
+}
+
+/* History dropdown for back/forward buttons */
+.historyPopover {
+  position: absolute;
+  top: 24px;
+  left: 0;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-primary);
+  border-radius: 0;
+  z-index: 110;
+  min-width: 180px;
+  max-width: 300px;
+  padding: 0;
+  overflow: hidden;
+  box-shadow: var(--panel-shadow);
+}
+
+.historyLabel {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Popover label for sections */
+.popoverLabel {
+  font-size: calc(10px * var(--font-scale));
+  color: var(--fg-tertiary);
+  padding: 6px var(--padding-md) 2px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-weight: 600;
+}
+
+/* Popover slider container */
+.popoverSlider {
+  padding: 4px var(--padding-md) 8px;
+}
+
+@media (max-width: 760px) {
+  .topBar {
+    align-items: flex-start;
+    flex-wrap: wrap;
+    gap: var(--padding-sm);
+    padding: var(--padding-sm);
+  }
+
+  .appIcon {
+    margin-right: 0;
+  }
+
+  .spacer {
+    flex-basis: 100%;
+    height: 0;
+  }
+
+  .searchContainer {
+    flex: 1 1 132px;
+    min-width: 0;
+  }
+
+  .searchInput {
+    min-width: 0;
+  }
+
+  .controlsContainer {
+    gap: var(--padding-xs);
+  }
+}

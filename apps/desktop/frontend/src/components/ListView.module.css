@@ -1,0 +1,86 @@
+.listViewContainer {
+  /* Remove top padding to bring table header closer to the top bar */
+  padding: 0 var(--padding-md) var(--padding-md);
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0; /* allow inner scroll container to size properly */
+}
+
+/* If we need any additional styles specific to ListView */
+.listHeader {
+  margin-bottom: var(--padding-sm);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.listTitle {
+  font-size: calc(13px * var(--font-scale));
+  font-weight: 600;
+  color: var(--fg-title);
+}
+
+.listActions {
+  display: flex;
+  gap: var(--padding-sm);
+}
+
+.actionButton {
+  background: none;
+  color: var(--fg-secondary);
+  border: 1px solid var(--border-primary);
+  border-radius: 0;
+  padding: 2px 6px;
+  font-size: calc(12px * var(--font-scale));
+  cursor: pointer;
+  outline: none;
+}
+
+.actionButton:hover {
+  background: var(--bg-hover);
+  color: var(--fg-primary);
+  border-color: var(--border-secondary);
+}
+
+.actionButton:focus-visible {
+  outline: 1px solid var(--accent-primary);
+  outline-offset: -1px;
+}
+
+.emptyState {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  min-height: var(--empty-state-min-height);
+  color: var(--fg-tertiary);
+  text-align: center;
+  padding: var(--padding-md);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-primary);
+  box-shadow: var(--inset-divider);
+}
+
+.emptyStateIcon {
+  font-size: 20px;
+  margin-bottom: var(--padding-sm);
+  opacity: 0.6;
+}
+
+.emptyStateText {
+  font-size: calc(13px * var(--font-scale));
+  margin-bottom: var(--padding-sm);
+}
+
+.emptyStateSubtext {
+  font-size: calc(12px * var(--font-scale));
+  opacity: 0.7;
+}
+
+/* DnD: list area under drag-over */
+.droppableOver {
+  background: var(--state-drop-bg);
+}

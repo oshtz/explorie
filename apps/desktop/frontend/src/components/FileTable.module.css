@@ -1,0 +1,384 @@
+.tableContainer {
+  overflow: auto;
+  height: 100%;
+  min-height: 0; /* allow to shrink in flex parents */
+  position: relative; /* for marquee overlay */
+  background: var(--bg-primary);
+  border: 1px solid var(--border-primary);
+  box-shadow: var(--inset-divider);
+}
+.tableContainer,
+.fileTable,
+.fileTable * {
+  -webkit-user-select: none;
+  -moz-user-select: none;
+  -ms-user-select: none;
+  user-select: none;
+}
+
+.fileTable {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+
+/* Fixed row height for smoother virtualization/scrolling */
+.fileTable tbody tr {
+  height: var(--row-height);
+}
+/* Remove vertical padding on first cell so inner flex can center across full row height */
+.fileTable tbody td:first-child {
+  padding-top: 0;
+  padding-bottom: 0;
+}
+
+/* Sticky header */
+.fileTable thead th {
+  position: sticky;
+  top: 0;
+  background: var(--bg-elevated);
+  z-index: 1;
+  box-shadow: inset 0 -1px 0 var(--border-primary);
+}
+
+/* Virtualized body styles */
+.tableBody {
+  width: 100%;
+  overflow: auto;
+  /* Height can be controlled by parent; default reasonable height */
+  max-height: 60vh;
+}
+
+.virtualRow {
+  background-color: transparent;
+  box-shadow: inset 0 -1px 0 var(--border-subtle);
+  transition:
+    background-color var(--motion-fast),
+    box-shadow var(--motion-fast),
+    opacity var(--motion-fast);
+}
+.virtualRow:hover {
+  background-color: var(--bg-hover);
+}
+.virtualRow.selected {
+  background-color: var(--bg-selected-strong);
+  color: var(--fg-title);
+  box-shadow:
+    inset 2px 0 0 var(--accent-primary),
+    inset 0 -1px 0 rgba(var(--accent-primary-rgb), 0.22);
+}
+.virtualRow.clickable {
+  cursor: pointer;
+}
+
+.rowGrid {
+  display: grid;
+  align-items: center;
+}
+
+/* Default cell padding */
+.fileTable th,
+.fileTable td {
+  padding: 6px var(--padding-md);
+  text-align: left;
+  vertical-align: middle;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.fileTable thead tr {
+  /* No background needed, rely on th style */
+}
+
+.fileTable th {
+  color: var(--fg-secondary);
+  font-weight: 600;
+  font-size: calc(10px * var(--font-scale)); /* more compact header */
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  cursor: pointer;
+  border-bottom: 1px solid var(--border-primary);
+  user-select: none;
+  padding: 3px var(--padding-sm); /* tighter vertical padding */
+  line-height: 1.2;
+}
+
+.fileTable th:hover {
+  color: var(--fg-primary);
+  background: var(--bg-hover);
+}
+
+.fileTable th.sortable {
+  /* Add styles if needed */
+}
+
+.sortIcon {
+  margin-left: 4px;
+  opacity: 0.7;
+}
+
+/* Make sort icon smaller to keep header compact */
+.sortIcon img {
+  width: 10px;
+  height: 10px;
+}
+
+.sortSpinner {
+  display: inline-block;
+  width: 10px; /* smaller to reduce header height */
+  height: 10px;
+  border: 2px solid var(--border-primary);
+  border-top-color: var(--fg-secondary);
+  border-radius: 50%;
+  margin-left: 6px;
+  vertical-align: middle;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.fileTable tbody tr {
+  background-color: transparent;
+  box-shadow: inset 0 -1px 0 var(--border-subtle);
+  transition:
+    background-color var(--motion-fast),
+    box-shadow var(--motion-fast),
+    opacity var(--motion-fast);
+}
+
+.fileTable tbody tr:hover {
+  background-color: var(--bg-hover);
+}
+
+.fileTable tbody tr.selected {
+  background-color: var(--bg-selected-strong);
+  color: var(--fg-title);
+  box-shadow:
+    inset 2px 0 0 var(--accent-primary),
+    inset 0 -1px 0 rgba(var(--accent-primary-rgb), 0.22);
+}
+
+.fileTable tbody tr.clickable {
+  cursor: pointer;
+}
+
+.fileTable tbody tr:focus,
+.fileTable tbody tr:focus-visible,
+.virtualRow:focus,
+.virtualRow:focus-visible {
+  outline: none;
+}
+
+.fileTable tbody tr:focus-visible,
+.virtualRow:focus-visible {
+  box-shadow: var(--row-focus-shadow);
+}
+
+.fileTable tbody tr.selected:focus-visible,
+.virtualRow.selected:focus-visible {
+  box-shadow:
+    inset 0 0 0 1px rgba(var(--accent-primary-rgb), 0.64),
+    inset 2px 0 0 var(--accent-primary),
+    inset 0 -1px 0 rgba(var(--accent-primary-rgb), 0.22);
+}
+
+.fileTable td {
+  font-size: calc(12px * var(--font-scale));
+  color: var(--fg-primary);
+}
+.virtualRow > div {
+  font-size: calc(12px * var(--font-scale));
+  color: var(--fg-primary);
+}
+
+.fileTable tbody tr:hover td {
+  /* color: var(--fg-title); /* Optional: brighten text on hover */
+}
+
+.fileTable tbody tr.selected td {
+  color: var(--fg-title);
+}
+
+/* DnD: row being targeted as folder drop */
+.dropTargetRow {
+  outline: 2px dashed var(--state-drop-outline);
+  outline-offset: -2px;
+  background: var(--state-drop-bg);
+}
+
+.dragSource {
+  opacity: 0.44;
+}
+
+.fileNameCell {
+  display: flex;
+  align-items: center; /* center icon + text vertically */
+  gap: var(--padding-sm);
+  height: var(--row-height); /* match row height */
+  padding: 6px 0; /* mimic cell vertical padding visually */
+}
+
+.fileIcon {
+  font-size: calc(14px * var(--font-scale));
+  width: 1.2em;
+  color: var(--fg-secondary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.fileName {
+  font-family: var(--font-base);
+  font-weight: 500;
+  line-height: 1;
+}
+
+.fileSize,
+.fileModified {
+  text-align: right;
+  color: var(--fg-secondary);
+  font-size: calc(11px * var(--font-scale));
+}
+
+/* Column width adjustments */
+.fileTable th:nth-child(1),
+.fileTable td:nth-child(1) {
+  /* Name */
+  width: 60%; /* Allocate more space to name */
+}
+
+.fileTable th:nth-child(2),
+.fileTable td:nth-child(2) {
+  /* Size */
+  width: 20%;
+}
+
+.fileTable th:nth-child(3),
+.fileTable td:nth-child(3) {
+  /* Modified */
+  width: 20%;
+}
+
+.customColumn {
+  min-width: 96px;
+  max-width: 180px;
+  color: var(--fg-secondary);
+  font-size: calc(11px * var(--font-scale));
+  line-height: 1.3;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tag {
+  display: inline-flex;
+  align-items: center;
+  max-width: 120px;
+  min-height: 18px;
+  padding: 1px 7px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  font-size: calc(10px * var(--font-scale));
+  font-weight: 600;
+  margin-left: var(--padding-sm);
+  line-height: 1.35;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+
+.tagGreen {
+  background-color: rgba(var(--accent-green-rgb, 158, 206, 106), 0.15);
+  border-color: rgba(var(--accent-green-rgb, 158, 206, 106), 0.3);
+  color: var(--accent-green);
+}
+
+.tagYellow {
+  background-color: rgba(var(--accent-yellow-rgb, 224, 175, 104), 0.15);
+  border-color: rgba(var(--accent-yellow-rgb, 224, 175, 104), 0.3);
+  color: var(--accent-yellow);
+}
+
+.tagPurple {
+  background-color: rgba(var(--accent-secondary-rgb, 187, 154, 247), 0.15);
+  border-color: rgba(var(--accent-secondary-rgb, 187, 154, 247), 0.3);
+  color: var(--accent-secondary);
+}
+
+.tagBlue {
+  background-color: rgba(var(--accent-primary-rgb, 122, 162, 247), 0.15);
+  border-color: rgba(var(--accent-primary-rgb, 122, 162, 247), 0.3);
+  color: var(--accent-primary);
+}
+
+.tagRed {
+  background-color: rgba(var(--accent-red-rgb, 247, 118, 142), 0.15);
+  border-color: rgba(var(--accent-red-rgb, 247, 118, 142), 0.3);
+  color: var(--accent-red);
+}
+
+.tagGray {
+  background-color: var(--bg-tertiary);
+  border-color: var(--border-primary);
+  color: var(--fg-tertiary);
+}
+
+.tagDone {
+  background-color: rgba(var(--accent-green-rgb, 158, 206, 106), 0.18);
+  border-color: rgba(var(--accent-green-rgb, 158, 206, 106), 0.36);
+  color: var(--accent-green);
+}
+
+.tagInProgress {
+  background-color: rgba(var(--accent-yellow-rgb, 224, 175, 104), 0.18);
+  border-color: rgba(var(--accent-yellow-rgb, 224, 175, 104), 0.36);
+  color: var(--accent-yellow);
+}
+
+.tagTodo {
+  background-color: rgba(var(--accent-primary-rgb, 122, 162, 247), 0.18);
+  border-color: rgba(var(--accent-primary-rgb, 122, 162, 247), 0.36);
+  color: var(--accent-primary);
+}
+
+/* Context menu */
+.contextMenu {
+  position: fixed;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-primary);
+  z-index: 2000;
+  min-width: 140px;
+  box-shadow: var(--panel-shadow);
+}
+.contextItem {
+  padding: 6px 10px;
+  font-size: 12px;
+  color: var(--fg-primary);
+  cursor: pointer;
+}
+.contextItem:hover {
+  background: var(--bg-hover);
+}
+.contextIcon {
+  margin-right: 8px;
+  width: 1.2em;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  color: var(--fg-secondary);
+}
+
+/* Marquee selection rectangle */
+.marquee {
+  border: 1px solid var(--accent-primary, #0078d4);
+  background: rgba(var(--accent-primary-rgb, 0, 120, 212), 0.15);
+  z-index: 100;
+}

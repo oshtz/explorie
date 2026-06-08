@@ -1,0 +1,239 @@
+.container {
+  background-color: var(--bg-secondary);
+  border-radius: 0;
+  padding: var(--padding-sm);
+  margin-top: var(--padding-sm);
+  border: 1px solid var(--border-primary);
+  max-width: 100%;
+  overflow: hidden;
+}
+
+.title {
+  margin-top: 0;
+  margin-bottom: var(--padding-sm);
+  font-size: calc(13px * var(--font-scale));
+  font-weight: 600;
+  color: var(--fg-title);
+  padding-bottom: var(--padding-sm);
+  border-bottom: 1px solid var(--border-primary);
+}
+
+.fieldsContainer {
+  display: flex;
+  flex-direction: column;
+  gap: var(--padding-xs);
+  margin-bottom: var(--padding-sm);
+  max-height: 300px;
+  overflow-y: auto;
+  padding-right: var(--padding-sm);
+}
+
+.fieldRow {
+  display: flex;
+  flex-direction: column;
+  padding: var(--padding-xs);
+  border-radius: 0;
+  background-color: var(--bg-primary);
+  border: 1px solid var(--border-primary);
+}
+
+.fieldRow:hover {
+  border-color: var(--border-secondary);
+}
+
+.fieldLabel {
+  font-weight: 500;
+  font-size: calc(12px * var(--font-scale));
+  color: var(--fg-title);
+  margin-bottom: 2px;
+}
+
+.fieldValueContainer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--padding-sm);
+}
+
+.fieldValue {
+  font-size: calc(12px * var(--font-scale));
+  color: var(--fg-primary);
+  flex: 1;
+  word-break: break-word;
+  max-width: 60%;
+}
+
+.fieldActions {
+  display: flex;
+  gap: var(--padding-xs);
+}
+
+.editButton,
+.removeButton,
+.saveButton,
+.cancelButton,
+.addButton,
+.addTagButton {
+  font-size: calc(12px * var(--font-scale));
+  padding: 2px 6px;
+  border-radius: 0;
+  border: 1px solid var(--border-primary);
+  background-color: var(--bg-tertiary);
+  color: var(--fg-primary);
+  cursor: pointer;
+}
+
+.editButton:hover,
+.saveButton:hover,
+.addButton:hover,
+.addTagButton:hover {
+  background-color: var(--bg-selected);
+  color: var(--fg-primary);
+}
+
+.removeButton:hover,
+.cancelButton:hover,
+.removeTagButton:hover {
+  background-color: var(--bg-selected);
+  color: var(--fg-primary);
+}
+
+.addButton {
+  background-color: var(--bg-tertiary);
+  color: var(--fg-primary);
+  border-color: var(--border-primary);
+  font-weight: 500;
+  padding: 4px 8px;
+}
+
+.addButton:disabled {
+  background-color: var(--bg-tertiary);
+  color: var(--fg-tertiary);
+  border-color: var(--border-primary);
+  cursor: not-allowed;
+}
+
+.editInputContainer {
+  display: flex;
+  flex-direction: column;
+  gap: var(--padding-xs);
+  position: relative;
+}
+
+.fieldInput {
+  font-size: calc(12px * var(--font-scale));
+  padding: 4px 6px;
+  border-radius: 0;
+  border: 1px solid var(--border-primary);
+  background-color: var(--bg-primary);
+  color: var(--fg-primary);
+  width: 100%;
+}
+
+.fieldInput:focus {
+  outline: none;
+  border-color: var(--border-secondary);
+}
+
+.editButtons {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--padding-xs);
+  margin-top: var(--padding-xs);
+}
+
+.addFieldContainer {
+  display: flex;
+  flex-direction: column;
+  gap: var(--padding-sm);
+  border-top: 1px solid var(--border-primary);
+  padding-top: var(--padding-sm);
+}
+
+.addFieldInputGroup {
+  display: flex;
+  gap: var(--padding-sm);
+}
+
+.fieldNameContainer,
+.fieldValueContainer {
+  flex: 1;
+  position: relative;
+}
+
+.fieldNameInput,
+.fieldValueInput {
+  width: 100%;
+  font-size: calc(12px * var(--font-scale));
+  padding: 4px 6px;
+  border-radius: 0;
+  border: 1px solid var(--border-primary);
+  background-color: var(--bg-primary);
+  color: var(--fg-primary);
+}
+
+.fieldNameInput:focus,
+.fieldValueInput:focus {
+  outline: none;
+  border-color: var(--border-secondary);
+}
+
+.suggestions {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  background-color: var(--bg-primary);
+  border: 1px solid var(--border-primary);
+  border-radius: 0;
+  z-index: 10;
+  max-height: 150px;
+  overflow-y: auto;
+}
+
+.suggestion {
+  padding: 4px 8px;
+  font-size: calc(12px * var(--font-scale));
+  cursor: pointer;
+  color: var(--fg-primary);
+}
+
+.suggestion:hover {
+  background-color: var(--bg-tertiary);
+}
+
+.tagsContainer {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--padding-xs);
+  align-items: center;
+}
+
+.tag {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  background-color: var(--bg-tertiary);
+  color: var(--fg-secondary);
+  font-size: calc(11px * var(--font-scale));
+  font-weight: 500;
+  padding: 2px 6px;
+  border-radius: 0;
+}
+
+.removeTagButton {
+  background: none;
+  border: none;
+  color: inherit;
+  font-size: 14px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px;
+  margin-left: 2px;
+}
+
+.removeTagButton:hover {
+  color: var(--accent-red);
+}

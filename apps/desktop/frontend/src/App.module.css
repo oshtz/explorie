@@ -1,0 +1,157 @@
+.appContainer {
+  display: flex;
+  flex-direction: column; /* vertical: TitleBar on top, body below */
+  height: 100vh;
+  width: 100vw;
+  box-sizing: border-box;
+  background: var(--bg-sunken);
+  color: var(--fg-primary);
+  overflow: hidden;
+}
+
+.appBody {
+  display: flex;
+  flex: 1;
+  min-height: 0; /* allow children to shrink */
+  min-width: 0;
+}
+
+/* Thin vertical handle between sidebar and main area */
+.sidebarResizer {
+  width: 4px;
+  cursor: col-resize;
+  background: transparent;
+  flex: 0 0 auto;
+  height: 100%;
+}
+
+.sidebarResizer:hover {
+  background: var(--state-selected-outline);
+}
+
+.sidebarResizing *,
+.sidebarResizing {
+  /* While dragging, prevent accidental text selection */
+  user-select: none !important;
+  cursor: col-resize !important;
+}
+
+.mainArea {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  box-sizing: border-box;
+  background: var(--bg-primary);
+  overflow: hidden;
+  min-width: 0; /* Prevent flexbox overflow issues */
+}
+
+.mainContent {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.contentWrapper {
+  flex: 3;
+  display: flex;
+  flex-direction: column;
+  padding: var(--padding-md);
+  min-width: 0;
+  height: 100%;
+  box-sizing: border-box;
+  overflow: hidden; /* avoid nested scroll parents for DnD; inner views scroll */
+  position: relative;
+  background: var(--bg-primary);
+  box-shadow:
+    var(--inset-divider),
+    inset 1px 0 0 rgba(255, 255, 255, 0.018);
+}
+
+.topBarContainer {
+  position: sticky;
+  top: 0; /* sticky within content area, below TitleBar */
+  z-index: 100;
+  background: var(--bg-topbar);
+  border-bottom: 1px solid var(--border-primary);
+  box-shadow: var(--inset-divider);
+  margin-bottom: var(--padding-md);
+}
+
+.titleBarContainer {
+  position: sticky;
+  top: 0;
+  z-index: 200; /* above header */
+}
+
+.previewPanel {
+  flex: 0 0 auto;
+  min-width: 280px;
+  max-width: 720px;
+  height: 100%;
+  background: var(--bg-elevated);
+  border-left: 1px solid var(--border-primary);
+  padding: var(--padding-sm);
+  box-sizing: border-box;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  gap: var(--padding-sm);
+  box-shadow:
+    inset 1px 0 0 var(--border-subtle),
+    var(--inset-divider);
+}
+
+.previewResizer {
+  width: 4px;
+  cursor: col-resize;
+  background: transparent;
+  flex: 0 0 auto;
+  height: 100%;
+}
+
+.previewResizer:hover {
+  background: var(--state-selected-outline);
+}
+
+.loadingMessage {
+  padding: var(--padding-sm);
+  text-align: center;
+  color: var(--fg-secondary);
+}
+
+.errorMessage {
+  padding: var(--padding-sm);
+  text-align: center;
+  color: var(--accent-red); /* Use variable */
+  background-color: transparent;
+  border-left: 2px solid var(--accent-red);
+}
+
+/* File list container - needs to fill available space */
+:global(#file-list) {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+}
+
+/* Drag overlay clone */
+.dragOverlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  transform: translate(var(--drag-x, 0px), var(--drag-y, 0px));
+  pointer-events: none;
+  z-index: 10000;
+  padding: 6px 8px;
+  background: var(--bg-selected);
+  border: 1px solid var(--border-secondary);
+  box-shadow: var(--panel-shadow);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}

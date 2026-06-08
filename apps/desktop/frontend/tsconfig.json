@@ -1,0 +1,15 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "jsx": "react-jsx",
+    "moduleResolution": "node",
+    "esModuleInterop": true,
+    "strict": true,
+    "allowJs": true,
+    "skipLibCheck": true,
+    "types": ["@types/react", "@types/react-dom"]
+  },
+  "include": ["src", "index.html"],
+  "exclude": ["node_modules"]
+}

@@ -1,0 +1,32 @@
+[package]
+name = "explorie-desktop"
+version = "0.1.0"
+edition = "2024"
+description = "explorie desktop app (Tauri + React)"
+build = "build.rs"
+authors = ["explorie contributors"]
+license = "MIT"
+repository = "https://github.com/oshtz/explorie"
+
+[dependencies]
+tauri = { version = "2.2.0", features = ["protocol-asset"] }
+tauri-plugin-fs = "2.2.1"
+explorie-core = { path = "../../../../crates/core" }
+explorie-plugin-host = { path = "../../../../crates/plugin-host" }
+explorie-ffmpeg-wrapper = { path = "../../../../crates/ffmpeg-wrapper" }
+dirs = "5.0.1"
+sysinfo = "0.30.5"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+open = "5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
+[build-dependencies]
+tauri-build = { version = "2.2.0", features = [] }

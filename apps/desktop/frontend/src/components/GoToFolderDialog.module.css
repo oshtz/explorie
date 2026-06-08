@@ -1,0 +1,225 @@
+.backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 9998;
+  background: rgba(0, 0, 0, 0.58);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 15vh;
+  animation: fadeIn 0.1s ease-out;
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.dialog {
+  width: 100%;
+  max-width: 560px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--border-radius-lg, 8px);
+  padding: 20px;
+  box-shadow: var(--overlay-shadow);
+  animation: slideIn 0.15s ease-out;
+}
+
+@keyframes slideIn {
+  from {
+    opacity: 0;
+    transform: translateY(-20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.title {
+  margin: 0 0 16px 0;
+  font-size: 16px;
+  font-weight: 500;
+  color: var(--fg-title);
+}
+
+.inputContainer {
+  margin-bottom: 12px;
+}
+
+.input {
+  width: 100%;
+  padding: 10px 14px;
+  font-size: 14px;
+  font-family: var(--font-mono, monospace);
+  color: var(--fg-primary);
+  background: var(--bg-sunken);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--border-radius-sm, 4px);
+  outline: none;
+  transition:
+    border-color 0.15s,
+    box-shadow 0.15s;
+}
+
+.input:focus {
+  border-color: var(--accent-primary);
+  box-shadow: var(--focus-ring);
+}
+
+.input::placeholder {
+  color: var(--fg-tertiary);
+}
+
+.inputError {
+  border-color: #ff6b6b;
+}
+
+.inputError:focus {
+  border-color: #ff6b6b;
+  box-shadow: 0 0 0 2px rgba(255, 107, 107, 0.2);
+}
+
+.errorText {
+  display: block;
+  margin-top: 6px;
+  font-size: 12px;
+  color: #ff6b6b;
+}
+
+.hint {
+  margin-bottom: 16px;
+  font-size: 12px;
+  color: var(--fg-tertiary);
+}
+
+.hint kbd {
+  display: inline-block;
+  padding: 2px 6px;
+  margin: 0 2px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-primary);
+  border-radius: 0;
+  font-family: inherit;
+  font-size: 11px;
+}
+
+.actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.cancelButton,
+.goButton {
+  padding: 8px 16px;
+  font-size: 13px;
+  font-weight: 500;
+  border: none;
+  border-radius: 0;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.cancelButton {
+  background: transparent;
+  color: var(--fg-secondary);
+}
+
+.cancelButton:hover {
+  background: var(--bg-hover);
+  color: var(--fg-primary);
+}
+
+.goButton {
+  background: var(--accent-primary);
+  color: #000;
+}
+
+.goButton:hover:not(:disabled) {
+  filter: brightness(1.1);
+}
+
+.goButton:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Suggestions dropdown */
+.suggestions {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  margin-top: 4px;
+  max-height: 240px;
+  overflow-y: auto;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-primary);
+  border-radius: 0;
+  box-shadow: var(--panel-shadow);
+  z-index: 10;
+}
+
+.suggestionItem {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  cursor: pointer;
+  transition: background 0.1s;
+}
+
+.suggestionItem:hover,
+.suggestionSelected {
+  background: var(--bg-hover);
+}
+
+.suggestionIcon {
+  flex-shrink: 0;
+  font-size: 14px;
+}
+
+.suggestionText {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-family: var(--font-mono, monospace);
+  color: var(--fg-primary);
+}
+
+.suggestionBadge {
+  flex-shrink: 0;
+  padding: 2px 6px;
+  font-size: 10px;
+  font-weight: 500;
+  text-transform: uppercase;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-primary);
+  border-radius: 0;
+  color: var(--fg-tertiary);
+}
+
+.inputContainer {
+  position: relative;
+  margin-bottom: 12px;
+}
+
+.hintSecondary {
+  opacity: 0.7;
+  font-size: 11px;
+}
+
+/* Reduce motion */
+:global(body.reduceMotion) .backdrop,
+:global(body.reduceMotion) .dialog {
+  animation: none !important;
+}

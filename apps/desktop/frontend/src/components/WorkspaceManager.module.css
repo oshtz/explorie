@@ -1,0 +1,377 @@
+.backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.58);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  animation: fadeIn 0.15s ease-out;
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.dialog {
+  width: 100%;
+  max-width: 500px;
+  max-height: 80vh;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--border-radius-lg, 8px);
+  box-shadow: var(--overlay-shadow);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  animation: scaleIn 0.15s ease-out;
+}
+
+@keyframes scaleIn {
+  from {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border-primary);
+  background: var(--bg-topbar);
+  box-shadow: var(--inset-divider);
+}
+
+.title {
+  margin: 0;
+  font-size: calc(16px * var(--font-scale, 1));
+  font-weight: 600;
+  color: var(--fg-primary);
+}
+
+.closeButton {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  background: transparent;
+  border: none;
+  border-radius: var(--border-radius-sm, 4px);
+  color: var(--fg-secondary);
+  cursor: pointer;
+  transition:
+    background 0.1s,
+    color 0.1s;
+}
+
+.closeButton:hover {
+  background: var(--bg-hover);
+  color: var(--fg-primary);
+}
+
+.body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+/* Save section */
+.saveSection {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 16px;
+  background: var(--bg-sunken);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--border-radius-sm, 4px);
+}
+
+.saveSectionTitle {
+  font-size: calc(12px * var(--font-scale, 1));
+  font-weight: 600;
+  color: var(--fg-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.saveRow {
+  display: flex;
+  gap: 8px;
+}
+
+.input {
+  flex: 1;
+  background: var(--bg-sunken);
+  border: 1px solid var(--border-primary);
+  color: var(--fg-primary);
+  font-size: calc(13px * var(--font-scale, 1));
+  padding: 8px 10px;
+  outline: none;
+}
+
+.input:focus {
+  border-color: var(--accent-primary);
+}
+
+.saveButton {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--accent-primary);
+  border: none;
+  color: var(--bg-primary);
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 600;
+  padding: 8px 14px;
+  cursor: pointer;
+  transition: opacity 0.1s;
+}
+
+.saveButton:hover {
+  opacity: 0.9;
+}
+
+.saveButton:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.saveInfo {
+  font-size: calc(11px * var(--font-scale, 1));
+  color: var(--fg-tertiary);
+}
+
+/* List section */
+.listSection {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex: 1;
+  min-height: 0;
+}
+
+.listTitle {
+  font-size: calc(12px * var(--font-scale, 1));
+  font-weight: 600;
+  color: var(--fg-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.emptyState {
+  padding: 24px 16px;
+  text-align: center;
+  color: var(--fg-tertiary);
+  font-size: calc(13px * var(--font-scale, 1));
+}
+
+.list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  overflow-y: auto;
+  max-height: 300px;
+}
+
+.workspaceItem {
+  display: flex;
+  align-items: center;
+  padding: 10px 12px;
+  background: var(--bg-sunken);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--border-radius-sm, 4px);
+  transition: background 0.1s;
+}
+
+.workspaceItem:hover {
+  background: var(--bg-hover);
+}
+
+.workspaceActive {
+  border-left: 3px solid var(--accent-primary);
+}
+
+.workspaceInfo {
+  flex: 1;
+  min-width: 0;
+  cursor: pointer;
+}
+
+.workspaceName {
+  font-size: calc(13px * var(--font-scale, 1));
+  font-weight: 500;
+  color: var(--fg-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspaceMeta {
+  font-size: calc(11px * var(--font-scale, 1));
+  color: var(--fg-tertiary);
+  margin-top: 2px;
+}
+
+.workspaceActions {
+  display: flex;
+  gap: 4px;
+  opacity: 0;
+  transition: opacity 0.1s;
+}
+
+.workspaceItem:hover .workspaceActions {
+  opacity: 1;
+}
+
+.iconButton {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  background: transparent;
+  border: none;
+  border-radius: var(--border-radius-sm, 4px);
+  color: var(--fg-secondary);
+  cursor: pointer;
+  transition:
+    background 0.1s,
+    color 0.1s;
+}
+
+.iconButton:hover {
+  background: var(--bg-hover);
+  color: var(--fg-primary);
+}
+
+/* Edit row */
+.editRow {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: 1;
+}
+
+.editInput {
+  flex: 1;
+  background: var(--bg-sunken);
+  border: 1px solid var(--accent-primary);
+  color: var(--fg-primary);
+  font-size: calc(13px * var(--font-scale, 1));
+  padding: 6px 8px;
+  outline: none;
+}
+
+/* Delete confirm */
+.deleteConfirm {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  font-size: calc(13px * var(--font-scale, 1));
+  color: var(--fg-secondary);
+}
+
+.deleteConfirmButton {
+  color: #e53e3e;
+}
+
+.deleteConfirmButton:hover {
+  color: #e53e3e;
+  background: rgba(229, 62, 62, 0.1);
+}
+
+/* Footer */
+.footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 20px;
+  border-top: 1px solid var(--border-primary);
+  background: var(--bg-topbar);
+  gap: 12px;
+}
+
+.footerActions {
+  display: flex;
+  gap: 8px;
+}
+
+.footerButton {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: transparent;
+  border: 1px solid var(--border-primary);
+  color: var(--fg-secondary);
+  font-size: calc(12px * var(--font-scale, 1));
+  padding: 6px 12px;
+  cursor: pointer;
+  transition:
+    background 0.1s,
+    color 0.1s,
+    border-color 0.1s;
+}
+
+.footerButton:hover {
+  background: var(--bg-hover);
+  color: var(--fg-primary);
+  border-color: var(--fg-tertiary);
+}
+
+.footerButton:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.importMessage {
+  font-size: calc(12px * var(--font-scale, 1));
+  padding: 4px 8px;
+  border-radius: var(--border-radius-sm, 4px);
+  flex: 1;
+  text-align: center;
+}
+
+.importMessage.success {
+  color: #68d391;
+  background: rgba(104, 211, 145, 0.1);
+}
+
+.importMessage.error {
+  color: #fc8181;
+  background: rgba(252, 129, 129, 0.1);
+}
+
+.cancelButton {
+  background: transparent;
+  border: 1px solid var(--border-primary);
+  color: var(--fg-secondary);
+  font-size: calc(13px * var(--font-scale, 1));
+  padding: 8px 16px;
+  cursor: pointer;
+  transition:
+    background 0.1s,
+    color 0.1s;
+}
+
+.cancelButton:hover {
+  background: var(--bg-hover);
+  color: var(--fg-primary);
+}

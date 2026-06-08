@@ -1,0 +1,292 @@
+.backdrop {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.58);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  animation: fadeIn 0.15s ease;
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.dialog {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--border-radius-lg);
+  min-width: 400px;
+  max-width: 540px;
+  animation: slideIn 0.15s ease;
+  box-shadow: var(--overlay-shadow);
+}
+
+@keyframes slideIn {
+  from {
+    opacity: 0;
+    transform: scale(0.95) translateY(-10px);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
+}
+
+.header {
+  padding: var(--padding-md) var(--padding-lg);
+  border-bottom: 1px solid var(--border-primary);
+  background: var(--bg-topbar);
+  box-shadow: var(--inset-divider);
+}
+
+.title {
+  margin: 0;
+  font-size: calc(14px * var(--font-scale));
+  font-weight: 600;
+  color: var(--fg-primary);
+  display: flex;
+  align-items: center;
+  gap: var(--padding-sm);
+}
+
+.warningIcon {
+  color: var(--fg-error, #f87171);
+  display: flex;
+  align-items: center;
+}
+
+.content {
+  padding: var(--padding-lg);
+}
+
+.summary {
+  background: var(--bg-sunken);
+  border: 1px solid var(--border-primary);
+  border-radius: 0;
+  padding: var(--padding-md);
+  margin-bottom: var(--padding-md);
+}
+
+.summaryRow {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: calc(12px * var(--font-scale));
+  padding: 2px 0;
+}
+
+.summaryLabel {
+  color: var(--fg-secondary);
+}
+
+.summaryValue {
+  color: var(--fg-primary);
+  font-weight: 500;
+}
+
+.summaryDetail {
+  color: var(--fg-secondary);
+  font-weight: 400;
+  margin-left: var(--padding-xs);
+}
+
+.loading {
+  color: var(--fg-secondary);
+  font-style: italic;
+}
+
+.fileList {
+  max-height: 200px;
+  overflow-y: auto;
+  border: 1px solid var(--border-primary);
+  border-radius: 0;
+  margin-bottom: var(--padding-md);
+}
+
+.fileItem {
+  display: flex;
+  align-items: center;
+  gap: var(--padding-sm);
+  padding: var(--padding-sm) var(--padding-md);
+  font-size: calc(12px * var(--font-scale));
+  color: var(--fg-primary);
+  border-bottom: 1px solid var(--border-primary);
+}
+
+.fileItem:last-child {
+  border-bottom: none;
+}
+
+.fileItem svg {
+  flex-shrink: 0;
+  color: var(--fg-secondary);
+}
+
+.fileName {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.itemCount {
+  color: var(--fg-secondary);
+  font-size: calc(11px * var(--font-scale));
+  flex-shrink: 0;
+}
+
+.fileSize {
+  color: var(--fg-secondary);
+  font-size: calc(11px * var(--font-scale));
+  flex-shrink: 0;
+}
+
+.trashBadge {
+  background: var(--accent-secondary, #f59e0b);
+  color: white;
+  font-size: calc(10px * var(--font-scale));
+  padding: 1px 6px;
+  border-radius: 9999px;
+  flex-shrink: 0;
+}
+
+.moreItems {
+  padding: var(--padding-sm) var(--padding-md);
+  font-size: calc(11px * var(--font-scale));
+  color: var(--fg-secondary);
+  font-style: italic;
+  text-align: center;
+}
+
+.warning {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--padding-sm);
+  padding: var(--padding-sm) var(--padding-md);
+  background: rgba(245, 158, 11, 0.1);
+  border: 1px solid rgba(245, 158, 11, 0.3);
+  border-radius: var(--border-radius);
+  margin-bottom: var(--padding-md);
+  font-size: calc(12px * var(--font-scale));
+  color: var(--fg-warning, #f59e0b);
+}
+
+.warning svg {
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.description {
+  margin: 0 0 var(--padding-md) 0;
+  font-size: calc(12px * var(--font-scale));
+  color: var(--fg-secondary);
+  line-height: 1.5;
+}
+
+.descriptionWarning {
+  margin: 0 0 var(--padding-md) 0;
+  font-size: calc(12px * var(--font-scale));
+  color: var(--fg-error, #f87171);
+  line-height: 1.5;
+  font-weight: 500;
+}
+
+.checkboxLabel {
+  display: flex;
+  align-items: center;
+  gap: var(--padding-sm);
+  font-size: calc(12px * var(--font-scale));
+  color: var(--fg-secondary);
+  cursor: pointer;
+}
+
+.checkbox {
+  cursor: pointer;
+}
+
+.footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--padding-sm);
+  padding: var(--padding-md) var(--padding-lg);
+  border-top: 1px solid var(--border-primary);
+  background: var(--bg-topbar);
+}
+
+.cancelButton,
+.trashButton,
+.deleteButton {
+  display: flex;
+  align-items: center;
+  gap: var(--padding-xs);
+  padding: var(--padding-sm) var(--padding-md);
+  font-size: calc(12px * var(--font-scale));
+  border-radius: 0;
+  cursor: pointer;
+  transition:
+    background 0.15s ease,
+    border-color 0.15s ease,
+    opacity 0.15s ease;
+}
+
+.cancelButton {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-primary);
+  color: var(--fg-primary);
+}
+
+.cancelButton:hover {
+  background: var(--bg-hover);
+  border-color: var(--border-secondary);
+}
+
+.trashButton {
+  background: var(--accent-primary);
+  border: 1px solid var(--accent-primary);
+  color: white;
+}
+
+.trashButton:hover:not(:disabled) {
+  opacity: 0.9;
+}
+
+.trashButton:focus {
+  outline: none;
+  box-shadow: 0 0 0 2px rgba(var(--accent-primary-rgb, 122, 162, 247), 0.3);
+}
+
+.trashButton:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.deleteButton {
+  background: var(--fg-error, #f87171);
+  border: 1px solid var(--fg-error, #f87171);
+  color: white;
+}
+
+.deleteButton:hover:not(:disabled) {
+  background: #ef4444;
+  border-color: #ef4444;
+}
+
+.deleteButton:focus {
+  outline: none;
+  box-shadow: 0 0 0 2px rgba(248, 113, 113, 0.3);
+}
+
+.deleteButton:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}

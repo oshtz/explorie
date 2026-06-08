@@ -1,0 +1,15 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/core",
+    "crates/plugin-host",
+    "crates/ffmpeg-wrapper",
+    "apps/cli",
+    "apps/desktop/frontend/src-tauri"
+]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"

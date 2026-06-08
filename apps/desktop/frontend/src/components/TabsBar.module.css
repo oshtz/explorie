@@ -1,0 +1,105 @@
+.tabsBar {
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
+  padding: var(--padding-xs) var(--padding-sm);
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border-primary);
+  background: var(--bg-elevated);
+  box-shadow: var(--inset-divider);
+}
+
+.tabItem {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border: 1px solid var(--border-primary);
+  border-bottom: none;
+  background: var(--bg-secondary);
+  color: var(--fg-secondary);
+  cursor: pointer;
+  user-select: none;
+  max-width: 220px;
+  font-size: calc(12px * var(--font-scale));
+  line-height: 1.2;
+  transition:
+    color 80ms ease,
+    background-color 80ms ease,
+    border-color 80ms ease;
+}
+
+.tabItem:hover {
+  color: var(--fg-primary);
+  background: var(--bg-hover);
+  border-color: var(--border-secondary);
+}
+
+.tabItem:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 1px;
+}
+
+.tabItemActive {
+  color: var(--fg-title);
+  background: var(--bg-primary);
+  border-color: var(--border-secondary);
+  box-shadow: inset 0 2px 0 var(--accent-primary);
+}
+
+.tabTitle {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.closeBtn {
+  border: none;
+  background: transparent;
+  color: var(--fg-secondary);
+  cursor: pointer;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  line-height: 0;
+  opacity: 0;
+  transition:
+    opacity 80ms linear,
+    color 80ms ease;
+}
+
+.tabItem:hover .closeBtn,
+.tabItem:focus-visible .closeBtn,
+.tabItemActive .closeBtn {
+  opacity: 0.9;
+}
+
+.tabItemActive .closeBtn {
+  color: var(--fg-secondary);
+}
+
+.addBtn {
+  margin-left: 6px;
+  border: 1px solid var(--border-primary);
+  background: var(--bg-secondary);
+  color: var(--fg-secondary);
+  padding: 4px 8px;
+  border-bottom: none;
+  cursor: pointer;
+  font-size: calc(12px * var(--font-scale));
+  line-height: 1.2;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.addBtn:hover {
+  color: var(--fg-primary);
+  background: var(--bg-hover);
+  border-color: var(--border-secondary);
+}
+
+.addBtn:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 1px;
+}

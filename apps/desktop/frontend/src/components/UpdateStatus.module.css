@@ -1,0 +1,51 @@
+.container {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.label {
+  min-width: 140px;
+  font-size: calc(12px * var(--font-scale));
+  color: var(--fg-primary);
+}
+
+.value {
+  font-size: calc(12px * var(--font-scale));
+  color: var(--fg-secondary);
+}
+
+.status {
+  font-size: calc(12px * var(--font-scale));
+  color: var(--fg-tertiary);
+}
+
+.actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.notes {
+  border: 1px solid var(--border-primary);
+  background: var(--bg-secondary);
+  padding: 6px 8px;
+  max-height: 140px;
+  overflow: auto;
+  white-space: pre-wrap;
+  font-size: calc(12px * var(--font-scale));
+  color: var(--fg-secondary);
+}
+
+.error {
+  font-size: calc(12px * var(--font-scale));
+  color: #ff6b6b;
+}

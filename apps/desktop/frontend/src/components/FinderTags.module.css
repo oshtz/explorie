@@ -1,0 +1,179 @@
+/* FinderTags component styles */
+
+.finderTags {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.tagList {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 12px;
+  font-size: 12px;
+  background-color: var(--bg-tertiary);
+  color: var(--text-primary);
+  border: 1px solid var(--border-color);
+  transition: background-color 0.15s ease;
+}
+
+.tag:hover {
+  background-color: var(--bg-hover);
+}
+
+.tagDot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.tagName {
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.removeButton {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  margin-left: 2px;
+  background: none;
+  border: none;
+  cursor: pointer;
+  opacity: 0.6;
+  transition: opacity 0.15s ease;
+  color: inherit;
+}
+
+.removeButton:hover {
+  opacity: 1;
+}
+
+.addButton {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border-radius: 50%;
+  background-color: var(--bg-tertiary);
+  border: 1px dashed var(--border-color);
+  cursor: pointer;
+  color: var(--text-secondary);
+  transition: all 0.15s ease;
+}
+
+.addButton:hover {
+  background-color: var(--bg-hover);
+  border-style: solid;
+  color: var(--text-primary);
+}
+
+.addForm {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.tagInput {
+  flex: 1;
+  min-width: 100px;
+  max-width: 200px;
+  padding: 4px 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.tagInput:focus {
+  outline: none;
+  border-color: var(--accent-color);
+}
+
+.colorSelect {
+  padding: 4px 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.colorSelect:focus {
+  outline: none;
+  border-color: var(--accent-color);
+}
+
+.confirmButton,
+.cancelButton {
+  padding: 4px 12px;
+  border-radius: 4px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.confirmButton {
+  background-color: var(--accent-color);
+  color: white;
+  border: none;
+}
+
+.confirmButton:hover:not(:disabled) {
+  filter: brightness(1.1);
+}
+
+.confirmButton:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.cancelButton {
+  background-color: var(--bg-tertiary);
+  color: var(--text-primary);
+  border: 1px solid var(--border-color);
+}
+
+.cancelButton:hover {
+  background-color: var(--bg-hover);
+}
+
+.loading {
+  font-size: 12px;
+  color: var(--text-secondary);
+  font-style: italic;
+}
+
+.error {
+  font-size: 11px;
+  color: var(--color-error);
+  padding: 4px 8px;
+  background-color: var(--color-error-bg);
+  border-radius: 4px;
+}
+
+/* Empty state */
+.tagList:empty::after {
+  content: 'No tags';
+  font-size: 12px;
+  color: var(--text-tertiary);
+  font-style: italic;
+}

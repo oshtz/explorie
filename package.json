@@ -1,0 +1,60 @@
+{
+  "name": "explorie",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Ridiculously fast, fully-hackable file manager.",
+  "repository": "https://github.com/oshtz/explorie",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20",
+    "pnpm": ">=9"
+  },
+  "scripts": {
+    "dev": "pnpm run desktop:dev",
+    "dev:watch": "pnpm run desktop:dev:watch",
+    "desktop:dev": "pnpm --filter explorie-desktop tauri:dev",
+    "desktop:dev:watch": "pnpm --filter explorie-desktop tauri:dev:watch",
+    "desktop:web": "pnpm --filter explorie-desktop dev",
+    "desktop:build": "pnpm --filter explorie-desktop tauri:build",
+    "rust:watch": "cargo watch -w crates -x check -x \"test --workspace\"",
+    "rust:check": "cargo check --workspace",
+    "lint": "cargo fmt --all --check && cargo clippy --workspace --all-targets --all-features -D warnings",
+    "lint:ts": "eslint apps/desktop/frontend/src",
+    "lint:ts:fix": "eslint apps/desktop/frontend/src --fix",
+    "release:check": "node scripts/release-check.mjs",
+    "release:check:test": "node --test scripts/release-check.test.mjs",
+    "test": "cargo test --workspace && pnpm exec playwright test",
+    "test:rust": "cargo test --workspace",
+    "test:unit": "pnpm --filter explorie-desktop test",
+    "format": "cargo fmt --all",
+    "format:ts": "prettier --write \"apps/desktop/frontend/src/**/*.{ts,tsx,css}\"",
+    "format:check": "prettier --check \"apps/desktop/frontend/src/**/*.{ts,tsx,css}\"",
+    "typecheck": "pnpm --filter explorie-desktop exec tsc --noEmit",
+    "prepare": "husky"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.52.0",
+    "@tauri-apps/cli": "^2.5.0",
+    "@types/node": "^22.14.1",
+    "@typescript-eslint/eslint-plugin": "^7.18.0",
+    "@typescript-eslint/parser": "^7.18.0",
+    "eslint": "^8.57.0",
+    "eslint-plugin-react": "^7.35.0",
+    "eslint-plugin-react-hooks": "^4.6.2",
+    "husky": "^9.1.6",
+    "lint-staged": "^15.2.10",
+    "prettier": "^3.3.3"
+  },
+  "lint-staged": {
+    "apps/desktop/frontend/src/**/*.{ts,tsx}": [
+      "eslint --fix",
+      "prettier --write"
+    ],
+    "apps/desktop/frontend/src/**/*.css": [
+      "prettier --write"
+    ],
+    "**/*.rs": [
+      "cargo fmt --"
+    ]
+  }
+}

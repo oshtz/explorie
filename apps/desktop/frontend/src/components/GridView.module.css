@@ -1,0 +1,151 @@
+.gridContainer {
+  padding: var(--padding-md);
+  width: 100%;
+  height: 100%;
+  overflow: auto;
+  background: var(--bg-primary);
+}
+
+/* DnD highlight when dragging over the grid area */
+.droppableOver {
+  background: var(--bg-selected-soft);
+}
+
+.gridItem {
+  cursor: pointer;
+  background: var(--bg-elevated);
+  border-radius: 0;
+  padding: var(--padding-md) var(--padding-sm) var(--padding-sm) var(--padding-sm);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border-primary);
+  position: relative;
+  user-select: none;
+  box-shadow: var(--inset-divider);
+  transition:
+    background-color 100ms ease,
+    border-color 100ms ease,
+    box-shadow 100ms ease,
+    opacity 100ms ease;
+}
+
+.gridItem:hover {
+  background: var(--bg-hover);
+  border-color: var(--border-secondary);
+}
+
+.gridItem:active {
+  transform: none;
+}
+
+.gridItem:focus,
+.gridItem:focus-visible {
+  outline: none;
+}
+
+.gridItem:focus-visible {
+  border-color: var(--state-selected-outline);
+  box-shadow:
+    inset 0 0 0 1px rgba(var(--accent-primary-rgb), 0.44),
+    var(--focus-ring);
+}
+
+.selected {
+  background: var(--bg-selected-strong);
+  border-color: var(--accent-primary);
+  box-shadow:
+    inset 0 2px 0 var(--accent-primary),
+    var(--inset-divider);
+}
+
+/* DnD: folder item being targeted for drop */
+.dropTarget {
+  background: var(--state-drop-bg);
+  border-color: var(--state-drop-outline);
+  outline: 2px dashed var(--state-drop-outline);
+  outline-offset: -3px;
+}
+
+.dragSource {
+  opacity: 0.46;
+}
+
+.folder {
+  color: var(--fg-primary);
+}
+
+.file {
+  color: var(--fg-secondary);
+}
+
+.fileIcon {
+  font-size: calc(28px * var(--font-scale));
+  margin-bottom: var(--padding-sm);
+  opacity: 0.9;
+}
+
+.fileName {
+  font-size: calc(12px * var(--font-scale));
+  text-align: center;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  width: 100%;
+  max-width: 120px;
+  font-weight: 500;
+}
+
+.fileSize {
+  font-size: calc(10px * var(--font-scale));
+  color: var(--fg-tertiary);
+  margin-top: 4px;
+}
+
+.gridContent {
+  position: absolute;
+  left: 0;
+  right: 0;
+  display: grid;
+  justify-content: start;
+  align-content: start;
+}
+
+.emptyState {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  min-height: var(--empty-state-min-height);
+  color: var(--fg-tertiary);
+  text-align: center;
+  padding: var(--padding-md);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-primary);
+  box-shadow: var(--inset-divider);
+}
+
+.emptyStateIcon {
+  font-size: calc(20px * var(--font-scale));
+  margin-bottom: var(--padding-sm);
+  opacity: 0.6;
+}
+
+.emptyStateText {
+  font-size: calc(12px * var(--font-scale));
+  margin-bottom: var(--padding-sm);
+}
+
+.emptyStateSubtext {
+  font-size: calc(11px * var(--font-scale));
+  opacity: 0.7;
+}
+
+/* Marquee selection rectangle */
+.marquee {
+  border: 1px solid var(--accent-primary, #0078d4);
+  background: rgba(var(--accent-primary-rgb, 0, 120, 212), 0.15);
+  z-index: 100;
+}

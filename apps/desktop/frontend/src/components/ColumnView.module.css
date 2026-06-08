@@ -1,0 +1,221 @@
+.columnContainer {
+  display: flex;
+  gap: 0; /* No gap - resize handles fill the space */
+  align-items: stretch;
+  /* Fill remaining space in parent */
+  flex: 1 1 auto;
+  width: 100%;
+  height: 100%;
+  min-height: 0; /* allow children to shrink within available height */
+  min-width: 0; /* allow horizontal scrolling */
+  overflow-x: auto; /* allow columns to scroll horizontally */
+  overflow-y: hidden;
+  /* Ensure scrollbar is always visible when needed */
+  scrollbar-gutter: stable;
+  background: var(--bg-primary);
+}
+
+.column {
+  flex: 0 0 auto; /* Don't grow or shrink, use set width */
+  background: var(--bg-elevated);
+  border-radius: 0;
+  padding: var(--padding-sm);
+  border: 1px solid var(--border-primary);
+  /* Use flex-basis for height instead of 100% which can cause issues */
+  height: auto;
+  min-height: 0;
+  max-height: 100%;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden; /* Keep list scrolling, header fixed */
+  box-sizing: border-box;
+  box-shadow: var(--inset-divider);
+}
+
+/* Column resize handle */
+.columnResizeHandle {
+  width: 8px;
+  flex: 0 0 8px;
+  cursor: col-resize;
+  background: transparent;
+  position: relative;
+  z-index: 10;
+  transition: background 0.15s ease;
+  align-self: stretch; /* Stretch to match column height */
+}
+
+.columnResizeHandle::before {
+  content: '';
+  position: absolute;
+  left: 3px;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: transparent;
+  transition: background 0.15s ease;
+}
+
+.columnResizeHandle:hover::before,
+.columnResizeHandleActive::before {
+  background: var(--accent-primary);
+}
+
+.columnResizeHandle:hover,
+.columnResizeHandleActive {
+  background: var(--bg-selected-soft);
+}
+
+/* Prevent text selection while resizing */
+:global(body).columnResizing {
+  cursor: col-resize !important;
+  user-select: none !important;
+  -webkit-user-select: none !important;
+}
+
+:global(body).columnResizing * {
+  cursor: col-resize !important;
+}
+
+.columnHeader {
+  font-weight: 600;
+  margin-bottom: var(--padding-sm);
+  font-size: calc(12px * var(--font-scale));
+  display: flex;
+  align-items: center;
+  outline: none;
+  border-radius: 0;
+  padding: 2px 6px;
+  margin: -2px -6px 4px -6px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.columnHeaderActive {
+  color: var(--fg-primary);
+  cursor: default;
+}
+
+.columnHeaderClickable {
+  color: var(--accent-primary);
+  cursor: pointer;
+}
+
+.columnHeaderClickable:hover {
+  background: var(--bg-hover);
+}
+
+.fileList {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  position: relative;
+  overflow-y: auto;
+  overflow-x: hidden;
+  flex: 1 1 0; /* Grow to fill, shrink if needed, base size 0 */
+  min-height: 0;
+  height: 0; /* Combined with flex: 1 1 0, this ensures proper scrolling */
+}
+
+/* DnD: column under drag-over */
+.droppableOver {
+  background: var(--bg-selected-soft);
+}
+
+.fileItem {
+  cursor: pointer;
+  min-height: 26px;
+  padding: 4px 6px;
+  border-radius: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  transition:
+    background-color var(--motion-fast),
+    box-shadow var(--motion-fast),
+    opacity var(--motion-fast);
+  margin-bottom: 2px;
+  -webkit-user-select: none;
+  -moz-user-select: none;
+  -ms-user-select: none;
+  user-select: none;
+}
+
+.fileItem:hover {
+  background: var(--bg-hover);
+}
+
+.fileItem:focus,
+.fileItem:focus-visible {
+  outline: none;
+}
+
+.fileItem:focus-visible {
+  box-shadow: var(--row-focus-shadow);
+}
+
+.selected {
+  background: var(--bg-selected-strong);
+  /* Remove blue outline to match ListView */
+  outline: none;
+  box-shadow: inset 2px 0 0 var(--accent-primary);
+}
+
+/* DnD: folder item being targeted for drop */
+.dropTarget {
+  background: var(--state-drop-bg);
+  outline: 1px dashed var(--state-drop-outline);
+  outline-offset: -1px;
+}
+
+.dragSource {
+  opacity: 0.46;
+}
+
+.folder {
+  color: var(--fg-primary);
+}
+
+.file {
+  color: var(--fg-secondary);
+}
+
+.fileIcon {
+  font-size: calc(12px * var(--font-scale));
+  opacity: 0.9;
+}
+
+.fileName {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: calc(12px * var(--font-scale));
+}
+
+.fileSize {
+  font-size: calc(10px * var(--font-scale));
+  color: var(--fg-tertiary);
+}
+
+/* Marquee selection rectangle */
+.marquee {
+  border: 1px solid var(--accent-primary, #0078d4);
+  background: rgba(var(--accent-primary-rgb, 0, 120, 212), 0.15);
+  z-index: 100;
+}
+
+/* Ensure selected items use the same foreground style as ListView */
+.fileItem.selected {
+  color: var(--fg-title);
+}
+
+@media (max-width: 760px) {
+  .column {
+    width: 100% !important;
+    min-width: 0 !important;
+    max-width: 100% !important;
+  }
+
+  .columnResizeHandle {
+    display: none;
+  }
+}

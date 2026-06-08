@@ -1,0 +1,222 @@
+.backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  animation: fadeIn 0.15s ease-out;
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.overlay {
+  width: 100%;
+  max-width: 720px;
+  max-height: 80vh;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--border-radius-lg, 8px);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  animation: scaleIn 0.15s ease-out;
+}
+
+@keyframes scaleIn {
+  from {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border-primary);
+}
+
+.title {
+  margin: 0;
+  font-size: calc(16px * var(--font-scale, 1));
+  font-weight: 600;
+  color: var(--fg-primary);
+}
+
+.closeButton {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  background: transparent;
+  border: none;
+  border-radius: var(--border-radius-sm, 4px);
+  color: var(--fg-secondary);
+  cursor: pointer;
+  transition:
+    background 0.1s,
+    color 0.1s;
+}
+
+.closeButton:hover {
+  background: var(--bg-secondary);
+  color: var(--fg-primary);
+}
+
+.searchWrapper {
+  display: flex;
+  align-items: center;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--border-primary);
+  gap: 10px;
+}
+
+.searchIcon {
+  color: var(--fg-tertiary);
+  flex-shrink: 0;
+}
+
+.searchInput {
+  flex: 1;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--fg-primary);
+  font-size: calc(14px * var(--font-scale, 1));
+  font-family: var(--font-base);
+}
+
+.searchInput::placeholder {
+  color: var(--fg-tertiary);
+}
+
+.content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px 20px;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 20px;
+}
+
+@media (max-width: 600px) {
+  .grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.category {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.categoryTitle {
+  margin: 0 0 4px 0;
+  font-size: calc(11px * var(--font-scale, 1));
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--fg-tertiary);
+}
+
+.shortcuts {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.shortcutItem {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 8px;
+  border-radius: var(--border-radius-sm, 4px);
+  transition: background 0.1s;
+}
+
+.shortcutItem:hover {
+  background: var(--bg-secondary);
+}
+
+.description {
+  font-size: calc(13px * var(--font-scale, 1));
+  color: var(--fg-primary);
+  flex: 1;
+  min-width: 0;
+}
+
+.keys {
+  font-size: calc(11px * var(--font-scale, 1));
+  padding: 3px 8px;
+  background: var(--bg-tertiary, var(--bg-secondary));
+  border: 1px solid var(--border-primary);
+  border-radius: 4px;
+  color: var(--fg-secondary);
+  font-family: var(--font-mono);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.noResults {
+  padding: 40px 20px;
+  text-align: center;
+  color: var(--fg-tertiary);
+  font-size: calc(14px * var(--font-scale, 1));
+}
+
+.footer {
+  display: flex;
+  justify-content: center;
+  padding: 10px 20px;
+  border-top: 1px solid var(--border-primary);
+  background: var(--bg-secondary);
+  font-size: calc(11px * var(--font-scale, 1));
+  color: var(--fg-tertiary);
+}
+
+.footer kbd {
+  padding: 1px 4px;
+  margin: 0 2px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-primary);
+  border-radius: 3px;
+  font-family: var(--font-mono);
+  font-size: calc(10px * var(--font-scale, 1));
+}
+
+.footer {
+  justify-content: space-between;
+}
+
+.docsLink {
+  color: var(--accent-primary, #7cc7ff);
+  text-decoration: none;
+  transition: opacity 0.1s;
+}
+
+.docsLink:hover {
+  opacity: 0.8;
+  text-decoration: underline;
+}

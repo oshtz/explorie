@@ -1,0 +1,194 @@
+{
+  "identifier": "com.explorie.desktop",
+  "productName": "explorie",
+  "build": {
+    "beforeDevCommand": "pnpm run dev",
+    "beforeBuildCommand": "pnpm run build",
+    "devUrl": "http://localhost:5173",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "explorie",
+        "width": 1024,
+        "height": 768,
+        "resizable": true,
+        "fullscreen": false,
+        "decorations": false,
+        "visible": true
+      }
+    ],
+    "security": {
+      "csp": null,
+      "assetProtocol": {
+        "enable": true,
+        "scope": [
+          "$HOME/**",
+          "$DOWNLOAD/**",
+          "$DOWNLOADS/**",
+          "$DOCUMENT/**",
+          "$DESKTOP/**",
+          "$PICTURE/**",
+          "$VIDEO/**",
+          "$AUDIO/**",
+          "$PUBLIC/**",
+          "/Users/**",
+          "/Volumes/**",
+          "/tmp/**",
+          "/private/**",
+          "C:/**",
+          "D:/**",
+          "E:/**",
+          "F:/**",
+          "G:/**"
+        ]
+      },
+      "capabilities": [
+        {
+          "identifier": "main-capability",
+          "description": "Allow file system access for the main window",
+          "windows": ["main"],
+          "permissions": [
+            "fs:default",
+            "core:window:allow-show",
+            {
+              "identifier": "fs:read-all",
+              "allow": [
+                { "path": "$HOME/**" },
+                { "path": "$DOWNLOAD/**" },
+                { "path": "$DOWNLOADS/**" },
+                { "path": "$DOCUMENT/**" },
+                { "path": "$DESKTOP/**" },
+                { "path": "$PICTURE/**" },
+                { "path": "$VIDEO/**" },
+                { "path": "$AUDIO/**" },
+                { "path": "$PUBLIC/**" },
+                { "path": "/Users/**" },
+                { "path": "/Volumes/**" },
+                { "path": "/tmp/**" },
+                { "path": "/private/**" },
+                { "path": "C:\\**" },
+                { "path": "D:\\**" },
+                { "path": "E:\\**" },
+                { "path": "F:\\**" },
+                { "path": "G:\\**" }
+              ]
+            },
+            {
+              "identifier": "fs:write-all",
+              "allow": [
+                { "path": "$HOME/**" },
+                { "path": "$DOWNLOAD/**" },
+                { "path": "$DOWNLOADS/**" },
+                { "path": "$DOCUMENT/**" },
+                { "path": "$DESKTOP/**" },
+                { "path": "$PICTURE/**" },
+                { "path": "$VIDEO/**" },
+                { "path": "$AUDIO/**" },
+                { "path": "$PUBLIC/**" }
+              ]
+            },
+            {
+              "identifier": "fs:allow-read-text-file",
+              "allow": [
+                { "path": "$HOME/**" },
+                { "path": "$DOWNLOAD/**" },
+                { "path": "$DOWNLOADS/**" },
+                { "path": "$DOCUMENT/**" },
+                { "path": "$DESKTOP/**" },
+                { "path": "$PICTURE/**" },
+                { "path": "$VIDEO/**" },
+                { "path": "$AUDIO/**" },
+                { "path": "$PUBLIC/**" },
+                { "path": "/Users/**" },
+                { "path": "/Volumes/**" },
+                { "path": "/tmp/**" },
+                { "path": "/private/**" },
+                { "path": "C:\\**" },
+                { "path": "D:\\**" },
+                { "path": "E:\\**" },
+                { "path": "F:\\**" },
+                { "path": "G:\\**" }
+              ]
+            },
+            {
+              "identifier": "fs:allow-write-text-file",
+              "allow": [
+                { "path": "$HOME/**" },
+                { "path": "$DOWNLOAD/**" },
+                { "path": "$DOWNLOADS/**" },
+                { "path": "$DOCUMENT/**" },
+                { "path": "$DESKTOP/**" },
+                { "path": "$PICTURE/**" },
+                { "path": "$VIDEO/**" },
+                { "path": "$AUDIO/**" },
+                { "path": "$PUBLIC/**" }
+              ]
+            },
+            {
+              "identifier": "fs:allow-read-dir",
+              "allow": [
+                { "path": "$HOME/**" },
+                { "path": "$DOWNLOAD/**" },
+                { "path": "$DOWNLOADS/**" },
+                { "path": "$DOCUMENT/**" },
+                { "path": "$DESKTOP/**" },
+                { "path": "$PICTURE/**" },
+                { "path": "$VIDEO/**" },
+                { "path": "$AUDIO/**" },
+                { "path": "$PUBLIC/**" },
+                { "path": "/Users/**" },
+                { "path": "/Volumes/**" },
+                { "path": "/tmp/**" },
+                { "path": "/private/**" },
+                { "path": "C:\\**" },
+                { "path": "D:\\**" },
+                { "path": "E:\\**" },
+                { "path": "F:\\**" },
+                { "path": "G:\\**" }
+              ]
+            },
+            {
+              "identifier": "fs:allow-exists",
+              "allow": [
+                { "path": "$HOME/**" },
+                { "path": "$DOWNLOAD/**" },
+                { "path": "$DOWNLOADS/**" },
+                { "path": "$DOCUMENT/**" },
+                { "path": "$DESKTOP/**" },
+                { "path": "$PICTURE/**" },
+                { "path": "$VIDEO/**" },
+                { "path": "$AUDIO/**" },
+                { "path": "$PUBLIC/**" },
+                { "path": "/Users/**" },
+                { "path": "/Volumes/**" },
+                { "path": "/tmp/**" },
+                { "path": "/private/**" },
+                { "path": "C:\\**" },
+                { "path": "D:\\**" },
+                { "path": "E:\\**" },
+                { "path": "F:\\**" },
+                { "path": "G:\\**" }
+              ]
+            },
+            "core:window:allow-minimize",
+            "core:window:allow-toggle-maximize",
+            "core:window:allow-close",
+            "core:window:allow-start-dragging"
+          ]
+        }
+      ]
+    }
+  },
+  "plugins": {
+    "fs": {
+      "requireLiteralLeadingDot": false
+    }
+  },
+  "bundle": {
+    "active": true,
+    "icon": ["icons/icon.icns", "icons/icon.ico", "icons/icon.png"]
+  }
+}

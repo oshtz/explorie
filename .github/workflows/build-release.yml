@@ -1,0 +1,510 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: "9"
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "pnpm"
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./ -> target"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Tauri icons
+        run: pnpm --filter explorie-desktop tauri:icon
+
+      - name: Build frontend
+        run: pnpm --filter explorie-desktop build
+
+      - name: Build Tauri app (no bundles)
+        run: pnpm --filter explorie-desktop exec tauri build --no-bundle
+
+      - name: Restore Enigma Virtual Box installer cache
+        uses: actions/cache@v4
+        continue-on-error: true
+        with:
+          path: ${{ runner.tool_cache }}/enigma-virtualbox/enigmavb_setup.exe
+          key: enigma-virtualbox-installer-v1-${{ vars.EVB_INSTALLER_SHA256 || 'unverified' }}
+          restore-keys: |
+            enigma-virtualbox-installer-v1-
+
+      - name: Install Enigma Virtual Box
+        shell: pwsh
+        env:
+          EVB_INSTALLER_URL: ${{ vars.EVB_INSTALLER_URL }}
+          EVB_INSTALLER_SHA256: ${{ vars.EVB_INSTALLER_SHA256 }}
+        run: |
+          function Find-EvbConsole {
+            $candidatePaths = @(
+              "C:\Program Files (x86)\Enigma Virtual Box\enigmavbconsole.exe",
+              "C:\Program Files\Enigma Virtual Box\enigmavbconsole.exe"
+            )
+            foreach ($candidate in $candidatePaths) {
+              if (Test-Path $candidate) {
+                return $candidate
+              }
+            }
+
+            $command = Get-Command enigmavbconsole.exe -ErrorAction SilentlyContinue
+            if ($command) {
+              return $command.Source
+            }
+
+            return $null
+          }
+
+          $cacheRoot = if ($env:RUNNER_TOOL_CACHE) { $env:RUNNER_TOOL_CACHE } else { $env:RUNNER_TEMP }
+          $evbCacheDir = Join-Path $cacheRoot "enigma-virtualbox"
+          New-Item -ItemType Directory -Force -Path $evbCacheDir | Out-Null
+          $evbInstaller = Join-Path $evbCacheDir "enigmavb_setup.exe"
+          $expectedHash = if ($env:EVB_INSTALLER_SHA256) {
+            $env:EVB_INSTALLER_SHA256.ToUpperInvariant()
+          } else {
+            "AB743F5E3DD927A288E126BBB053D367F270592E89378C9A06B7F3B15FA1EE35"
+          }
+
+          function Test-EvbInstaller {
+            param([string]$Path)
+
+            if (-not (Test-Path $Path)) {
+              return $false
+            }
+
+            $installer = Get-Item $Path
+            if ($installer.Length -le 1MB) {
+              Write-Warning "Ignoring EVB installer with unexpected size: $($installer.Length) bytes"
+              return $false
+            }
+
+            if ($expectedHash) {
+              $actualHash = (Get-FileHash -Path $Path -Algorithm SHA256).Hash
+              if ($actualHash -ne $expectedHash) {
+                Write-Warning "Ignoring EVB installer with unexpected SHA256: $actualHash"
+                return $false
+              }
+            }
+
+            return $true
+          }
+
+          $evbConsole = Find-EvbConsole
+          if (-not $evbConsole -and (Get-Command winget -ErrorAction SilentlyContinue)) {
+            Write-Host "Installing Enigma Virtual Box through winget"
+            winget install --id Enigma.VirtualBox --exact --silent --accept-package-agreements --accept-source-agreements
+            if ($LASTEXITCODE -ne 0) {
+              Write-Warning "winget failed to install Enigma.VirtualBox with exit code $LASTEXITCODE"
+            }
+            $evbConsole = Find-EvbConsole
+          }
+
+          $evbUrls = @()
+          if ($env:EVB_INSTALLER_URL) {
+            $evbUrls += $env:EVB_INSTALLER_URL
+          }
+          $evbUrls += @(
+            "https://www.enigmaprotector.com/assets/files/enigmavb.exe",
+            "https://enigmaprotector.com/assets/files/enigmavb.exe"
+          )
+
+          if (-not $evbConsole) {
+            if (Test-EvbInstaller -Path $evbInstaller) {
+              $downloaded = $true
+              Write-Host "Using cached EVB installer: $evbInstaller"
+            } else {
+              Remove-Item -Path $evbInstaller -Force -ErrorAction SilentlyContinue
+              $downloaded = $false
+              foreach ($evbUrl in $evbUrls) {
+                Write-Host "Trying: $evbUrl"
+                for ($attempt = 1; $attempt -le 3; $attempt++) {
+                  try {
+                    $headers = @{
+                      "User-Agent" = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                      "Accept" = "application/octet-stream,application/x-msdownload,*/*"
+                    }
+                    Invoke-WebRequest -Uri $evbUrl -OutFile $evbInstaller -UseBasicParsing -Headers $headers -MaximumRedirection 5
+
+                    if (Test-EvbInstaller -Path $evbInstaller) {
+                      $downloaded = $true
+                      Write-Host "Downloaded successfully from $evbUrl"
+                      break
+                    }
+                  } catch {
+                    Write-Host "Attempt $attempt failed: $_"
+                  }
+                  Start-Sleep -Seconds 2
+                }
+                if ($downloaded) {
+                  break
+                }
+              }
+            }
+
+            if (-not $downloaded) {
+              throw "Enigma Virtual Box is required to create explorie-portable.exe, but winget and direct installer download both failed."
+            }
+
+            $process = Start-Process -FilePath $evbInstaller -ArgumentList "/VERYSILENT","/NORESTART" -Wait -PassThru
+            if ($process.ExitCode -ne 0) {
+              throw "EVB installer failed with exit code $($process.ExitCode)"
+            }
+            $evbConsole = Find-EvbConsole
+          }
+
+          if ($evbConsole -and (Test-Path $evbConsole)) {
+            Write-Host "EVB console ready: $evbConsole"
+            "EVB_CONSOLE=$evbConsole" | Out-File -FilePath $env:GITHUB_ENV -Append
+          } else {
+            throw "EVB installation failed: enigmavbconsole.exe not found"
+          }
+
+      - name: Create portable exe
+        shell: pwsh
+        run: |
+          $inputExe = $null
+          $candidatePaths = @(
+            "apps/desktop/frontend/src-tauri/target/release/explorie-desktop.exe",
+            "apps/desktop/frontend/src-tauri/target/release/explorie.exe",
+            "target/release/explorie-desktop.exe",
+            "target/release/explorie.exe"
+          )
+          foreach ($candidate in $candidatePaths) {
+            if (Test-Path $candidate) {
+              $inputExe = (Resolve-Path $candidate).Path
+              break
+            }
+          }
+
+          if (-not $inputExe) {
+            $searchRoots = @(
+              "apps/desktop/frontend/src-tauri/target",
+              "target"
+            )
+            foreach ($root in $searchRoots) {
+              if (Test-Path $root) {
+                $inputExe = Get-ChildItem -Path $root -Recurse -Filter "*.exe" |
+                  Where-Object {
+                    $_.FullName -match "\\\\release\\\\" -and
+                    $_.FullName -notmatch "\\\\deps\\\\" -and
+                    $_.FullName -notmatch "\\\\build\\\\"
+                  } |
+                  Sort-Object -Property Length -Descending |
+                  Select-Object -First 1 -ExpandProperty FullName
+                if ($inputExe) { break }
+              }
+            }
+          }
+
+          if (-not $inputExe) {
+            foreach ($root in @("apps/desktop/frontend/src-tauri/target", "target")) {
+              if (Test-Path $root) {
+                Get-ChildItem -Path $root -Recurse -Filter "*.exe" | ForEach-Object { $_.FullName }
+              }
+            }
+            throw "Release exe not found under apps/desktop/frontend/src-tauri/target or target"
+          }
+          $outputExe = Join-Path (Split-Path $inputExe -Parent) "explorie-portable.exe"
+          New-Item -ItemType Directory -Force -Path (Split-Path $outputExe) | Out-Null
+          $webviewDll = $null
+          foreach ($root in @("apps/desktop/frontend/src-tauri/target", "target")) {
+            if (Test-Path $root) {
+              $webviewDll = Get-ChildItem -Path $root -Filter "WebView2Loader.dll" -Recurse | Select-Object -First 1
+              if ($webviewDll) { break }
+            }
+          }
+          if (-not $webviewDll) {
+            throw "WebView2Loader.dll not found under apps/desktop/frontend/src-tauri/target or target"
+          }
+          $webviewDllPath = $webviewDll.FullName
+
+          $evbStaging = Join-Path $PWD "evb-staging"
+          New-Item -ItemType Directory -Force -Path $evbStaging | Out-Null
+          Copy-Item -Path $webviewDllPath -Destination $evbStaging -Force
+          $evbProject = Join-Path $PWD "explorie.evb"
+          pnpm --package=@insco/enigma-virtualbox dlx enigmavirtualbox generate $evbStaging --input $inputExe --output $outputExe --project-name $evbProject
+          if ($LASTEXITCODE -ne 0) {
+            throw "enigmavirtualbox generate failed"
+          }
+          $evbConsole = $env:EVB_CONSOLE
+          if (-not (Test-Path $evbConsole)) {
+            throw "enigmavbconsole.exe not found at $evbConsole"
+          }
+          & $evbConsole $evbProject
+          if ($LASTEXITCODE -ne 0) {
+            throw "enigmavbconsole failed"
+          }
+
+          if (Test-Path $outputExe) {
+            $size = [math]::Round((Get-Item $outputExe).Length / 1MB, 2)
+            Write-Host "Portable exe created: $size MB"
+          } else {
+            throw "Failed to create portable exe"
+          }
+          "PORTABLE_EXE_PATH=$outputExe" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Upload portable exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: explorie-portable
+          path: ${{ env.PORTABLE_EXE_PATH }}
+
+      - name: Determine release tag
+        id: release_tag
+        if: github.ref == 'refs/heads/main'
+        shell: pwsh
+        run: |
+          $version = (Get-Content package.json | ConvertFrom-Json).version
+          if (-not $version) {
+            throw "package.json version not found"
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=v$version" >> $env:GITHUB_OUTPUT
+
+      - name: Check for existing release
+        id: release_check
+        if: github.ref == 'refs/heads/main'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const tag = '${{ steps.release_tag.outputs.tag }}';
+            try {
+              await github.rest.repos.getReleaseByTag({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag
+              });
+              core.setOutput('exists', 'true');
+            } catch (error) {
+              core.setOutput('exists', 'false');
+            }
+
+      - name: Publish release artifact (tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          files: |
+            ${{ env.PORTABLE_EXE_PATH }}
+
+      - name: Publish release artifact (main create)
+        if: github.ref == 'refs/heads/main' && steps.release_check.outputs.exists != 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: ${{ steps.release_tag.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          files: |
+            ${{ env.PORTABLE_EXE_PATH }}
+
+      - name: Publish release artifact (main existing)
+        if: github.ref == 'refs/heads/main' && steps.release_check.outputs.exists == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: ${{ steps.release_tag.outputs.tag }}
+          files: |
+            ${{ env.PORTABLE_EXE_PATH }}
+
+  build-macos:
+    runs-on: macos-latest
+
+    steps:
+      - name: Check Apple signing secrets
+        id: apple-secrets
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          missing=0
+          if [ -z "$APPLE_CERTIFICATE" ]; then missing=1; fi
+          if [ -z "$APPLE_CERTIFICATE_PASSWORD" ]; then missing=1; fi
+          if [ -z "$APPLE_SIGNING_IDENTITY" ]; then missing=1; fi
+          if [ -z "$APPLE_ID" ]; then missing=1; fi
+          if [ -z "$APPLE_PASSWORD" ]; then missing=1; fi
+          if [ -z "$APPLE_TEAM_ID" ]; then missing=1; fi
+
+          if [ "$missing" -eq 0 ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Skip macOS build (missing secrets)
+        if: steps.apple-secrets.outputs.available != 'true'
+        run: echo "Apple signing secrets not configured; skipping macOS build."
+
+      - name: Checkout repository
+        if: steps.apple-secrets.outputs.available == 'true'
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        if: steps.apple-secrets.outputs.available == 'true'
+        uses: pnpm/action-setup@v4
+        with:
+          version: "9"
+          run_install: false
+
+      - name: Setup Node.js
+        if: steps.apple-secrets.outputs.available == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "pnpm"
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Setup Rust
+        if: steps.apple-secrets.outputs.available == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Rust cache
+        if: steps.apple-secrets.outputs.available == 'true'
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./ -> target"
+
+      - name: Install dependencies
+        if: steps.apple-secrets.outputs.available == 'true'
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Tauri icons
+        if: steps.apple-secrets.outputs.available == 'true'
+        run: pnpm --filter explorie-desktop tauri:icon
+
+      - name: Build frontend
+        if: steps.apple-secrets.outputs.available == 'true'
+        run: pnpm --filter explorie-desktop build
+
+      - name: Import Apple codesign certs
+        if: steps.apple-secrets.outputs.available == 'true'
+        uses: apple-actions/import-codesign-certs@v2
+        with:
+          p12-file-base64: ${{ secrets.APPLE_CERTIFICATE }}
+          p12-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+
+      - name: Build Tauri app (dmg)
+        if: steps.apple-secrets.outputs.available == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: pnpm --filter explorie-desktop exec tauri build --bundles dmg
+
+      - name: Upload dmg
+        if: steps.apple-secrets.outputs.available == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: explorie-macOS-dmg
+          path: target/release/bundle/dmg/*.dmg
+
+      - name: Determine release tag
+        id: release_tag
+        if: steps.apple-secrets.outputs.available == 'true' && github.ref == 'refs/heads/main'
+        run: |
+          version=$(node -p "require('./package.json').version")
+          if [ -z "$version" ]; then
+            echo "package.json version not found"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+      - name: Delete existing dmg asset if present (tag)
+        if: steps.apple-secrets.outputs.available == 'true' && startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          # Check if release exists first
+          if ! gh api "repos/${{ github.repository }}/releases/tags/$tag" >/dev/null 2>&1; then
+            echo "Release $tag does not exist yet, skipping asset cleanup"
+            exit 0
+          fi
+          for dmg in target/release/bundle/dmg/*.dmg; do
+            asset_name=$(basename "$dmg")
+            asset_id=$(gh api "repos/${{ github.repository }}/releases/tags/$tag" --jq ".assets[] | select(.name == \"$asset_name\") | .id" 2>/dev/null || echo "")
+            if [ -n "$asset_id" ] && [ "$asset_id" != "null" ]; then
+              echo "Deleting existing asset: $asset_name (id: $asset_id)"
+              gh api -X DELETE "repos/${{ github.repository }}/releases/assets/$asset_id"
+            fi
+          done
+
+      - name: Publish release artifact (tag)
+        if: steps.apple-secrets.outputs.available == 'true' && startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          files: |
+            target/release/bundle/dmg/*.dmg
+
+      - name: Delete existing dmg asset if present
+        if: steps.apple-secrets.outputs.available == 'true' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ steps.release_tag.outputs.tag }}"
+          # Check if release exists first
+          if ! gh api "repos/${{ github.repository }}/releases/tags/$tag" >/dev/null 2>&1; then
+            echo "Release $tag does not exist yet, skipping asset cleanup"
+            exit 0
+          fi
+          for dmg in target/release/bundle/dmg/*.dmg; do
+            asset_name=$(basename "$dmg")
+            asset_id=$(gh api "repos/${{ github.repository }}/releases/tags/$tag" --jq ".assets[] | select(.name == \"$asset_name\") | .id" 2>/dev/null || echo "")
+            if [ -n "$asset_id" ] && [ "$asset_id" != "null" ]; then
+              echo "Deleting existing asset: $asset_name (id: $asset_id)"
+              gh api -X DELETE "repos/${{ github.repository }}/releases/assets/$asset_id"
+            fi
+          done
+
+      - name: Publish release artifact (main)
+        if: steps.apple-secrets.outputs.available == 'true' && github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: ${{ steps.release_tag.outputs.tag }}
+          files: |
+            target/release/bundle/dmg/*.dmg

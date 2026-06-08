@@ -1,0 +1,405 @@
+:root {
+  /* Minimal, terminal-like dark theme */
+  --bg-primary: #0f0f0f; /* base */
+  --bg-secondary: #151515; /* panels */
+  --bg-tertiary: #1b1b1b; /* hover */
+  --bg-selected: #202020; /* selected */
+  --bg-topbar: #111111; /* top bar */
+  --bg-elevated: #181818;
+  --bg-sunken: #0b0b0b;
+  --bg-hover: rgba(255, 255, 255, 0.045);
+  --bg-active: rgba(255, 255, 255, 0.075);
+  --bg-selected-soft: rgba(var(--accent-primary-rgb), 0.1);
+  --bg-selected-strong: rgba(var(--accent-primary-rgb), 0.16);
+  --state-hover-outline: rgba(255, 255, 255, 0.09);
+  --state-selected-outline: rgba(var(--accent-primary-rgb), 0.42);
+  --state-drop-bg: rgba(var(--accent-primary-rgb), 0.14);
+  --state-drop-outline: rgba(var(--accent-primary-rgb), 0.76);
+
+  --fg-primary: #dddddd; /* main text - 14.3:1 contrast */
+  --fg-secondary: #aaaaaa; /* dim text - 9.2:1 contrast */
+  --fg-tertiary: #8a8a8a; /* extra dim - 5.8:1 contrast (WCAG AA compliant) */
+  --fg-title: #ffffff; /* titles */
+
+  --border-primary: #252525; /* borders */
+  --border-secondary: #303030; /* light borders */
+  --border-subtle: rgba(255, 255, 255, 0.055);
+  --border-strong: #3a3a3a;
+
+  /* Sparse accents; keep subdued */
+  --accent-primary: #7cc7ff; /* calm blue */
+  --accent-primary-rgb: 124, 199, 255;
+  --accent-secondary: #9ad1a8; /* muted green */
+  --accent-secondary-rgb: 154, 209, 168;
+  --accent-green: #9ad1a8;
+  --accent-green-rgb: 154, 209, 168;
+  --accent-yellow: #d1c28a;
+  --accent-yellow-rgb: 209, 194, 138;
+  --accent-red: #ff8aa0;
+  --accent-red-rgb: 255, 138, 160;
+  --fg-error: var(--accent-red);
+  --fg-success: var(--accent-green);
+  --fg-warning: var(--accent-yellow);
+
+  /* Compatibility aliases used by older component modules */
+  --text-primary: var(--fg-primary);
+  --text-secondary: var(--fg-secondary);
+  --text-tertiary: var(--fg-tertiary);
+  --color-text-secondary: var(--fg-secondary);
+  --border-color: var(--border-primary);
+  --border-radius: var(--border-radius-sm);
+
+  /* Fonts */
+  --font-sans:
+    system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Arial, sans-serif;
+  --font-mono:
+    ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New',
+    monospace;
+  --font-base: var(--font-mono);
+
+  /* Tight spacing, square corners */
+  --border-radius-sm: 0px;
+  --border-radius-md: 0px;
+  --border-radius-lg: 0px;
+  --padding-xs: 2px;
+  --padding-sm: 4px;
+  --padding-md: 8px;
+  --padding-lg: 12px;
+  --control-height-sm: 24px;
+  --control-height-md: 30px;
+  --command-size-sm: 24px;
+  --command-size-md: 30px;
+  --empty-state-min-height: 180px;
+  --metadata-label-width: 88px;
+  --motion-fast: 100ms ease;
+  --motion-med: 140ms ease;
+  --panel-shadow: 0 16px 40px rgba(0, 0, 0, 0.34);
+  --overlay-shadow: 0 24px 70px rgba(0, 0, 0, 0.48);
+  --inset-divider: inset 0 1px 0 var(--border-subtle);
+  --focus-ring: 0 0 0 3px rgba(var(--accent-primary-rgb), 0.22);
+  --row-focus-shadow:
+    inset 0 0 0 1px rgba(var(--accent-primary-rgb), 0.58), inset 2px 0 0 var(--accent-primary);
+
+  /* Global sizing */
+  --icon-size: 14px;
+  --row-height: 34px;
+  --grid-min-width: 140px;
+
+  /* Scrollbar styling */
+  --scrollbar-size: 6px;
+  --scrollbar-track: var(--bg-secondary);
+  --scrollbar-thumb: var(--border-secondary);
+  --scrollbar-thumb-hover: rgba(var(--accent-primary-rgb), 0.45);
+  --scrollbar-thumb-active: rgba(var(--accent-primary-rgb), 0.65);
+  --scrollbar-corner: var(--bg-primary);
+  --ui-scale: 1;
+  --font-scale: 1;
+}
+
+/* Apply box-sizing globally */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+body {
+  font-family: var(--font-base);
+  font-size: calc(14px * var(--font-scale));
+  font-optical-sizing: auto;
+  font-weight: 400;
+  font-style: normal;
+  background: var(--bg-primary); /* Use CSS variable */
+  color: var(--fg-primary); /* Use CSS variable */
+  margin: 0;
+  padding: 0;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Light theme variables: inverted palette */
+.theme-light {
+  --bg-primary: #f6f6f6;
+  --bg-secondary: #efefef;
+  --bg-tertiary: #e8e8e8;
+  --bg-selected: #e2e2e2;
+  --bg-topbar: #f3f3f3;
+  --bg-elevated: #ffffff;
+  --bg-sunken: #ececec;
+  --bg-hover: rgba(0, 0, 0, 0.045);
+  --bg-active: rgba(0, 0, 0, 0.075);
+  --bg-selected-soft: rgba(var(--accent-primary-rgb), 0.1);
+  --bg-selected-strong: rgba(var(--accent-primary-rgb), 0.16);
+
+  --fg-primary: #222222;
+  --fg-secondary: #555555;
+  --fg-tertiary: #707070; /* Improved for WCAG AA - 5.1:1 contrast */
+  --fg-title: #000000;
+
+  --border-primary: #d0d0d0;
+  --border-secondary: #c6c6c6;
+  --border-subtle: rgba(0, 0, 0, 0.055);
+  --border-strong: #b4b4b4;
+  --panel-shadow: 0 16px 40px rgba(0, 0, 0, 0.12);
+  --overlay-shadow: 0 24px 70px rgba(0, 0, 0, 0.22);
+
+  --scrollbar-track: var(--bg-secondary);
+  --scrollbar-thumb: #c0c0c0;
+  --scrollbar-thumb-hover: rgba(var(--accent-primary-rgb), 0.35);
+  --scrollbar-thumb-active: rgba(var(--accent-primary-rgb), 0.55);
+  --scrollbar-corner: var(--bg-primary);
+}
+
+/* High contrast dark theme - WCAG AAA compliant */
+.theme-dark.high-contrast,
+.high-contrast {
+  --bg-primary: #000000;
+  --bg-secondary: #0a0a0a;
+  --bg-tertiary: #141414;
+  --bg-selected: #1a1a1a;
+  --bg-topbar: #050505;
+  --bg-elevated: #111111;
+  --bg-sunken: #000000;
+  --bg-hover: rgba(255, 255, 255, 0.12);
+  --bg-active: rgba(255, 255, 255, 0.18);
+
+  --fg-primary: #ffffff; /* 21:1 contrast */
+  --fg-secondary: #e0e0e0; /* 15.9:1 contrast */
+  --fg-tertiary: #b0b0b0; /* 10.4:1 contrast */
+  --fg-title: #ffffff;
+
+  --border-primary: #404040;
+  --border-secondary: #505050;
+  --border-subtle: #303030;
+  --border-strong: #707070;
+  --panel-shadow: none;
+  --overlay-shadow: none;
+
+  --accent-primary: #80d0ff; /* Brighter for visibility */
+  --accent-primary-rgb: 128, 208, 255;
+}
+
+/* High contrast light theme - WCAG AAA compliant */
+.theme-light.high-contrast {
+  --bg-primary: #ffffff;
+  --bg-secondary: #f5f5f5;
+  --bg-tertiary: #ebebeb;
+  --bg-selected: #e0e0e0;
+  --bg-topbar: #fafafa;
+  --bg-elevated: #ffffff;
+  --bg-sunken: #eeeeee;
+  --bg-hover: rgba(0, 0, 0, 0.12);
+  --bg-active: rgba(0, 0, 0, 0.18);
+
+  --fg-primary: #000000; /* 21:1 contrast */
+  --fg-secondary: #1a1a1a; /* 18.1:1 contrast */
+  --fg-tertiary: #333333; /* 12.6:1 contrast */
+  --fg-title: #000000;
+
+  --border-primary: #808080;
+  --border-secondary: #707070;
+  --border-subtle: #b8b8b8;
+  --border-strong: #505050;
+  --panel-shadow: none;
+  --overlay-shadow: none;
+
+  --accent-primary: #0066cc; /* Darker for visibility on white */
+  --accent-primary-rgb: 0, 102, 204;
+}
+
+/* Global custom scrollbars */
+/* Firefox */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
+}
+
+/* Chromium/WebKit - Force custom scrollbars on all platforms including macOS */
+*::-webkit-scrollbar {
+  -webkit-appearance: none; /* Override macOS overlay scrollbar */
+  width: var(--scrollbar-size);
+  height: var(--scrollbar-size);
+}
+*::-webkit-scrollbar-track {
+  -webkit-appearance: none;
+  background: var(--scrollbar-track);
+}
+*::-webkit-scrollbar-thumb {
+  -webkit-appearance: none;
+  background-color: var(--scrollbar-thumb);
+  border: 1px solid var(--border-primary);
+  border-radius: 0;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background-color: var(--scrollbar-thumb-hover);
+  border-color: rgba(var(--accent-primary-rgb), 0.5);
+}
+*::-webkit-scrollbar-thumb:active {
+  background-color: var(--scrollbar-thumb-active);
+  border-color: rgba(var(--accent-primary-rgb), 0.7);
+}
+*::-webkit-scrollbar-corner {
+  -webkit-appearance: none;
+  background: var(--scrollbar-corner);
+}
+/* Ensure scrollbar is always visible (not overlay style) */
+*::-webkit-scrollbar-button {
+  display: none;
+}
+
+/* Force scrollbar gutter to always be present for layout stability */
+.fileList,
+.columnContainer,
+.listViewContainer,
+.gridViewContainer {
+  scrollbar-gutter: stable;
+}
+
+/* Ensure controls use terminal font + minimal styling */
+button,
+input,
+select,
+textarea {
+  font-family: inherit;
+  color: var(--fg-primary);
+}
+
+input,
+select,
+textarea {
+  background: var(--bg-sunken);
+  border: 1px solid var(--border-primary);
+  border-radius: 0;
+  color: var(--fg-primary);
+  padding: 4px 6px;
+  transition:
+    background-color 100ms ease,
+    border-color 100ms ease,
+    box-shadow 100ms ease;
+}
+
+button {
+  background: none;
+  border: 1px solid var(--border-primary);
+  border-radius: 0;
+  color: var(--fg-primary);
+  padding: 2px 8px;
+  transition:
+    background-color 100ms ease,
+    border-color 100ms ease,
+    color 100ms ease,
+    opacity 100ms ease;
+}
+
+button:hover {
+  background: var(--bg-hover);
+}
+
+input:focus,
+select:focus,
+textarea:focus {
+  background: var(--bg-primary);
+  border-color: var(--border-strong);
+  box-shadow: var(--focus-ring);
+}
+
+/* Focus indicators for keyboard navigation */
+:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
+}
+
+/* Remove default focus ring when using mouse (focus-visible polyfill) */
+:focus:not(:focus-visible) {
+  outline: none;
+}
+
+/* Enhanced focus for interactive elements */
+button:focus-visible,
+a:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+[role='button']:focus-visible,
+[role='menuitem']:focus-visible,
+[role='row']:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
+  box-shadow: var(--focus-ring);
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  font-optical-sizing: auto;
+  margin-top: 0;
+  color: var(--fg-title); /* Use title color */
+}
+
+/* Pixel icons: invert for dark UI and follow global icon size */
+.pixelIcon {
+  filter: invert(1);
+  width: var(--icon-size);
+  height: var(--icon-size);
+}
+
+/* Optional variants and theme guard */
+.pixelIcon-muted {
+  opacity: 0.6;
+}
+.pixelIcon-accent {
+  filter: invert(66%) sepia(12%) saturate(1800%) hue-rotate(182deg) brightness(103%) contrast(101%);
+}
+.theme-light .pixelIcon {
+  filter: none;
+}
+
+/* Reduce motion - respect user preferences */
+/* System preference */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Manual class toggle (for in-app setting) */
+.reduceMotion *,
+.reduceMotion *::before,
+.reduceMotion *::after {
+  transition-duration: 0.01ms !important;
+  animation-duration: 0.01ms !important;
+  animation-iteration-count: 1 !important;
+}
+.reduceMotion {
+  scroll-behavior: auto !important;
+}
+
+/* Keep Victor Mono available if needed */
+.font-mono {
+  font-family: var(--font-mono);
+}
+
+.font-bold {
+  font-weight: 700;
+}
