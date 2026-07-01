@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import type { FileEntry } from '../store';
 import { updateCustomFields } from '../utils/fs';
 import { useToast } from './Toast';
@@ -30,6 +30,42 @@ export function CustomFieldsEditor({ file, onUpdate }: CustomFieldsEditorProps) 
   const [showFieldSuggestions, setShowFieldSuggestions] = useState(false);
   const [showValueSuggestions, setShowValueSuggestions] = useState(false);
   const [editingField, setEditingField] = useState<string | null>(null);
+  const fieldSuggestionsTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const valueSuggestionsTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const hideFieldSuggestionsSoon = () => {
+    if (fieldSuggestionsTimeoutRef.current) {
+      clearTimeout(fieldSuggestionsTimeoutRef.current);
+    }
+
+    fieldSuggestionsTimeoutRef.current = setTimeout(() => {
+      setShowFieldSuggestions(false);
+      fieldSuggestionsTimeoutRef.current = null;
+    }, 200);
+  };
+
+  const hideValueSuggestionsSoon = () => {
+    if (valueSuggestionsTimeoutRef.current) {
+      clearTimeout(valueSuggestionsTimeoutRef.current);
+    }
+
+    valueSuggestionsTimeoutRef.current = setTimeout(() => {
+      setShowValueSuggestions(false);
+      valueSuggestionsTimeoutRef.current = null;
+    }, 200);
+  };
+
+  useEffect(() => {
+    return () => {
+      if (fieldSuggestionsTimeoutRef.current) {
+        clearTimeout(fieldSuggestionsTimeoutRef.current);
+      }
+
+      if (valueSuggestionsTimeoutRef.current) {
+        clearTimeout(valueSuggestionsTimeoutRef.current);
+      }
+    };
+  }, []);
 
   // Filtered suggestions based on input
   const filteredFieldSuggestions = FIELD_SUGGESTIONS.filter((suggestion) =>
@@ -255,7 +291,7 @@ export function CustomFieldsEditor({ file, onUpdate }: CustomFieldsEditorProps) 
                     value={newFieldValue}
                     onChange={(e) => setNewFieldValue(e.target.value)}
                     onFocus={() => setShowValueSuggestions(getValueSuggestions(field).length > 0)}
-                    onBlur={() => setTimeout(() => setShowValueSuggestions(false), 200)}
+                    onBlur={hideValueSuggestionsSoon}
                     className={styles.fieldInput}
                     autoFocus
                   />
@@ -345,7 +381,7 @@ export function CustomFieldsEditor({ file, onUpdate }: CustomFieldsEditorProps) 
               value={newFieldName}
               onChange={(e) => setNewFieldName(e.target.value)}
               onFocus={() => setShowFieldSuggestions(true)}
-              onBlur={() => setTimeout(() => setShowFieldSuggestions(false), 200)}
+              onBlur={hideFieldSuggestionsSoon}
               className={styles.fieldNameInput}
             />
 
@@ -377,7 +413,7 @@ export function CustomFieldsEditor({ file, onUpdate }: CustomFieldsEditorProps) 
                   setShowValueSuggestions(true);
                 }
               }}
-              onBlur={() => setTimeout(() => setShowValueSuggestions(false), 200)}
+              onBlur={hideValueSuggestionsSoon}
               className={styles.fieldValueInput}
             />
 
