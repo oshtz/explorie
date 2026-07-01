@@ -16,7 +16,7 @@
     "tauri:icon": "tauri icon ./public/icon.png -o ./src-tauri/icons"
   },
   "devDependencies": {
-    "@vitest/coverage-v8": "^1.6.0",
+    "@vitest/coverage-v8": "^3.2.6",
     "@testing-library/jest-dom": "^6.5.0",
     "@testing-library/react": "^16.2.0",
     "@testing-library/user-event": "^14.6.1",
