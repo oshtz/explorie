@@ -1,6 +1,6 @@
 {
   "name": "explorie",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "private": true,
   "description": "Ridiculously fast, fully-hackable file manager.",
   "repository": "https://github.com/oshtz/explorie",
