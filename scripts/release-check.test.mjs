@@ -373,6 +373,10 @@ test('workflows block audits and publish the exact attested draft assets', async
   assert.match(release, /name: Validate release source[\s\S]*?runs-on: windows-latest/);
   assert.match(release, /exec -- tauri build --no-bundle --ci -- --locked/);
   assert.match(release, /exec -- tauri build --bundles dmg --ci -- --locked/);
+  assert.match(
+    release,
+    /name: Notarize and staple macOS DMG[\s\S]*?xcrun notarytool submit[\s\S]*?--wait[\s\S]*?xcrun stapler staple/
+  );
   assert.match(release, /Smoke test Windows installer/);
   assert.match(release, /Smoke test macOS DMG/);
   assert.match(

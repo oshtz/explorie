@@ -204,9 +204,9 @@ macOS releases require these signing secrets:
 
 - macOS: base64-encoded P12 in `APPLE_CERTIFICATE`, plus `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID`.
 
-The v0.2.4 workflow publishes an explicitly named unsigned Windows x64 NSIS installer, a signed/notarized macOS arm64 DMG, and platform SHA-256 manifests. Windows signing remains optional when `WINDOWS_CODESIGN_CERTIFICATE` and `WINDOWS_CODESIGN_PASSWORD` are later configured. CI installs and launch-smokes each package on its target runner; publication additionally requires explicit proof that both candidates passed disposable filesystem operations on real machines.
+The v0.2.5 workflow publishes an explicitly named unsigned Windows x64 NSIS installer, a signed/notarized macOS arm64 DMG, and platform SHA-256 manifests. Windows signing remains optional when `WINDOWS_CODESIGN_CERTIFICATE` and `WINDOWS_CODESIGN_PASSWORD` are later configured. CI installs and launch-smokes each package on its target runner; publication additionally requires explicit proof that both candidates passed disposable filesystem operations on real machines.
 
-The v0.2.4 draft contains `explorie-0.2.4-windows-x64-setup-unsigned.exe`, `explorie-0.2.4-macos-arm64.dmg`, `SHA256SUMS-windows.txt`, and `SHA256SUMS-macos.txt`.
+The v0.2.5 draft contains `explorie-0.2.5-windows-x64-setup-unsigned.exe`, `explorie-0.2.5-macos-arm64.dmg`, `SHA256SUMS-windows.txt`, and `SHA256SUMS-macos.txt`.
 
 Before creating a new tag, manually verify:
 
@@ -216,7 +216,7 @@ Before creating a new tag, manually verify:
 - Exercise copy, move, rename, delete/trash, undo/redo, archive, and extract flows on disposable files.
 - Reopen the app and confirm persisted settings.
 - Confirm Windows and macOS packaged-app behavior on real machines.
-- Uninstall v0.1.0 before installing v0.2.4; the permanent `com.omershatz.explorie` identity intentionally starts a clean installation lineage.
+- Uninstall v0.1.0 before installing v0.2.5; the permanent `com.omershatz.explorie` identity intentionally starts a clean installation lineage.
 - Install both packages on real machines, confirm the Windows unsigned warning is expected, and verify macOS signing/notarization plus both SHA-256 manifests.
 
 ---
