@@ -351,15 +351,23 @@ test('runReleaseCheck stops before commands when release prerequisites fail', as
 });
 
 test('workflows block audits and publish the exact attested draft assets', async () => {
-  const [ci, release] = await Promise.all([
+  const [ci, release, mountDaemon] = await Promise.all([
     readFile(path.join(process.cwd(), '.github/workflows/ci.yml'), 'utf8'),
     readFile(path.join(process.cwd(), '.github/workflows/build-release.yml'), 'utf8'),
+    readFile(
+      path.join(
+        process.cwd(),
+        'apps/desktop/frontend/src-tauri/macos/MountDaemon.m'
+      ),
+      'utf8'
+    ),
   ]);
 
   assert.match(ci, /--port 47173 --strictPort/);
   assert.doesNotMatch(ci, /audit[^\n]*\|\| true/);
   assert.match(ci, /name: Rust Tests & Coverage[\s\S]*?runs-on: windows-latest/);
-  assert.match(ci, /name: macOS Core Tests[\s\S]*?runs-on: macos-latest/);
+  assert.match(ci, /name: macOS Core Tests & Tauri Build[\s\S]*?runs-on: macos-latest/);
+  assert.match(ci, /Build macOS application[\s\S]*?tauri build --no-bundle --ci -- --locked/);
   assert.match(ci, /name: Lint & Type Check[\s\S]*?runs-on: windows-latest/);
   assert.equal((ci.match(/name: Prepare native dependencies/g) ?? []).length, 2);
   assert.doesNotMatch(ci, /rclone-x86_64-unknown-linux-gnu/);
@@ -408,6 +416,9 @@ test('workflows block audits and publish the exact attested draft assets', async
   assert.match(release, /spctl --assess/);
   assert.doesNotMatch(release, /softprops\/action-gh-release|gh api -X DELETE/);
   assert.doesNotMatch(release, /apply_update|app\.zip|updater/i);
+  assert.match(mountDaemon, /kSecGuestAttributePid/);
+  assert.match(mountDaemon, /connection\.processIdentifier/);
+  assert.doesNotMatch(mountDaemon, /\.auditToken/);
 });
 
 test('writeReleaseReports writes timestamped and latest JSON/Markdown files', async () => {
