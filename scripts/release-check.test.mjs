@@ -355,10 +355,7 @@ test('workflows block audits and publish the exact attested draft assets', async
     readFile(path.join(process.cwd(), '.github/workflows/ci.yml'), 'utf8'),
     readFile(path.join(process.cwd(), '.github/workflows/build-release.yml'), 'utf8'),
     readFile(
-      path.join(
-        process.cwd(),
-        'apps/desktop/frontend/src-tauri/macos/MountDaemon.m'
-      ),
+      path.join(process.cwd(), 'apps/desktop/frontend/src-tauri/macos/MountDaemon.m'),
       'utf8'
     ),
   ]);
@@ -378,6 +375,11 @@ test('workflows block audits and publish the exact attested draft assets', async
   assert.match(release, /exec -- tauri build --bundles dmg --ci -- --locked/);
   assert.match(release, /Smoke test Windows installer/);
   assert.match(release, /Smoke test macOS DMG/);
+  assert.match(
+    release,
+    /name: Verify and stage macOS package[\s\S]*?hdiutil attach "\$\{dmgs\[0\]\}"[\s\S]*?app="\$\{apps\[0\]\}"/
+  );
+  assert.doesNotMatch(release, /app="target\/release\/bundle\/macos\/explorie\.app"/);
   assert.doesNotMatch(release, /node scripts\/release-check\.mjs --preflight/);
   assert.match(release, /--draft/);
   assert.match(release, /gh release download/);
