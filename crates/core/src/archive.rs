@@ -123,6 +123,25 @@ fn link_or_reparse_error(path: &Path) -> io::Error {
     )
 }
 
+fn is_trusted_system_path_alias(path: &Path) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let expected = match path.to_str() {
+            Some("/var") => Path::new("/private/var"),
+            Some("/tmp") => Path::new("/private/tmp"),
+            Some("/etc") => Path::new("/private/etc"),
+            _ => return false,
+        };
+        return fs::canonicalize(path).is_ok_and(|resolved| resolved == expected);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        false
+    }
+}
+
 fn ensure_no_link_ancestors(path: &Path) -> io::Result<()> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -134,7 +153,10 @@ fn ensure_no_link_ancestors(path: &Path) -> io::Result<()> {
 
     for ancestor in ancestors {
         match fs::symlink_metadata(ancestor) {
-            Ok(metadata) if metadata_is_link_or_reparse(&metadata) => {
+            Ok(metadata)
+                if metadata_is_link_or_reparse(&metadata)
+                    && !is_trusted_system_path_alias(ancestor) =>
+            {
                 return Err(link_or_reparse_error(ancestor));
             }
             Ok(_) => {}
@@ -2436,6 +2458,37 @@ mod tests {
         fs::write(&archive_path, b"prior archive").unwrap();
         assert!(create_zip_archive(&sources, &archive_path, CompressionLevel::Normal).is_err());
         assert_eq!(fs::read(&archive_path).unwrap(), b"prior archive");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_source_through_user_symlinked_parent_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let actual = temp.path().join("actual");
+        let alias = temp.path().join("alias");
+        fs::create_dir(&actual).unwrap();
+        fs::write(actual.join("input.txt"), b"input").unwrap();
+        symlink(&actual, &alias).unwrap();
+
+        let output = temp.path().join("output.zip");
+        let result = create_zip_archive(
+            &[alias.join("input.txt")],
+            &output,
+            CompressionLevel::Normal,
+        );
+
+        assert!(result.is_err());
+        assert!(!output.exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_root_owned_path_aliases_are_trusted() {
+        for alias in ["/var", "/tmp", "/etc"] {
+            ensure_no_link_ancestors(Path::new(alias)).unwrap();
+        }
     }
 
     #[test]

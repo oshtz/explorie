@@ -359,6 +359,7 @@ test('workflows block audits and publish the exact attested draft assets', async
   assert.match(ci, /--port 47173 --strictPort/);
   assert.doesNotMatch(ci, /audit[^\n]*\|\| true/);
   assert.match(ci, /name: Rust Tests & Coverage[\s\S]*?runs-on: windows-latest/);
+  assert.match(ci, /name: macOS Core Tests[\s\S]*?runs-on: macos-latest/);
   assert.match(ci, /name: Lint & Type Check[\s\S]*?runs-on: windows-latest/);
   assert.equal((ci.match(/name: Prepare native dependencies/g) ?? []).length, 2);
   assert.doesNotMatch(ci, /rclone-x86_64-unknown-linux-gnu/);

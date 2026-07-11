@@ -113,6 +113,25 @@ jobs:
             echo "Coverage report not generated" >> $GITHUB_STEP_SUMMARY
           fi
 
+  test-rust-macos:
+    name: macOS Core Tests
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './ -> target'
+
+      - name: Test native file operations on macOS
+        run: cargo test -p explorie-core
+
   test-e2e:
     name: Playwright E2E
     runs-on: ubuntu-latest
