@@ -1,4 +1,4 @@
-import React, { useMemo, useEffect, useState, useCallback } from 'react';
+import React, { useMemo, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import type { FileEntry } from '../store';
 import { useFileStore } from '../store';
@@ -19,8 +19,6 @@ interface StatusBarProps {
   files: FileEntry[];
   selectedFile: FileEntry | null;
   currentPath: string;
-  onFilterChange?: (mode: 'all' | 'folders' | 'files') => void;
-  onViewModeChange?: (mode: 'list' | 'grid' | 'column') => void;
 }
 
 function formatFileSize(bytes: number): string {
@@ -41,24 +39,15 @@ function getOperationProgress(operation: FileOperation): number | null {
   return null;
 }
 
-export function StatusBar({
-  files,
-  selectedFile,
-  currentPath,
-  onFilterChange,
-  onViewModeChange,
-}: StatusBarProps) {
-  const { viewMode, filterMode, searchQuery, showHidden, setFilterMode, setViewMode } =
-    useFileStore(
-      useShallow((s) => ({
-        viewMode: s.viewMode,
-        filterMode: s.filterMode,
-        searchQuery: s.searchQuery,
-        showHidden: s.showHidden,
-        setFilterMode: s.setFilterMode,
-        setViewMode: s.setViewMode,
-      }))
-    );
+export function StatusBar({ files, selectedFile, currentPath }: StatusBarProps) {
+  const { viewMode, filterMode, searchQuery, showHidden } = useFileStore(
+    useShallow((s) => ({
+      viewMode: s.viewMode,
+      filterMode: s.filterMode,
+      searchQuery: s.searchQuery,
+      showHidden: s.showHidden,
+    }))
+  );
   const { operations, setShowProgressPanel } = useOperationQueueStore(
     useShallow((s) => ({
       operations: s.operations,
@@ -148,17 +137,13 @@ export function StatusBar({
   }, [diskInfo]);
 
   const operationSummary = useMemo(() => {
-    const active = operations.filter(
-      (o) => o.status === 'running' || o.status === 'pending' || o.status === 'paused'
-    );
+    const active = operations.filter((o) => o.status === 'running');
     if (active.length === 0) return null;
     const primary = active.find((o) => o.status === 'running') ?? active[0];
     const typeLabel: Record<FileOperation['type'], string> = {
       copy: 'Copying',
       move: 'Moving',
       delete: 'Deleting',
-      compress: 'Compressing',
-      extract: 'Extracting',
     };
     if (active.length === 1) {
       const progress = getOperationProgress(primary);
@@ -176,34 +161,10 @@ export function StatusBar({
     return { label, title };
   }, [operations]);
 
-  // Click handlers for interactive sections
-  const handleFilterClick = useCallback(() => {
-    // Cycle through filter modes: all -> folders -> files -> all
-    const nextMode = filterMode === 'all' ? 'folders' : filterMode === 'folders' ? 'files' : 'all';
-    setFilterMode(nextMode);
-    onFilterChange?.(nextMode);
-  }, [filterMode, setFilterMode, onFilterChange]);
-
-  const handleViewModeClick = useCallback(() => {
-    // Cycle through view modes: list -> grid -> column -> list
-    const nextMode = viewMode === 'list' ? 'grid' : viewMode === 'grid' ? 'column' : 'list';
-    setViewMode(nextMode);
-    onViewModeChange?.(nextMode);
-  }, [viewMode, setViewMode, onViewModeChange]);
-
-  const handleItemCountClick = useCallback(() => {
-    // Toggle between showing all, folders only, or files only
-    handleFilterClick();
-  }, [handleFilterClick]);
-
   return (
     <div className={styles.statusBar}>
       <div className={styles.leftCluster}>
-        <div
-          className={`${styles.section} ${styles.clickable}`}
-          onClick={handleItemCountClick}
-          title="Click to filter by type"
-        >
+        <div className={styles.section}>
           <span className={styles.itemCount}>{itemCountStr}</span>
           {stats.totalSize > 0 && (
             <span className={styles.totalSize}>{formatFileSize(stats.totalSize)}</span>
@@ -211,44 +172,42 @@ export function StatusBar({
         </div>
 
         {filterStatus && (
-          <div
-            className={`${styles.section} ${styles.clickable}`}
-            onClick={handleFilterClick}
-            title="Click to change filter"
-          >
+          <div className={styles.section}>
             <span className={styles.filterStatus}>{filterStatus}</span>
           </div>
         )}
 
         {operationSummary && (
-          <div
+          <button
+            type="button"
             className={`${styles.section} ${styles.clickable}`}
             onClick={() => setShowProgressPanel(true)}
             title={operationSummary.title}
+            aria-label={`${operationSummary.title}. Show operation details`}
+            aria-live="polite"
           >
             <span className={styles.operationStatus}>{operationSummary.label}</span>
-          </div>
+          </button>
         )}
       </div>
 
       <div className={styles.rightCluster}>
         {selectionInfo && (
-          <div className={styles.section}>
+          <div className={`${styles.section} ${styles.selectionSection}`}>
             <span className={styles.selection}>{selectionInfo}</span>
           </div>
         )}
 
         {diskSpaceInfo && (
-          <div className={styles.section} title={`Disk: ${diskInfo?.name || 'Unknown'}`}>
+          <div
+            className={`${styles.section} ${styles.diskSection}`}
+            title={`Disk: ${diskInfo?.name || 'Unknown'}`}
+          >
             <span className={styles.diskSpace}>{diskSpaceInfo}</span>
           </div>
         )}
 
-        <div
-          className={`${styles.section} ${styles.clickable}`}
-          onClick={handleViewModeClick}
-          title="Click to change view mode"
-        >
+        <div className={`${styles.section} ${styles.viewSection}`}>
           <span className={styles.viewMode}>
             {viewMode === 'list' ? 'List' : viewMode === 'grid' ? 'Grid' : 'Column'} view
           </span>

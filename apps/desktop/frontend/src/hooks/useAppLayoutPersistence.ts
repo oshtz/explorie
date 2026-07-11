@@ -9,9 +9,39 @@ const SIDEBAR_MIN = 160;
 const SIDEBAR_MAX = 480;
 const PREVIEW_MIN = 280;
 const PREVIEW_MAX = 720;
+const FILE_SURFACE_MIN = 420;
+const SPLITTER_WIDTH = 8;
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
+}
+
+export function calculatePaneLayout(
+  containerWidth: number,
+  preferredSidebarWidth: number,
+  preferredPreviewWidth: number,
+  previewRequested: boolean
+) {
+  const sidebarMax = Math.min(
+    SIDEBAR_MAX,
+    Math.max(SIDEBAR_MIN, containerWidth - SPLITTER_WIDTH - FILE_SURFACE_MIN)
+  );
+  const sidebarWidth = clamp(preferredSidebarWidth, SIDEBAR_MIN, sidebarMax);
+  const mainWidth = Math.max(0, containerWidth - sidebarWidth - SPLITTER_WIDTH);
+  const previewVisible =
+    previewRequested && mainWidth >= FILE_SURFACE_MIN + SPLITTER_WIDTH + PREVIEW_MIN;
+  const previewMax = Math.min(
+    PREVIEW_MAX,
+    Math.max(PREVIEW_MIN, mainWidth - SPLITTER_WIDTH - FILE_SURFACE_MIN)
+  );
+
+  return {
+    sidebarWidth,
+    previewWidth: previewVisible
+      ? clamp(preferredPreviewWidth, PREVIEW_MIN, previewMax)
+      : clamp(preferredPreviewWidth, PREVIEW_MIN, PREVIEW_MAX),
+    previewVisible,
+  };
 }
 
 function readPersistedWidth(key: string, fallback: number, min: number, max: number): number {

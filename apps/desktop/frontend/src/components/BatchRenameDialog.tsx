@@ -1,7 +1,8 @@
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import type { FileEntry } from '../store';
 import { Icon } from './Icon';
 import { validateFileName } from '../utils/fileName';
+import { createFocusTrap } from '../utils/accessibility';
 import styles from './BatchRenameDialog.module.css';
 
 type RenameMode = 'replace' | 'regex' | 'number' | 'case' | 'prefix-suffix' | 'datetime';
@@ -110,8 +111,21 @@ function getDateForFile(file: FileEntry, source: DateSource): Date {
 }
 
 export function BatchRenameDialog({ open, files, onClose, onApply }: BatchRenameDialogProps) {
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const focusTrapRef = useRef<ReturnType<typeof createFocusTrap> | null>(null);
   const [mode, setMode] = useState<RenameMode>('replace');
   const [applying, setApplying] = useState(false);
+
+  useEffect(() => {
+    if (!open || !dialogRef.current) return;
+    const trap = createFocusTrap(dialogRef.current);
+    focusTrapRef.current = trap;
+    trap.activate();
+    return () => {
+      focusTrapRef.current = null;
+      trap.deactivate();
+    };
+  }, [open]);
 
   // Find & Replace state
   const [findText, setFindText] = useState('');
@@ -235,7 +249,7 @@ export function BatchRenameDialog({ open, files, onClose, onApply }: BatchRename
             break;
           }
         }
-      } catch (e) {
+      } catch {
         // Invalid regex or other error - keep original
         newBaseName = baseName;
       }
@@ -318,9 +332,24 @@ export function BatchRenameDialog({ open, files, onClose, onApply }: BatchRename
 
   return (
     <div className={styles.backdrop} onClick={handleBackdropClick}>
-      <div className={styles.dialog}>
+      <div
+        ref={dialogRef}
+        className={styles.dialog}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="batch-rename-title"
+        onKeyDown={(e) => {
+          focusTrapRef.current?.handleKeyDown(e);
+          if (e.key === 'Escape' && !applying) {
+            e.preventDefault();
+            onClose();
+          }
+        }}
+      >
         <div className={styles.header}>
-          <h2 className={styles.title}>Batch Rename</h2>
+          <h2 id="batch-rename-title" className={styles.title}>
+            Batch Rename
+          </h2>
           <span className={styles.fileCount}>{files.length} files</span>
           <button
             className={styles.closeButton}
@@ -378,8 +407,12 @@ export function BatchRenameDialog({ open, files, onClose, onApply }: BatchRename
             {mode === 'replace' && (
               <>
                 <div className={styles.field}>
-                  <label className={styles.label}>Find</label>
+                  <label className={styles.label} htmlFor="batch-find">
+                    Find
+                  </label>
                   <input
+                    id="batch-find"
+                    data-autofocus
                     type="text"
                     className={styles.input}
                     value={findText}
@@ -389,8 +422,11 @@ export function BatchRenameDialog({ open, files, onClose, onApply }: BatchRename
                   />
                 </div>
                 <div className={styles.field}>
-                  <label className={styles.label}>Replace with</label>
+                  <label className={styles.label} htmlFor="batch-replace">
+                    Replace with
+                  </label>
                   <input
+                    id="batch-replace"
                     type="text"
                     className={styles.input}
                     value={replaceText}
@@ -412,8 +448,11 @@ export function BatchRenameDialog({ open, files, onClose, onApply }: BatchRename
             {mode === 'regex' && (
               <>
                 <div className={styles.field}>
-                  <label className={styles.label}>Pattern (regex)</label>
+                  <label className={styles.label} htmlFor="batch-regex-pattern">
+                    Pattern (regex)
+                  </label>
                   <input
+                    id="batch-regex-pattern"
                     type="text"
                     className={styles.input}
                     value={regexPattern}
@@ -423,8 +462,11 @@ export function BatchRenameDialog({ open, files, onClose, onApply }: BatchRename
                   />
                 </div>
                 <div className={styles.field}>
-                  <label className={styles.label}>Replace with</label>
+                  <label className={styles.label} htmlFor="batch-regex-replace">
+                    Replace with
+                  </label>
                   <input
+                    id="batch-regex-replace"
                     type="text"
                     className={styles.input}
                     value={regexReplace}
@@ -433,8 +475,11 @@ export function BatchRenameDialog({ open, files, onClose, onApply }: BatchRename
                   />
                 </div>
                 <div className={styles.field}>
-                  <label className={styles.label}>Flags</label>
+                  <label className={styles.label} htmlFor="batch-regex-flags">
+                    Flags
+                  </label>
                   <input
+                    id="batch-regex-flags"
                     type="text"
                     className={`${styles.input} ${styles.inputSmall}`}
                     value={regexFlags}
@@ -449,8 +494,11 @@ export function BatchRenameDialog({ open, files, onClose, onApply }: BatchRename
               <>
                 <div className={styles.fieldRow}>
                   <div className={styles.field}>
-                    <label className={styles.label}>Start at</label>
+                    <label className={styles.label} htmlFor="batch-number-start">
+                      Start at
+                    </label>
                     <input
+                      id="batch-number-start"
                       type="number"
                       className={`${styles.input} ${styles.inputSmall}`}
                       value={numberStart}
@@ -459,8 +507,11 @@ export function BatchRenameDialog({ open, files, onClose, onApply }: BatchRename
                     />
                   </div>
                   <div className={styles.field}>
-                    <label className={styles.label}>Digits</label>
+                    <label className={styles.label} htmlFor="batch-number-digits">
+                      Digits
+                    </label>
                     <input
+                      id="batch-number-digits"
                       type="number"
                       className={`${styles.input} ${styles.inputSmall}`}
                       value={numberDigits}
@@ -471,8 +522,11 @@ export function BatchRenameDialog({ open, files, onClose, onApply }: BatchRename
                   </div>
                 </div>
                 <div className={styles.field}>
-                  <label className={styles.label}>Position</label>
+                  <label className={styles.label} htmlFor="batch-number-position">
+                    Position
+                  </label>
                   <select
+                    id="batch-number-position"
                     className={styles.select}
                     value={numberPosition}
                     onChange={(e) => {
@@ -486,8 +540,11 @@ export function BatchRenameDialog({ open, files, onClose, onApply }: BatchRename
                   </select>
                 </div>
                 <div className={styles.field}>
-                  <label className={styles.label}>Separator</label>
+                  <label className={styles.label} htmlFor="batch-number-separator">
+                    Separator
+                  </label>
                   <input
+                    id="batch-number-separator"
                     type="text"
                     className={`${styles.input} ${styles.inputSmall}`}
                     value={numberSeparator}
@@ -501,8 +558,11 @@ export function BatchRenameDialog({ open, files, onClose, onApply }: BatchRename
             {mode === 'case' && (
               <>
                 <div className={styles.field}>
-                  <label className={styles.label}>Transform to</label>
+                  <label className={styles.label} htmlFor="batch-case-mode">
+                    Transform to
+                  </label>
                   <select
+                    id="batch-case-mode"
                     className={styles.select}
                     value={caseMode}
                     onChange={(e) => {
@@ -517,8 +577,11 @@ export function BatchRenameDialog({ open, files, onClose, onApply }: BatchRename
                   </select>
                 </div>
                 <div className={styles.field}>
-                  <label className={styles.label}>Apply to</label>
+                  <label className={styles.label} htmlFor="batch-case-target">
+                    Apply to
+                  </label>
                   <select
+                    id="batch-case-target"
                     className={styles.select}
                     value={caseApplyTo}
                     onChange={(e) => {
@@ -537,8 +600,11 @@ export function BatchRenameDialog({ open, files, onClose, onApply }: BatchRename
             {mode === 'prefix-suffix' && (
               <>
                 <div className={styles.field}>
-                  <label className={styles.label}>Prefix</label>
+                  <label className={styles.label} htmlFor="batch-prefix">
+                    Prefix
+                  </label>
                   <input
+                    id="batch-prefix"
                     type="text"
                     className={styles.input}
                     value={prefix}
@@ -548,8 +614,11 @@ export function BatchRenameDialog({ open, files, onClose, onApply }: BatchRename
                   />
                 </div>
                 <div className={styles.field}>
-                  <label className={styles.label}>Suffix</label>
+                  <label className={styles.label} htmlFor="batch-suffix">
+                    Suffix
+                  </label>
                   <input
+                    id="batch-suffix"
                     type="text"
                     className={styles.input}
                     value={suffix}
@@ -563,8 +632,11 @@ export function BatchRenameDialog({ open, files, onClose, onApply }: BatchRename
             {mode === 'datetime' && (
               <>
                 <div className={styles.field}>
-                  <label className={styles.label}>Date source</label>
+                  <label className={styles.label} htmlFor="batch-date-source">
+                    Date source
+                  </label>
                   <select
+                    id="batch-date-source"
                     className={styles.select}
                     value={dateSource}
                     onChange={(e) => {
@@ -577,8 +649,11 @@ export function BatchRenameDialog({ open, files, onClose, onApply }: BatchRename
                   </select>
                 </div>
                 <div className={styles.field}>
-                  <label className={styles.label}>Format</label>
+                  <label className={styles.label} htmlFor="batch-date-format">
+                    Format
+                  </label>
                   <select
+                    id="batch-date-format"
                     className={styles.select}
                     value={dateFormat}
                     onChange={(e) => setDateFormat(e.target.value)}
@@ -592,6 +667,7 @@ export function BatchRenameDialog({ open, files, onClose, onApply }: BatchRename
                     <option value="YYYY-MM-DD_HH-mm-ss">2024-01-15_14-30-25 (full)</option>
                   </select>
                   <input
+                    aria-label="Custom date format"
                     type="text"
                     className={`${styles.input} ${styles.inputSmall}`}
                     value={dateFormat}
@@ -604,8 +680,11 @@ export function BatchRenameDialog({ open, files, onClose, onApply }: BatchRename
                   </span>
                 </div>
                 <div className={styles.field}>
-                  <label className={styles.label}>Position</label>
+                  <label className={styles.label} htmlFor="batch-date-position">
+                    Position
+                  </label>
                   <select
+                    id="batch-date-position"
                     className={styles.select}
                     value={datePosition}
                     onChange={(e) => {
@@ -619,8 +698,11 @@ export function BatchRenameDialog({ open, files, onClose, onApply }: BatchRename
                   </select>
                 </div>
                 <div className={styles.field}>
-                  <label className={styles.label}>Separator</label>
+                  <label className={styles.label} htmlFor="batch-date-separator">
+                    Separator
+                  </label>
                   <input
+                    id="batch-date-separator"
                     type="text"
                     className={`${styles.input} ${styles.inputSmall}`}
                     value={dateSeparator}

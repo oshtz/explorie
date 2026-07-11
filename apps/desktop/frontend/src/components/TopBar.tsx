@@ -15,6 +15,8 @@ import { useUndoRedoStore, useCanUndo, useCanRedo } from '../undoRedoStore';
 import { basename } from '../utils/path';
 import { useToast } from './Toast';
 import { reportError } from '../utils/errorReporter';
+import { useShallow } from 'zustand/shallow';
+import { TextInputDialog } from './TextInputDialog';
 
 interface TopBarProps {
   currentPath: string;
@@ -34,6 +36,19 @@ interface TopBarProps {
   onForwardHistorySelect?: (index: number) => void;
 }
 
+const isSyncthingConflict = (name: string) => name.includes('.sync-conflict-');
+
+function validateWebsiteUrl(value: string): string | null {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'http:' || url.protocol === 'https:'
+      ? null
+      : 'Use an http:// or https:// URL';
+  } catch {
+    return 'Enter a valid website URL';
+  }
+}
+
 export function TopBar({
   currentPath,
   onUp,
@@ -49,7 +64,6 @@ export function TopBar({
   onBackHistorySelect,
   onForwardHistorySelect,
 }: TopBarProps) {
-  const isDevBuild = import.meta.env.DEV;
   const { show: showToast } = useToast();
   // Get the setViewMode function directly from the store
   const {
@@ -65,10 +79,6 @@ export function TopBar({
     sortKey,
     sortDir,
     setSort,
-    enableDnDLargeLists,
-    setEnableDnDLargeLists,
-    devMockEntries,
-    setDevMockEntries,
     filterMode,
     setFilterMode,
     searchQuery,
@@ -77,9 +87,54 @@ export function TopBar({
     pathStack,
     setPathStack,
     addSmartFolder,
-  } = useFileStore();
+    files,
+  } = useFileStore(
+    useShallow((state) => ({
+      setViewMode: state.setViewMode,
+      theme: state.theme,
+      setTheme: state.setTheme,
+      showHidden: state.showHidden,
+      setShowHidden: state.setShowHidden,
+      showPreviewPanel: state.showPreviewPanel,
+      setShowPreviewPanel: state.setShowPreviewPanel,
+      showFolderSizes: state.showFolderSizes,
+      setShowFolderSizes: state.setShowFolderSizes,
+      sortKey: state.sortKey,
+      sortDir: state.sortDir,
+      setSort: state.setSort,
+      filterMode: state.filterMode,
+      setFilterMode: state.setFilterMode,
+      searchQuery: state.searchQuery,
+      setSearchQuery: state.setSearchQuery,
+      setFiles: state.setFiles,
+      pathStack: state.pathStack,
+      setPathStack: state.setPathStack,
+      addSmartFolder: state.addSmartFolder,
+      files: state.files,
+    }))
+  );
   // Local search input state for immediate feedback, debounced to store
   const [localSearchQuery, setLocalSearchQuery] = useState(searchQuery);
+  const [inputDialog, setInputDialog] = useState<'saved-search' | 'website' | null>(null);
+  const [syncthingRoot, setSyncthingRoot] = useState<string | null>(null);
+  const syncthingConflicts = useMemo(
+    () => files.filter((file) => isSyncthingConflict(file.name ?? basename(file.path))).length,
+    [files]
+  );
+
+  useEffect(() => {
+    let active = true;
+    void invoke<unknown>('get_syncthing_root', { path: currentPath })
+      .then((root) => {
+        if (active) setSyncthingRoot(typeof root === 'string' && root ? root : null);
+      })
+      .catch(() => {
+        if (active) setSyncthingRoot(null);
+      });
+    return () => {
+      active = false;
+    };
+  }, [currentPath]);
 
   // Create debounced setter for store
   const debouncedSetSearchQuery = useMemo(
@@ -115,24 +170,8 @@ export function TopBar({
   // Save current search as a Smart Folder
   const handleSaveSearch = useCallback(() => {
     if (!localSearchQuery.trim()) return;
-
-    const name = window.prompt(
-      'Enter a name for this saved search:',
-      `Search: ${localSearchQuery}`
-    );
-    if (!name?.trim()) return;
-
-    const criteria: SmartFolderCriteria = {
-      namePattern: localSearchQuery,
-      searchPaths: [currentPath],
-      recursive: true,
-      typeFilter: filterMode === 'all' ? 'all' : filterMode === 'folders' ? 'folders' : 'files',
-    };
-
-    addSmartFolder(name.trim(), criteria);
-
-    showToast(`Smart folder saved: ${name.trim()}`, { type: 'success' });
-  }, [localSearchQuery, currentPath, filterMode, addSmartFolder, showToast]);
+    setInputDialog('saved-search');
+  }, [localSearchQuery]);
 
   // Popover state and anchor ref managed here
   const [popoverOpen, setPopoverOpen] = useState(false);
@@ -161,7 +200,6 @@ export function TopBar({
   const [forwardHistoryOpen, setForwardHistoryOpen] = React.useState(false);
   const forwardButtonRef = React.useRef<HTMLButtonElement>(null);
   const forwardPopoverRef = React.useRef<HTMLDivElement>(null);
-  const [appIconPressed, setAppIconPressed] = React.useState(false);
 
   // Generate unique IDs for ARIA associations
   const idPrefix = useId();
@@ -175,18 +213,57 @@ export function TopBar({
     forwardHistory: `${idPrefix}-forward-history`,
   };
 
-  // Show the full active directory path in the TopBar
+  useEffect(() => {
+    if (
+      !popoverOpen &&
+      !moreOpen &&
+      !createOpen &&
+      !sortOpen &&
+      !filterOpen &&
+      !backHistoryOpen &&
+      !forwardHistoryOpen
+    ) {
+      return;
+    }
 
-  React.useEffect(() => {
-    if (!appIconPressed || typeof window === 'undefined') return;
-    const handlePointerRelease = () => setAppIconPressed(false);
-    window.addEventListener('pointerup', handlePointerRelease);
-    window.addEventListener('pointercancel', handlePointerRelease);
-    return () => {
-      window.removeEventListener('pointerup', handlePointerRelease);
-      window.removeEventListener('pointercancel', handlePointerRelease);
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      const trigger = popoverOpen
+        ? buttonRef.current
+        : moreOpen
+          ? moreButtonRef.current
+          : createOpen
+            ? createButtonRef.current
+            : sortOpen
+              ? sortButtonRef.current
+              : filterOpen
+                ? filterButtonRef.current
+                : backHistoryOpen
+                  ? backButtonRef.current
+                  : forwardButtonRef.current;
+      setPopoverOpen(false);
+      setMoreOpen(false);
+      setCreateOpen(false);
+      setSortOpen(false);
+      setFilterOpen(false);
+      setBackHistoryOpen(false);
+      setForwardHistoryOpen(false);
+      trigger?.focus();
     };
-  }, [appIconPressed]);
+
+    document.addEventListener('keydown', handleEscape);
+    return () => document.removeEventListener('keydown', handleEscape);
+  }, [
+    popoverOpen,
+    moreOpen,
+    createOpen,
+    sortOpen,
+    filterOpen,
+    backHistoryOpen,
+    forwardHistoryOpen,
+  ]);
+
+  // Show the full active directory path in the TopBar
 
   // Close popover on outside click
   React.useEffect(() => {
@@ -345,31 +422,13 @@ export function TopBar({
     setCreateOpen(false);
     await refreshAfterFsChange();
   };
-  const handleCreateWebsite = async () => {
-    try {
-      const url = window.prompt('Enter URL for the website link', 'https://');
-      if (!url) {
-        setCreateOpen(false);
-        return;
-      }
-      await createWebsiteLinkIn(currentPath, url);
-    } catch (e) {
-      reportError('Create website link failed', e, { toast: showToast });
-    }
+  const handleCreateWebsite = () => {
     setCreateOpen(false);
-    await refreshAfterFsChange();
+    setInputDialog('website');
   };
 
   return (
     <div className={styles.topBar}>
-      {/* App icon */}
-      <img
-        src={appIconPressed ? '/icon-face-closed.png' : '/icon-face.png'}
-        alt="explorie"
-        className={styles.appIcon}
-        onPointerDown={() => setAppIconPressed(true)}
-        onPointerUp={() => setAppIconPressed(false)}
-      />
       {/* Back button with history dropdown */}
       <div className={styles.controlsContainer}>
         <button
@@ -396,7 +455,7 @@ export function TopBar({
             className={styles.historyPopover}
             ref={backPopoverRef}
             id={popoverIds.backHistory}
-            role="menu"
+            role="group"
             aria-label="Navigation history"
           >
             {/* Show most recent first (reverse order) */}
@@ -409,7 +468,6 @@ export function TopBar({
                   <button
                     key={`back-${path}`}
                     className={styles.popoverItem}
-                    role="menuitem"
                     onClick={() => {
                       onBackHistorySelect?.(idx);
                       setBackHistoryOpen(false);
@@ -453,7 +511,7 @@ export function TopBar({
             className={styles.historyPopover}
             ref={forwardPopoverRef}
             id={popoverIds.forwardHistory}
-            role="menu"
+            role="group"
             aria-label="Forward history"
           >
             {forwardHistory.slice(0, 10).map((path, idx) => {
@@ -462,7 +520,6 @@ export function TopBar({
                 <button
                   key={`forward-${path}`}
                   className={styles.popoverItem}
-                  role="menuitem"
                   onClick={() => {
                     onForwardHistorySelect?.(idx);
                     setForwardHistoryOpen(false);
@@ -498,6 +555,13 @@ export function TopBar({
       ) : (
         <div className={styles.folderName}>{currentPath}</div>
       )}
+      {syncthingRoot && (
+        <span className={styles.syncthingBadge} title={`Synced by Syncthing: ${syncthingRoot}`}>
+          Syncthing
+          {syncthingConflicts > 0 &&
+            ` · ${syncthingConflicts} conflict${syncthingConflicts === 1 ? '' : 's'}`}
+        </span>
+      )}
       {/* Spacer */}
       <div className={styles.spacer} />
 
@@ -508,7 +572,6 @@ export function TopBar({
           title="Create"
           aria-label="Create new item"
           aria-expanded={createOpen}
-          aria-haspopup="menu"
           aria-controls={popoverIds.create}
           className={`${styles.controlButton} ${createOpen ? styles.controlButtonActive : ''}`}
           onClick={() => setCreateOpen((v) => !v)}
@@ -517,25 +580,25 @@ export function TopBar({
         </button>
         {createOpen && (
           <div
-            className={styles.popover}
+            className={`${styles.popover} ${styles.createPopover}`}
             ref={createPopoverRef}
             id={popoverIds.create}
-            role="menu"
+            role="group"
             aria-label="Create options"
           >
-            <button className={styles.popoverItem} role="menuitem" onClick={handleCreateFolder}>
+            <button className={styles.popoverItem} onClick={handleCreateFolder}>
               <span className={styles.popoverIcon}>
                 <Icon name="folder" />
               </span>
               <span>New Folder</span>
             </button>
-            <button className={styles.popoverItem} role="menuitem" onClick={handleCreateNote}>
+            <button className={styles.popoverItem} onClick={handleCreateNote}>
               <span className={styles.popoverIcon}>
                 <Icon name="file-text" />
               </span>
               <span>New Note</span>
             </button>
-            <button className={styles.popoverItem} role="menuitem" onClick={handleCreateWebsite}>
+            <button className={styles.popoverItem} onClick={handleCreateWebsite}>
               <span className={styles.popoverIcon}>
                 <Icon name="link" />
               </span>
@@ -551,6 +614,7 @@ export function TopBar({
       {/* Search bar */}
       <div className={styles.searchContainer} role="search">
         <input
+          id="explorie-search-input"
           type="text"
           placeholder="Search"
           aria-label="Search files and folders"
@@ -597,7 +661,6 @@ export function TopBar({
           title="Change View"
           aria-label="Change view mode"
           aria-expanded={popoverOpen}
-          aria-haspopup="menu"
           aria-controls={popoverIds.view}
           className={`${styles.controlButton} ${popoverOpen ? styles.controlButtonActive : ''}`}
           onClick={() => setPopoverOpen((v) => !v)}
@@ -609,14 +672,13 @@ export function TopBar({
             className={styles.popover}
             ref={popoverRef}
             id={popoverIds.view}
-            role="menu"
+            role="group"
             aria-label="View options"
           >
             {viewModes.map((mode) => (
               <button
                 key={mode.key}
-                role="menuitemradio"
-                aria-checked={viewMode === mode.key}
+                aria-pressed={viewMode === mode.key}
                 className={`${styles.popoverItem} ${viewMode === mode.key ? styles.popoverItemActive : ''}`}
                 onClick={() => {
                   setViewModeStore(mode.key as ViewMode);
@@ -633,8 +695,7 @@ export function TopBar({
             <div className={styles.popoverDivider} role="separator" />
             {/* Hidden files toggle */}
             <button
-              role="menuitemcheckbox"
-              aria-checked={showHidden}
+              aria-pressed={showHidden}
               className={`${styles.popoverItem} ${showHidden ? styles.popoverItemActive : ''}`}
               onClick={() => setShowHidden(!showHidden)}
             >
@@ -663,7 +724,6 @@ export function TopBar({
           title="Sort"
           aria-label="Sort options"
           aria-expanded={sortOpen}
-          aria-haspopup="menu"
           aria-controls={popoverIds.sort}
           className={`${styles.controlButton} ${sortOpen ? styles.controlButtonActive : ''}`}
           onClick={() => setSortOpen((v) => !v)}
@@ -675,7 +735,7 @@ export function TopBar({
             className={styles.popover}
             ref={sortPopoverRef}
             id={popoverIds.sort}
-            role="menu"
+            role="group"
             aria-label="Sort options"
           >
             {(
@@ -687,8 +747,7 @@ export function TopBar({
             ).map((opt) => (
               <button
                 key={opt.key}
-                role="menuitemradio"
-                aria-checked={sortKey === opt.key}
+                aria-pressed={sortKey === opt.key}
                 className={`${styles.popoverItem} ${sortKey === opt.key ? styles.popoverItemActive : ''}`}
                 onClick={() => {
                   // Toggle direction if same key, otherwise set to asc
@@ -718,7 +777,6 @@ export function TopBar({
           title="Filter"
           aria-label="Filter options"
           aria-expanded={filterOpen}
-          aria-haspopup="menu"
           aria-controls={popoverIds.filter}
           className={`${styles.controlButton} ${filterOpen ? styles.controlButtonActive : ''}`}
           onClick={() => setFilterOpen((v) => !v)}
@@ -730,7 +788,7 @@ export function TopBar({
             className={styles.popover}
             ref={filterPopoverRef}
             id={popoverIds.filter}
-            role="menu"
+            role="group"
             aria-label="Filter options"
           >
             {(
@@ -742,8 +800,7 @@ export function TopBar({
             ).map((opt) => (
               <button
                 key={opt.key}
-                role="menuitemradio"
-                aria-checked={filterMode === opt.key}
+                aria-pressed={filterMode === opt.key}
                 className={`${styles.popoverItem} ${filterMode === opt.key ? styles.popoverItemActive : ''}`}
                 onClick={() => {
                   setFilterMode(opt.key);
@@ -758,23 +815,12 @@ export function TopBar({
             ))}
           </div>
         )}
-        {/* Theme toggle */}
-        <button
-          title={theme === 'dark' ? 'Switch to Light Theme' : 'Switch to Dark Theme'}
-          aria-label={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}
-          aria-pressed={theme === 'dark'}
-          className={styles.controlButton}
-          onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
-        >
-          {theme === 'dark' ? <Icon name="sun" /> : <Icon name="moon" />}
-        </button>
         {/* More actions popover */}
         <button
           ref={moreButtonRef}
           title="More"
           aria-label="More options"
           aria-expanded={moreOpen}
-          aria-haspopup="menu"
           aria-controls={popoverIds.more}
           className={`${styles.controlButton} ${moreOpen ? styles.controlButtonActive : ''}`}
           onClick={() => setMoreOpen((v) => !v)}
@@ -786,13 +832,25 @@ export function TopBar({
             className={styles.popover}
             ref={morePopoverRef}
             id={popoverIds.more}
-            role="menu"
+            role="group"
             aria-label="More options"
           >
             <button
               className={styles.popoverItem}
-              role="menuitemcheckbox"
-              aria-checked={showFolderSizes}
+              aria-pressed={theme === 'light'}
+              onClick={() => {
+                setTheme(theme === 'dark' ? 'light' : 'dark');
+                setMoreOpen(false);
+              }}
+            >
+              <span className={styles.popoverIcon}>
+                <Icon name={theme === 'dark' ? 'sun' : 'moon'} />
+              </span>
+              <span>{theme === 'dark' ? 'Use Light Theme' : 'Use Dark Theme'}</span>
+            </button>
+            <button
+              className={styles.popoverItem}
+              aria-pressed={showFolderSizes}
               onClick={() => {
                 setShowFolderSizes(!showFolderSizes);
                 setMoreOpen(false);
@@ -805,40 +863,7 @@ export function TopBar({
             </button>
             <button
               className={styles.popoverItem}
-              role="menuitemcheckbox"
-              aria-checked={enableDnDLargeLists}
-              onClick={() => {
-                setEnableDnDLargeLists(!enableDnDLargeLists);
-                setMoreOpen(false);
-              }}
-              title="Enable drag & drop even on very large lists (may affect performance)"
-            >
-              <span className={styles.popoverIcon}>
-                <Icon name={enableDnDLargeLists ? 'check' : 'circle'} />
-              </span>
-              <span>Allow DnD on Large Lists</span>
-            </button>
-            {isDevBuild && (
-              <button
-                className={styles.popoverItem}
-                role="menuitemcheckbox"
-                aria-checked={devMockEntries}
-                onClick={() => {
-                  setDevMockEntries(!devMockEntries);
-                  setMoreOpen(false);
-                }}
-                title="Dev only: toggle 10k mock entries in the current folder"
-              >
-                <span className={styles.popoverIcon}>
-                  <Icon name={devMockEntries ? 'check' : 'circle'} />
-                </span>
-                <span>Dev: Mock 10k Entries</span>
-              </button>
-            )}
-            <button
-              className={styles.popoverItem}
-              role="menuitemcheckbox"
-              aria-checked={showPreviewPanel}
+              aria-pressed={showPreviewPanel}
               onClick={() => {
                 setShowPreviewPanel(!showPreviewPanel);
                 setMoreOpen(false);
@@ -852,6 +877,45 @@ export function TopBar({
           </div>
         )}
       </div>
+      <TextInputDialog
+        open={inputDialog === 'saved-search'}
+        title="Save search"
+        label="Name"
+        initialValue={`Search: ${localSearchQuery}`}
+        submitLabel="Save"
+        validate={(value) => (!value ? 'Name is required' : null)}
+        onCancel={() => setInputDialog(null)}
+        onSubmit={(name) => {
+          const criteria: SmartFolderCriteria = {
+            namePattern: localSearchQuery,
+            searchPaths: [currentPath],
+            recursive: true,
+            typeFilter:
+              filterMode === 'all' ? 'all' : filterMode === 'folders' ? 'folders' : 'files',
+          };
+          addSmartFolder(name, criteria);
+          showToast(`Smart folder saved: ${name}`, { type: 'success' });
+          setInputDialog(null);
+        }}
+      />
+      <TextInputDialog
+        open={inputDialog === 'website'}
+        title="Create website link"
+        label="Website URL"
+        initialValue="https://"
+        submitLabel="Create"
+        validate={validateWebsiteUrl}
+        onCancel={() => setInputDialog(null)}
+        onSubmit={async (url) => {
+          try {
+            await createWebsiteLinkIn(currentPath, url);
+            await refreshAfterFsChange();
+            setInputDialog(null);
+          } catch (error) {
+            reportError('Create website link failed', error, { toast: showToast });
+          }
+        }}
+      />
     </div>
   );
 }

@@ -19,6 +19,8 @@ import { reportError } from '../utils/errorReporter';
 import { deleteWithUndo } from '../utils/fileOperations';
 import { getSortableColumnProps, announceSelection } from '../utils/accessibility';
 import type { GetSelectedFilesFunction } from '../hooks/useKeyboardClipboard';
+import { useCentralFileSelection } from '../hooks/useCentralFileSelection';
+import type { DragStartHandler } from '../hooks/useDragStart';
 
 const LazyBatchRenameDialog = React.lazy(() =>
   import('./BatchRenameDialog').then((m) => ({ default: m.BatchRenameDialog }))
@@ -133,10 +135,10 @@ interface FileTableProps {
   showFolderSizesEnabled?: boolean;
   /** Whether a drag operation is currently in progress */
   isDragging?: boolean;
-  /** ID of the item currently being dragged */
-  draggingItemId?: string | null;
+  /** IDs of the items currently being dragged */
+  draggingItemIds?: ReadonlySet<string>;
   /** Callback fired when a drag operation begins */
-  onBeginDrag?: (file: FileEntry) => void;
+  onBeginDrag?: DragStartHandler;
   /** Callback fired when hovering over a folder during drag */
   onHoverFolder?: (file: FileEntry | null) => void;
   /** Callback fired when hovering over the table container during drag */
@@ -299,7 +301,7 @@ function FileTableInner({
   combineTargetId,
   showFolderSizesEnabled,
   isDragging,
-  draggingItemId,
+  draggingItemIds,
   onBeginDrag,
   onHoverFolder,
   onHoverContainer,
@@ -316,9 +318,7 @@ function FileTableInner({
     } catch {}
     return [];
   }, [files]);
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [anchorIndex, setAnchorIndex] = useState<number | null>(null);
-  const [cursorIndex, setCursorIndex] = useState<number | null>(null);
 
   // Track selection count for announcements
   const prevSelectionCount = useRef(0);
@@ -460,6 +460,9 @@ function FileTableInner({
     };
   }, [safeFiles, sortKey, sortDir]);
 
+  const { selectedIds, setSelectedIds, cursorIndex, setCursorIndex } =
+    useCentralFileSelection(sortedFiles);
+
   // Register getSelectedFiles for keyboard clipboard shortcuts
   useEffect(() => {
     if (getSelectedFilesRef) {
@@ -550,14 +553,14 @@ function FileTableInner({
         }
       }
     },
-    [sortedFiles.length]
+    [setSelectedIds, sortedFiles.length]
   );
 
   const handleEmptyClick = useCallback(() => {
     setSelectedIds(new Set());
     setAnchorIndex(null);
     setCursorIndex(null);
-  }, []);
+  }, [setCursorIndex, setSelectedIds]);
 
   const marquee = useMarqueeSelection({
     containerRef: containerRef as React.RefObject<HTMLElement>,
@@ -594,7 +597,7 @@ function FileTableInner({
       }
       pendingSelectPathRef.current = null;
     }
-  }, [sortedFiles, rowHeight]);
+  }, [rowHeight, setCursorIndex, setSelectedIds, sortedFiles]);
 
   // Global ESC handler to clear selection even without focus
   React.useEffect(() => {
@@ -607,7 +610,7 @@ function FileTableInner({
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, []);
+  }, [setCursorIndex, setSelectedIds]);
 
   // Note: using native table layout for consistent spacing and alignment
 
@@ -687,7 +690,7 @@ function FileTableInner({
         throw e;
       }
     },
-    [containerPath, setFiles, showToast]
+    [containerPath, setFiles, setSelectedIds, showToast]
   );
 
   const handleBatchRenameClose = useCallback(() => {
@@ -736,7 +739,7 @@ function FileTableInner({
         reportError('Delete failed', e, { toast: showToast });
       }
     },
-    [containerPath, setFiles, showToast]
+    [containerPath, setFiles, setSelectedIds, showToast]
   );
 
   const handleDeleteConfirm = useCallback(
@@ -789,7 +792,21 @@ function FileTableInner({
       setCursorIndex(index);
       onFileSelect?.(file);
     },
-    [anchorIndex, onFileSelect, selectedIds, sortedFiles]
+    [anchorIndex, onFileSelect, selectedIds, setCursorIndex, setSelectedIds, sortedFiles]
+  );
+
+  const scrollIndexIntoView = useCallback(
+    (index: number) => {
+      const element = containerRef.current;
+      if (!element) return;
+      const top = headerHeight + index * rowHeight;
+      const bottom = top + rowHeight;
+      const visibleTop = element.scrollTop + headerHeight;
+      const visibleBottom = element.scrollTop + element.clientHeight;
+      if (top < visibleTop) element.scrollTop = Math.max(0, top - headerHeight);
+      else if (bottom > visibleBottom) element.scrollTop = bottom - element.clientHeight;
+    },
+    [headerHeight, rowHeight]
   );
 
   const handleKeyDown = useCallback(
@@ -811,17 +828,27 @@ function FileTableInner({
           e.preventDefault();
           setEditingId(firstId);
         }
-      } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      } else if (
+        e.key === 'ArrowDown' ||
+        e.key === 'ArrowUp' ||
+        e.key === 'Home' ||
+        e.key === 'End'
+      ) {
         e.preventDefault();
+        if (sortedFiles.length === 0) return;
         const dir = e.key === 'ArrowDown' ? 1 : -1;
         const current =
           cursorIndex ??
           (selectedIds.size ? sortedFiles.findIndex((f) => selectedIds.has(f.id)) : -1);
-        const start = Math.max(
-          0,
-          current < 0 ? (dir > 0 ? 0 : sortedFiles.length - 1) : current + dir
-        );
-        const nextIdx = Math.min(sortedFiles.length - 1, Math.max(0, start));
+        const nextIdx =
+          e.key === 'Home'
+            ? 0
+            : e.key === 'End'
+              ? sortedFiles.length - 1
+              : Math.min(
+                  sortedFiles.length - 1,
+                  Math.max(0, current < 0 ? (dir > 0 ? 0 : sortedFiles.length - 1) : current + dir)
+                );
         const nextId = sortedFiles[nextIdx]?.id;
         if (nextId == null) return;
         if (e.shiftKey) {
@@ -838,9 +865,19 @@ function FileTableInner({
           setAnchorIndex(nextIdx);
           setCursorIndex(nextIdx);
         }
+        scrollIndexIntoView(nextIdx);
       }
     },
-    [anchorIndex, cursorIndex, selectedIds, setEditingId, sortedFiles]
+    [
+      anchorIndex,
+      cursorIndex,
+      scrollIndexIntoView,
+      selectedIds,
+      setCursorIndex,
+      setEditingId,
+      setSelectedIds,
+      sortedFiles,
+    ]
   );
 
   // Context menu state
@@ -898,7 +935,7 @@ function FileTableInner({
         role="grid"
         aria-label={`Files in current folder, ${sortedFiles.length} items`}
         aria-rowcount={sortedFiles.length + 1}
-        aria-colcount={4 + customColumns.length}
+        aria-colcount={3 + customColumns.length}
         aria-multiselectable="true"
         id={tableId}
       >
@@ -906,44 +943,45 @@ function FileTableInner({
           <tr role="row" aria-rowindex={1}>
             <th
               className={styles.sortable}
-              onClick={() => onSort('name')}
               role="columnheader"
               scope="col"
               {...getSortableColumnProps('name', sortKey, sortDir)}
             >
-              Name
-              {sortKey === 'name' && (
-                <span className={styles.sortIcon} aria-hidden="true">
-                  <Icon name={sortDir === 'asc' ? 'arrow-up' : 'arrow-down'} />
-                </span>
-              )}
-              {sortKey === 'name' && isSorting && (
-                <span className={styles.sortSpinner} aria-label="sorting" />
-              )}
+              <button type="button" className={styles.sortButton} onClick={() => onSort('name')}>
+                Name
+                {sortKey === 'name' && (
+                  <span className={styles.sortIcon} aria-hidden="true">
+                    <Icon name={sortDir === 'asc' ? 'arrow-up' : 'arrow-down'} />
+                  </span>
+                )}
+                {sortKey === 'name' && isSorting && (
+                  <span className={styles.sortSpinner} aria-label="sorting" />
+                )}
+              </button>
             </th>
             {customColumns.map((column) => (
               <th
                 key={column}
                 className={styles.sortable}
-                onClick={() => onSort(column)}
                 role="columnheader"
                 scope="col"
                 {...getSortableColumnProps(column, sortKey, sortDir)}
               >
-                {column.charAt(0).toUpperCase() + column.slice(1)}
-                {sortKey === column && (
-                  <span className={styles.sortIcon} aria-hidden="true">
-                    <Icon name={sortDir === 'asc' ? 'arrow-up' : 'arrow-down'} />
-                  </span>
-                )}
-                {sortKey === column && isSorting && (
-                  <span className={styles.sortSpinner} aria-label="sorting" />
-                )}
+                <button type="button" className={styles.sortButton} onClick={() => onSort(column)}>
+                  {column.charAt(0).toUpperCase() + column.slice(1)}
+                  {sortKey === column && (
+                    <span className={styles.sortIcon} aria-hidden="true">
+                      <Icon name={sortDir === 'asc' ? 'arrow-up' : 'arrow-down'} />
+                    </span>
+                  )}
+                  {sortKey === column && isSorting && (
+                    <span className={styles.sortSpinner} aria-label="sorting" />
+                  )}
+                </button>
               </th>
             ))}
             <th
               className={`${styles.sortable} ${styles.fileSize}`}
-              onClick={() => onSort('size')}
               title={
                 showFolderSizesEnabled
                   ? 'Folder sizes compute on demand and may take time'
@@ -953,47 +991,58 @@ function FileTableInner({
               scope="col"
               {...getSortableColumnProps('size', sortKey, sortDir)}
             >
-              Size
-              {sortKey === 'size' && (
-                <span className={styles.sortIcon} aria-hidden="true">
-                  <Icon name={sortDir === 'asc' ? 'arrow-up' : 'arrow-down'} />
-                </span>
-              )}
-              {sortKey === 'size' && isSorting && (
-                <span className={styles.sortSpinner} aria-label="sorting" />
-              )}
+              <button type="button" className={styles.sortButton} onClick={() => onSort('size')}>
+                Size
+                {sortKey === 'size' && (
+                  <span className={styles.sortIcon} aria-hidden="true">
+                    <Icon name={sortDir === 'asc' ? 'arrow-up' : 'arrow-down'} />
+                  </span>
+                )}
+                {sortKey === 'size' && isSorting && (
+                  <span className={styles.sortSpinner} aria-label="sorting" />
+                )}
+              </button>
             </th>
             <th
               className={`${styles.sortable} ${styles.fileModified}`}
-              onClick={() => onSort('modified')}
               role="columnheader"
               scope="col"
               {...getSortableColumnProps('modified', sortKey, sortDir)}
             >
-              Modified
-              {sortKey === 'modified' && (
-                <span className={styles.sortIcon} aria-hidden="true">
-                  <Icon name={sortDir === 'asc' ? 'arrow-up' : 'arrow-down'} />
-                </span>
-              )}
-              {sortKey === 'modified' && isSorting && (
-                <span className={styles.sortSpinner} aria-label="sorting" />
-              )}
+              <button
+                type="button"
+                className={styles.sortButton}
+                onClick={() => onSort('modified')}
+              >
+                Modified
+                {sortKey === 'modified' && (
+                  <span className={styles.sortIcon} aria-hidden="true">
+                    <Icon name={sortDir === 'asc' ? 'arrow-up' : 'arrow-down'} />
+                  </span>
+                )}
+                {sortKey === 'modified' && isSorting && (
+                  <span className={styles.sortSpinner} aria-label="sorting" />
+                )}
+              </button>
             </th>
           </tr>
         </thead>
         <tbody>
-          {virtualRows.length > 0 && <tr style={{ height: `${virtualRows[0].start}px` }} />}
+          {virtualRows.length > 0 && (
+            <tr aria-hidden="true" style={{ height: `${virtualRows[0].start}px` }} />
+          )}
           {virtualRows.map((vr) => {
             const index = vr.index;
             const file = sortedFiles[index];
+            if (!file) return null;
             const fileTags = getFileTags(file);
-            const isSource = isDragging && draggingItemId === file.id;
+            const isSource = isDragging && draggingItemIds?.has(file.id);
             const isSelected = selectedIds.has(file.id);
             const fileName = file.name ?? (file.path.split(/[/\\]/).pop() || file.path);
             return (
               <tr
                 key={file.id}
+                data-file-id={file.id}
                 role="row"
                 aria-rowindex={index + 2}
                 aria-selected={isSelected}
@@ -1001,25 +1050,38 @@ function FileTableInner({
                 className={`${styles.clickable} ${isSelected ? styles.selected : ''} ${isSource ? styles.dragSource : ''} ${combineTargetId === file.id && isDirectory(file) ? styles.dropTargetRow : ''}`}
                 onClick={(e) => handleRowClick(e, index, file)}
                 onContextMenu={(e) => {
-                  contextMenu.openForFile(e, file, containerPath);
-                  setSelectedIds(new Set([file.id]));
-                  setAnchorIndex(index);
-                  setCursorIndex(index);
+                  const clickedInSelection = selectedIds.has(file.id);
+                  const targetFiles = clickedInSelection
+                    ? sortedFiles.filter((entry) => selectedIds.has(entry.id))
+                    : [file];
+                  if (!clickedInSelection) {
+                    setSelectedIds(new Set([file.id]));
+                    setAnchorIndex(index);
+                    setCursorIndex(index);
+                    onFileSelect?.(file);
+                  }
+                  contextMenu.openForFiles(e, targetFiles, containerPath);
                 }}
                 onDoubleClick={() => {
                   if (isDirectory(file)) onFolderOpen?.(file);
                   else
                     invoke('open_path', { path: file.path }).catch((err) =>
-                      console.error('open_path failed', err)
+                      reportError('Open failed', err, {
+                        toast: showToast,
+                        context: { path: file.path },
+                      })
                     );
                 }}
-                tabIndex={0}
+                tabIndex={cursorIndex === index ? 0 : -1}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter') {
                     if (isDirectory(file)) onFolderOpen?.(file);
                     else
                       invoke('open_path', { path: file.path }).catch((err) =>
-                        console.error('open_path failed', err)
+                        reportError('Open failed', err, {
+                          toast: showToast,
+                          context: { path: file.path },
+                        })
                       );
                   } else if (e.key === ' ') {
                     handleRowClick(e, index, file);
@@ -1073,13 +1135,24 @@ function FileTableInner({
                             });
                             setFiles(withDisplayNames(res));
                           } catch {}
+                        } catch (error) {
+                          pendingSelectPathRef.current = null;
+                          setSelectedIds(new Set([file.id]));
+                          setAnchorIndex(index);
+                          setCursorIndex(index);
+                          reportError('Rename failed', error, {
+                            toast: showToast,
+                            context: { path: file.path },
+                          });
                         } finally {
                           setEditingId(null);
                         }
                       }}
                     />
                   ) : (
-                    <span className={styles.fileName}>{fileName}</span>
+                    <span className={styles.fileName} title={fileName}>
+                      {fileName}
+                    </span>
                   )}
                   {fileTags.map((tag) => (
                     <span
@@ -1115,6 +1188,7 @@ function FileTableInner({
           })}
           {virtualRows.length > 0 && (
             <tr
+              aria-hidden="true"
               style={{
                 height: `${Math.max(0, totalSize - (virtualRows[virtualRows.length - 1].start + virtualRows[virtualRows.length - 1].size))}px`,
               }}

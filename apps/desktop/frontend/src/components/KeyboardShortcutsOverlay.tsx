@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import styles from './KeyboardShortcutsOverlay.module.css';
+import { createFocusTrap } from '../utils/accessibility';
 
 interface Shortcut {
   keys: string;
@@ -45,6 +46,7 @@ const SHORTCUT_CATEGORIES: ShortcutCategory[] = [
       { keys: 'Ctrl + Click', description: 'Toggle item selection' },
       { keys: 'Shift + Click', description: 'Select range of items' },
       { keys: 'Escape', description: 'Clear selection' },
+      { keys: 'Type letters', description: 'Select by filename' },
     ],
   },
   {
@@ -67,6 +69,7 @@ const SHORTCUT_CATEGORIES: ShortcutCategory[] = [
       { keys: 'Ctrl + W', description: 'Close current tab' },
       { keys: 'Ctrl + Tab', description: 'Next tab' },
       { keys: 'Ctrl + Shift + Tab', description: 'Previous tab' },
+      { keys: 'Alt + Up/Down', description: 'Reorder focused Favorite' },
     ],
   },
   {
@@ -88,6 +91,18 @@ export function KeyboardShortcutsOverlay({ open, onClose }: KeyboardShortcutsOve
   const [searchQuery, setSearchQuery] = useState('');
   const inputRef = useRef<HTMLInputElement>(null);
   const overlayRef = useRef<HTMLDivElement>(null);
+  const focusTrapRef = useRef<ReturnType<typeof createFocusTrap> | null>(null);
+
+  useEffect(() => {
+    if (!open || !overlayRef.current) return;
+    const trap = createFocusTrap(overlayRef.current);
+    focusTrapRef.current = trap;
+    trap.activate();
+    return () => {
+      focusTrapRef.current = null;
+      trap.deactivate();
+    };
+  }, [open]);
 
   // Filter shortcuts based on search query
   const filteredCategories = useMemo(() => {
@@ -127,31 +142,6 @@ export function KeyboardShortcutsOverlay({ open, onClose }: KeyboardShortcutsOve
     [onClose]
   );
 
-  // Global key listener to close overlay on any key except when typing
-  useEffect(() => {
-    if (!open) return;
-
-    const handleGlobalKeyDown = (e: KeyboardEvent) => {
-      // Allow typing in search input
-      if (e.target === inputRef.current) {
-        if (e.key === 'Escape') {
-          e.preventDefault();
-          onClose();
-        }
-        return;
-      }
-
-      // Close on any key press (except modifiers alone)
-      if (!['Shift', 'Control', 'Alt', 'Meta'].includes(e.key)) {
-        e.preventDefault();
-        onClose();
-      }
-    };
-
-    window.addEventListener('keydown', handleGlobalKeyDown);
-    return () => window.removeEventListener('keydown', handleGlobalKeyDown);
-  }, [open, onClose]);
-
   // Handle backdrop click
   const handleBackdropClick = useCallback(
     (e: React.MouseEvent) => {
@@ -169,12 +159,18 @@ export function KeyboardShortcutsOverlay({ open, onClose }: KeyboardShortcutsOve
       <div
         ref={overlayRef}
         className={styles.overlay}
-        onKeyDown={handleKeyDown}
+        onKeyDown={(e) => {
+          focusTrapRef.current?.handleKeyDown(e);
+          handleKeyDown(e);
+        }}
         role="dialog"
-        aria-label="Keyboard shortcuts"
+        aria-modal="true"
+        aria-labelledby="keyboard-shortcuts-title"
       >
         <div className={styles.header}>
-          <h2 className={styles.title}>Keyboard Shortcuts</h2>
+          <h2 id="keyboard-shortcuts-title" className={styles.title}>
+            Keyboard shortcuts
+          </h2>
           <button className={styles.closeButton} onClick={onClose} aria-label="Close">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
               <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" />
@@ -194,6 +190,7 @@ export function KeyboardShortcutsOverlay({ open, onClose }: KeyboardShortcutsOve
           </svg>
           <input
             ref={inputRef}
+            data-autofocus
             type="text"
             className={styles.searchInput}
             placeholder="Search shortcuts..."
@@ -228,7 +225,7 @@ export function KeyboardShortcutsOverlay({ open, onClose }: KeyboardShortcutsOve
 
         <div className={styles.footer}>
           <span>
-            Press <kbd>Esc</kbd> or any key to close
+            Press <kbd>Esc</kbd> to close
           </span>
           <a
             className={styles.docsLink}

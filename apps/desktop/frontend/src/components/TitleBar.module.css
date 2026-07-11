@@ -1,29 +1,14 @@
 .titleBar {
   display: flex;
+  flex: 0 0 38px;
   align-items: center;
-  height: 32px;
-  padding: 0 var(--padding-md);
-  gap: var(--padding-md);
+  height: 38px;
+  padding-left: var(--padding-md);
   background: var(--bg-topbar);
   color: var(--fg-primary);
   border-bottom: 1px solid var(--border-primary);
   box-shadow: var(--inset-divider);
-  -webkit-app-region: drag; /* draggable area */
-}
-
-.left {
-  display: flex;
-  align-items: center;
-  gap: var(--padding-sm);
-  -webkit-app-region: drag;
-  cursor: default;
-}
-
-.appIcon {
-  display: inline-block;
-  height: 16px;
-  width: auto;
-  image-rendering: pixelated;
+  user-select: none;
 }
 
 .appName {
@@ -31,51 +16,50 @@
   font-size: calc(12px * var(--font-scale));
   font-weight: 600;
   letter-spacing: 0.04em;
-  user-select: none;
-  -webkit-app-region: drag;
-  cursor: default;
 }
 
-.spacer {
+.appIcon {
+  width: 18px;
+  height: 18px;
+  margin-right: var(--padding-sm);
+  image-rendering: pixelated;
+  pointer-events: none;
+}
+
+.dragRegion {
+  align-self: stretch;
   flex: 1;
-  -webkit-app-region: drag;
-  cursor: default;
 }
 
 .windowControls {
   display: flex;
-  align-items: center;
-  gap: 4px;
-  -webkit-app-region: no-drag;
+  align-self: stretch;
 }
 
 .windowButton {
+  display: grid;
+  width: 46px;
+  min-width: 46px;
+  padding: 0;
+  place-items: center;
   background: transparent;
-  border: 1px solid transparent;
+  border: 0;
+  border-radius: 0;
   color: var(--fg-secondary);
-  padding: 2px 6px;
-  line-height: 1;
-  cursor: pointer;
-  -webkit-app-region: no-drag;
+  cursor: default;
 }
 
 .windowButton:hover {
   color: var(--fg-primary);
   background: var(--bg-hover);
-  border-color: var(--border-secondary);
 }
 
-.windowButtonClose {
-  background: transparent;
-  border: 1px solid transparent;
-  color: var(--fg-secondary);
-  padding: 2px 6px;
-  line-height: 1;
-  cursor: pointer;
-  -webkit-app-region: no-drag;
+.windowButton:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: -2px;
 }
-.windowButtonClose:hover {
-  color: var(--accent-red);
-  background: rgba(var(--accent-red-rgb), 0.1);
-  border-color: rgba(var(--accent-red-rgb), 0.55);
+
+.closeButton:hover {
+  color: var(--fg-primary);
+  background: var(--accent-red);
 }

@@ -6,18 +6,23 @@
   border-radius: var(--border-radius-sm);
   z-index: 2000;
   min-width: 140px;
-  padding: 4px 0;
+  max-width: calc(100vw - 16px);
+  max-height: calc(100vh - 16px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: var(--padding-sm) 0;
   box-shadow: var(--panel-shadow), var(--inset-divider);
 }
 
 .contextItem {
-  padding: 6px 10px;
-  font-size: 12px;
+  padding: var(--padding-md) var(--padding-lg);
+  min-height: var(--control-height-md);
+  font-size: calc(12px * var(--font-scale));
   color: var(--fg-primary);
   cursor: pointer;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--padding-md);
 }
 
 .contextItem:hover {
@@ -37,7 +42,7 @@
 .separator {
   height: 1px;
   background: var(--border-primary);
-  margin: 4px 0;
+  margin: var(--padding-sm) 0;
 }
 
 /* Submenu container */
@@ -53,15 +58,15 @@
 }
 
 .submenu {
-  margin-left: 16px;
+  margin-left: var(--padding-xl);
   border-left: 1px solid var(--border-primary);
   background: var(--bg-elevated);
-  padding: 2px 0;
+  padding: var(--padding-xs) 0;
 }
 
 .submenu .contextItem {
-  padding-left: 8px;
-  font-size: 11px;
+  padding-left: var(--padding-md);
+  font-size: calc(12px * var(--font-scale));
 }
 
 .submenu .contextItem:hover {

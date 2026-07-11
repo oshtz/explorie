@@ -140,7 +140,7 @@ describe('finderIntegration', () => {
     expect(FINDER_TAG_CSS_COLORS.Blue).toBe('#007AFF');
   });
 
-  it('bases macOS-only feature availability on the current platform', async () => {
+  it('bases native feature availability on the current platform', async () => {
     mocks.invoke.mockResolvedValue('macos');
 
     await expect(isQuickLookAvailable()).resolves.toBe(true);
@@ -149,5 +149,6 @@ describe('finderIntegration', () => {
 
     mocks.invoke.mockResolvedValue('windows');
     await expect(isQuickLookAvailable()).resolves.toBe(false);
+    await expect(isOpenWithAvailable()).resolves.toBe(true);
   });
 });

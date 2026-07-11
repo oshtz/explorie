@@ -50,6 +50,30 @@ describe('ListView', () => {
   it('renders empty state when no files are visible', () => {
     render(<ListView currentPath="/root" files={[]} />);
     expect(screen.getByText('This folder is empty')).toBeInTheDocument();
+    expect(screen.getByTestId('file-table')).toBeInTheDocument();
+    expect(latestTableProps.files).toEqual([]);
+  });
+
+  it('distinguishes filtered results from an empty folder', () => {
+    storeState.searchQuery = 'missing';
+    render(
+      <ListView
+        currentPath="/root"
+        files={
+          [
+            {
+              id: 'file-1',
+              path: '/root/visible.txt',
+              size: 10,
+              modified: 0,
+              is_dir: false,
+              custom: {},
+            },
+          ] as any
+        }
+      />
+    );
+    expect(screen.getByText('No matching files')).toBeInTheDocument();
   });
 
   it('filters hidden files and injects draft entries', () => {

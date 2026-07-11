@@ -1,3 +1,4 @@
+import { screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
@@ -51,8 +52,10 @@ describe('main entrypoint', () => {
 
     expect(mocks.createRoot).toHaveBeenCalledWith(document.getElementById('root'));
     expect(mocks.render).toHaveBeenCalledTimes(1);
-    expect(mocks.render.mock.calls[0]?.[0]).toEqual(expect.objectContaining({ type: mocks.app }));
-  });
+    const rendered = mocks.render.mock.calls[0]?.[0];
+    expect(rendered.type.name).toBe('RootErrorBoundary');
+    expect(rendered.props.children).toEqual(expect.objectContaining({ type: mocks.app }));
+  }, 10_000);
 
   it('does not show the native window outside Tauri', async () => {
     await import('./main');
@@ -72,5 +75,19 @@ describe('main entrypoint', () => {
     expect(requestAnimationFrame).toHaveBeenCalled();
     expect(mocks.getCurrentWindow).toHaveBeenCalledTimes(1);
     expect(mocks.show).toHaveBeenCalledTimes(1);
+  });
+
+  it('renders a static fallback when React bootstrap fails', async () => {
+    mocks.createRoot.mockImplementation(() => {
+      throw new Error('React mount failed');
+    });
+
+    await import('./main');
+
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: 'Explorie couldn’t start' })).toBeVisible();
+    });
+    expect(screen.getByText('React mount failed')).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Restart Explorie' })).toBeVisible();
   });
 });

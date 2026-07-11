@@ -1,0 +1,180 @@
+.section {
+  padding: var(--padding-md) var(--padding-lg);
+}
+
+.heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--padding-sm) var(--padding-md);
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.heading button,
+.actions button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+.headingActions {
+  display: flex;
+  align-items: center;
+  gap: var(--padding-md);
+}
+
+.list {
+  display: grid;
+  gap: var(--padding-xs);
+}
+
+.item {
+  display: flex;
+  align-items: center;
+  border-radius: var(--border-radius-sm, 4px);
+}
+
+.item:hover {
+  background: var(--bg-hover);
+}
+
+.drive {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  align-items: center;
+  gap: var(--padding-md);
+  padding: var(--padding-sm);
+  border: 0;
+  background: transparent;
+  color: var(--text-primary);
+  cursor: pointer;
+  text-align: left;
+}
+
+.drive span:nth-child(2) {
+  overflow: hidden;
+  flex: 1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.actions {
+  display: none;
+  padding-right: 4px;
+}
+
+.item:hover .actions,
+.item:focus-within .actions {
+  display: flex;
+}
+
+.dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-tertiary);
+}
+
+.connected {
+  background: #55b879;
+}
+.connecting,
+.disconnecting {
+  background: #d5a642;
+}
+.error,
+.approval-required {
+  background: #dc6060;
+}
+
+.setup {
+  display: grid;
+  gap: var(--padding-sm);
+  margin: var(--padding-sm) 0;
+  padding: var(--padding-md);
+  border-radius: 4px;
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.setup button,
+.setup a,
+.empty {
+  border: 0;
+  background: transparent;
+  color: var(--accent-primary);
+  cursor: pointer;
+  text-align: left;
+}
+
+.setup small {
+  line-height: 1.35;
+}
+
+.empty {
+  padding: var(--padding-sm);
+  font-size: 11px;
+}
+
+.backdrop {
+  position: fixed;
+  z-index: 10000;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: rgb(0 0 0 / 45%);
+}
+
+.dialog {
+  display: grid;
+  width: min(420px, calc(100vw - 32px));
+  gap: var(--padding-lg);
+  padding: var(--padding-xl);
+  border: 1px solid var(--border-secondary);
+  border-radius: 10px;
+  color: var(--fg-primary);
+  background: var(--bg-elevated);
+  box-shadow: 0 20px 60px rgb(0 0 0 / 35%);
+}
+
+.dialog h2 {
+  margin: 0;
+  font-size: 18px;
+}
+
+.dialog label {
+  display: grid;
+  gap: var(--padding-sm);
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.dialog input,
+.dialog select {
+  min-height: 34px;
+  padding: var(--padding-sm) var(--padding-md);
+  border: 1px solid var(--border-secondary);
+  border-radius: 5px;
+  background: var(--bg-sunken);
+  color: var(--fg-primary);
+}
+
+.dialogActions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--padding-md);
+}
+
+.dialogActions button {
+  min-height: 32px;
+  padding: 0 12px;
+}

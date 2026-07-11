@@ -52,15 +52,10 @@ function operation(overrides: Partial<FileOperation> = {}): FileOperation {
     totalItems: overrides.totalItems ?? 2,
     processedItems: overrides.processedItems ?? 1,
     currentItem: overrides.currentItem,
-    startedAt: overrides.startedAt,
+    startedAt: overrides.startedAt ?? Date.now(),
     completedAt: overrides.completedAt,
-    estimatedTimeRemaining: overrides.estimatedTimeRemaining,
-    speed: overrides.speed,
     error: overrides.error,
-    failedItems: overrides.failedItems ?? [],
     conflictResolution: overrides.conflictResolution ?? 'ask',
-    conflicts: overrides.conflicts ?? [],
-    abortController: overrides.abortController,
   };
 }
 
@@ -119,28 +114,11 @@ describe('StatusBar', () => {
     expect(mocks.invoke).toHaveBeenCalledWith('get_disk_info', { path: '/root' });
   });
 
-  it('cycles filter and view modes from clickable status sections', async () => {
-    const user = userEvent.setup();
-    const onFilterChange = vi.fn();
-    const onViewModeChange = vi.fn();
+  it('keeps counts and view labels informational', () => {
+    render(<StatusBar currentPath="/root" files={[fileEntry()]} selectedFile={null} />);
 
-    render(
-      <StatusBar
-        currentPath="/root"
-        files={[fileEntry()]}
-        selectedFile={null}
-        onFilterChange={onFilterChange}
-        onViewModeChange={onViewModeChange}
-      />
-    );
-
-    await user.click(screen.getByTitle('Click to filter by type'));
-    expect(onFilterChange).toHaveBeenCalledWith('folders');
-    expect(useFileStore.getState().filterMode).toBe('folders');
-
-    await user.click(screen.getByTitle('Click to change view mode'));
-    expect(onViewModeChange).toHaveBeenCalledWith('grid');
-    expect(useFileStore.getState().viewMode).toBe('grid');
+    expect(screen.getByText('1 file').closest('button')).toBeNull();
+    expect(screen.getByText('List view').closest('button')).toBeNull();
   });
 
   it('shows operation progress and opens the progress panel', async () => {
@@ -150,7 +128,7 @@ describe('StatusBar', () => {
     render(<StatusBar currentPath="/root" files={[]} selectedFile={null} />);
 
     const operationStatus = screen.getByText('Copying 25%');
-    expect(operationStatus.closest('div')).toHaveAttribute('title', 'Copying 25% (1/2 items)');
+    expect(operationStatus.closest('button')).toHaveAttribute('title', 'Copying 25% (1/2 items)');
 
     await user.click(operationStatus);
     expect(useOperationQueueStore.getState().showProgressPanel).toBe(true);

@@ -1,7 +1,7 @@
 import React from 'react';
-import { render, screen, waitFor, fireEvent } from '@testing-library/react';
+import { cleanup, render, screen, waitFor, fireEvent } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Sidebar } from './Sidebar';
 
 // Create mock functions at module level so they persist
@@ -13,10 +13,6 @@ const mockDeleteSmartFolder = vi.fn();
 const mockRemoveFavorite = vi.fn();
 const mockReorderFavorites = vi.fn();
 const mockRenameFavorite = vi.fn();
-const mockRefreshDefaultExplorer = vi.fn(async () => null);
-const mockMakeDefaultExplorer = vi.fn(async () => {});
-const mockClearDefaultExplorerError = vi.fn();
-
 const smartFoldersData = {
   sf1: {
     id: 'sf1',
@@ -37,13 +33,6 @@ const invokeMock = vi.fn();
 vi.mock('../store', () => ({
   useFileStore: (selector?: (state: any) => any) => {
     const state = {
-      defaultExplorerSupported: false,
-      defaultExplorerEnabled: null,
-      defaultExplorerLoading: false,
-      defaultExplorerError: null,
-      refreshDefaultExplorer: mockRefreshDefaultExplorer,
-      makeDefaultExplorer: mockMakeDefaultExplorer,
-      clearDefaultExplorerError: mockClearDefaultExplorerError,
       favorites: favoritesData,
       removeFavorite: mockRemoveFavorite,
       reorderFavorites: mockReorderFavorites,
@@ -53,6 +42,7 @@ vi.mock('../store', () => ({
       setSearchQuery: mockSetSearchQuery,
       setFilterMode: mockSetFilterMode,
       setActiveSmartFolderId: mockSetActiveSmartFolderId,
+      activeSmartFolderId: 'sf1',
       setViewMode: mockSetViewMode,
     };
     if (selector) {
@@ -64,6 +54,10 @@ vi.mock('../store', () => ({
 
 vi.mock('@tauri-apps/api/core', () => ({
   invoke: (command: string) => invokeMock(command),
+}));
+
+vi.mock('@tauri-apps/api/event', () => ({
+  listen: vi.fn().mockResolvedValue(vi.fn()),
 }));
 
 describe('Sidebar', () => {
@@ -82,6 +76,8 @@ describe('Sidebar', () => {
       drives: ['/root'],
     });
   });
+
+  afterEach(cleanup);
 
   it('invokes navigation and settings callbacks', async () => {
     const user = userEvent.setup();
@@ -105,6 +101,68 @@ describe('Sidebar', () => {
     expect(onOpenSettings).toHaveBeenCalled();
   });
 
+  it('reorders user favorites by drag and drop', async () => {
+    render(<Sidebar recents={[]} />);
+    const docs = screen.getByLabelText('Go to Docs').closest('[draggable="true"]');
+    const pics = screen.getByLabelText('Go to Pics').closest('[draggable="true"]');
+    const dataTransfer = { effectAllowed: 'none', dropEffect: 'none', setData: vi.fn() };
+
+    expect(docs).not.toBeNull();
+    expect(pics).not.toBeNull();
+    fireEvent.dragStart(docs!, { dataTransfer });
+    fireEvent.dragOver(pics!, { dataTransfer });
+    fireEvent.drop(pics!, { dataTransfer });
+
+    expect(mockReorderFavorites).toHaveBeenCalledWith([favoritesData[1], favoritesData[0]]);
+  });
+
+  it('reorders favorites from the keyboard and exposes folder pin drops', async () => {
+    const onFileDragHoverFavorites = vi.fn();
+    render(
+      <Sidebar recents={[]} fileDragActive onFileDragHoverFavorites={onFileDragHoverFavorites} />
+    );
+
+    const docs = await screen.findByLabelText('Go to Docs');
+    fireEvent.keyDown(docs, { key: 'ArrowDown', altKey: true });
+    expect(mockReorderFavorites).toHaveBeenCalledWith([favoritesData[1], favoritesData[0]]);
+
+    fireEvent.mouseEnter(screen.getByRole('button', { name: 'Favorites' }));
+    expect(onFileDragHoverFavorites).toHaveBeenCalledOnce();
+  });
+
+  it('marks the current location after normalizing path separators', async () => {
+    render(<Sidebar recents={[]} currentPath="/root/Documents/" />);
+
+    const documents = await screen.findByLabelText('Go to Documents');
+    expect(documents).toHaveAttribute('aria-current', 'page');
+    expect(screen.getByLabelText('Go to Desktop')).not.toHaveAttribute('aria-current');
+  });
+
+  it('shows a retryable error when system locations fail to load', async () => {
+    const user = userEvent.setup();
+    invokeMock.mockImplementation((command: string) =>
+      command === 'list_system_locations'
+        ? Promise.reject(new Error('unavailable'))
+        : Promise.resolve({})
+    );
+    render(<Sidebar recents={[]} />);
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Locations unavailable');
+
+    invokeMock.mockResolvedValue({
+      desktop: '/root/Desktop',
+      documents: '/root/Documents',
+      downloads: '/root/Downloads',
+      pictures: '/root/Pictures',
+      music: '/root/Music',
+      videos: '/root/Videos',
+      home: '/root',
+      drives: ['/root'],
+    });
+    await user.click(screen.getByRole('button', { name: 'Retry' }));
+    expect((await screen.findAllByLabelText('Go to Desktop')).length).toBeGreaterThan(0);
+  });
+
   it('activates smart folder on click', async () => {
     render(<Sidebar recents={[]} />);
 
@@ -112,6 +170,7 @@ describe('Sidebar', () => {
 
     // Find and click the smart folder button using fireEvent for reliability
     const smartFolderButtons = await screen.findAllByLabelText('Open Recent Text');
+    expect(smartFolderButtons[0]).toHaveAttribute('aria-current', 'page');
     fireEvent.click(smartFolderButtons[0]);
 
     // Verify that the store functions are called with correct arguments

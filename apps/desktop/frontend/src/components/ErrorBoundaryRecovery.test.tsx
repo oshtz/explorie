@@ -2,7 +2,7 @@ import React from 'react';
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { ErrorBoundary, InlineErrorBoundary } from './ErrorBoundary';
+import { ErrorBoundary, InlineErrorBoundary, RootErrorBoundary } from './ErrorBoundary';
 import { RecoveryBanner } from './RecoveryBanner';
 
 function ExplodingChild({ shouldThrow }: { shouldThrow: () => boolean }) {
@@ -69,6 +69,23 @@ describe('ErrorBoundary components', () => {
     shouldThrow = false;
     await user.click(screen.getByRole('button', { name: 'Retry' }));
     expect(screen.getByText('Recovered content')).toBeInTheDocument();
+  });
+
+  it('shows a last-resort app fallback and restarts on request', async () => {
+    const user = userEvent.setup();
+    const onRestart = vi.fn();
+
+    render(
+      <RootErrorBoundary onRestart={onRestart}>
+        <ExplodingChild shouldThrow={() => true} />
+      </RootErrorBoundary>
+    );
+
+    expect(screen.getByRole('heading', { name: 'Explorie couldn’t start' })).toBeVisible();
+    expect(screen.getByText('Preview crashed')).toBeVisible();
+    await user.click(screen.getByRole('button', { name: 'Restart Explorie' }));
+
+    expect(onRestart).toHaveBeenCalledTimes(1);
   });
 });
 

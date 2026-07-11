@@ -16,9 +16,9 @@ import type {
   FavoriteItem,
   Workspace,
   SmartFolder,
-  ImportedFont,
   ThemeSpec,
 } from '../store/types';
+import type { RemoteDriveProfile } from './remoteDrives';
 
 // ============================================================================
 // Type Definitions
@@ -56,7 +56,6 @@ export interface LocalStorageSchema {
   'explorie:borderRadius': BorderRadius;
   'explorie:iconSize': number;
   'explorie:reduceMotion': boolean;
-  'explorie:importedFonts': ImportedFont[];
   'explorie:themes': Record<string, ThemeSpec>;
 
   // Navigation & Tabs
@@ -69,6 +68,7 @@ export interface LocalStorageSchema {
   'explorie:workspaces': Record<string, Workspace>;
   'explorie:lastWorkspaceId': string;
   'explorie:smartFolders': Record<string, SmartFolder>;
+  'explorie:remoteDrives': RemoteDriveProfile[];
 
   // Undo/Redo
   'explorie:undoTimeoutMinutes': number;

@@ -1,0 +1,110 @@
+.state {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--padding-sm);
+  min-height: var(--empty-state-min-height);
+  padding: var(--padding-2xl);
+  color: var(--fg-primary);
+  background: var(--bg-sunken);
+  border: 1px solid var(--border-primary);
+  text-align: center;
+}
+
+.errorState {
+  background: rgba(var(--accent-red-rgb), 0.06);
+  border-color: rgba(var(--accent-red-rgb), 0.4);
+}
+
+.icon {
+  margin-bottom: var(--padding-xs);
+  opacity: 0.72;
+}
+
+.errorIcon {
+  margin-bottom: var(--padding-xs);
+  opacity: 0.85;
+}
+
+.title {
+  margin: 0;
+  font-size: calc(16px * var(--font-scale));
+}
+
+.description,
+.path,
+.pickerError {
+  max-width: 60ch;
+  margin: 0;
+  color: var(--fg-secondary);
+  overflow-wrap: anywhere;
+}
+
+.path {
+  font-family: var(--font-mono);
+  font-size: calc(12px * var(--font-scale));
+  color: var(--fg-primary);
+}
+
+.notice {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: var(--padding-sm);
+  max-width: 60ch;
+  color: var(--fg-secondary);
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: var(--padding-sm);
+  margin-top: var(--padding-md);
+}
+
+.primaryButton,
+.secondaryButton {
+  display: inline-flex;
+  min-height: var(--control-height-md);
+  align-items: center;
+  justify-content: center;
+  gap: var(--padding-xs);
+  padding-inline: var(--padding-lg);
+  border-radius: var(--border-radius);
+  cursor: pointer;
+}
+
+.primaryButton {
+  color: var(--bg-primary);
+  background: var(--accent-primary);
+  border-color: var(--accent-primary);
+}
+
+.secondaryButton {
+  color: var(--fg-primary);
+  background: var(--bg-secondary);
+}
+
+.primaryButton:disabled,
+.secondaryButton:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
+.linkButton {
+  padding: 0;
+  color: var(--accent-primary);
+  background: none;
+  border: 0;
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.pickerError {
+  margin-top: var(--padding-sm);
+  color: var(--accent-red);
+}

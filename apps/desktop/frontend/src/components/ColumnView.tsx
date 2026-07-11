@@ -9,6 +9,7 @@ import type { SortKey, SortDir } from './FileTable';
 import { sortFiles } from './FileTable';
 import { createFolderIn, joinPaths, renamePath } from '../utils/fs';
 import { useDragStart } from '../hooks/useDragStart';
+import type { DragStartHandler } from '../hooks/useDragStart';
 import { useMarqueeSelection } from '../hooks/useMarqueeSelection';
 import { ContextMenu, useContextMenu } from './ContextMenu';
 import { useToast } from './Toast';
@@ -136,12 +137,35 @@ function ColumnResizeHandle({ colIdx, currentWidth, onResize }: ColumnResizeHand
     [colIdx, onResize]
   );
 
+  const handleKeyDown = useCallback(
+    (event: React.KeyboardEvent) => {
+      let nextWidth: number | null = null;
+      if (event.key === 'ArrowLeft') nextWidth = currentWidth - 10;
+      if (event.key === 'ArrowRight') nextWidth = currentWidth + 10;
+      if (event.key === 'Home') nextWidth = MIN_COLUMN_WIDTH;
+      if (event.key === 'End') nextWidth = MAX_COLUMN_WIDTH;
+      if (nextWidth === null) return;
+      event.preventDefault();
+      event.stopPropagation();
+      onResize(colIdx, nextWidth);
+    },
+    [colIdx, currentWidth, onResize]
+  );
+
   return (
     <div
       ref={handleRef}
       className={`${styles.columnResizeHandle} ${isResizing ? styles.columnResizeHandleActive : ''}`}
       onMouseDown={handleMouseDown}
       onDoubleClick={handleDoubleClick}
+      onKeyDown={handleKeyDown}
+      role="separator"
+      aria-orientation="vertical"
+      aria-label={`Resize column ${colIdx + 1}`}
+      aria-valuemin={MIN_COLUMN_WIDTH}
+      aria-valuemax={MAX_COLUMN_WIDTH}
+      aria-valuenow={currentWidth}
+      tabIndex={0}
       title="Drag to resize column (double-click to reset)"
     />
   );
@@ -229,11 +253,8 @@ function formatBytes(bytes: number, decimals = 1): string {
 // Row height for column view items
 const COLUMN_ROW_HEIGHT = 28;
 
-// Module-level storage for column selections - survives component remounts
 type ColumnSelection = { ids: Set<string>; anchor: number | null };
 type ColumnSelectionByPath = Record<string, ColumnSelection>;
-
-const globalSelectionByPath: ColumnSelectionByPath = {};
 
 interface ColumnFileListProps {
   path: string;
@@ -247,7 +268,7 @@ interface ColumnFileListProps {
   onHoverContainerPath?: (path: string) => void;
   onHoverFolder?: (file: FileEntry | null) => void;
   dragCombineTargetId?: string | null;
-  draggingItemId?: string | null;
+  draggingItemIds?: ReadonlySet<string>;
   dragStart: { onMouseDown: (e: React.MouseEvent, file: FileEntry) => void };
   editingId: string | null;
   renderEditingItem: (entry: FileEntry, path: string) => React.ReactNode;
@@ -265,7 +286,7 @@ function ColumnFileList({
   onHoverContainerPath,
   onHoverFolder,
   dragCombineTargetId,
-  draggingItemId,
+  draggingItemIds,
   dragStart,
   editingId,
   renderEditingItem,
@@ -318,15 +339,19 @@ function ColumnFileList({
     itemCount: visible.length,
     getItemId,
     onSelectionChange: handleMarqueeSelectionChange,
-    enabled: !draggingItemId,
+    enabled: !draggingItemIds?.size,
     itemSelector: 'li',
     onEmptyClick: handleEmptyClick,
   });
+  const focusId = selectedIds.values().next().value;
 
   return (
     <ul
       ref={listRef}
       className={styles.fileList}
+      role="listbox"
+      aria-label={`Files in ${path}`}
+      aria-multiselectable="true"
       onMouseEnter={() => onHoverContainerPath?.(path)}
       onMouseDown={(e) => {
         if (e.button !== 0) return;
@@ -350,16 +375,24 @@ function ColumnFileList({
           }}
         />
       )}
+      {visible.length === 0 && (
+        <li className={styles.emptyColumn} role="presentation">
+          This folder is empty
+        </li>
+      )}
       {visible.map((entry, index) => {
         const isFolder = isDirectory(entry);
         const fileName = entry.path.split(/[/\\]/).pop() || entry.path;
-        const isSource = draggingItemId === entry.id;
+        const isSource = draggingItemIds?.has(entry.id) ?? false;
 
         return (
           <li
             key={entry.id}
+            data-file-id={entry.id}
             className={`${styles.fileItem} ${isFolder ? styles.folder : styles.file} ${selectedIds.has(entry.id) ? styles.selected : ''} ${isSource ? styles.dragSource : ''} ${dragCombineTargetId === entry.id && isFolder ? styles.dropTarget : ''}`}
-            tabIndex={0}
+            role="option"
+            aria-selected={selectedIds.has(entry.id)}
+            tabIndex={focusId === entry.id ? 0 : -1}
             aria-label={isFolder ? `Open folder ${fileName}` : `Select file ${fileName}`}
             onClick={(e) => onItemClick(e, index, entry)}
             onContextMenu={(e) => onContextMenu(e, entry)}
@@ -383,8 +416,8 @@ function ColumnFileList({
             }}
             onMouseDown={(e) => dragStart.onMouseDown(e, entry)}
             onMouseEnter={() => {
-              if (draggingItemId && isFolder && draggingItemId !== entry.id) onHoverFolder?.(entry);
-              else if (draggingItemId) onHoverFolder?.(null);
+              if (draggingItemIds?.size && isFolder && !isSource) onHoverFolder?.(entry);
+              else if (draggingItemIds?.size) onHoverFolder?.(null);
             }}
             style={isSource ? { pointerEvents: 'none' } : undefined}
           >
@@ -394,7 +427,9 @@ function ColumnFileList({
             {editingId === entry.id ? (
               renderEditingItem(entry, path)
             ) : (
-              <span className={styles.fileName}>{fileName}</span>
+              <span className={styles.fileName} title={fileName}>
+                {fileName}
+              </span>
             )}
             <span className={styles.fileSize}>
               {entry.is_dir && entry.size === 0 ? '-' : formatBytes(entry.size)}
@@ -422,10 +457,10 @@ interface ColumnViewProps {
   onFileSelect?: (file: FileEntry | null) => void;
   /** ID of the folder currently being hovered during drag combine */
   dragCombineTargetId?: string | null;
-  /** ID of the item currently being dragged */
-  draggingItemId?: string | null;
+  /** IDs of the items currently being dragged */
+  draggingItemIds?: ReadonlySet<string>;
   /** Callback fired when a drag operation begins */
-  onBeginDrag?: (file: FileEntry) => void;
+  onBeginDrag?: DragStartHandler;
   /** Callback fired when hovering over a column container during drag */
   onHoverContainerPath?: (path: string) => void;
   /** Callback fired when hovering over a folder during drag */
@@ -445,7 +480,7 @@ function ColumnViewInner({
   onColumnBack,
   onFileSelect,
   dragCombineTargetId,
-  draggingItemId,
+  draggingItemIds,
   onBeginDrag,
   onHoverContainerPath,
   onHoverFolder,
@@ -457,26 +492,11 @@ function ColumnViewInner({
   const contextMenu = useContextMenu();
   const clipboard = useFileStore((s) => s.clipboard);
   const dragStart = useDragStart({ onBeginDrag, isEnabled: !!onBeginDrag });
-  // Multi-select state per column path
-  // Use global storage (survives remounts) + local state (for React re-renders)
-  const [selectionByPath, setSelectionByPathState] = useState<ColumnSelectionByPath>(() => ({
-    ...globalSelectionByPath,
-  })); // Initialize from global
-
-  // Wrapper that updates both global storage (immediately) and state (async)
-  const setSelectionByPath = useCallback((updater: React.SetStateAction<ColumnSelectionByPath>) => {
-    if (typeof updater === 'function') {
-      const newValue = updater(globalSelectionByPath);
-      // Update global storage immediately
-      Object.keys(globalSelectionByPath).forEach((k) => delete globalSelectionByPath[k]);
-      Object.assign(globalSelectionByPath, newValue);
-      setSelectionByPathState({ ...newValue });
-    } else {
-      Object.keys(globalSelectionByPath).forEach((k) => delete globalSelectionByPath[k]);
-      Object.assign(globalSelectionByPath, updater);
-      setSelectionByPathState({ ...updater });
-    }
-  }, []);
+  const selectedPaths = useFileStore((s) => s.selectedPaths);
+  const selectionCursorPath = useFileStore((s) => s.selectionCursorPath);
+  const setSelectedPaths = useFileStore((s) => s.setSelectedPaths);
+  const setSelectionCursorPath = useFileStore((s) => s.setSelectionCursorPath);
+  const [anchorsByPath, setAnchorsByPath] = useState<Record<string, number | null>>({});
   const {
     showHidden,
     sortKey,
@@ -525,6 +545,39 @@ function ColumnViewInner({
       return [];
     },
     [columnFiles]
+  );
+
+  const selectedPathSet = React.useMemo(() => new Set(selectedPaths), [selectedPaths]);
+  const selectionByPath = React.useMemo<ColumnSelectionByPath>(() => {
+    const next: ColumnSelectionByPath = {};
+    for (const path of Object.keys(columnFiles || {})) {
+      next[path] = {
+        ids: new Set(
+          getSafeFiles(path)
+            .filter((file) => selectedPathSet.has(file.path))
+            .map((file) => file.id)
+        ),
+        anchor: anchorsByPath[path] ?? null,
+      };
+    }
+    return next;
+  }, [anchorsByPath, columnFiles, getSafeFiles, selectedPathSet]);
+
+  const setSelectionByPath = useCallback(
+    (updater: React.SetStateAction<ColumnSelectionByPath>) => {
+      const next = typeof updater === 'function' ? updater(selectionByPath) : updater;
+      const paths: string[] = [];
+      const anchors: Record<string, number | null> = {};
+      for (const [path, selection] of Object.entries(next)) {
+        anchors[path] = selection.anchor;
+        for (const file of getSafeFiles(path)) {
+          if (selection.ids.has(file.id)) paths.push(file.path);
+        }
+      }
+      setAnchorsByPath(anchors);
+      setSelectedPaths(paths);
+    },
+    [getSafeFiles, selectionByPath, setSelectedPaths]
   );
 
   // Register getSelectedFiles for keyboard clipboard shortcuts
@@ -634,6 +687,7 @@ function ColumnViewInner({
         [path]: { ids: new Set<string>([file.id]), anchor: index },
       }));
     }
+    setSelectionCursorPath(file.path);
     onFileSelect?.(file);
   };
 
@@ -723,12 +777,13 @@ function ColumnViewInner({
     const visible = getVisibleFiles(activePath);
     if (visible.length === 0) return;
 
-    // Use global storage directly (survives remounts)
-    // Check if we already have a selection for this path
-    const existingSelection = globalSelectionByPath[activePath];
+    const existingSelection = selectionByPath[activePath];
     if (existingSelection && existingSelection.ids.size > 0) {
       // Verify the selection is still valid
-      const selectedId = existingSelection.ids.values().next().value as string;
+      const selectedId =
+        visible.find(
+          (file) => file.path === selectionCursorPath && existingSelection.ids.has(file.id)
+        )?.id ?? (existingSelection.ids.values().next().value as string);
       const selectedFile = visible.find((f) => f.id === selectedId);
       const selectedIndex = visible.findIndex((f) => f.id === selectedId);
 
@@ -754,13 +809,14 @@ function ColumnViewInner({
 
     containerRef.current?.focus();
     prevPathStackLengthRef.current = pathStack.length;
-    // Note: selectionByPath removed from dependencies - using ref instead
   }, [
     pathStack,
     columnFiles,
     getVisibleFiles,
     onFileSelect,
     scrollItemIntoView,
+    selectionCursorPath,
+    selectionByPath,
     setSelectionByPath,
   ]);
 
@@ -776,11 +832,13 @@ function ColumnViewInner({
         ...prev,
         [activePath]: { ids: all, anchor: visible.length ? 0 : null },
       }));
+      setSelectionCursorPath(visible[0]?.path ?? null);
     } else if (e.key === 'Escape') {
       setSelectionByPath((prev) => ({
         ...prev,
         [activePath]: { ids: new Set<string>(), anchor: null },
       }));
+      setSelectionCursorPath(null);
       onFileSelect?.(null);
     } else if (e.key === 'F2') {
       const firstId = Array.from(selectionByPath[activePath]?.ids || [])[0] as string | undefined;
@@ -823,6 +881,7 @@ function ColumnViewInner({
         }));
       }
       // Update preview panel and scroll into view
+      setSelectionCursorPath(nextFile.path);
       onFileSelect?.(nextFile);
       scrollItemIntoView(nextIdx);
     } else if (e.key === 'ArrowLeft') {
@@ -873,11 +932,12 @@ function ColumnViewInner({
           }
           return next;
         });
+        setSelectionCursorPath(null);
       }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [setSelectionByPath]);
+  }, [setSelectionByPath, setSelectionCursorPath]);
 
   // Delete handlers
   const performDelete = useCallback(
@@ -1011,10 +1071,13 @@ function ColumnViewInner({
                       : styles.columnHeaderActive
                   }`}
                   tabIndex={colIdx < pathStack.length - 1 ? 0 : -1}
+                  role={colIdx < pathStack.length - 1 ? 'button' : undefined}
                   aria-label={colIdx < pathStack.length - 1 ? `Go back to ${path}` : undefined}
+                  title={path}
                   onClick={() => colIdx < pathStack.length - 1 && onColumnBack(colIdx)}
                   onKeyDown={(e) => {
                     if ((e.key === 'Enter' || e.key === ' ') && colIdx < pathStack.length - 1) {
+                      e.preventDefault();
                       onColumnBack(colIdx);
                     }
                   }}
@@ -1041,12 +1104,24 @@ function ColumnViewInner({
                       }
                       onFolderClick={(entry) => onFolderClick(colIdx, entry)}
                       onContextMenu={(e, entry) => {
-                        contextMenu.openForFile(e, entry, path);
+                        const clickedInSelection = sel.has(entry.id);
+                        const targetFiles = clickedInSelection
+                          ? visible.filter((file) => sel.has(file.id))
+                          : [entry];
+                        if (!clickedInSelection) {
+                          const index = visible.findIndex((file) => file.id === entry.id);
+                          setSelectionByPath((prev) => ({
+                            ...prev,
+                            [path]: { ids: new Set([entry.id]), anchor: index },
+                          }));
+                          onFileSelect?.(entry);
+                        }
+                        contextMenu.openForFiles(e, targetFiles, path);
                       }}
                       onHoverContainerPath={onHoverContainerPath}
                       onHoverFolder={onHoverFolder}
                       dragCombineTargetId={dragCombineTargetId}
-                      draggingItemId={draggingItemId}
+                      draggingItemIds={draggingItemIds}
                       dragStart={dragStart}
                       editingId={editingId}
                       listRef={colIdx === pathStack.length - 1 ? lastColumnListRef : undefined}
@@ -1077,6 +1152,19 @@ function ColumnViewInner({
                                 }
                                 // Nudge column view refresh
                                 setPathStackStore([...(pathStackState || [])]);
+                              } catch (error) {
+                                const index = visible.findIndex((file) => file.id === entry.id);
+                                setSelectionByPath((prev) => ({
+                                  ...prev,
+                                  [containerPath]: {
+                                    ids: new Set([entry.id]),
+                                    anchor: index >= 0 ? index : null,
+                                  },
+                                }));
+                                reportError('Rename failed', error, {
+                                  toast: showToast,
+                                  context: { path: entry.path },
+                                });
                               } finally {
                                 setEditingId(null);
                               }

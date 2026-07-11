@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { useFileStore, type FileEntry, type SmartFolderCriteria, type ThemeSpec } from './store';
 import type { StoreState } from './store/types';
+import { normalizeThemeSpec } from './store/slices/uiSlice';
 
 const initialState = useFileStore.getState();
 
@@ -44,7 +45,6 @@ const themeSpec: ThemeSpec = {
   borderRadius: 8,
   iconSize: 20,
   reduceMotion: true,
-  fonts: [{ id: 'inter', name: 'Inter', href: 'https://fonts.example/inter.css' }],
 };
 
 function resetStore(overrides: Partial<StoreState> = {}) {
@@ -60,8 +60,6 @@ function resetStore(overrides: Partial<StoreState> = {}) {
       filterMode: 'all',
       showFolderSizes: false,
       previewExecutableScripts: false,
-      enableDnDLargeLists: false,
-      devMockEntries: false,
       confirmBeforeDelete: true,
       sortKey: 'name',
       sortDir: 'asc',
@@ -84,14 +82,9 @@ function resetStore(overrides: Partial<StoreState> = {}) {
       reduceMotion: false,
       highContrast: false,
       enableErrorReporting: false,
-      importedFonts: [],
       showPreviewPanel: false,
       showStatusBar: true,
       themes: {},
-      defaultExplorerSupported: false,
-      defaultExplorerEnabled: null,
-      defaultExplorerLoading: false,
-      defaultExplorerError: null,
       favorites: [],
       workspaces: {},
       lastWorkspaceId: null,
@@ -165,7 +158,6 @@ describe('useFileStore', () => {
     store.setFilterMode('files');
     store.setShowFolderSizes(true);
     store.setPreviewExecutableScripts(true);
-    store.setEnableDnDLargeLists(true);
     store.setConfirmBeforeDelete(false);
     store.setEditingId('file-1');
     store.setDraftNew({ id: 'draft-1', parentPath: '/root', name: 'New Folder' });
@@ -183,7 +175,6 @@ describe('useFileStore', () => {
       filterMode: 'files',
       showFolderSizes: true,
       previewExecutableScripts: true,
-      enableDnDLargeLists: true,
       confirmBeforeDelete: false,
       editingId: 'file-1',
       draftNew: { id: 'draft-1', parentPath: '/root', name: 'New Folder' },
@@ -255,22 +246,6 @@ describe('useFileStore', () => {
     expect(localStorage.getItem('explorie:iconSize')).toBe('10');
   });
 
-  it('dedupes imported fonts and resets selected custom font when removed', () => {
-    const store = useFileStore.getState();
-    const font = { id: 'font-1', name: 'Mono Pro', href: 'https://fonts.example/mono.css' };
-
-    store.addImportedFont(font);
-    store.addImportedFont({ ...font, href: 'https://fonts.example/mono-v2.css' });
-    store.addImportedFont({ id: 'font-2', name: 'mono pro', href: 'https://fonts.example/x.css' });
-    store.setFontCustom('Mono Pro');
-    store.removeImportedFont('font-1');
-
-    expect(useFileStore.getState().importedFonts).toEqual([]);
-    expect(useFileStore.getState().font).toBe('system');
-    expect(useFileStore.getState().fontCustom).toBe('');
-    expect(localStorage.getItem('explorie:font')).toBe('system');
-  });
-
   it('saves, deletes, and applies theme specs', () => {
     const store = useFileStore.getState();
 
@@ -285,13 +260,7 @@ describe('useFileStore', () => {
     store.saveTheme('Bright', themeSpec);
     expect(useFileStore.getState().themes.Bright).toEqual(themeSpec);
 
-    store.applyThemeSpec({
-      ...themeSpec,
-      fonts: [
-        { id: 'existing', name: 'Inter', href: 'https://fonts.example/inter-old.css' },
-        { id: 'mono', name: 'Mono', href: 'https://fonts.example/mono.css' },
-      ],
-    });
+    store.applyThemeSpec(themeSpec);
     expect(useFileStore.getState()).toMatchObject({
       theme: 'light',
       accent: 'pink',
@@ -300,38 +269,29 @@ describe('useFileStore', () => {
       fontCustom: 'Inter',
       borderRadius: 8,
     });
-    expect(useFileStore.getState().importedFonts.map((font) => font.name)).toEqual([
-      'Inter',
-      'Mono',
-    ]);
     expect(localStorage.getItem('explorie:theme')).toBe('light');
 
     store.deleteTheme('Current');
     expect(useFileStore.getState().themes.Current).toBeUndefined();
   });
 
-  it('reports default explorer integration as unavailable outside Windows Tauri', async () => {
-    await expect(useFileStore.getState().refreshDefaultExplorer()).resolves.toBeNull();
-    expect(useFileStore.getState()).toMatchObject({
-      defaultExplorerSupported: false,
-      defaultExplorerEnabled: null,
-      defaultExplorerLoading: false,
-      defaultExplorerError: null,
+  it('normalizes valid theme values and rejects invalid field types', () => {
+    expect(
+      normalizeThemeSpec({
+        ...themeSpec,
+        uiScale: 5,
+        listRowHeight: 10,
+        gridMinWidth: 999,
+        iconSize: 2,
+      })
+    ).toMatchObject({
+      uiScale: 1.4,
+      listRowHeight: 26,
+      gridMinWidth: 260,
+      iconSize: 10,
     });
-
-    await expect(useFileStore.getState().makeDefaultExplorer()).rejects.toThrow(
-      'Default explorer integration is only available on Windows.'
-    );
-    expect(useFileStore.getState().defaultExplorerError).toBe(
-      'Default explorer integration is only available on Windows.'
-    );
-
-    useFileStore.getState().clearDefaultExplorerError();
-    expect(useFileStore.getState().defaultExplorerError).toBeNull();
-
-    await expect(useFileStore.getState().revertDefaultExplorer()).rejects.toThrow(
-      'Default explorer integration is only available on Windows.'
-    );
+    expect(normalizeThemeSpec({ ...themeSpec, accent: 'unsafe' })).toBeNull();
+    expect(normalizeThemeSpec({ ...themeSpec, reduceMotion: 'false' })).toBeNull();
   });
 
   it('saves, loads, renames, sorts, exports, and deletes workspaces', () => {

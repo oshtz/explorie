@@ -1,26 +1,27 @@
 .tabsBar {
   display: flex;
-  align-items: flex-end;
-  gap: 6px;
-  padding: var(--padding-xs) var(--padding-sm);
-  padding-bottom: 6px;
+  align-items: center;
+  gap: var(--padding-sm);
+  min-height: 40px;
+  padding: var(--padding-sm);
   border-bottom: 1px solid var(--border-primary);
   background: var(--bg-elevated);
   box-shadow: var(--inset-divider);
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior-x: contain;
 }
 
 .tabItem {
-  display: inline-flex;
+  display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 4px 8px;
+  flex: 0 1 220px;
+  min-width: 96px;
+  max-width: 220px;
   border: 1px solid var(--border-primary);
-  border-bottom: none;
   background: var(--bg-secondary);
   color: var(--fg-secondary);
-  cursor: pointer;
   user-select: none;
-  max-width: 220px;
   font-size: calc(12px * var(--font-scale));
   line-height: 1.2;
   transition:
@@ -29,15 +30,11 @@
     border-color 80ms ease;
 }
 
-.tabItem:hover {
+.tabItem:hover,
+.tabItem:focus-within {
   color: var(--fg-primary);
   background: var(--bg-hover);
   border-color: var(--border-secondary);
-}
-
-.tabItem:focus-visible {
-  outline: 2px solid var(--accent-primary);
-  outline-offset: 1px;
 }
 
 .tabItemActive {
@@ -47,7 +44,41 @@
   box-shadow: inset 0 2px 0 var(--accent-primary);
 }
 
+.tabDragging {
+  opacity: 0.45;
+}
+
+.tabDropTarget {
+  border-color: var(--state-drop-outline);
+  background: var(--state-drop-bg);
+  box-shadow: inset 0 -2px 0 var(--state-drop-outline);
+}
+
+.tabButton {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--padding-sm);
+  min-width: 0;
+  min-height: var(--command-size-md);
+  padding: var(--padding-sm) var(--padding-md);
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  flex: 1 1 auto;
+  font: inherit;
+}
+
+.tabButton:hover {
+  background: transparent;
+}
+
+.tabButton:focus-visible {
+  outline-offset: -2px;
+}
+
 .tabTitle {
+  min-width: 0;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -58,18 +89,21 @@
   background: transparent;
   color: var(--fg-secondary);
   cursor: pointer;
+  width: var(--command-size-md);
+  height: var(--command-size-md);
   padding: 0;
   display: flex;
   align-items: center;
   line-height: 0;
   opacity: 0;
+  flex: 0 0 auto;
   transition:
     opacity 80ms linear,
     color 80ms ease;
 }
 
 .tabItem:hover .closeBtn,
-.tabItem:focus-visible .closeBtn,
+.tabItem:focus-within .closeBtn,
 .tabItemActive .closeBtn {
   opacity: 0.9;
 }
@@ -79,18 +113,19 @@
 }
 
 .addBtn {
-  margin-left: 6px;
+  flex: 0 0 var(--command-size-md);
+  width: var(--command-size-md);
+  height: var(--command-size-md);
   border: 1px solid var(--border-primary);
   background: var(--bg-secondary);
   color: var(--fg-secondary);
-  padding: 4px 8px;
-  border-bottom: none;
+  padding: 0;
   cursor: pointer;
   font-size: calc(12px * var(--font-scale));
   line-height: 1.2;
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  justify-content: center;
 }
 
 .addBtn:hover {

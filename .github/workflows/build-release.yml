@@ -3,18 +3,125 @@ name: Build and Release
 on:
   push:
     tags:
-      - "v*"
+      - 'v*'
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish this tag after real-machine validation
+        type: boolean
+        required: true
+        default: false
+      windows_real_machine_verified:
+        description: Windows install, launch, unsigned warning, and disposable filesystem operations passed
+        type: boolean
+        required: true
+        default: false
+      macos_real_machine_verified:
+        description: Signed/notarized macOS install, launch, and disposable filesystem operations passed
+        type: boolean
+        required: true
+        default: false
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
 jobs:
+  validate:
+    name: Validate release source
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: '9'
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Chromium
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Test release checks
+        run: pnpm release:check:test
+
+      - name: Run release checks
+        env:
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        run: pnpm release:check
+
+      - name: Validate publication attestation
+        if: inputs.publish == true
+        shell: bash
+        run: |
+          if [ "$GITHUB_REF_TYPE" != "tag" ]; then
+            echo "Publication must be dispatched from the validated version tag."
+            exit 1
+          fi
+          if [ "${{ inputs.windows_real_machine_verified }}" != "true" ] || [ "${{ inputs.macos_real_machine_verified }}" != "true" ]; then
+            echo "Both candidate packages require real-machine filesystem-operation attestation."
+            exit 1
+          fi
+
+      - name: Upload release-check evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-check
+          path: |
+            .release-checks/latest.json
+            .release-checks/latest.md
+          if-no-files-found: warn
+
+      - name: Validate release state
+        if: github.ref_type == 'tag'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          PUBLISH: ${{ inputs.publish || false }}
+        run: |
+          state=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null || echo missing)
+          if [ "$EVENT_NAME" = "push" ] && [ "$state" != "missing" ]; then
+            echo "Release $GITHUB_REF_NAME already exists; refusing to replace it."
+            exit 1
+          fi
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$PUBLISH" = "true" ] && [ "$state" != "true" ]; then
+            echo "Release $GITHUB_REF_NAME must exist as a draft before publication."
+            exit 1
+          fi
+
   build-windows:
+    name: Package Windows
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: validate
     runs-on: windows-latest
 
     steps:
@@ -24,329 +131,206 @@ jobs:
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
-          version: "9"
+          version: '9'
           run_install: false
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
-          cache: "pnpm"
+          node-version: '20'
+          cache: 'pnpm'
           cache-dependency-path: pnpm-lock.yaml
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
 
       - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:
-          workspaces: "./ -> target"
+          workspaces: './ -> target'
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Generate Tauri icons
-        run: pnpm --filter explorie-desktop tauri:icon
+      - name: Test native file operations on Windows
+        run: cargo test -p explorie-core
 
-      - name: Build frontend
-        run: pnpm --filter explorie-desktop build
-
-      - name: Build Tauri app (no bundles)
-        run: pnpm --filter explorie-desktop exec tauri build --no-bundle
-
-      - name: Restore Enigma Virtual Box installer cache
-        uses: actions/cache@v4
-        continue-on-error: true
-        with:
-          path: ${{ runner.tool_cache }}/enigma-virtualbox/enigmavb_setup.exe
-          key: enigma-virtualbox-installer-v1-${{ vars.EVB_INSTALLER_SHA256 || 'unverified' }}
-          restore-keys: |
-            enigma-virtualbox-installer-v1-
-
-      - name: Install Enigma Virtual Box
+      - name: Check Windows signing prerequisites
+        id: signing
         shell: pwsh
         env:
-          EVB_INSTALLER_URL: ${{ vars.EVB_INSTALLER_URL }}
-          EVB_INSTALLER_SHA256: ${{ vars.EVB_INSTALLER_SHA256 }}
+          CERTIFICATE: ${{ secrets.WINDOWS_CODESIGN_CERTIFICATE }}
+          CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_PASSWORD }}
         run: |
-          function Find-EvbConsole {
-            $candidatePaths = @(
-              "C:\Program Files (x86)\Enigma Virtual Box\enigmavbconsole.exe",
-              "C:\Program Files\Enigma Virtual Box\enigmavbconsole.exe"
-            )
-            foreach ($candidate in $candidatePaths) {
-              if (Test-Path $candidate) {
-                return $candidate
-              }
-            }
+          $available = [bool]$env:CERTIFICATE -and [bool]$env:CERTIFICATE_PASSWORD
+          if (-not $available) { Write-Warning "The Windows package will be unsigned." }
+          "available=$($available.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
 
-            $command = Get-Command enigmavbconsole.exe -ErrorAction SilentlyContinue
-            if ($command) {
-              return $command.Source
-            }
+      - name: Build application executable
+        run: pnpm --filter explorie-desktop exec -- tauri build --no-bundle --ci -- --locked
 
-            return $null
-          }
-
-          $cacheRoot = if ($env:RUNNER_TOOL_CACHE) { $env:RUNNER_TOOL_CACHE } else { $env:RUNNER_TEMP }
-          $evbCacheDir = Join-Path $cacheRoot "enigma-virtualbox"
-          New-Item -ItemType Directory -Force -Path $evbCacheDir | Out-Null
-          $evbInstaller = Join-Path $evbCacheDir "enigmavb_setup.exe"
-          $expectedHash = if ($env:EVB_INSTALLER_SHA256) {
-            $env:EVB_INSTALLER_SHA256.ToUpperInvariant()
-          } else {
-            "AB743F5E3DD927A288E126BBB053D367F270592E89378C9A06B7F3B15FA1EE35"
-          }
-
-          function Test-EvbInstaller {
-            param([string]$Path)
-
-            if (-not (Test-Path $Path)) {
-              return $false
-            }
-
-            $installer = Get-Item $Path
-            if ($installer.Length -le 1MB) {
-              Write-Warning "Ignoring EVB installer with unexpected size: $($installer.Length) bytes"
-              return $false
-            }
-
-            if ($expectedHash) {
-              $actualHash = (Get-FileHash -Path $Path -Algorithm SHA256).Hash
-              if ($actualHash -ne $expectedHash) {
-                Write-Warning "Ignoring EVB installer with unexpected SHA256: $actualHash"
-                return $false
-              }
-            }
-
-            return $true
-          }
-
-          $evbConsole = Find-EvbConsole
-          if (-not $evbConsole -and (Get-Command winget -ErrorAction SilentlyContinue)) {
-            Write-Host "Installing Enigma Virtual Box through winget"
-            winget install --id Enigma.VirtualBox --exact --silent --accept-package-agreements --accept-source-agreements
-            if ($LASTEXITCODE -ne 0) {
-              Write-Warning "winget failed to install Enigma.VirtualBox with exit code $LASTEXITCODE"
-            }
-            $evbConsole = Find-EvbConsole
-          }
-
-          $evbUrls = @()
-          if ($env:EVB_INSTALLER_URL) {
-            $evbUrls += $env:EVB_INSTALLER_URL
-          }
-          $evbUrls += @(
-            "https://www.enigmaprotector.com/assets/files/enigmavb.exe",
-            "https://enigmaprotector.com/assets/files/enigmavb.exe"
-          )
-
-          if (-not $evbConsole) {
-            if (Test-EvbInstaller -Path $evbInstaller) {
-              $downloaded = $true
-              Write-Host "Using cached EVB installer: $evbInstaller"
-            } else {
-              Remove-Item -Path $evbInstaller -Force -ErrorAction SilentlyContinue
-              $downloaded = $false
-              foreach ($evbUrl in $evbUrls) {
-                Write-Host "Trying: $evbUrl"
-                for ($attempt = 1; $attempt -le 3; $attempt++) {
-                  try {
-                    $headers = @{
-                      "User-Agent" = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                      "Accept" = "application/octet-stream,application/x-msdownload,*/*"
-                    }
-                    Invoke-WebRequest -Uri $evbUrl -OutFile $evbInstaller -UseBasicParsing -Headers $headers -MaximumRedirection 5
-
-                    if (Test-EvbInstaller -Path $evbInstaller) {
-                      $downloaded = $true
-                      Write-Host "Downloaded successfully from $evbUrl"
-                      break
-                    }
-                  } catch {
-                    Write-Host "Attempt $attempt failed: $_"
-                  }
-                  Start-Sleep -Seconds 2
-                }
-                if ($downloaded) {
-                  break
-                }
-              }
-            }
-
-            if (-not $downloaded) {
-              throw "Enigma Virtual Box is required to create explorie-portable.exe, but winget and direct installer download both failed."
-            }
-
-            $process = Start-Process -FilePath $evbInstaller -ArgumentList "/VERYSILENT","/NORESTART" -Wait -PassThru
-            if ($process.ExitCode -ne 0) {
-              throw "EVB installer failed with exit code $($process.ExitCode)"
-            }
-            $evbConsole = Find-EvbConsole
-          }
-
-          if ($evbConsole -and (Test-Path $evbConsole)) {
-            Write-Host "EVB console ready: $evbConsole"
-            "EVB_CONSOLE=$evbConsole" | Out-File -FilePath $env:GITHUB_ENV -Append
-          } else {
-            throw "EVB installation failed: enigmavbconsole.exe not found"
-          }
-
-      - name: Create portable exe
+      - name: Verify bundled native dependencies
         shell: pwsh
         run: |
-          $inputExe = $null
-          $candidatePaths = @(
-            "apps/desktop/frontend/src-tauri/target/release/explorie-desktop.exe",
-            "apps/desktop/frontend/src-tauri/target/release/explorie.exe",
-            "target/release/explorie-desktop.exe",
-            "target/release/explorie.exe"
-          )
-          foreach ($candidate in $candidatePaths) {
-            if (Test-Path $candidate) {
-              $inputExe = (Resolve-Path $candidate).Path
-              break
-            }
+          $rclone = "target/release/rclone.exe"
+          if (-not (Test-Path -LiteralPath $rclone -PathType Leaf)) { throw "Bundled rclone executable was not built." }
+          $version = & $rclone version | Select-Object -First 1
+          if ($version -ne "rclone v1.74.4") { throw "Unexpected bundled rclone version: $version" }
+          $winfsp = "apps/desktop/frontend/src-tauri/resources/winfsp-2.1.25156.msi"
+          if (-not (Test-Path -LiteralPath $winfsp -PathType Leaf)) { throw "Bundled WinFsp installer was not prepared." }
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $winfsp).Hash.ToLowerInvariant()
+          if ($hash -ne "073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a") { throw "WinFsp installer hash mismatch." }
+          $signature = Get-AuthenticodeSignature -LiteralPath $winfsp
+          if ($signature.Status -ne "Valid" -or $signature.SignerCertificate.Subject -notmatch "NAVIMATICS") {
+            throw "WinFsp installer signature is invalid."
           }
 
-          if (-not $inputExe) {
-            $searchRoots = @(
-              "apps/desktop/frontend/src-tauri/target",
-              "target"
-            )
-            foreach ($root in $searchRoots) {
-              if (Test-Path $root) {
-                $inputExe = Get-ChildItem -Path $root -Recurse -Filter "*.exe" |
-                  Where-Object {
-                    $_.FullName -match "\\\\release\\\\" -and
-                    $_.FullName -notmatch "\\\\deps\\\\" -and
-                    $_.FullName -notmatch "\\\\build\\\\"
-                  } |
-                  Sort-Object -Property Length -Descending |
-                  Select-Object -First 1 -ExpandProperty FullName
-                if ($inputExe) { break }
-              }
-            }
+      - name: Locate Windows signing tool
+        if: steps.signing.outputs.available == 'true'
+        id: signtool
+        shell: pwsh
+        run: |
+          $tool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if (-not $tool) { throw "signtool.exe was not found." }
+          "path=$($tool.FullName)" >> $env:GITHUB_OUTPUT
+
+      - name: Sign application executable
+        if: steps.signing.outputs.available == 'true'
+        shell: pwsh
+        env:
+          CERTIFICATE: ${{ secrets.WINDOWS_CODESIGN_CERTIFICATE }}
+          CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_PASSWORD }}
+          SIGNTOOL: ${{ steps.signtool.outputs.path }}
+        run: |
+          $certificatePath = Join-Path $env:RUNNER_TEMP "explorie-codesign.pfx"
+          [IO.File]::WriteAllBytes($certificatePath, [Convert]::FromBase64String($env:CERTIFICATE))
+          foreach ($executable in @("target/release/explorie-desktop.exe", "target/release/rclone.exe")) {
+            & $env:SIGNTOOL sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $certificatePath /p $env:CERTIFICATE_PASSWORD $executable
+            if ($LASTEXITCODE -ne 0) { throw "Executable signing failed: $executable" }
+            & $env:SIGNTOOL verify /pa /v $executable
+            if ($LASTEXITCODE -ne 0) { throw "Executable signature verification failed: $executable" }
+          }
+          Remove-Item -LiteralPath $certificatePath -Force
+
+      - name: Build NSIS installer
+        run: pnpm --filter explorie-desktop exec -- tauri bundle --bundles nsis --ci
+
+      - name: Sign and stage Windows installer
+        shell: pwsh
+        env:
+          CERTIFICATE: ${{ secrets.WINDOWS_CODESIGN_CERTIFICATE }}
+          CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_PASSWORD }}
+          SIGNTOOL: ${{ steps.signtool.outputs.path }}
+          SIGNING_AVAILABLE: ${{ steps.signing.outputs.available }}
+        run: |
+          $installers = @(Get-ChildItem target/release/bundle/nsis/*-setup.exe)
+          if ($installers.Count -ne 1) {
+            throw "Expected exactly one NSIS installer, found $($installers.Count)."
           }
 
-          if (-not $inputExe) {
-            foreach ($root in @("apps/desktop/frontend/src-tauri/target", "target")) {
-              if (Test-Path $root) {
-                Get-ChildItem -Path $root -Recurse -Filter "*.exe" | ForEach-Object { $_.FullName }
-              }
-            }
-            throw "Release exe not found under apps/desktop/frontend/src-tauri/target or target"
-          }
-          $outputExe = Join-Path (Split-Path $inputExe -Parent) "explorie-portable.exe"
-          New-Item -ItemType Directory -Force -Path (Split-Path $outputExe) | Out-Null
-          $webviewDll = $null
-          foreach ($root in @("apps/desktop/frontend/src-tauri/target", "target")) {
-            if (Test-Path $root) {
-              $webviewDll = Get-ChildItem -Path $root -Filter "WebView2Loader.dll" -Recurse | Select-Object -First 1
-              if ($webviewDll) { break }
-            }
-          }
-          if (-not $webviewDll) {
-            throw "WebView2Loader.dll not found under apps/desktop/frontend/src-tauri/target or target"
-          }
-          $webviewDllPath = $webviewDll.FullName
-
-          $evbStaging = Join-Path $PWD "evb-staging"
-          New-Item -ItemType Directory -Force -Path $evbStaging | Out-Null
-          Copy-Item -Path $webviewDllPath -Destination $evbStaging -Force
-          $evbProject = Join-Path $PWD "explorie.evb"
-          pnpm --package=@insco/enigma-virtualbox dlx enigmavirtualbox generate $evbStaging --input $inputExe --output $outputExe --project-name $evbProject
-          if ($LASTEXITCODE -ne 0) {
-            throw "enigmavirtualbox generate failed"
-          }
-          $evbConsole = $env:EVB_CONSOLE
-          if (-not (Test-Path $evbConsole)) {
-            throw "enigmavbconsole.exe not found at $evbConsole"
-          }
-          & $evbConsole $evbProject
-          if ($LASTEXITCODE -ne 0) {
-            throw "enigmavbconsole failed"
+          $installer = $installers[0].FullName
+          if ($env:SIGNING_AVAILABLE -eq "true") {
+            $certificatePath = Join-Path $env:RUNNER_TEMP "explorie-codesign.pfx"
+            [IO.File]::WriteAllBytes($certificatePath, [Convert]::FromBase64String($env:CERTIFICATE))
+            & $env:SIGNTOOL sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $certificatePath /p $env:CERTIFICATE_PASSWORD $installer
+            if ($LASTEXITCODE -ne 0) { throw "Installer signing failed." }
+            & $env:SIGNTOOL verify /pa /v $installer
+            if ($LASTEXITCODE -ne 0) { throw "Installer signature verification failed." }
+            Remove-Item -LiteralPath $certificatePath -Force
           }
 
-          if (Test-Path $outputExe) {
-            $size = [math]::Round((Get-Item $outputExe).Length / 1MB, 2)
-            Write-Host "Portable exe created: $size MB"
-          } else {
-            throw "Failed to create portable exe"
-          }
-          "PORTABLE_EXE_PATH=$outputExe" | Out-File -FilePath $env:GITHUB_ENV -Append
+          $version = (Get-Content package.json | ConvertFrom-Json).version
+          $staging = "release-artifacts/windows"
+          New-Item -ItemType Directory -Force $staging | Out-Null
+          $suffix = if ($env:SIGNING_AVAILABLE -eq "true") { "" } else { "-unsigned" }
+          $asset = Join-Path $staging "explorie-$version-windows-x64-setup$suffix.exe"
+          Copy-Item -LiteralPath $installer -Destination $asset
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $asset).Hash.ToLowerInvariant()
+          "$hash *$(Split-Path $asset -Leaf)" | Set-Content -Encoding ascii (Join-Path $staging "SHA256SUMS-windows.txt")
 
-      - name: Upload portable exe
+      - name: Smoke test Windows installer
+        shell: pwsh
+        run: |
+          $installers = @(Get-ChildItem target/release/bundle/nsis/*-setup.exe)
+          if ($installers.Count -ne 1) { throw "Expected exactly one NSIS installer." }
+
+          $installDir = Join-Path $env:RUNNER_TEMP "explorie-smoke-$env:GITHUB_RUN_ID"
+          if (Test-Path -LiteralPath $installDir) { throw "Smoke-test directory already exists." }
+          $install = Start-Process -FilePath $installers[0].FullName -ArgumentList @("/S", "/D=$installDir") -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "NSIS smoke install failed with exit code $($install.ExitCode)." }
+
+          $installedExe = Get-ChildItem -LiteralPath $installDir -Recurse -Filter "*.exe" |
+            Where-Object { $_.Name -notmatch "(?i)uninstall" } |
+            Sort-Object { if ($_.Name -match "(?i)^explorie(-desktop)?\.exe$") { 0 } else { 1 } } |
+            Select-Object -First 1
+          if (-not $installedExe) { throw "Installed application executable was not found." }
+          $installedRclone = Get-ChildItem -LiteralPath $installDir -Recurse -Filter "rclone.exe" | Select-Object -First 1
+          if (-not $installedRclone) { throw "Installed rclone sidecar was not found." }
+          $rcloneVersion = & $installedRclone.FullName version | Select-Object -First 1
+          if ($rcloneVersion -ne "rclone v1.74.4") { throw "Unexpected installed rclone version: $rcloneVersion" }
+          if (-not (Get-ChildItem -LiteralPath $installDir -Recurse -Filter "rclone-COPYING" | Select-Object -First 1)) {
+            throw "Installed rclone license was not found."
+          }
+          $winfspInstaller = Get-ChildItem -LiteralPath $installDir -Recurse -Filter "winfsp-2.1.25156.msi" | Select-Object -First 1
+          if (-not $winfspInstaller) { throw "Bundled WinFsp installer was not found." }
+          if (-not (Get-ChildItem -LiteralPath $installDir -Recurse -Filter "winfsp-NOTICE.txt" | Select-Object -First 1)) {
+            throw "Bundled WinFsp notice was not found."
+          }
+
+          $app = Start-Process -FilePath $installedExe.FullName -WorkingDirectory $installedExe.DirectoryName -PassThru
+          Start-Sleep -Seconds 8
+          $app.Refresh()
+          if ($app.HasExited) { throw "Installed application exited during launch smoke test." }
+          Stop-Process -Id $app.Id -Force
+
+      - name: Upload Windows package
         uses: actions/upload-artifact@v4
         with:
-          name: explorie-portable
-          path: ${{ env.PORTABLE_EXE_PATH }}
-
-      - name: Determine release tag
-        id: release_tag
-        if: github.ref == 'refs/heads/main'
-        shell: pwsh
-        run: |
-          $version = (Get-Content package.json | ConvertFrom-Json).version
-          if (-not $version) {
-            throw "package.json version not found"
-          }
-          "version=$version" >> $env:GITHUB_OUTPUT
-          "tag=v$version" >> $env:GITHUB_OUTPUT
-
-      - name: Check for existing release
-        id: release_check
-        if: github.ref == 'refs/heads/main'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const tag = '${{ steps.release_tag.outputs.tag }}';
-            try {
-              await github.rest.repos.getReleaseByTag({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                tag
-              });
-              core.setOutput('exists', 'true');
-            } catch (error) {
-              core.setOutput('exists', 'false');
-            }
-
-      - name: Publish release artifact (tag)
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          files: |
-            ${{ env.PORTABLE_EXE_PATH }}
-
-      - name: Publish release artifact (main create)
-        if: github.ref == 'refs/heads/main' && steps.release_check.outputs.exists != 'true'
-        uses: softprops/action-gh-release@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          tag_name: ${{ steps.release_tag.outputs.tag }}
-          target_commitish: ${{ github.sha }}
-          files: |
-            ${{ env.PORTABLE_EXE_PATH }}
-
-      - name: Publish release artifact (main existing)
-        if: github.ref == 'refs/heads/main' && steps.release_check.outputs.exists == 'true'
-        uses: softprops/action-gh-release@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          tag_name: ${{ steps.release_tag.outputs.tag }}
-          files: |
-            ${{ env.PORTABLE_EXE_PATH }}
+          name: explorie-windows
+          path: release-artifacts/windows/*
+          if-no-files-found: error
 
   build-macos:
+    name: Package macOS
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: validate
     runs-on: macos-latest
 
     steps:
-      - name: Check Apple signing secrets
-        id: apple-secrets
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: '9'
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './ -> target'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Test native file operations on macOS
+        run: cargo test -p explorie-core
+
+      - name: Check Apple signing prerequisites
+        id: signing
         shell: bash
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -356,155 +340,208 @@ jobs:
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          missing=0
-          if [ -z "$APPLE_CERTIFICATE" ]; then missing=1; fi
-          if [ -z "$APPLE_CERTIFICATE_PASSWORD" ]; then missing=1; fi
-          if [ -z "$APPLE_SIGNING_IDENTITY" ]; then missing=1; fi
-          if [ -z "$APPLE_ID" ]; then missing=1; fi
-          if [ -z "$APPLE_PASSWORD" ]; then missing=1; fi
-          if [ -z "$APPLE_TEAM_ID" ]; then missing=1; fi
-
-          if [ "$missing" -eq 0 ]; then
-            echo "available=true" >> "$GITHUB_OUTPUT"
+          available=true
+          for value in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            if [ -z "${!value}" ]; then available=false; fi
+          done
+          if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "$available" != "true" ]; then
+            echo "Tagged releases require all Apple signing and notarization secrets."
+            exit 1
+          fi
+          if [ "$available" != "true" ]; then
+            echo "::warning::Manual macOS package will use an ad-hoc signature and will not be notarized."
+          fi
+          echo "available=$available" >> "$GITHUB_OUTPUT"
+          if [ "$available" = "true" ]; then
+            echo "identity=$APPLE_SIGNING_IDENTITY" >> "$GITHUB_OUTPUT"
           else
-            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "identity=-" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Skip macOS build (missing secrets)
-        if: steps.apple-secrets.outputs.available != 'true'
-        run: echo "Apple signing secrets not configured; skipping macOS build."
-
-      - name: Checkout repository
-        if: steps.apple-secrets.outputs.available == 'true'
-        uses: actions/checkout@v4
-
-      - name: Setup pnpm
-        if: steps.apple-secrets.outputs.available == 'true'
-        uses: pnpm/action-setup@v4
-        with:
-          version: "9"
-          run_install: false
-
-      - name: Setup Node.js
-        if: steps.apple-secrets.outputs.available == 'true'
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-          cache: "pnpm"
-          cache-dependency-path: pnpm-lock.yaml
-
-      - name: Setup Rust
-        if: steps.apple-secrets.outputs.available == 'true'
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-
-      - name: Rust cache
-        if: steps.apple-secrets.outputs.available == 'true'
-        uses: swatinem/rust-cache@v2
-        with:
-          workspaces: "./ -> target"
-
-      - name: Install dependencies
-        if: steps.apple-secrets.outputs.available == 'true'
-        run: pnpm install --frozen-lockfile
-
-      - name: Generate Tauri icons
-        if: steps.apple-secrets.outputs.available == 'true'
-        run: pnpm --filter explorie-desktop tauri:icon
-
-      - name: Build frontend
-        if: steps.apple-secrets.outputs.available == 'true'
-        run: pnpm --filter explorie-desktop build
-
-      - name: Import Apple codesign certs
-        if: steps.apple-secrets.outputs.available == 'true'
+      - name: Import Apple signing certificate
+        if: steps.signing.outputs.available == 'true'
         uses: apple-actions/import-codesign-certs@v2
         with:
           p12-file-base64: ${{ secrets.APPLE_CERTIFICATE }}
           p12-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
 
-      - name: Build Tauri app (dmg)
-        if: steps.apple-secrets.outputs.available == 'true'
+      - name: Build macOS app and DMG
         env:
+          APPLE_SIGNING_IDENTITY: ${{ steps.signing.outputs.identity }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-        run: pnpm --filter explorie-desktop exec tauri build --bundles dmg
+        run: pnpm --filter explorie-desktop exec -- tauri build --bundles dmg --ci -- --locked
 
-      - name: Upload dmg
-        if: steps.apple-secrets.outputs.available == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: explorie-macOS-dmg
-          path: target/release/bundle/dmg/*.dmg
-
-      - name: Determine release tag
-        id: release_tag
-        if: steps.apple-secrets.outputs.available == 'true' && github.ref == 'refs/heads/main'
+      - name: Verify and stage macOS package
+        shell: bash
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_SIGNING_AVAILABLE: ${{ steps.signing.outputs.available }}
         run: |
-          version=$(node -p "require('./package.json').version")
-          if [ -z "$version" ]; then
-            echo "package.json version not found"
+          set -euo pipefail
+          app="target/release/bundle/macos/explorie.app"
+          test -d "$app"
+          helper="$app/Contents/Resources/explorie-mountd"
+          rclone="$app/Contents/MacOS/rclone"
+          rclone_license="$app/Contents/Resources/licenses/rclone-COPYING"
+          helper_plist="$app/Contents/Library/LaunchDaemons/com.omershatz.explorie.mountd.plist"
+          test -x "$helper"
+          test -x "$rclone"
+          test -f "$rclone_license"
+          test -f "$helper_plist"
+          test "$("$rclone" version | head -n 1)" = 'rclone v1.74.4'
+          /usr/libexec/PlistBuddy -c 'Print :BundleProgram' "$helper_plist" | grep -Fx 'Contents/Resources/explorie-mountd'
+          /usr/libexec/PlistBuddy -c 'Print :AssociatedBundleIdentifiers:0' "$helper_plist" | grep -Fx 'com.omershatz.explorie'
+          codesign --verify --strict --verbose=2 "$helper"
+          codesign --verify --strict --verbose=2 "$rclone"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign -d --verbose=4 "$helper" 2>&1 | grep -Fx 'Identifier=com.omershatz.explorie.mountd'
+          codesign -d --verbose=4 "$app" 2>&1 | grep -Fx 'Identifier=com.omershatz.explorie'
+          codesign -d --verbose=4 "$helper" 2>&1 | grep -E 'flags=.*runtime'
+          codesign -d --verbose=4 "$app" 2>&1 | grep -E 'flags=.*runtime'
+          if [ "$APPLE_SIGNING_AVAILABLE" = "true" ]; then
+            codesign -d --verbose=4 "$helper" 2>&1 | grep -Fx "TeamIdentifier=$APPLE_TEAM_ID"
+            codesign -d --verbose=4 "$rclone" 2>&1 | grep -Fx "TeamIdentifier=$APPLE_TEAM_ID"
+            codesign -d --verbose=4 "$app" 2>&1 | grep -Fx "TeamIdentifier=$APPLE_TEAM_ID"
+          fi
+
+          shopt -s nullglob
+          dmgs=(target/release/bundle/dmg/*.dmg)
+          if [ "${#dmgs[@]}" -ne 1 ]; then
+            echo "Expected exactly one DMG, found ${#dmgs[@]}."
             exit 1
           fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "tag=v$version" >> "$GITHUB_OUTPUT"
-
-      - name: Delete existing dmg asset if present (tag)
-        if: steps.apple-secrets.outputs.available == 'true' && startsWith(github.ref, 'refs/tags/v')
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          tag="${GITHUB_REF#refs/tags/}"
-          # Check if release exists first
-          if ! gh api "repos/${{ github.repository }}/releases/tags/$tag" >/dev/null 2>&1; then
-            echo "Release $tag does not exist yet, skipping asset cleanup"
-            exit 0
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            xcrun stapler validate "$app"
+            xcrun stapler validate "${dmgs[0]}"
+            spctl --assess --type execute --verbose=2 "$app"
+            spctl --assess --type open --context context:primary-signature --verbose=2 "${dmgs[0]}"
           fi
-          for dmg in target/release/bundle/dmg/*.dmg; do
-            asset_name=$(basename "$dmg")
-            asset_id=$(gh api "repos/${{ github.repository }}/releases/tags/$tag" --jq ".assets[] | select(.name == \"$asset_name\") | .id" 2>/dev/null || echo "")
-            if [ -n "$asset_id" ] && [ "$asset_id" != "null" ]; then
-              echo "Deleting existing asset: $asset_name (id: $asset_id)"
-              gh api -X DELETE "repos/${{ github.repository }}/releases/assets/$asset_id"
-            fi
-          done
 
-      - name: Publish release artifact (tag)
-        if: steps.apple-secrets.outputs.available == 'true' && startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          files: |
-            target/release/bundle/dmg/*.dmg
+          version=$(node -p "require('./package.json').version")
+          mkdir -p release-artifacts/macos
+          asset="release-artifacts/macos/explorie-$version-macos-arm64.dmg"
+          cp "${dmgs[0]}" "$asset"
+          (cd release-artifacts/macos && shasum -a 256 "$(basename "$asset")" > SHA256SUMS-macos.txt)
 
-      - name: Delete existing dmg asset if present
-        if: steps.apple-secrets.outputs.available == 'true' && github.ref == 'refs/heads/main'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Smoke test macOS DMG
+        shell: bash
         run: |
-          tag="${{ steps.release_tag.outputs.tag }}"
-          # Check if release exists first
-          if ! gh api "repos/${{ github.repository }}/releases/tags/$tag" >/dev/null 2>&1; then
-            echo "Release $tag does not exist yet, skipping asset cleanup"
-            exit 0
-          fi
-          for dmg in target/release/bundle/dmg/*.dmg; do
-            asset_name=$(basename "$dmg")
-            asset_id=$(gh api "repos/${{ github.repository }}/releases/tags/$tag" --jq ".assets[] | select(.name == \"$asset_name\") | .id" 2>/dev/null || echo "")
-            if [ -n "$asset_id" ] && [ "$asset_id" != "null" ]; then
-              echo "Deleting existing asset: $asset_name (id: $asset_id)"
-              gh api -X DELETE "repos/${{ github.repository }}/releases/assets/$asset_id"
-            fi
-          done
+          set -euo pipefail
+          shopt -s nullglob
+          dmgs=(target/release/bundle/dmg/*.dmg)
+          if [ "${#dmgs[@]}" -ne 1 ]; then exit 1; fi
 
-      - name: Publish release artifact (main)
-        if: steps.apple-secrets.outputs.available == 'true' && github.ref == 'refs/heads/main'
-        uses: softprops/action-gh-release@v2
+          mount_point=$(mktemp -d)
+          hdiutil attach "${dmgs[0]}" -nobrowse -readonly -mountpoint "$mount_point" >/dev/null
+          cleanup() { hdiutil detach "$mount_point" -quiet || true; }
+          trap cleanup EXIT
+
+          apps=("$mount_point"/*.app)
+          if [ "${#apps[@]}" -ne 1 ]; then
+            echo "Expected exactly one app in the DMG."
+            exit 1
+          fi
+          installed_app="$RUNNER_TEMP/explorie-smoke-$GITHUB_RUN_ID.app"
+          ditto "${apps[0]}" "$installed_app"
+          cleanup
+          trap - EXIT
+
+          binary="$installed_app/Contents/MacOS/explorie-desktop"
+          rclone="$installed_app/Contents/MacOS/rclone"
+          if [ ! -x "$binary" ]; then
+            echo "Installed application executable was not found."
+            exit 1
+          fi
+          test -x "$rclone"
+          test "$("$rclone" version | head -n 1)" = 'rclone v1.74.4'
+          "$binary" >"$RUNNER_TEMP/explorie-smoke.log" 2>&1 &
+          app_pid=$!
+          sleep 8
+          if ! kill -0 "$app_pid" 2>/dev/null; then
+            cat "$RUNNER_TEMP/explorie-smoke.log"
+            echo "Installed application exited during launch smoke test."
+            exit 1
+          fi
+          kill "$app_pid"
+          wait "$app_pid" || true
+
+      - name: Upload macOS package
+        uses: actions/upload-artifact@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          tag_name: ${{ steps.release_tag.outputs.tag }}
-          files: |
-            target/release/bundle/dmg/*.dmg
+          name: explorie-macos
+          path: release-artifacts/macos/*
+          if-no-files-found: error
+
+  candidate:
+    name: Create draft candidate release
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: [validate, build-windows, build-macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download candidate packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: explorie-*
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: Verify packages and create draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd release-artifacts
+          sha256sum --check SHA256SUMS-windows.txt
+          sha256sum --check SHA256SUMS-macos.txt
+          gh release create "$GITHUB_REF_NAME" ./* \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --draft \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes
+
+  publish:
+    name: Publish verified draft release
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.ref_type == 'tag' &&
+      inputs.publish == true &&
+      inputs.windows_real_machine_verified == true &&
+      inputs.macos_real_machine_verified == true
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download and verify draft assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir release-artifacts
+          gh release download "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern 'explorie-*' \
+            --pattern 'SHA256SUMS-*' \
+            --dir release-artifacts
+          cd release-artifacts
+          sha256sum --check SHA256SUMS-windows.txt
+          sha256sum --check SHA256SUMS-macos.txt
+          shopt -s nullglob
+          windows=(explorie-*-windows-x64-setup*.exe)
+          macos=(explorie-*-macos-arm64.dmg)
+          if [ "${#windows[@]}" -ne 1 ] || [ "${#macos[@]}" -ne 1 ]; then
+            echo "Draft release must contain exactly one Windows installer and one macOS DMG."
+            exit 1
+          fi
+
+      - name: Publish the verified draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --latest

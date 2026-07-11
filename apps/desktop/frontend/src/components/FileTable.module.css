@@ -79,7 +79,7 @@
 /* Default cell padding */
 .fileTable th,
 .fileTable td {
-  padding: 6px var(--padding-md);
+  padding: var(--padding-sm) var(--padding-md);
   text-align: left;
   vertical-align: middle;
   white-space: nowrap;
@@ -94,13 +94,13 @@
 .fileTable th {
   color: var(--fg-secondary);
   font-weight: 600;
-  font-size: calc(10px * var(--font-scale)); /* more compact header */
+  font-size: calc(11px * var(--font-scale));
   text-transform: uppercase;
   letter-spacing: 0.03em;
   cursor: pointer;
   border-bottom: 1px solid var(--border-primary);
   user-select: none;
-  padding: 3px var(--padding-sm); /* tighter vertical padding */
+  padding: 0;
   line-height: 1.2;
 }
 
@@ -113,8 +113,33 @@
   /* Add styles if needed */
 }
 
+.sortButton {
+  display: inline-flex;
+  width: 100%;
+  align-items: center;
+  min-height: var(--command-size-md);
+  padding: 0 var(--padding-md);
+  border: 0;
+  color: inherit;
+  font: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  cursor: pointer;
+  background: transparent;
+}
+
+.sortButton:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: -2px;
+}
+
+.fileSize .sortButton,
+.fileModified .sortButton {
+  justify-content: flex-end;
+}
+
 .sortIcon {
-  margin-left: 4px;
+  margin-left: var(--padding-sm);
   opacity: 0.7;
 }
 
@@ -131,7 +156,7 @@
   border: 2px solid var(--border-primary);
   border-top-color: var(--fg-secondary);
   border-radius: 50%;
-  margin-left: 6px;
+  margin-left: var(--padding-sm);
   vertical-align: middle;
   animation: spin 0.8s linear infinite;
 }
@@ -213,6 +238,7 @@
 
 .dragSource {
   opacity: 0.44;
+  transition: opacity 120ms cubic-bezier(0.22, 1, 0.36, 1);
 }
 
 .fileNameCell {
@@ -220,7 +246,7 @@
   align-items: center; /* center icon + text vertically */
   gap: var(--padding-sm);
   height: var(--row-height); /* match row height */
-  padding: 6px 0; /* mimic cell vertical padding visually */
+  padding: var(--padding-sm) 0;
 }
 
 .fileIcon {
@@ -230,12 +256,17 @@
   display: flex;
   align-items: center;
   justify-content: center;
+  flex: 0 0 auto;
 }
 
 .fileName {
   font-family: var(--font-base);
   font-weight: 500;
   line-height: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .fileSize,
@@ -280,7 +311,7 @@
   align-items: center;
   max-width: 120px;
   min-height: 18px;
-  padding: 1px 7px;
+  padding: var(--padding-xs) var(--padding-md);
   border: 1px solid transparent;
   border-radius: 999px;
   font-size: calc(10px * var(--font-scale));
@@ -292,6 +323,7 @@
   text-transform: uppercase;
   vertical-align: middle;
   white-space: nowrap;
+  flex: 0 0 auto;
 }
 
 .tagGreen {
@@ -358,7 +390,7 @@
   box-shadow: var(--panel-shadow);
 }
 .contextItem {
-  padding: 6px 10px;
+  padding: var(--padding-md) var(--padding-lg);
   font-size: 12px;
   color: var(--fg-primary);
   cursor: pointer;
@@ -367,7 +399,7 @@
   background: var(--bg-hover);
 }
 .contextIcon {
-  margin-right: 8px;
+  margin-right: var(--padding-md);
   width: 1.2em;
   display: inline-flex;
   align-items: center;

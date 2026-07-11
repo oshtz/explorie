@@ -20,10 +20,14 @@ type StoreState = {
   uiScale: number;
   clipboard: { mode: 'copy' | 'cut'; files: FileEntry[] } | null;
   confirmBeforeDelete: boolean;
+  selectedPaths: string[];
+  selectionCursorPath: string | null;
   setConfirmBeforeDelete: (v: boolean) => void;
   setEditingId: (id: string | null) => void;
   setDraftNew: (draft: DraftNew | null) => void;
   setFiles: (files: FileEntry[]) => void;
+  setSelectedPaths: (paths: string[]) => void;
+  setSelectionCursorPath: (path: string | null) => void;
 };
 
 const mocks = vi.hoisted(() => ({
@@ -34,6 +38,7 @@ const mocks = vi.hoisted(() => ({
   contextOpenForEmpty: vi.fn(),
   contextOpenForFiles: vi.fn(),
   contextClose: vi.fn(),
+  convertFileSrc: vi.fn(),
   createFolderIn: vi.fn(),
   deleteWithUndo: vi.fn(),
   dragMouseDown: vi.fn(),
@@ -43,6 +48,7 @@ const mocks = vi.hoisted(() => ({
   renamePath: vi.fn(),
   reportError: vi.fn(),
   virtualColumnCount: 3,
+  virtualGap: 0,
 }));
 
 let storeState: StoreState;
@@ -79,16 +85,32 @@ vi.mock('../undoRedoStore', () => ({
 }));
 
 vi.mock('../hooks/useDragStart', () => ({
-  useDragStart: ({ onBeginDrag }: { onBeginDrag?: (file: FileEntry) => void }) => ({
+  useDragStart: ({
+    onBeginDrag,
+  }: {
+    onBeginDrag?: (file: FileEntry, point: { x: number; y: number }) => void;
+  }) => ({
     onMouseDown: (_event: React.MouseEvent, file: FileEntry) => {
       mocks.dragMouseDown(file);
-      onBeginDrag?.(file);
+      onBeginDrag?.(file, { x: 0, y: 0 });
     },
   }),
 }));
 
+vi.mock('../hooks/useCentralFileSelection', async () => {
+  const ReactActual = await vi.importActual<typeof import('react')>('react');
+  return {
+    useCentralFileSelection: () => {
+      const [selectedIds, setSelectedIds] = ReactActual.useState<Set<string>>(new Set());
+      const [cursorIndex, setCursorIndex] = ReactActual.useState<number | null>(null);
+      return { selectedIds, setSelectedIds, cursorIndex, setCursorIndex };
+    },
+  };
+});
+
 vi.mock('../hooks/useVirtualGrid', () => ({
-  useVirtualGrid: ({ count }: { count: number }) => {
+  useVirtualGrid: ({ count, gap }: { count: number; gap: number }) => {
+    mocks.virtualGap = gap;
     if (count === 0) {
       return {
         totalHeight: 0,
@@ -312,6 +334,7 @@ vi.mock('./Toast', () => ({
 }));
 
 vi.mock('@tauri-apps/api/core', () => ({
+  convertFileSrc: mocks.convertFileSrc,
   invoke: mocks.invoke,
 }));
 
@@ -346,6 +369,7 @@ describe('GridView', () => {
     mocks.contextActionFile = null;
     mocks.contextActionFiles = [];
     mocks.virtualColumnCount = 3;
+    mocks.virtualGap = 0;
     mocks.createFolderIn.mockReset();
     mocks.createFolderIn.mockResolvedValue('/root/New Folder');
     mocks.deleteWithUndo.mockReset();
@@ -361,6 +385,9 @@ describe('GridView', () => {
     mocks.contextOpenForEmpty.mockReset();
     mocks.contextOpenForFiles.mockReset();
     mocks.contextClose.mockReset();
+    mocks.convertFileSrc.mockReset();
+    mocks.convertFileSrc.mockImplementation((path: string) => `asset://${path}`);
+    document.documentElement.dataset.platform = 'web';
 
     storeState = {
       showHidden: false,
@@ -375,16 +402,58 @@ describe('GridView', () => {
       uiScale: 1,
       clipboard: null,
       confirmBeforeDelete: true,
+      selectedPaths: [],
+      selectionCursorPath: null,
       setConfirmBeforeDelete: vi.fn(),
       setEditingId: vi.fn(),
       setDraftNew: vi.fn(),
       setFiles: vi.fn(),
+      setSelectedPaths: vi.fn((paths) => {
+        storeState.selectedPaths = paths;
+      }),
+      setSelectionCursorPath: vi.fn((path) => {
+        storeState.selectionCursorPath = path;
+      }),
     };
   });
 
   it('renders empty state when no files are visible', () => {
-    render(<GridView currentPath="/root" files={[]} />);
+    storeState.clipboard = { mode: 'copy', files: [] };
+    const { container } = render(<GridView currentPath="/root" files={[]} />);
     expect(screen.getByText('This folder is empty')).toBeInTheDocument();
+    fireEvent.contextMenu(getGridContainer(container));
+    expect(mocks.contextOpenForEmpty).toHaveBeenCalledWith(expect.any(Object), '/root');
+  });
+
+  it('keeps rendered and virtualized grid gaps synchronized across density and scale', () => {
+    const file = makeFile({ id: 'file-1', path: '/root/hello.txt' });
+    const { container, rerender } = render(<GridView currentPath="/root" files={[file]} />);
+    const gridContent = () =>
+      container.querySelector<HTMLElement>('[style*="grid-template-columns"]');
+
+    expect(mocks.virtualGap).toBe(12);
+    expect(gridContent()).toHaveStyle({ gap: '12px' });
+
+    storeState.density = 'compact';
+    rerender(<GridView currentPath="/root" files={[file]} />);
+    expect(mocks.virtualGap).toBe(8);
+    expect(gridContent()).toHaveStyle({ gap: '8px' });
+
+    storeState.uiScale = 1.4;
+    rerender(<GridView currentPath="/root" files={[file]} />);
+    expect(mocks.virtualGap).toBe(11);
+    expect(gridContent()).toHaveStyle({ gap: '11px' });
+  });
+
+  it('distinguishes filtered results from an empty folder', () => {
+    storeState.searchQuery = 'missing';
+    render(
+      <GridView
+        currentPath="/root"
+        files={[makeFile({ id: 'file-1', path: '/root/visible.txt' })]}
+      />
+    );
+    expect(screen.getByText('No matching files')).toBeInTheDocument();
   });
 
   it('renders file names, derived basenames, and formatted sizes', () => {
@@ -398,6 +467,116 @@ describe('GridView', () => {
     expect(screen.getByText('hello.txt')).toBeInTheDocument();
     expect(screen.getByText('2 KB')).toBeInTheDocument();
     expect(screen.getByLabelText('Select file hello.txt')).toBeInTheDocument();
+  });
+
+  it('shows image and video thumbnails and loads native executable icons on Windows', async () => {
+    document.documentElement.dataset.platform = 'windows';
+    mocks.invoke.mockImplementation(async (command: string) => {
+      if (command === 'get_file_icon') return 'C:\\Temp\\file-icon.png';
+      if (command === 'get_file_thumbnail') return 'C:\\Temp\\media-thumbnail.png';
+      return [];
+    });
+    render(
+      <GridView
+        currentPath="/root"
+        files={[
+          makeFile({ id: 'image', path: '/root/photo.jpg' }),
+          makeFile({ id: 'video', path: '/root/clip.mp4' }),
+          makeFile({ id: 'exe', path: 'C:\\Tools\\setup.exe' }),
+        ]}
+      />
+    );
+
+    expect(screen.getAllByLabelText('Loading thumbnail')).toHaveLength(2);
+    await waitFor(() =>
+      expect(screen.getByLabelText('Select file photo.jpg').querySelector('img')).toHaveAttribute(
+        'src',
+        'asset://C:\\Temp\\media-thumbnail.png'
+      )
+    );
+    await waitFor(() =>
+      expect(screen.getByLabelText('Select file clip.mp4').querySelector('img')).toHaveAttribute(
+        'src',
+        'asset://C:\\Temp\\media-thumbnail.png'
+      )
+    );
+    await waitFor(() =>
+      expect(screen.getByLabelText('Select file setup.exe').querySelector('img')).toHaveAttribute(
+        'src',
+        'asset://C:\\Temp\\file-icon.png'
+      )
+    );
+    expect(mocks.invoke).toHaveBeenCalledWith('get_file_icon', {
+      path: 'C:\\Tools\\setup.exe',
+    });
+    expect(mocks.invoke).toHaveBeenCalledWith('get_file_thumbnail', {
+      path: '/root/photo.jpg',
+      maxSize: 280,
+    });
+    expect(mocks.invoke).toHaveBeenCalledWith('get_file_thumbnail', {
+      path: '/root/clip.mp4',
+      maxSize: 280,
+    });
+  });
+
+  it('distinguishes failed thumbnails from generic file fallbacks', async () => {
+    mocks.invoke.mockImplementation(async (command: string) => {
+      if (command === 'get_file_thumbnail') return null;
+      return [];
+    });
+    render(
+      <GridView
+        currentPath="/root"
+        files={[
+          makeFile({ id: 'image-failed', path: '/root/broken.jpg' }),
+          makeFile({ id: 'generic', path: '/root/notes.txt' }),
+        ]}
+      />
+    );
+
+    expect(screen.getByLabelText('Generic file icon')).toBeInTheDocument();
+    expect(await screen.findByLabelText('Thumbnail unavailable')).toBeInTheDocument();
+  });
+
+  it('ignores stale thumbnail responses after the visible files change', async () => {
+    let resolveFirst: (value: string) => void = () => {};
+    mocks.invoke.mockImplementation(async (command: string, args?: { path?: string }) => {
+      if (command !== 'get_file_thumbnail') return [];
+      if (args?.path === '/root/first.jpg') {
+        return new Promise<string>((resolve) => {
+          resolveFirst = resolve;
+        });
+      }
+      return 'C:\\Temp\\second-thumbnail.png';
+    });
+    const { rerender } = render(
+      <GridView
+        currentPath="/root"
+        files={[makeFile({ id: 'first-image', path: '/root/first.jpg' })]}
+      />
+    );
+    await waitFor(() =>
+      expect(mocks.invoke).toHaveBeenCalledWith('get_file_thumbnail', {
+        path: '/root/first.jpg',
+        maxSize: 280,
+      })
+    );
+
+    rerender(
+      <GridView
+        currentPath="/root"
+        files={[makeFile({ id: 'second-image', path: '/root/second.jpg' })]}
+      />
+    );
+    resolveFirst('C:\\Temp\\first-thumbnail.png');
+
+    await waitFor(() =>
+      expect(screen.getByLabelText('Select file second.jpg').querySelector('img')).toHaveAttribute(
+        'src',
+        'asset://C:\\Temp\\second-thumbnail.png'
+      )
+    );
+    expect(document.querySelector('img[src*="first-thumbnail"]')).toBeNull();
   });
 
   it('filters hidden entries, folder mode, search results, and injects a matching draft folder', () => {
@@ -481,6 +660,12 @@ describe('GridView', () => {
     fireEvent.keyDown(grid, { key: 'Escape' });
     fireEvent.keyDown(grid, { key: 'F2' });
     expect(storeState.setEditingId).toHaveBeenCalledTimes(1);
+
+    Object.defineProperty(grid, 'clientHeight', { configurable: true, value: 100 });
+    fireEvent.keyDown(grid, { key: 'End' });
+    expect(grid.scrollTop).toBeGreaterThan(0);
+    fireEvent.keyDown(grid, { key: 'Home' });
+    expect(grid.scrollTop).toBe(0);
   });
 
   it('opens folders through double click and opens files through keyboard and double click invoke', () => {
@@ -531,6 +716,30 @@ describe('GridView', () => {
     expect(storeState.setEditingId).toHaveBeenLastCalledWith(null);
   });
 
+  it('reports inline rename failures against the original path', async () => {
+    storeState.editingId = 'file';
+    mocks.renamePath.mockRejectedValueOnce(new Error('denied'));
+    render(
+      <GridView
+        currentPath="/root"
+        files={[makeFile({ id: 'file', path: '/root/original.txt', is_dir: false })]}
+      />
+    );
+
+    const input = screen.getByDisplayValue('original.txt');
+    fireEvent.change(input, { target: { value: 'blocked.txt' } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+
+    await waitFor(() =>
+      expect(mocks.reportError).toHaveBeenCalledWith(
+        'Rename failed',
+        expect.any(Error),
+        expect.objectContaining({ context: { path: '/root/original.txt' } })
+      )
+    );
+    expect(storeState.setEditingId).toHaveBeenLastCalledWith(null);
+  });
+
   it('creates draft folders on inline rename commit and cancels blank draft names', async () => {
     storeState.draftNew = { id: 'draft-blank', parentPath: '/root', name: 'Untitled Folder' };
     storeState.editingId = 'draft-blank';
@@ -556,11 +765,15 @@ describe('GridView', () => {
 
   it('opens context menus for selected files and for empty space when clipboard data exists', async () => {
     storeState.clipboard = { mode: 'copy', files: [] };
+    const onFileSelect = vi.fn();
     const files = [
       makeFile({ id: 'a', path: '/root/a.txt' }),
       makeFile({ id: 'b', path: '/root/b.txt' }),
+      makeFile({ id: 'c', path: '/root/c.txt' }),
     ];
-    const { container } = render(<GridView currentPath="/root" files={files} />);
+    const { container } = render(
+      <GridView currentPath="/root" files={files} onFileSelect={onFileSelect} />
+    );
 
     fireEvent.click(screen.getByLabelText('Select file a.txt'));
     fireEvent.click(screen.getByLabelText('Select file b.txt'), { ctrlKey: true });
@@ -572,6 +785,14 @@ describe('GridView', () => {
         '/root'
       )
     );
+
+    fireEvent.contextMenu(screen.getByLabelText('Select file c.txt'));
+    expect(mocks.contextOpenForFiles).toHaveBeenLastCalledWith(
+      expect.any(Object),
+      [files[2]],
+      '/root'
+    );
+    expect(onFileSelect).toHaveBeenLastCalledWith(files[2]);
 
     fireEvent.contextMenu(getGridContainer(container));
     expect(mocks.contextOpenForEmpty).toHaveBeenCalledWith(expect.any(Object), '/root');
@@ -690,7 +911,7 @@ describe('GridView', () => {
         currentPath="/root"
         files={files}
         isDragging
-        draggingItemId="file"
+        draggingItemIds={new Set(['file'])}
         onBeginDrag={onBeginDrag}
         onHoverFolder={onHoverFolder}
         onHoverContainer={onHoverContainer}
@@ -699,7 +920,7 @@ describe('GridView', () => {
 
     fireEvent.mouseDown(screen.getByLabelText('Open folder Folder'));
     expect(mocks.dragMouseDown).toHaveBeenCalledWith(files[0]);
-    expect(onBeginDrag).toHaveBeenCalledWith(files[0]);
+    expect(onBeginDrag).toHaveBeenCalledWith(files[0], { x: 0, y: 0 });
 
     fireEvent.mouseEnter(getGridContainer(container));
     expect(onHoverContainer).toHaveBeenCalledWith('/root');

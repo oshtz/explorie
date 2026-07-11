@@ -18,7 +18,6 @@ const mocks = vi.hoisted(() => ({
   getCachedPreview: vi.fn(),
   invoke: vi.fn(),
   readBinaryFile: vi.fn(),
-  readTextFile: vi.fn(),
   setCachedPreview: vi.fn(),
 }));
 
@@ -29,10 +28,6 @@ vi.mock('../store', () => {
   useFileStore.getState = () => storeState;
   return { useFileStore };
 });
-
-vi.mock('../utils/fs', () => ({
-  readTextFile: (path: string) => mocks.readTextFile(path),
-}));
 
 vi.mock('@tauri-apps/api/core', () => ({
   convertFileSrc: (path: string, protocol?: string) => mocks.convertFileSrc(path, protocol),
@@ -110,6 +105,13 @@ vi.mock('./Preview', () => ({
 }));
 
 describe('FilePreviewer', () => {
+  const mockTextPreview = (text: string, truncated = false) => {
+    mocks.invoke.mockImplementation(async (command: string) => {
+      if (command === 'read_text_preview') return { text, truncated };
+      return undefined;
+    });
+  };
+
   afterEach(() => {
     cleanup();
     vi.restoreAllMocks();
@@ -127,14 +129,12 @@ describe('FilePreviewer', () => {
     mocks.getCachedPreview.mockReturnValue(undefined);
     mocks.invoke.mockReset();
     mocks.readBinaryFile.mockReset();
-    mocks.readTextFile.mockReset();
     mocks.setCachedPreview.mockReset();
   });
 
-  it('shows the load more button for truncated text', async () => {
-    const user = userEvent.setup();
-    const longText = 'a'.repeat(200_000);
-    mocks.readTextFile.mockResolvedValue(longText);
+  it('keeps truncated text previews bounded', async () => {
+    const previewText = 'a'.repeat(128 * 1024);
+    mockTextPreview(previewText, true);
 
     render(
       <FilePreviewer
@@ -149,26 +149,31 @@ describe('FilePreviewer', () => {
       />
     );
 
-    const button = await screen.findByRole('button', { name: 'Load more' });
-    expect(button).toBeInTheDocument();
+    expect(await screen.findByRole('status')).toHaveTextContent(
+      'Preview limited to the first 128 KB'
+    );
     expect(screen.getByTestId('preview-content-length')).toHaveTextContent('131072');
-
-    await user.click(button);
-    expect(screen.getByTestId('preview-content-length')).toHaveTextContent('200000');
+    expect(mocks.invoke).toHaveBeenCalledWith('read_text_preview', {
+      path: '/root/readme.txt',
+      maxBytes: 128 * 1024,
+    });
   });
 
   it('loads text files and propagates preview updates to the file store', async () => {
     const user = userEvent.setup();
     const file = makeFile('/root/readme.txt', { id: 'readme', name: 'readme.txt' });
     storeState.files = [file, makeFile('/root/other.txt', { id: 'other', name: 'other.txt' })];
-    mocks.readTextFile.mockResolvedValue('hello from explorie');
+    mockTextPreview('hello from explorie');
 
     render(<FilePreviewer file={file} />);
 
     await waitFor(() =>
       expect(screen.getByTestId('preview')).toHaveAttribute('data-loading', 'false')
     );
-    expect(mocks.readTextFile).toHaveBeenCalledWith('/root/readme.txt');
+    expect(mocks.invoke).toHaveBeenCalledWith('read_text_preview', {
+      path: '/root/readme.txt',
+      maxBytes: 128 * 1024,
+    });
     expect(screen.getByTestId('preview')).toHaveAttribute('data-type', 'text/plain');
     expect(screen.getByTestId('preview-content-length')).toHaveTextContent('19');
     expect(screen.getByTestId('preview-content-sample')).toHaveTextContent('hello from explorie');
@@ -187,17 +192,22 @@ describe('FilePreviewer', () => {
   });
 
   it('loads text-like provider formats beyond the legacy extension list', async () => {
-    mocks.readTextFile.mockResolvedValue('name: explorie');
+    mockTextPreview('name: explorie');
 
     render(<FilePreviewer file={makeFile('/root/config.yaml')} />);
 
-    await waitFor(() => expect(mocks.readTextFile).toHaveBeenCalledWith('/root/config.yaml'));
+    await waitFor(() =>
+      expect(mocks.invoke).toHaveBeenCalledWith('read_text_preview', {
+        path: '/root/config.yaml',
+        maxBytes: 128 * 1024,
+      })
+    );
     expect(screen.getByTestId('preview')).toHaveAttribute('data-type', 'text/plain');
     expect(screen.getByTestId('preview-content-sample')).toHaveTextContent('name: explorie');
   });
 
   it('shows formatted text loading errors in an error preview', async () => {
-    mocks.readTextFile.mockRejectedValue(new Error('ENOENT: no such file or directory'));
+    mocks.invoke.mockRejectedValue(new Error('ENOENT: no such file or directory'));
 
     render(<FilePreviewer file={makeFile('/root/missing.txt')} />);
 
@@ -216,17 +226,25 @@ describe('FilePreviewer', () => {
     await waitFor(() =>
       expect(screen.getByTestId('preview')).toHaveAttribute('data-loading', 'false')
     );
-    expect(mocks.readTextFile).not.toHaveBeenCalled();
+    expect(mocks.invoke).not.toHaveBeenCalledWith(
+      'read_text_preview',
+      expect.objectContaining({ path: '/root/install.ps1' })
+    );
     expect(screen.getByTestId('preview')).toHaveAttribute('data-type', '');
 
     unmount();
     cleanup();
     storeState.previewExecutableScripts = true;
-    mocks.readTextFile.mockResolvedValue('Write-Host "hello"');
+    mockTextPreview('Write-Host "hello"');
 
     render(<FilePreviewer file={scriptFile} />);
 
-    await waitFor(() => expect(mocks.readTextFile).toHaveBeenCalledWith('/root/install.ps1'));
+    await waitFor(() =>
+      expect(mocks.invoke).toHaveBeenCalledWith('read_text_preview', {
+        path: '/root/install.ps1',
+        maxBytes: 128 * 1024,
+      })
+    );
     expect(screen.getByTestId('preview')).toHaveAttribute('data-type', 'text/plain');
     expect(screen.getByTestId('preview-content-sample')).toHaveTextContent('Write-Host "hello"');
   });

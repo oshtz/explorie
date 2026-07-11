@@ -4,14 +4,14 @@
 
 # explorie
 
-**Fast, local-first file manager for Windows and macOS.**
+**Pre-release, local-first file manager for Windows. macOS is a build target, not yet a verified release target.**
 _MIT-licensed, built to be understandable, extensible, and easy to customize._
 
 ---
 
 ## Overview
 
-explorie is a Tauri + React file manager for **Windows and macOS** with plain JSON metadata, themeable UI, and a "do what you want" philosophy. The Rust core exposes directory listing, size calculation, and `.explorie.json` custom fields. A minimal plugin host and FFmpeg command builder are included for experimentation (both wired into the CLI and exposed as Tauri commands).
+explorie is a Tauri + React file manager currently validated on **Windows**, with macOS support under active release validation. It uses plain JSON metadata and a themeable UI. The Rust core owns directory listing, file operations, size calculation, archives, and `.explorie.json` custom fields.
 
 Key traits:
 
@@ -25,19 +25,20 @@ Current features:
 - **Tabbed browsing:** Open multiple directories in tabs (Ctrl/Cmd+T).
 - **File previews:** Images, browser-playable videos, PDFs, code files with syntax highlighting, archive listings, and optional helper-generated previews.
 - **Custom metadata:** Read/write `.explorie.json` for custom fields per folder.
-- **Theming:** Dark/light/system themes, accent colors, custom fonts (including Google Fonts import), UI scale, density, and more.
+- **Theming:** Dark/light/system themes, accent colors, local font stacks, UI scale, density, and more.
 - **Drag & drop:** Move files between folders with visual feedback.
 - **Settings panel:** Comprehensive appearance and behavior customization.
-- **OS integration:** Option to set as default file manager (Windows), native window controls.
+- **OS integration:** Native window controls and platform file opening.
+- **Persistent Remote Drives:** Reconnect existing rclone remotes as native Windows drive letters or macOS volumes while explorie is running.
 
 ---
 
 ## Tech Stack
 
-- **UI:** React 19, Vite 6, PNPM 9, Zustand 5, @tanstack/react-virtual, highlight.js (code previews), pixelarticons.
-- **Desktop:** Tauri 2.2 (Rust 2024 edition), with plugins for FS access and window controls.
-- **CLI:** Rust binary sharing the core crate; extra subcommands for plugin calling and FFmpeg command previews.
-- **Libs:** `crates/core` (fs + metadata), `crates/plugin-host` (in-memory registry), `crates/ffmpeg-wrapper` (FFmpeg command builder), `packages/sdk` (TS helpers).
+- **UI:** React 19, Vite 6, PNPM 9, Zustand 5, @tanstack/react-virtual, pixelarticons.
+- **Desktop:** Tauri 2 (Rust 2024 edition), with filesystem and window integration.
+- **CLI:** Rust binary sharing the core crate, with listing and FFmpeg command-preview modes.
+- **Libs:** `crates/core` (filesystem, metadata, archives, and file operations) and `crates/ffmpeg-wrapper` (FFmpeg command builder).
 - **Tests:** `cargo test`, Playwright e2e.
 
 ---
@@ -63,8 +64,8 @@ Current features:
 
 ### Platform Notes
 
-- **Windows:** Targets Windows 10/11. WebView2 runtime (usually pre-installed).
-- **macOS:** Targets macOS 11+ (Big Sur). Xcode Command Line Tools required.
+- **Windows:** Targets Windows 10/11. WebView2 runtime is usually pre-installed. When Remote Drives first need WinFsp, Explorie offers the bundled official installer with a native administrator prompt.
+- **macOS:** Builds target macOS 13+ and require Xcode Command Line Tools. Remote Drives use an administrator-approved, bundle-contained mount helper. Do not treat macOS as release-ready until the signed package passes the real-machine checklist below.
 
 ---
 
@@ -76,18 +77,14 @@ apps/
     frontend/
       src/
         components/        # React components (ListView, GridView, ColumnView, Preview, etc.)
-        hooks/             # Custom React hooks (useDirSize, useDragStart, useVirtualRows, etc.)
+        hooks/             # Custom React hooks (useTabs, useDragStart, useVirtualRows, etc.)
         utils/             # Utilities (fs, date, highlight, customColumns)
         workers/           # Web workers (sortWorker)
       src-tauri/           # Tauri Rust backend with file system commands
   cli/                     # CLI binary (Rust)
 crates/
   core/                    # Rust business logic for listing, sizes, metadata
-  plugin-host/             # Minimal plugin registry/dispatcher
   ffmpeg-wrapper/          # FFmpeg command builder
-packages/
-  sdk/                     # TypeScript SDK helpers + types
-  themes/                  # Example theme(s) (e.g., dracula.css)
 tests/                     # Playwright specs
 sample/                    # Demo data + .explorie.json examples
 ```
@@ -104,7 +101,7 @@ pnpm install                             # install frontend deps
 pnpm desktop:dev                         # run Tauri dev (frontend + Rust)
 # or: pnpm desktop:web                   # web-only Vite dev
 
-cargo run -p explorie-cli -- --help      # CLI help (listing, plugin-call, ffmpeg-preview)
+cargo run -p explorie-cli -- --help      # CLI help (listing and ffmpeg-preview)
 ```
 
 ---
@@ -139,21 +136,7 @@ For release-candidate verification, run `pnpm release:check` and use the release
 ```bash
 cargo run -p explorie-cli -- --help
 explorie [--with-sizes] [path]                           # List directory
-explorie plugin-call info summary '{"path": "."}'        # Call plugin
 explorie ffmpeg-preview in.mp4 out.webm --vf scale=1280:720  # Preview FFmpeg args
-```
-
-PowerShell-friendly JSON payload:
-
-```powershell
-$payload = '{\"path\":\".\"}'
-cargo run -p explorie-cli -- plugin-call info summary $payload
-```
-
-`cmd.exe` inline JSON payload:
-
-```bat
-cargo run -p explorie-cli -- plugin-call info summary {\"path\":\".\"}
 ```
 
 ---
@@ -182,22 +165,23 @@ Add screenshots or a short demo GIF here before publishing the final public repo
 
 explorie is a local file manager. To browse and preview files, the desktop app requests broad read access to common user folders, mounted volumes, and Windows drive roots through Tauri's filesystem and asset protocols. Write access is intended for explicit file operations that the user initiates, such as rename, move, copy, delete, archive, extract, and metadata edits.
 
-Review `apps/desktop/frontend/src-tauri/tauri.conf.json` before shipping forks or release artifacts. Treat plugins, custom builds, and helper binaries with the same care as any other local file-management tool. Do not paste sensitive file contents, private paths, credentials, or exploit details into public issues.
+Review `apps/desktop/frontend/src-tauri/tauri.conf.json` before shipping forks or release artifacts. Treat custom builds and helper binaries with the same care as any other local file-management tool. Do not paste sensitive file contents, private paths, credentials, or exploit details into public issues.
 
 Security vulnerabilities should be reported through GitHub private vulnerability reporting for the release repository. If private reporting is unavailable, open a minimal public issue asking for a private contact route without including exploit details.
 
 explorie does not include telemetry. Diagnostics exports are local-only and are designed to redact path-like and sensitive values, but review any report before sharing it.
 
+Remote Drives use the bundled, pinned rclone executable with the user's existing rclone configuration. Choose **Remote Drives → Configure** to open rclone's own interactive setup in a terminal; when it closes, Explorie refreshes the remote list and opens the Add Drive dialog. Explorie never stores provider credentials or OAuth tokens. Encrypted rclone configurations must be unlockable non-interactively through the user's existing rclone environment or password command. Mount processes run only while explorie is open; stable per-profile VFS caches allow interrupted uploads to resume.
+
 ---
 
 ## Known Limitations
 
-- Public binary releases still need real-machine packaged-app QA on Windows and macOS before broad distribution.
+- Public binary releases still need real-machine packaged-app QA before broad distribution; macOS is explicitly not release-ready until that proof exists.
 - MP4, WebM, and M4V previews use the platform WebView video stack. Codec support depends on the OS/WebView; H.264/AAC MP4 is the expected happy path.
 - MOV, AVI, MKV, WMV, FLV, M2TS, MPEG/MPG, and 3GP previews use FFmpeg to generate a still thumbnail when FFmpeg is installed.
 - Office/OpenDocument previews require LibreOffice. HEIC/HEIF/TIFF/PSD previews require ImageMagick.
-- macOS Finder/Quick Look integration, notarized DMG behavior, and Windows default-file-manager registration should be checked on real machines for each release candidate.
-- The plugin host is intentionally minimal. Treat experimental plugins as trusted local code.
+- macOS Finder/Quick Look integration and notarized DMG behavior should be checked on real machines for each release candidate.
 
 ---
 
@@ -206,19 +190,34 @@ explorie does not include telemetry. Diagnostics exports are local-only and are 
 Run:
 
 ```bash
+cargo install cargo-audit --locked # once per machine
 pnpm release:check
 ```
 
-The command writes local evidence under `.release-checks/`, which is ignored by git. Check `.release-checks/latest.md` before publishing. It runs TypeScript, ESLint, Prettier, Rust fmt/tests/clippy, frontend unit tests, Playwright E2E on an isolated local Vite port, frontend build, Tauri no-bundle build, and whitespace checks.
+The command writes local evidence under `.release-checks/`, which is ignored by git. It requires a clean, version-aligned working tree; runs dependency audits, static checks, tests, Playwright on an isolated strict port, and a Tauri no-bundle build; then verifies the executable under the workspace `target/release` directory.
 
-Before publishing binaries, also manually verify:
+Automated updates are disabled. Releases are immutable and version-tag based. Bump the matching versions in the root package, desktop package, and desktop Cargo manifest, then push a new `v<version>` tag. That tag builds the candidate packages once and attaches them to a draft release. After those exact assets pass the real-machine checklist below, manually dispatch the release workflow from that tag with the Windows and macOS attestations enabled. The dispatch verifies and publishes the existing draft without rebuilding it. Existing releases and assets are never replaced; failures are fixed in a new version.
+
+Protect `v*` tags and enable immutable releases in the GitHub repository settings before public distribution.
+
+macOS releases require these signing secrets:
+
+- macOS: base64-encoded P12 in `APPLE_CERTIFICATE`, plus `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID`.
+
+The v0.2.0 workflow publishes an explicitly named unsigned Windows x64 NSIS installer, a signed/notarized macOS arm64 DMG, and platform SHA-256 manifests. Windows signing remains optional when `WINDOWS_CODESIGN_CERTIFICATE` and `WINDOWS_CODESIGN_PASSWORD` are later configured. CI installs and launch-smokes each package on its target runner; publication additionally requires explicit proof that both candidates passed disposable filesystem operations on real machines.
+
+The v0.2.0 draft contains `explorie-0.2.0-windows-x64-setup-unsigned.exe`, `explorie-0.2.0-macos-arm64.dmg`, `SHA256SUMS-windows.txt`, and `SHA256SUMS-macos.txt`.
+
+Before creating a new tag, manually verify:
 
 - Launch the generated app on the target OS.
 - Open folders in List, Grid, and Column views.
 - Preview text, image, PDF/document, video, archive, and unsupported files.
 - Exercise copy, move, rename, delete/trash, undo/redo, archive, and extract flows on disposable files.
 - Reopen the app and confirm persisted settings.
-- Confirm Windows default-file-manager and macOS packaged-app behavior on real machines if those features are part of the release.
+- Confirm Windows and macOS packaged-app behavior on real machines.
+- Uninstall v0.1.0 before installing v0.2.0; the permanent `com.omershatz.explorie` identity intentionally starts a clean installation lineage.
+- Install both packages on real machines, confirm the Windows unsigned warning is expected, and verify macOS signing/notarization plus both SHA-256 manifests.
 
 ---
 
@@ -262,9 +261,9 @@ The metadata stays next to your files and is not synced by explorie itself.
 
 explorie source code is MIT-licensed. The current dependency graph is primarily MIT, Apache-2.0, Apache-2.0/MIT dual-licensed, BSD-2-Clause, BSD-3-Clause, ISC, MIT-0, and compatible permissive licenses. Current frontend tooling scans also show `caniuse-lite` under CC-BY-4.0, `argparse` under Python-2.0, and `type-fest` under MIT or CC0-1.0.
 
-Notable runtime and UI dependencies include React, Vite, Tauri, Zustand, TanStack Virtual, highlight.js, Pixelarticons, and Rust crates for filesystem, archive, tracing, Tauri, and platform integration. Optional external helpers such as FFmpeg, LibreOffice, and ImageMagick are not bundled by this repository; their own licenses apply to user-installed copies.
+Notable runtime and UI dependencies include React, Vite, Tauri, Zustand, TanStack Virtual, highlight.js, Pixelarticons, and Rust crates for filesystem, archive, tracing, Tauri, and platform integration. Explorie bundles rclone v1.74.4 under its MIT license and includes the license in packaged applications. Windows packages also include the official, unmodified WinFsp installer: **WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos**, [source and license](https://github.com/winfsp/winfsp). Optional external helpers such as FFmpeg, LibreOffice, and ImageMagick are not bundled; their own licenses apply to user-installed copies.
 
-The sample Dracula theme is provided as a small CSS example. App icons and sample assets in this repository are project assets unless replaced before release.
+App icons and sample assets in this repository are project assets unless replaced before release.
 
 Before publishing a binary distribution, regenerate dependency license evidence from the final release repository and artifact build:
 

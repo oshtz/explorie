@@ -9,10 +9,8 @@ type FeatureName =
   | 'thumbnail'
   | 'archivePreview'
   | 'quickLook'
-  | 'autoUpdate'
   | 'customFields'
-  | 'smartFolders'
-  | 'pluginHost';
+  | 'smartFolders';
 
 interface FeatureStatus {
   enabled: boolean;

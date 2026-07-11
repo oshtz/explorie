@@ -9,7 +9,7 @@ const mocks = vi.hoisted(() => ({
   archiveActionFiles: [] as FileEntry[],
   contextActionFiles: [] as FileEntry[],
   contextOpenForEmpty: vi.fn(),
-  contextOpenForFile: vi.fn(),
+  contextOpenForFiles: vi.fn(),
   createFolderIn: vi.fn(),
   deleteWithUndo: vi.fn(),
   invoke: vi.fn(),
@@ -35,11 +35,15 @@ type StoreState = {
   pathStack: string[];
   clipboard: null | { mode: 'copy' | 'cut'; items: FileEntry[]; sourcePath: string };
   confirmBeforeDelete: boolean;
+  selectedPaths: string[];
+  selectionCursorPath: string | null;
   setEditingId: (id: string | null) => void;
   setDraftNew: (draft: { id: string; parentPath: string; name: string } | null) => void;
   setPathStack: (stack: string[]) => void;
   setFiles: (files: any) => void;
   setConfirmBeforeDelete: (confirm: boolean) => void;
+  setSelectedPaths: (paths: string[]) => void;
+  setSelectionCursorPath: (path: string | null) => void;
 };
 
 let storeState: StoreState;
@@ -53,9 +57,13 @@ vi.mock('../store', () => {
 });
 
 vi.mock('../hooks/useDragStart', () => ({
-  useDragStart: ({ onBeginDrag }: { onBeginDrag?: (file: FileEntry) => void }) => ({
+  useDragStart: ({
+    onBeginDrag,
+  }: {
+    onBeginDrag?: (file: FileEntry, point: { x: number; y: number }) => void;
+  }) => ({
     onMouseDown: (_event: React.MouseEvent, file: FileEntry) => {
-      onBeginDrag?.(file);
+      onBeginDrag?.(file, { x: 0, y: 0 });
     },
   }),
 }));
@@ -116,7 +124,7 @@ vi.mock('./ContextMenu', async () => {
     useContextMenu: () => ({
       state: { open: false, containerPath: '/root' },
       openForEmpty: mocks.contextOpenForEmpty,
-      openForFile: mocks.contextOpenForFile,
+      openForFiles: mocks.contextOpenForFiles,
       close: vi.fn(),
     }),
   };
@@ -273,11 +281,19 @@ describe('ColumnView', () => {
       pathStack: ['/root', '/root/docs'],
       clipboard: null,
       confirmBeforeDelete: true,
+      selectedPaths: [],
+      selectionCursorPath: null,
       setEditingId: vi.fn(),
       setDraftNew: vi.fn(),
       setPathStack: vi.fn(),
       setFiles: vi.fn(),
       setConfirmBeforeDelete: vi.fn(),
+      setSelectedPaths: vi.fn((paths) => {
+        storeState.selectedPaths = paths;
+      }),
+      setSelectionCursorPath: vi.fn((path) => {
+        storeState.selectionCursorPath = path;
+      }),
     };
   });
 
@@ -347,6 +363,7 @@ describe('ColumnView', () => {
       />
     );
 
+    fireEvent.click(screen.getByLabelText('Open folder projects'));
     await waitFor(() => expect(onFileSelect).toHaveBeenCalledWith(folder));
 
     fireEvent.keyDown(getColumnContainer(container), { key: 'ArrowRight' });
@@ -376,6 +393,35 @@ describe('ColumnView', () => {
       expect(mocks.renamePath).toHaveBeenCalledWith('/rename/original.txt', 'renamed.txt')
     );
     expect(mocks.invoke).not.toHaveBeenCalledWith('open_path', { path: '/rename/original.txt' });
+  });
+
+  it('reports inline rename failures against the original path', async () => {
+    storeState.pathStack = ['/rename'];
+    storeState.editingId = 'file-original';
+    const file = makeEntry('/rename/original.txt', { id: 'file-original' });
+    mocks.renamePath.mockRejectedValueOnce(new Error('denied'));
+
+    render(
+      <ColumnView
+        pathStack={storeState.pathStack}
+        columnFiles={{ '/rename': [file] } as any}
+        onFolderClick={vi.fn()}
+        onColumnBack={vi.fn()}
+      />
+    );
+
+    const input = screen.getByDisplayValue('original.txt');
+    fireEvent.change(input, { target: { value: 'blocked.txt' } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+
+    await waitFor(() =>
+      expect(mocks.reportError).toHaveBeenCalledWith(
+        'Rename failed',
+        expect.any(Error),
+        expect.objectContaining({ context: { path: '/rename/original.txt' } })
+      )
+    );
+    expect(storeState.setEditingId).toHaveBeenLastCalledWith(null);
   });
 
   it('handles keyboard select-all, arrow movement, rename, clear, and column back', async () => {
@@ -460,6 +506,43 @@ describe('ColumnView', () => {
     );
   });
 
+  it('preserves a column multi-selection for context actions', async () => {
+    storeState.pathStack = ['/context-selection'];
+    const onFileSelect = vi.fn();
+    const files = [
+      makeEntry('/context-selection/a.txt', { id: 'context-a' }),
+      makeEntry('/context-selection/b.txt', { id: 'context-b' }),
+      makeEntry('/context-selection/c.txt', { id: 'context-c' }),
+    ];
+
+    render(
+      <ColumnView
+        pathStack={storeState.pathStack}
+        columnFiles={{ '/context-selection': files } as any}
+        onFolderClick={vi.fn()}
+        onColumnBack={vi.fn()}
+        onFileSelect={onFileSelect}
+      />
+    );
+
+    fireEvent.click(screen.getByLabelText('Select file a.txt'));
+    fireEvent.click(screen.getByLabelText('Select file b.txt'), { ctrlKey: true });
+    fireEvent.contextMenu(screen.getByLabelText('Select file b.txt'));
+    expect(mocks.contextOpenForFiles).toHaveBeenLastCalledWith(
+      expect.any(Object),
+      [files[0], files[1]],
+      '/context-selection'
+    );
+
+    fireEvent.contextMenu(screen.getByLabelText('Select file c.txt'));
+    expect(mocks.contextOpenForFiles).toHaveBeenLastCalledWith(
+      expect.any(Object),
+      [files[2]],
+      '/context-selection'
+    );
+    expect(onFileSelect).toHaveBeenLastCalledWith(files[2]);
+  });
+
   it('reports folder hover targets while dragging', () => {
     storeState.pathStack = ['/drag-hover'];
     const folder = makeEntry('/drag-hover/projects', { id: 'folder-projects', is_dir: true });
@@ -472,7 +555,7 @@ describe('ColumnView', () => {
         columnFiles={{ '/drag-hover': [folder, file] } as any}
         onFolderClick={vi.fn()}
         onColumnBack={vi.fn()}
-        draggingItemId="file-being-dragged"
+        draggingItemIds={new Set(['file-being-dragged'])}
         onHoverFolder={onHoverFolder}
       />
     );
@@ -504,7 +587,11 @@ describe('ColumnView', () => {
     );
 
     fireEvent.contextMenu(screen.getByLabelText('Select file readme.md'));
-    expect(mocks.contextOpenForFile).toHaveBeenCalledWith(expect.any(Object), files[1], '/actions');
+    expect(mocks.contextOpenForFiles).toHaveBeenCalledWith(
+      expect.any(Object),
+      [files[1]],
+      '/actions'
+    );
 
     fireEvent.click(screen.getByText('Mock delete action'));
     expect(await screen.findByTestId('delete-dialog')).toBeInTheDocument();

@@ -1,10 +1,8 @@
-import { invoke, isTauri } from '@tauri-apps/api/core';
 import type { StateCreator } from 'zustand';
 import type {
   StoreState,
   UISlice,
   ThemeSpec,
-  ImportedFont,
   ThemeMode,
   AccentColor,
   Density,
@@ -13,15 +11,79 @@ import type {
 } from '../types';
 import type { ViewMode } from '../../components/ViewModeToggle';
 
-const isWindowsPlatform = typeof navigator !== 'undefined' && /windows/i.test(navigator.userAgent);
-const isTauriRuntime = () => {
-  try {
-    return isTauri();
-  } catch {
-    return false;
+const THEME_MODES = ['dark', 'light', 'system'] as const;
+const ACCENT_COLORS = ['blue', 'green', 'purple', 'orange', 'pink', 'custom'] as const;
+const DENSITIES = ['comfortable', 'compact'] as const;
+const FONT_CHOICES = ['mono', 'system', 'serif', 'custom'] as const;
+const BORDER_RADII = [0, 4, 8] as const;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isOneOf<T extends readonly unknown[]>(values: T, value: unknown): value is T[number] {
+  return values.includes(value);
+}
+
+function clampNumber(value: unknown, min: number, max: number): number | null {
+  return typeof value === 'number' && Number.isFinite(value)
+    ? Math.min(max, Math.max(min, value))
+    : null;
+}
+
+export function normalizeThemeSpec(value: unknown): ThemeSpec | null {
+  if (!isRecord(value)) return null;
+
+  const uiScale = clampNumber(value.uiScale, 0.9, 1.4);
+  const listRowHeight = clampNumber(value.listRowHeight, 26, 52);
+  const gridMinWidth = clampNumber(value.gridMinWidth, 120, 260);
+  const iconSize = clampNumber(value.iconSize, 10, 24);
+
+  if (
+    !isOneOf(THEME_MODES, value.theme) ||
+    !isOneOf(ACCENT_COLORS, value.accent) ||
+    typeof value.accentCustom !== 'string' ||
+    !/^#[0-9a-f]{6}$/i.test(value.accentCustom) ||
+    !isOneOf(DENSITIES, value.density) ||
+    uiScale === null ||
+    listRowHeight === null ||
+    gridMinWidth === null ||
+    !isOneOf(FONT_CHOICES, value.font) ||
+    (value.fontCustom !== undefined && typeof value.fontCustom !== 'string') ||
+    !isOneOf(BORDER_RADII, value.borderRadius) ||
+    iconSize === null ||
+    typeof value.reduceMotion !== 'boolean'
+  ) {
+    return null;
   }
-};
-const isDefaultExplorerAvailable = () => isWindowsPlatform && isTauriRuntime();
+
+  return {
+    theme: value.theme,
+    accent: value.accent,
+    accentCustom: value.accentCustom,
+    density: value.density,
+    uiScale,
+    listRowHeight: Math.round(listRowHeight),
+    gridMinWidth: Math.round(gridMinWidth),
+    font: value.font,
+    fontCustom: value.fontCustom ?? '',
+    borderRadius: value.borderRadius,
+    iconSize: Math.round(iconSize),
+    reduceMotion: value.reduceMotion,
+  };
+}
+
+function normalizeThemeMap(value: unknown): Record<string, ThemeSpec> | null {
+  if (!isRecord(value)) return null;
+  const normalized: Record<string, ThemeSpec> = {};
+  for (const [name, spec] of Object.entries(value)) {
+    const cleanName = name.trim();
+    const cleanSpec = normalizeThemeSpec(spec);
+    if (!cleanName || cleanName.toLowerCase() === 'default' || !cleanSpec) return null;
+    normalized[cleanName] = cleanSpec;
+  }
+  return normalized;
+}
 
 export const createUISlice: StateCreator<StoreState, [], [], UISlice> = (set) => ({
   viewMode: (() => {
@@ -81,7 +143,7 @@ export const createUISlice: StateCreator<StoreState, [], [], UISlice> = (set) =>
     try {
       if (typeof window !== 'undefined') {
         const v = parseFloat(window.localStorage.getItem('explorie:uiScale') || '');
-        if (Number.isFinite(v) && v >= 0.8 && v <= 1.4) return v;
+        if (Number.isFinite(v) && v >= 0.9 && v <= 1.4) return v;
       }
     } catch {}
     return 1.0;
@@ -171,25 +233,6 @@ export const createUISlice: StateCreator<StoreState, [], [], UISlice> = (set) =>
     } catch {}
     return false; // Opt-in, defaults to false
   })(),
-  importedFonts: (() => {
-    try {
-      if (typeof window !== 'undefined') {
-        const raw = window.localStorage.getItem('explorie:importedFonts');
-        const arr = raw ? JSON.parse(raw) : [];
-        return Array.isArray(arr)
-          ? (arr.filter(
-              (f: unknown): f is ImportedFont =>
-                f !== null &&
-                typeof f === 'object' &&
-                typeof (f as ImportedFont).name === 'string' &&
-                typeof (f as ImportedFont).href === 'string' &&
-                typeof (f as ImportedFont).id === 'string'
-            ) as ImportedFont[])
-          : [];
-      }
-    } catch {}
-    return [] as ImportedFont[];
-  })(),
   showPreviewPanel: (() => {
     try {
       if (typeof window !== 'undefined') {
@@ -213,15 +256,11 @@ export const createUISlice: StateCreator<StoreState, [], [], UISlice> = (set) =>
     try {
       if (typeof window !== 'undefined') {
         const raw = window.localStorage.getItem('explorie:themes');
-        if (raw) return JSON.parse(raw);
+        if (raw) return normalizeThemeMap(JSON.parse(raw)) ?? {};
       }
     } catch {}
     return {};
   })(),
-  defaultExplorerSupported: isDefaultExplorerAvailable(),
-  defaultExplorerEnabled: null,
-  defaultExplorerLoading: false,
-  defaultExplorerError: null,
   setViewMode: (mode) => {
     try {
       if (typeof window !== 'undefined') {
@@ -258,7 +297,7 @@ export const createUISlice: StateCreator<StoreState, [], [], UISlice> = (set) =>
     set({ density: d });
   },
   setUiScale: (v) => {
-    const s = Math.min(1.4, Math.max(0.8, v));
+    const s = Math.min(1.4, Math.max(0.9, v));
     try {
       if (typeof window !== 'undefined') window.localStorage.setItem('explorie:uiScale', String(s));
     } catch {}
@@ -329,48 +368,6 @@ export const createUISlice: StateCreator<StoreState, [], [], UISlice> = (set) =>
     } catch {}
     set({ enableErrorReporting: v });
   },
-  addImportedFont: (font: ImportedFont) => {
-    set((state) => {
-      const exists = (state.importedFonts || []).some(
-        (f) => f.id === font.id || f.name.toLowerCase() === font.name.toLowerCase()
-      );
-      const next = exists ? state.importedFonts : [...(state.importedFonts || []), font];
-      try {
-        if (typeof window !== 'undefined') {
-          window.localStorage.setItem('explorie:importedFonts', JSON.stringify(next));
-        }
-      } catch {}
-      return { importedFonts: next };
-    });
-  },
-  removeImportedFont: (id) => {
-    set((state) => {
-      const next = (state.importedFonts || []).filter((f) => f.id !== id);
-      try {
-        if (typeof window !== 'undefined') {
-          window.localStorage.setItem('explorie:importedFonts', JSON.stringify(next));
-        }
-      } catch {}
-      const removed = (state.importedFonts || []).find((f) => f.id === id);
-      const updates: Partial<UISlice> = { importedFonts: next };
-      if (
-        removed &&
-        state.font === 'custom' &&
-        state.fontCustom &&
-        removed.name.toLowerCase() === String(state.fontCustom).toLowerCase()
-      ) {
-        updates.font = 'system';
-        updates.fontCustom = '';
-        try {
-          if (typeof window !== 'undefined') {
-            window.localStorage.setItem('explorie:font', 'system');
-            window.localStorage.setItem('explorie:fontCustom', '');
-          }
-        } catch {}
-      }
-      return updates;
-    });
-  },
   setShowPreviewPanel: (show) => {
     try {
       if (typeof window !== 'undefined') {
@@ -387,74 +384,9 @@ export const createUISlice: StateCreator<StoreState, [], [], UISlice> = (set) =>
     } catch {}
     set({ showStatusBar: show });
   },
-  refreshDefaultExplorer: async () => {
-    if (!isDefaultExplorerAvailable()) {
-      set({
-        defaultExplorerSupported: false,
-        defaultExplorerEnabled: null,
-        defaultExplorerLoading: false,
-        defaultExplorerError: null,
-      });
-      return null;
-    }
-    set({ defaultExplorerSupported: true });
-    set({ defaultExplorerLoading: true, defaultExplorerError: null });
-    try {
-      const value = await invoke<boolean>('is_default_file_manager');
-      set({ defaultExplorerEnabled: value, defaultExplorerLoading: false });
-      return value;
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      set({ defaultExplorerLoading: false, defaultExplorerError: message });
-      return null;
-    }
-  },
-  makeDefaultExplorer: async () => {
-    if (!isDefaultExplorerAvailable()) {
-      const message = 'Default explorer integration is only available on Windows.';
-      set({
-        defaultExplorerSupported: false,
-        defaultExplorerLoading: false,
-        defaultExplorerError: message,
-      });
-      throw new Error(message);
-    }
-    set({ defaultExplorerSupported: true });
-    set({ defaultExplorerLoading: true, defaultExplorerError: null });
-    try {
-      await invoke('set_default_file_manager');
-      set({ defaultExplorerEnabled: true, defaultExplorerLoading: false });
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      set({ defaultExplorerLoading: false, defaultExplorerError: message });
-      throw err instanceof Error ? err : new Error(message);
-    }
-  },
-  revertDefaultExplorer: async () => {
-    if (!isDefaultExplorerAvailable()) {
-      const message = 'Default explorer integration is only available on Windows.';
-      set({
-        defaultExplorerSupported: false,
-        defaultExplorerLoading: false,
-        defaultExplorerError: message,
-      });
-      throw new Error(message);
-    }
-    set({ defaultExplorerSupported: true });
-    set({ defaultExplorerLoading: true, defaultExplorerError: null });
-    try {
-      await invoke('revert_default_file_manager');
-      set({ defaultExplorerEnabled: false, defaultExplorerLoading: false });
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      set({ defaultExplorerLoading: false, defaultExplorerError: message });
-      throw err instanceof Error ? err : new Error(message);
-    }
-  },
-  clearDefaultExplorerError: () => set({ defaultExplorerError: null }),
   saveTheme: (name: string, spec?: ThemeSpec) => {
     set((state) => {
-      const s: ThemeSpec = spec || {
+      const candidate: ThemeSpec = spec || {
         theme: state.theme,
         accent: state.accent,
         accentCustom: state.accentCustom,
@@ -467,8 +399,9 @@ export const createUISlice: StateCreator<StoreState, [], [], UISlice> = (set) =>
         borderRadius: state.borderRadius,
         iconSize: state.iconSize,
         reduceMotion: state.reduceMotion,
-        fonts: state.importedFonts,
       };
+      const s = normalizeThemeSpec(candidate);
+      if (!s) return {};
       const next = { ...(state.themes || {}), [name]: s } as Record<string, ThemeSpec>;
       try {
         if (typeof window !== 'undefined') {
@@ -491,23 +424,22 @@ export const createUISlice: StateCreator<StoreState, [], [], UISlice> = (set) =>
     });
   },
   applyThemeSpec: (spec: ThemeSpec) => {
-    set((state) => {
+    set(() => {
+      const normalized = normalizeThemeSpec(spec);
+      if (!normalized) return {};
       const applied: Partial<StoreState> = {
-        theme: spec.theme ?? state.theme,
-        accent: spec.accent ?? state.accent,
-        accentCustom: spec.accentCustom ?? state.accentCustom,
-        density: spec.density ?? state.density,
-        uiScale: typeof spec.uiScale === 'number' ? spec.uiScale : state.uiScale,
-        listRowHeight:
-          typeof spec.listRowHeight === 'number' ? spec.listRowHeight : state.listRowHeight,
-        gridMinWidth:
-          typeof spec.gridMinWidth === 'number' ? spec.gridMinWidth : state.gridMinWidth,
-        font: spec.font ?? state.font,
-        fontCustom: spec.fontCustom ?? state.fontCustom,
-        borderRadius: spec.borderRadius ?? state.borderRadius,
-        iconSize: typeof spec.iconSize === 'number' ? spec.iconSize : state.iconSize,
-        reduceMotion:
-          typeof spec.reduceMotion === 'boolean' ? spec.reduceMotion : state.reduceMotion,
+        theme: normalized.theme,
+        accent: normalized.accent,
+        accentCustom: normalized.accentCustom,
+        density: normalized.density,
+        uiScale: normalized.uiScale,
+        listRowHeight: normalized.listRowHeight,
+        gridMinWidth: normalized.gridMinWidth,
+        font: normalized.font,
+        fontCustom: normalized.fontCustom,
+        borderRadius: normalized.borderRadius,
+        iconSize: normalized.iconSize,
+        reduceMotion: normalized.reduceMotion,
       };
       try {
         if (typeof window !== 'undefined') {
@@ -523,16 +455,6 @@ export const createUISlice: StateCreator<StoreState, [], [], UISlice> = (set) =>
           window.localStorage.setItem('explorie:borderRadius', String(applied.borderRadius));
           window.localStorage.setItem('explorie:iconSize', String(applied.iconSize));
           window.localStorage.setItem('explorie:reduceMotion', String(applied.reduceMotion));
-          if (Array.isArray(spec.fonts)) {
-            const merged = [...(state.importedFonts || [])];
-            for (const f of spec.fonts) {
-              if (!merged.find((x) => x.name.toLowerCase() === f.name.toLowerCase())) {
-                merged.push({ id: f.id || `${f.name}-${Date.now()}`, name: f.name, href: f.href });
-              }
-            }
-            window.localStorage.setItem('explorie:importedFonts', JSON.stringify(merged));
-            (applied as Partial<UISlice>).importedFonts = merged;
-          }
         }
       } catch {}
       return applied;

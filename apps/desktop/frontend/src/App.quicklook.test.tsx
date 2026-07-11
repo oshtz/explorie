@@ -1,5 +1,5 @@
 import React from 'react';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { invoke } from '@tauri-apps/api/core';
 import App from './App';
@@ -49,6 +49,7 @@ const sampleFiles: FileEntry[] = [
 ];
 
 vi.mock('@tauri-apps/api/core', () => ({
+  isTauri: () => true,
   invoke: vi.fn(async (command: string) => {
     if (command === 'list_files') return sampleFiles;
     if (command === 'get_dir_size') return 0;
@@ -56,8 +57,12 @@ vi.mock('@tauri-apps/api/core', () => ({
   }),
 }));
 
-vi.mock('./services/updater', () => ({
-  isTauriRuntime: () => true,
+vi.mock('@tauri-apps/api/window', () => ({
+  getCurrentWindow: () => ({
+    minimize: vi.fn(),
+    toggleMaximize: vi.fn(),
+    close: vi.fn(),
+  }),
 }));
 
 vi.mock('./components/Toast', () => ({
@@ -178,7 +183,7 @@ vi.mock('./hooks/useNavigationHandlers', () => ({
 
 vi.mock('./hooks/useFileDragAndDrop', () => ({
   useFileDragAndDrop: () => ({
-    draggingId: null,
+    draggingItemIds: new Set<string>(),
     combineTargetId: null,
     dragOverlay: null,
     dragPos: { x: 0, y: 0 },
@@ -186,6 +191,8 @@ vi.mock('./hooks/useFileDragAndDrop', () => ({
     beginDrag: vi.fn(),
     handleHoverFolder: vi.fn(),
     handleHoverContainerPath: vi.fn(),
+    handleGatherComplete: vi.fn(),
+    handleDragAnimationComplete: vi.fn(),
   }),
 }));
 
@@ -282,23 +289,15 @@ vi.mock('./components/TabsBar', () => ({
 }));
 
 vi.mock('./components/Sidebar', () => ({
-  Sidebar: () => null,
-}));
-
-vi.mock('./components/TitleBar', () => ({
-  TitleBar: () => null,
+  Sidebar: ({ onSelectLocation }: { onSelectLocation: (path: string) => void }) => (
+    <button type="button" onClick={() => onSelectLocation('/other')}>
+      Navigate elsewhere
+    </button>
+  ),
 }));
 
 vi.mock('./components/StatusBar', () => ({
   StatusBar: () => null,
-}));
-
-vi.mock('./components/AutoUpdater', () => ({
-  AutoUpdater: () => null,
-}));
-
-vi.mock('./components/InfoBox', () => ({
-  InfoBox: () => null,
 }));
 
 vi.mock('./components/SettingsPanel', () => ({
@@ -357,7 +356,6 @@ function resetFileStore(overrides: Partial<StoreState> = {}) {
     activeSmartFolderId: null,
     smartFolders: {},
     clipboard: null,
-    devMockEntries: false,
     highContrast: false,
     accent: 'blue',
     accentCustom: '#7cc7ff',
@@ -365,7 +363,6 @@ function resetFileStore(overrides: Partial<StoreState> = {}) {
     uiScale: 1,
     font: 'mono',
     fontCustom: '',
-    importedFonts: [],
     borderRadius: 0,
     iconSize: 16,
     reduceMotion: false,
@@ -390,6 +387,38 @@ function installBrowserStubs() {
     })),
   });
 }
+
+describe('App spacing variables', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    window.localStorage.clear();
+    installBrowserStubs();
+    resetFileStore();
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  it('scales the complete spacing set for comfortable and compact density', async () => {
+    render(<App />);
+    const root = document.documentElement;
+    const spacing = () =>
+      ['xs', 'sm', 'md', 'lg', 'xl', '2xl'].map((size) =>
+        root.style.getPropertyValue(`--padding-${size}`)
+      );
+
+    await waitFor(() => expect(spacing()).toEqual(['2px', '4px', '8px', '12px', '16px', '24px']));
+
+    act(() => useFileStore.setState({ density: 'compact' }));
+    await waitFor(() => expect(spacing()).toEqual(['2px', '3px', '6px', '9px', '12px', '18px']));
+
+    act(() => useFileStore.setState({ uiScale: 1.4 }));
+    await waitFor(() =>
+      expect(spacing()).toEqual(['2.8px', '4.2px', '8.4px', '12.6px', '16.8px', '25.2px'])
+    );
+  });
+});
 
 describe('App Quick Look shortcut', () => {
   beforeEach(() => {
@@ -470,5 +499,45 @@ describe('App Quick Look shortcut', () => {
       path: '/root',
       calc_dir_size: false,
     });
+  });
+
+  it('clears stale previews after navigation', async () => {
+    resetFileStore({ showPreviewPanel: true });
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Select alpha.txt' }));
+    expect(screen.getByTestId('file-previewer')).toHaveTextContent('Previewing alpha.txt');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Navigate elsewhere' }));
+    await waitFor(() => expect(screen.queryByTestId('file-previewer')).not.toBeInTheDocument());
+  });
+
+  it('keeps a failed folder load retryable', async () => {
+    const invokeMock = vi.mocked(invoke);
+    invokeMock.mockRejectedValueOnce(new Error('Access denied')).mockResolvedValueOnce(sampleFiles);
+
+    render(<App />);
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Access denied');
+    fireEvent.click(screen.getByRole('button', { name: 'Try again' }));
+
+    expect(await screen.findByRole('button', { name: 'Select alpha.txt' })).toBeVisible();
+    await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument());
+  });
+
+  it('provides keyboard-operable pane separators without application role', async () => {
+    resetFileStore({ showPreviewPanel: true });
+    render(<App />);
+
+    expect(screen.queryByRole('application')).not.toBeInTheDocument();
+    const sidebarSeparator = screen.getByRole('separator', { name: 'Resize sidebar' });
+    fireEvent.keyDown(sidebarSeparator, { key: 'ArrowRight' });
+    expect(sidebarSeparator).toHaveAttribute('aria-valuenow', '230');
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Select alpha.txt' }));
+    const previewSeparator = screen.getByRole('separator', { name: 'Resize preview panel' });
+    fireEvent.keyDown(previewSeparator, { key: 'ArrowLeft' });
+    expect(previewSeparator).toHaveAttribute('aria-valuenow', '358');
+    expect(previewSeparator).toHaveAttribute('aria-valuetext', '358 pixels; preferred 370');
   });
 });

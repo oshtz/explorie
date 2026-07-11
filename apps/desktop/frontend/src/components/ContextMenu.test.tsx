@@ -117,6 +117,7 @@ function menuState(overrides: Partial<ContextMenuState> = {}): ContextMenuState 
 
 describe('ContextMenu', () => {
   beforeEach(() => {
+    document.documentElement.dataset.platform = 'web';
     mocks.storeState.clipboard = null;
     mocks.storeState.favorites = [];
     mocks.storeState.setClipboard.mockReset();
@@ -277,6 +278,7 @@ describe('ContextMenu', () => {
     await user.click(screen.getByRole('menuitem', { name: /Batch Rename \(2\)/ }));
     expect(onBatchRename).toHaveBeenCalledWith([first, second]);
 
+    await user.click(screen.getByRole('menuitem', { name: 'Advanced' }));
     await user.click(screen.getByRole('menuitem', { name: /Compress \(2\)/ }));
     expect(onCompress).toHaveBeenCalledWith([first, second]);
 
@@ -301,6 +303,7 @@ describe('ContextMenu', () => {
       />
     );
 
+    await user.click(screen.getByRole('menuitem', { name: 'Advanced' }));
     await user.click(screen.getByRole('menuitem', { name: /Extract Here/ }));
     expect(onExtract).toHaveBeenCalledWith(archive);
 
@@ -314,6 +317,7 @@ describe('ContextMenu', () => {
       />
     );
 
+    await user.click(screen.getByRole('menuitem', { name: 'Advanced' }));
     await user.click(screen.getByRole('menuitem', { name: /Compare with "base.txt"/ }));
     expect(onCompare).toHaveBeenCalledWith([target, current]);
     expect(onSetCompareTarget).toHaveBeenCalledWith(null);
@@ -327,10 +331,11 @@ describe('ContextMenu', () => {
     mocks.getAppsForFile.mockResolvedValue([
       { name: 'Visual Studio Code', path: '/Applications/Code.app' },
     ]);
+    document.documentElement.dataset.platform = 'windows';
 
     render(<ContextMenu state={menuState({ files: [selected] })} onClose={vi.fn()} />);
 
-    await user.click(screen.getByRole('menuitem', { name: /Reveal in File Manager/ }));
+    await user.click(screen.getByRole('menuitem', { name: 'Show in Explorer' }));
     expect(mocks.revealInFileManager).toHaveBeenCalledWith('/workspace/report.txt');
 
     await user.click(await screen.findByRole('menuitem', { name: /Quick Look/ }));
@@ -344,5 +349,43 @@ describe('ContextMenu', () => {
 
     expect(mocks.getAppsForFile).toHaveBeenCalledWith('/workspace/report.txt');
     expect(mocks.openWithApp).toHaveBeenCalledWith('/workspace/report.txt', 'Visual Studio Code');
+  });
+
+  it('clamps to the viewport and restores focus when closed', async () => {
+    const originalWidth = window.innerWidth;
+    const originalHeight = window.innerHeight;
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 300 });
+    Object.defineProperty(window, 'innerHeight', { configurable: true, value: 250 });
+    const rectSpy = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue({
+      x: 0,
+      y: 0,
+      width: 160,
+      height: 200,
+      top: 0,
+      right: 160,
+      bottom: 200,
+      left: 0,
+      toJSON: () => ({}),
+    });
+    const trigger = document.createElement('button');
+    document.body.append(trigger);
+
+    const { rerender } = render(
+      <ContextMenu state={menuState({ x: 290, y: 240, focusTarget: trigger })} onClose={vi.fn()} />
+    );
+
+    const menu = screen.getByRole('menu');
+    await waitFor(() => {
+      expect(menu).toHaveStyle({ left: '132px', top: '42px' });
+    });
+    rerender(
+      <ContextMenu state={menuState({ open: false, focusTarget: trigger })} onClose={vi.fn()} />
+    );
+    expect(trigger).toHaveFocus();
+
+    trigger.remove();
+    rectSpy.mockRestore();
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: originalWidth });
+    Object.defineProperty(window, 'innerHeight', { configurable: true, value: originalHeight });
   });
 });

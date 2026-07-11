@@ -1,26 +1,30 @@
 import React from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import styles from './SettingsPanel.module.css';
 import { useFileStore } from '../store';
 import type { ThemeSpec } from '../store';
+import { normalizeThemeSpec } from '../store/slices/uiSlice';
+import { createFocusTrap } from '../utils/accessibility';
 import { Icon } from './Icon';
-import { UpdateStatus } from './UpdateStatus';
-import { reportError } from '../utils/errorReporter';
-import { invoke } from '@tauri-apps/api/core';
 
 interface SettingsPanelProps {
   open: boolean;
   onClose: () => void;
 }
 
-type SettingsTab = 'general' | 'appearance' | 'advanced' | 'themes' | 'plugins' | 'about';
+type SettingsTab = 'general' | 'integration' | 'appearance' | 'themes' | 'about';
 type AccentPreset = Exclude<ThemeSpec['accent'], 'custom'>;
+
+type SystemIntegrationStatus = {
+  supported: boolean;
+  enabled: boolean;
+};
 
 const SETTINGS_TABS: { key: SettingsTab; label: string }[] = [
   { key: 'general', label: 'General' },
+  { key: 'integration', label: 'System Integration' },
   { key: 'appearance', label: 'Appearance' },
-  { key: 'advanced', label: 'Advanced' },
   { key: 'themes', label: 'Themes' },
-  { key: 'plugins', label: 'Plugins' },
   { key: 'about', label: 'About' },
 ];
 
@@ -54,15 +58,14 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
     setFont,
     fontCustom,
     setFontCustom,
-    importedFonts,
-    addImportedFont,
-    removeImportedFont,
     borderRadius,
     setBorderRadius,
     iconSize,
     setIconSize,
     reduceMotion,
     setReduceMotion,
+    highContrast,
+    setHighContrast,
     listRowHeight,
     setListRowHeight,
     gridMinWidth,
@@ -75,20 +78,8 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
     setShowStatusBar,
     showFolderSizes,
     setShowFolderSizes,
-    enableDnDLargeLists,
-    setEnableDnDLargeLists,
     previewExecutableScripts,
     setPreviewExecutableScripts,
-    devMockEntries,
-    setDevMockEntries,
-    defaultExplorerSupported,
-    defaultExplorerEnabled,
-    defaultExplorerLoading,
-    defaultExplorerError,
-    refreshDefaultExplorer,
-    makeDefaultExplorer,
-    revertDefaultExplorer,
-    clearDefaultExplorerError,
     confirmBeforeDelete,
     setConfirmBeforeDelete,
     enableErrorReporting,
@@ -96,22 +87,26 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
   } = useFileStore();
 
   const dialogRef = React.useRef<HTMLDivElement>(null);
-  const [activeTab, setActiveTab] = React.useState<SettingsTab>('appearance');
+  const focusTrapRef = React.useRef<ReturnType<typeof createFocusTrap> | null>(null);
+  const [activeTab, setActiveTab] = React.useState<SettingsTab>('general');
   const [status, setStatus] = React.useState<string>('');
-  const [defaultStatus, setDefaultStatus] = React.useState<string>('');
   const [themeName, setThemeName] = React.useState<string>('');
   const [importText, setImportText] = React.useState<string>('');
+  const [systemIntegration, setSystemIntegration] = React.useState<SystemIntegrationStatus | null>(
+    null
+  );
+  const [systemIntegrationBusy, setSystemIntegrationBusy] = React.useState(false);
   const themes = useFileStore((s) => s.themes);
 
-  // Plugin management state
-  const [plugins, setPlugins] = React.useState<string[]>([]);
-  const [pluginMethods, setPluginMethods] = React.useState<Record<string, string[]>>({});
-  const [selectedPlugin, setSelectedPlugin] = React.useState<string | null>(null);
-  const [selectedMethod, setSelectedMethod] = React.useState<string | null>(null);
-  const [pluginPayload, setPluginPayload] = React.useState<string>('');
-  const [pluginResult, setPluginResult] = React.useState<string>('');
-  const [pluginLoading, setPluginLoading] = React.useState(false);
-  const [pluginsLoading, setPluginsLoading] = React.useState(false);
+  React.useEffect(() => {
+    if (!open) return;
+    setActiveTab('general');
+    setStatus('');
+    setSystemIntegration(null);
+    void invoke<SystemIntegrationStatus>('get_system_integration_status')
+      .then(setSystemIntegration)
+      .catch(() => setSystemIntegration({ supported: false, enabled: false }));
+  }, [open]);
 
   React.useEffect(() => {
     if (!open) return;
@@ -122,165 +117,64 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
     return () => document.removeEventListener('keydown', onKey);
   }, [open, onClose]);
 
-  // Prevent background scroll, focus dialog, and trap focus
+  // Prevent background scroll and keep keyboard focus in the dialog.
   React.useEffect(() => {
     if (!open) return;
     const prev = document.body.style.overflow;
-    document.body.style.overflow = 'hidden';
     const el = dialogRef.current;
-    setTimeout(() => el?.focus(), 0);
+    if (!el) return;
+    document.body.style.overflow = 'hidden';
+    const trap = createFocusTrap(el);
+    focusTrapRef.current = trap;
+    const frame = requestAnimationFrame(() => trap.activate());
     return () => {
+      cancelAnimationFrame(frame);
+      focusTrapRef.current = null;
+      trap.deactivate();
       document.body.style.overflow = prev;
     };
   }, [open]);
 
-  React.useEffect(() => {
-    if (!open) {
-      setDefaultStatus('');
-      clearDefaultExplorerError();
-      return;
-    }
-    if (defaultExplorerSupported) {
-      refreshDefaultExplorer().catch((err) =>
-        reportError('Failed to check default explorer status', err, { warning: true })
-      );
-    }
-  }, [open, defaultExplorerSupported, refreshDefaultExplorer, clearDefaultExplorerError]);
-
-  // Load plugins when the plugins tab is selected
-  React.useEffect(() => {
-    if (!open || activeTab !== 'plugins') return;
-
-    const loadPlugins = async () => {
-      setPluginsLoading(true);
-      try {
-        const pluginList = await invoke<string[]>('list_plugins');
-        setPlugins(pluginList);
-
-        // Load methods for each plugin
-        const methodsMap: Record<string, string[]> = {};
-        for (const plugin of pluginList) {
-          try {
-            const methods = await invoke<string[]>('get_plugin_methods', { plugin });
-            methodsMap[plugin] = methods;
-          } catch {
-            methodsMap[plugin] = [];
-          }
-        }
-        setPluginMethods(methodsMap);
-
-        // Select first plugin if available
-        setSelectedPlugin((currentPlugin) => {
-          if (currentPlugin || pluginList.length === 0) return currentPlugin;
-          const firstPlugin = pluginList[0];
-          const methods = methodsMap[firstPlugin] || [];
-          if (methods.length > 0) {
-            setSelectedMethod(methods[0]);
-          }
-          return firstPlugin;
-        });
-      } catch (err) {
-        reportError('Failed to load plugins', err);
-      } finally {
-        setPluginsLoading(false);
-      }
-    };
-
-    loadPlugins();
-  }, [open, activeTab]);
-
-  const invokePlugin = async () => {
-    if (!selectedPlugin || !selectedMethod) return;
-
-    setPluginLoading(true);
-    setPluginResult('');
-
-    try {
-      let payload = null;
-      if (pluginPayload.trim()) {
-        try {
-          payload = JSON.parse(pluginPayload);
-        } catch {
-          setPluginResult('Error: Invalid JSON payload');
-          setPluginLoading(false);
-          return;
-        }
-      }
-
-      const result = await invoke('call_plugin', {
-        plugin: selectedPlugin,
-        method: selectedMethod,
-        payload,
-      });
-      setPluginResult(JSON.stringify(result, null, 2));
-    } catch (err) {
-      setPluginResult(`Error: ${err}`);
-    } finally {
-      setPluginLoading(false);
-    }
+  const onKeyDownTrap = (e: React.KeyboardEvent) => {
+    focusTrapRef.current?.handleKeyDown(e);
   };
 
-  const onKeyDownTrap = (e: React.KeyboardEvent) => {
-    if (e.key !== 'Tab') return;
-    const panel = dialogRef.current;
-    if (!panel) return;
-    const focusable = panel.querySelectorAll<HTMLElement>(
-      'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
-    );
-    if (focusable.length === 0) return;
-    const first = focusable[0];
-    const last = focusable[focusable.length - 1];
-    if (e.shiftKey) {
-      if (document.activeElement === first) {
-        last.focus();
-        e.preventDefault();
-      }
-    } else {
-      if (document.activeElement === last) {
-        first.focus();
-        e.preventDefault();
-      }
+  const updateSystemIntegration = async (enabled: boolean) => {
+    setSystemIntegrationBusy(true);
+    setStatus('');
+    try {
+      const next = await invoke<SystemIntegrationStatus>('set_system_integration', { enabled });
+      setSystemIntegration(next);
+      setStatus(enabled ? 'Windows integration enabled' : 'Windows integration removed');
+    } catch (error) {
+      setStatus(`Could not update Windows integration: ${String(error)}`);
+    } finally {
+      setSystemIntegrationBusy(false);
     }
   };
 
   const resetToDefaults = () => {
     setTheme('dark');
     setFont('mono');
+    setFontCustom('');
     setBorderRadius(0);
     setIconSize(14);
     setShowHidden(false);
     setShowFolderSizes(false);
     setShowPreviewPanel(false);
-    setEnableDnDLargeLists(false);
+    setShowStatusBar(true);
     setPreviewExecutableScripts(false);
-    setDevMockEntries(false);
+    setConfirmBeforeDelete(true);
+    setEnableErrorReporting(false);
     setAccent('blue');
     setAccentCustom('#7cc7ff');
     setDensity('comfortable');
     setUiScale(1.0);
+    setListRowHeight(34);
+    setGridMinWidth(140);
     setReduceMotion(false);
-  };
-
-  const handleMakeDefaultExplorer = async () => {
-    clearDefaultExplorerError();
-    setDefaultStatus('');
-    try {
-      await makeDefaultExplorer();
-      setDefaultStatus('explorie is now the default file manager.');
-    } catch (err) {
-      reportError('Failed to set as default explorer', err);
-    }
-  };
-
-  const handleRevertDefaultExplorer = async () => {
-    clearDefaultExplorerError();
-    setDefaultStatus('');
-    try {
-      await revertDefaultExplorer();
-      setDefaultStatus('Windows Explorer restored as default.');
-    } catch (err) {
-      reportError('Failed to restore Windows Explorer as default', err);
-    }
+    setHighContrast(false);
+    setStatus('Settings restored to defaults');
   };
 
   if (!open) return null;
@@ -312,29 +206,23 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
           </button>
         </div>
         <div className={styles.content}>
-          <div
-            className={styles.tabs}
-            role="tablist"
-            aria-label="Settings Tabs"
-            aria-orientation="vertical"
-          >
+          <nav className={styles.tabs} aria-label="Settings sections">
             {SETTINGS_TABS.map((t) => (
               <button
                 key={t.key}
                 type="button"
-                role="tab"
-                aria-selected={activeTab === t.key}
+                aria-current={activeTab === t.key ? 'page' : undefined}
                 className={`${styles.tab} ${activeTab === t.key ? styles.tabActive : ''}`}
                 onClick={() => setActiveTab(t.key)}
               >
                 {t.label}
               </button>
             ))}
-          </div>
+          </nav>
 
           {activeTab === 'general' && (
             <div className={styles.section}>
-              <div className={styles.sectionTitle}>General</div>
+              <h2 className={styles.sectionTitle}>General</h2>
               <label className={styles.checkboxRow}>
                 <input
                   type="checkbox"
@@ -387,16 +275,64 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
                 <span className={styles.checkboxRowLabel}>
                   Error reporting
                   <span className={styles.rowHint}>
-                    Collect anonymous error data to help improve explorie
+                    Keep diagnostics in memory for local export; nothing is sent
+                  </span>
+                </span>
+              </label>
+              <label className={styles.checkboxRow}>
+                <input
+                  type="checkbox"
+                  checked={previewExecutableScripts}
+                  onChange={(e) => setPreviewExecutableScripts(e.target.checked)}
+                />
+                <span className={styles.checkboxRowLabel}>
+                  Preview executable scripts
+                  <span className={styles.rowHint}>
+                    Display raw PowerShell and batch script contents
                   </span>
                 </span>
               </label>
             </div>
           )}
 
+          {activeTab === 'integration' && (
+            <div className={styles.section}>
+              <h2 className={styles.sectionTitle}>System Integration</h2>
+              {systemIntegration === null ? (
+                <div className={styles.row}>
+                  <div className={styles.rowLabel}>Windows</div>
+                  <div className={styles.controls}>Checking integration…</div>
+                </div>
+              ) : systemIntegration.supported ? (
+                <label className={styles.checkboxRow}>
+                  <input
+                    type="checkbox"
+                    checked={systemIntegration.enabled}
+                    disabled={systemIntegrationBusy}
+                    onChange={(event) => void updateSystemIntegration(event.target.checked)}
+                  />
+                  <span className={styles.checkboxRowLabel}>
+                    Open folders with Explorie
+                    <span className={styles.rowHint}>
+                      Adds “Open in Explorie” to folder, drive, and folder-background menus. Windows
+                      Explorer remains available.
+                    </span>
+                  </span>
+                </label>
+              ) : (
+                <div className={styles.row}>
+                  <div className={styles.rowLabel}>Unavailable</div>
+                  <div className={styles.controls}>
+                    System integration is currently available only on Windows.
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
           {activeTab === 'appearance' && (
             <div className={styles.section}>
-              <div className={styles.sectionTitle}>Appearance</div>
+              <h2 className={styles.sectionTitle}>Appearance</h2>
               {/* Theme selection */}
               <div className={styles.row}>
                 <div className={styles.rowLabel}>Theme</div>
@@ -479,8 +415,9 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
                 <div className={styles.controls}>
                   <input
                     type="range"
+                    aria-label="UI scale"
                     min={0.9}
-                    max={1.2}
+                    max={1.4}
                     step={0.01}
                     value={uiScale}
                     onChange={(e) => setUiScale(parseFloat(e.target.value))}
@@ -495,6 +432,7 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
                 <div className={styles.controls}>
                   <input
                     type="range"
+                    aria-label="List row height"
                     min={26}
                     max={52}
                     step={1}
@@ -511,6 +449,7 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
                 <div className={styles.controls}>
                   <input
                     type="range"
+                    aria-label="Grid card width"
                     min={120}
                     max={260}
                     step={2}
@@ -526,26 +465,10 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
                 <div className={styles.rowLabel}>Font</div>
                 <div className={styles.controls}>
                   <select
-                    value={(() => {
-                      if (font === 'custom') {
-                        const hit = (importedFonts || []).find(
-                          (f) => f.name.toLowerCase() === (fontCustom || '').toLowerCase()
-                        );
-                        return hit ? `import:${hit.id}` : 'custom';
-                      }
-                      return font;
-                    })()}
+                    aria-label="Font"
+                    value={font}
                     onChange={(e) => {
                       const v = e.target.value;
-                      if (v.startsWith('import:')) {
-                        const id = v.slice('import:'.length);
-                        const f = (importedFonts || []).find((x) => x.id === id);
-                        if (f) {
-                          setFont('custom');
-                          setFontCustom(f.name);
-                        }
-                        return;
-                      }
                       if (isFontChoice(v)) {
                         setFont(v);
                       }
@@ -554,123 +477,20 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
                     <option value="system">System (Sans)</option>
                     <option value="mono">System Mono</option>
                     <option value="serif">Serif</option>
-                    {(importedFonts || []).length > 0 && <option disabled>────────</option>}
-                    {(importedFonts || []).map((f) => (
-                      <option key={f.id} value={`import:${f.id}`}>
-                        Imported: {f.name}
-                      </option>
-                    ))}
                     <option value="custom">Custom…</option>
                   </select>
-                  {font === 'custom' &&
-                    (!importedFonts ||
-                      !(importedFonts || []).some(
-                        (f) => f.name.toLowerCase() === (fontCustom || '').toLowerCase()
-                      )) && (
-                      <input
-                        type="text"
-                        placeholder="CSS font-family, e.g. 'Fira Code', monospace"
-                        className={styles.inputMedium}
-                        value={fontCustom}
-                        onChange={(e) => setFontCustom(e.target.value)}
-                      />
-                    )}
+                  {font === 'custom' && (
+                    <input
+                      type="text"
+                      aria-label="Custom font family"
+                      placeholder="CSS font-family, e.g. 'Fira Code', monospace"
+                      className={styles.inputMedium}
+                      value={fontCustom}
+                      onChange={(e) => setFontCustom(e.target.value)}
+                    />
+                  )}
                 </div>
               </div>
-
-              {/* Import Google Font */}
-              <div className={styles.row}>
-                <div className={styles.rowLabel}>Import font</div>
-                <div className={styles.controls}>
-                  <input
-                    id="gf-url"
-                    type="text"
-                    placeholder="Google Fonts CSS URL (optional)"
-                    className={styles.inputWide}
-                  />
-                  <input
-                    id="gf-name"
-                    type="text"
-                    placeholder="Family name (e.g., Inter)"
-                    className={styles.inputNarrow}
-                  />
-                  <button
-                    onClick={() => {
-                      const urlInput = (
-                        document.getElementById('gf-url') as HTMLInputElement
-                      )?.value.trim();
-                      let name = (
-                        document.getElementById('gf-name') as HTMLInputElement
-                      )?.value.trim();
-                      let url = urlInput;
-
-                      function buildUrl(family: string) {
-                        const fam = family.trim().replace(/\s+/g, '+');
-                        return `https://fonts.googleapis.com/css2?family=${encodeURIComponent(fam)}:wght@400;700&display=swap`;
-                      }
-                      function parseNameFromUrl(u: string): string | null {
-                        try {
-                          const parsed = new URL(u);
-                          const fam = parsed.searchParams.getAll('family')[0];
-                          if (!fam) return null;
-                          return fam.split(':')[0].replace(/\+/g, ' ');
-                        } catch {
-                          return null;
-                        }
-                      }
-
-                      // If only name is provided, generate URL
-                      if (!url && name) url = buildUrl(name);
-                      // If only URL is provided, try to extract name
-                      if (url && !name) name = parseNameFromUrl(url) || '';
-
-                      if (!name && !url) {
-                        setStatus('Enter a font name or provide a Google Fonts CSS URL');
-                        return;
-                      }
-                      if (!url) {
-                        setStatus('Could not generate URL for that name');
-                        return;
-                      }
-                      if (!name) {
-                        setStatus('Could not infer family name from the URL');
-                        return;
-                      }
-
-                      const id = `${name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${Date.now()}`;
-                      addImportedFont({ id, name, href: url });
-                      setFont('custom');
-                      setFontCustom(name);
-                      setStatus(`Imported font: ${name}`);
-                    }}
-                  >
-                    Add
-                  </button>
-                </div>
-              </div>
-
-              {/* Manage imported fonts */}
-              {(importedFonts || []).length > 0 && (
-                <div className={styles.row}>
-                  <div className={styles.rowLabel}>Manage fonts</div>
-                  <div className={`${styles.controls} ${styles.flexWrap}`}>
-                    {(importedFonts || []).map((f) => (
-                      <span key={f.id} className={styles.tagBadge}>
-                        <strong>{f.name}</strong>
-                        <button
-                          onClick={() => {
-                            setFont('custom');
-                            setFontCustom(f.name);
-                          }}
-                        >
-                          Use
-                        </button>
-                        <button onClick={() => removeImportedFont(f.id)}>Remove</button>
-                      </span>
-                    ))}
-                  </div>
-                </div>
-              )}
 
               {/* Corners */}
               <div className={styles.row}>
@@ -694,6 +514,7 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
                 <div className={styles.controls}>
                   <input
                     type="range"
+                    aria-label="Icon size"
                     min={12}
                     max={20}
                     step={1}
@@ -704,29 +525,35 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
                 </div>
               </div>
 
-              {/* Reduce motion */}
-              <div className={styles.row}>
-                <div className={styles.rowLabel}>Reduce motion</div>
-                <div className={styles.controls}>
-                  <input
-                    type="checkbox"
-                    checked={reduceMotion}
-                    onChange={(e) => setReduceMotion(e.target.checked)}
-                  />
-                </div>
-              </div>
+              <label className={styles.checkboxRow}>
+                <input
+                  type="checkbox"
+                  checked={reduceMotion}
+                  onChange={(e) => setReduceMotion(e.target.checked)}
+                />
+                <span className={styles.checkboxRowLabel}>Reduce motion</span>
+              </label>
+              <label className={styles.checkboxRow}>
+                <input
+                  type="checkbox"
+                  checked={highContrast}
+                  onChange={(e) => setHighContrast(e.target.checked)}
+                />
+                <span className={styles.checkboxRowLabel}>High contrast</span>
+              </label>
             </div>
           )}
 
           {activeTab === 'themes' && (
             <div className={styles.section}>
-              <div className={styles.sectionTitle}>Theme Presets</div>
+              <h2 className={styles.sectionTitle}>Theme presets</h2>
               {/* Save current theme */}
               <div className={styles.row}>
                 <div className={styles.rowLabel}>Save as</div>
                 <div className={styles.controls}>
                   <input
                     type="text"
+                    aria-label="Theme name"
                     placeholder="Theme name"
                     value={themeName}
                     onChange={(e) => setThemeName(e.target.value)}
@@ -755,6 +582,7 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
                   <span className={styles.tagBadge}>
                     <strong>Default</strong>
                     <button
+                      aria-label="Apply default theme"
                       onClick={() => {
                         const def: ThemeSpec = {
                           theme: 'dark',
@@ -781,6 +609,7 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
                     <span key={name} className={styles.tagBadge}>
                       <strong>{name}</strong>
                       <button
+                        aria-label={`Apply ${name} theme`}
                         onClick={() => {
                           useFileStore.getState().applyThemeSpec(spec as ThemeSpec);
                           setStatus(`Applied theme: ${name}`);
@@ -789,6 +618,7 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
                         Apply
                       </button>
                       <button
+                        aria-label={`Update ${name} theme`}
                         onClick={() => {
                           if (name.toLowerCase() === 'default') {
                             setStatus('Default theme is built-in');
@@ -801,6 +631,7 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
                         Update
                       </button>
                       <button
+                        aria-label={`Delete ${name} theme`}
                         onClick={() => {
                           if (name.toLowerCase() === 'default') {
                             setStatus('Default theme cannot be deleted');
@@ -839,7 +670,6 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
                         borderRadius,
                         iconSize,
                         reduceMotion,
-                        fonts: importedFonts,
                       };
                       const txt = JSON.stringify(s, null, 2);
                       try {
@@ -885,6 +715,7 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
                 <div className={styles.rowLabel}>Import</div>
                 <div className={`${styles.controls} ${styles.flex1}`}>
                   <textarea
+                    aria-label="Theme JSON"
                     placeholder="Paste JSON for a theme spec or a map of themes"
                     value={importText}
                     onChange={(e) => setImportText(e.target.value)}
@@ -894,46 +725,44 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
                     onClick={() => {
                       try {
                         const obj = JSON.parse(importText);
-                        if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
-                          if ('theme' in obj || 'accent' in obj) {
-                            // single spec
-                            const name =
-                              themeName.trim() || `Imported ${new Date().toLocaleString()}`;
-                            const spec = obj as ThemeSpec;
-                            useFileStore.getState().saveTheme(name, spec);
-                            // Merge fonts immediately into imported list
-                            if (Array.isArray(spec.fonts)) {
-                              for (const f of spec.fonts)
-                                addImportedFont({
-                                  id: f.id || `${f.name}-${Date.now()}`,
-                                  name: f.name,
-                                  href: f.href,
-                                });
-                            }
-                            setStatus(`Imported as: ${name}`);
-                          } else {
-                            // map
-                            const entries = Object.entries(obj as Record<string, ThemeSpec>);
-                            let count = 0;
-                            for (const [n, s] of entries) {
-                              useFileStore.getState().saveTheme(n, s);
-                              count++;
-                              if (Array.isArray(s.fonts)) {
-                                for (const f of s.fonts)
-                                  addImportedFont({
-                                    id: f.id || `${f.name}-${Date.now()}`,
-                                    name: f.name,
-                                    href: f.href,
-                                  });
-                              }
-                            }
-                            setStatus(`Imported ${count} themes`);
+                        const singleSpec = normalizeThemeSpec(obj);
+                        if (singleSpec) {
+                          const name =
+                            themeName.trim() || `Imported ${new Date().toLocaleString()}`;
+                          if (name.toLowerCase() === 'default') {
+                            setStatus('Name "Default" is reserved');
+                            return;
                           }
-                        } else {
-                          setStatus('Invalid JSON');
+                          useFileStore.getState().saveTheme(name, singleSpec);
+                          setStatus(`Imported as: ${name}`);
+                          return;
                         }
+
+                        if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
+                          setStatus('Theme JSON must be a theme or map of themes');
+                          return;
+                        }
+                        const entries = Object.entries(obj as Record<string, unknown>);
+                        const normalized = entries.map(([name, spec]) => [
+                          name.trim(),
+                          normalizeThemeSpec(spec),
+                        ]) as [string, ThemeSpec | null][];
+                        if (
+                          normalized.length === 0 ||
+                          normalized.some(
+                            ([name, spec]) =>
+                              !name || name.toLowerCase() === 'default' || spec === null
+                          )
+                        ) {
+                          setStatus('Theme map contains an invalid name or theme');
+                          return;
+                        }
+                        for (const [name, spec] of normalized) {
+                          useFileStore.getState().saveTheme(name, spec!);
+                        }
+                        setStatus(`Imported ${normalized.length} themes`);
                       } catch {
-                        setStatus('Failed to import JSON');
+                        setStatus('Theme JSON is not valid JSON');
                       }
                     }}
                   >
@@ -941,289 +770,33 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
                   </button>
                 </div>
               </div>
-
-              {status && (
-                <div className={styles.row}>
-                  <div className={styles.rowLabel}>Status</div>
-                  <div className={styles.controls}>
-                    <span className={styles.textSecondary}>{status}</span>
-                  </div>
-                </div>
-              )}
-            </div>
-          )}
-
-          {activeTab === 'advanced' && (
-            <div className={styles.section}>
-              <div className={styles.sectionTitle}>Advanced</div>
-              <div className={styles.row}>
-                <div
-                  className={styles.rowLabel}
-                  title="Allow drag & drop even on large lists (may be slower)"
-                >
-                  DnD on large lists
-                </div>
-                <div className={styles.controls}>
-                  <input
-                    id="dnd-large-lists"
-                    type="checkbox"
-                    checked={enableDnDLargeLists}
-                    onChange={(e) => setEnableDnDLargeLists(e.target.checked)}
-                  />
-                </div>
-              </div>
-              <div className={styles.row}>
-                <div
-                  className={styles.rowLabel}
-                  title="Display the raw contents of PowerShell or batch scripts in the preview panel."
-                >
-                  Preview executable scripts
-                </div>
-                <div className={styles.controls}>
-                  <input
-                    id="preview-executable-scripts"
-                    type="checkbox"
-                    checked={previewExecutableScripts}
-                    onChange={(e) => setPreviewExecutableScripts(e.target.checked)}
-                  />
-                </div>
-              </div>
-              <div className={styles.row}>
-                <div
-                  className={styles.rowLabel}
-                  title="Development helper: populate mock entries in views (local only)"
-                >
-                  Dev: mock entries
-                </div>
-                <div className={styles.controls}>
-                  <input
-                    id="dev-mock-entries"
-                    type="checkbox"
-                    checked={devMockEntries}
-                    onChange={(e) => setDevMockEntries(e.target.checked)}
-                  />
-                </div>
-              </div>
-              {defaultExplorerSupported ? (
-                <>
-                  <div className={styles.row}>
-                    <div className={styles.rowLabel}>Default explorer</div>
-                    <div className={`${styles.controls} ${styles.actionsRow}`}>
-                      <button
-                        type="button"
-                        onClick={handleMakeDefaultExplorer}
-                        disabled={
-                          defaultExplorerLoading ||
-                          defaultExplorerEnabled === true ||
-                          defaultExplorerEnabled === null
-                        }
-                      >
-                        {defaultExplorerLoading && defaultExplorerEnabled === false
-                          ? 'Setting…'
-                          : 'Make explorie default'}
-                      </button>
-                      <button
-                        type="button"
-                        onClick={handleRevertDefaultExplorer}
-                        disabled={
-                          defaultExplorerLoading ||
-                          defaultExplorerEnabled === false ||
-                          defaultExplorerEnabled === null
-                        }
-                      >
-                        {defaultExplorerLoading && defaultExplorerEnabled === true
-                          ? 'Reverting…'
-                          : 'Revert to Windows Explorer'}
-                      </button>
-                    </div>
-                  </div>
-                  <div className={styles.row}>
-                    <div className={styles.rowLabel} aria-hidden="true" />
-                    <div className={`${styles.controls} ${styles.statusControls}`}>
-                      <span className={styles.statusText}>
-                        {defaultExplorerLoading
-                          ? defaultExplorerEnabled === false
-                            ? 'Setting explorie as the default explorer…'
-                            : 'Restoring Windows Explorer…'
-                          : typeof defaultExplorerEnabled === 'boolean'
-                            ? defaultExplorerEnabled
-                              ? 'explorie is currently the default explorer.'
-                              : 'Windows Explorer is currently the default explorer.'
-                            : 'Checking default explorer status…'}
-                      </span>
-                      {defaultStatus && (
-                        <span className={styles.statusTextSuccess}>{defaultStatus}</span>
-                      )}
-                      {defaultExplorerError && (
-                        <span className={styles.statusTextError}>{defaultExplorerError}</span>
-                      )}
-                    </div>
-                  </div>
-                </>
-              ) : (
-                <div className={styles.row}>
-                  <div className={styles.rowLabel}>Default explorer</div>
-                  <div className={`${styles.controls} ${styles.statusControls}`}>
-                    <span className={styles.statusText}>Only available on Windows builds.</span>
-                  </div>
-                </div>
-              )}
-              <div className={styles.row}>
-                <div className={styles.rowLabel}>Reset all settings</div>
-                <div className={`${styles.controls} ${styles.actionsRow}`}>
-                  <button onClick={resetToDefaults} title="Restore defaults">
-                    Reset
-                  </button>
-                </div>
-              </div>
-            </div>
-          )}
-
-          {activeTab === 'plugins' && (
-            <div className={styles.section}>
-              <div className={styles.sectionTitle}>Plugins</div>
-              {pluginsLoading ? (
-                <div className={styles.row}>
-                  <span className={styles.textMuted}>Loading plugins...</span>
-                </div>
-              ) : plugins.length === 0 ? (
-                <div className={styles.row}>
-                  <span className={styles.textMuted}>No plugins registered</span>
-                </div>
-              ) : (
-                <>
-                  {/* Plugin selector */}
-                  <div className={styles.row}>
-                    <div className={styles.rowLabel}>Plugin</div>
-                    <div className={styles.controls}>
-                      <select
-                        value={selectedPlugin || ''}
-                        onChange={(e) => {
-                          const plugin = e.target.value;
-                          setSelectedPlugin(plugin);
-                          setPluginResult('');
-                          const methods = pluginMethods[plugin] || [];
-                          setSelectedMethod(methods.length > 0 ? methods[0] : null);
-                        }}
-                      >
-                        {plugins.map((p) => (
-                          <option key={p} value={p}>
-                            {p}
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-                  </div>
-
-                  {/* Method selector */}
-                  {selectedPlugin && (
-                    <div className={styles.row}>
-                      <div className={styles.rowLabel}>Method</div>
-                      <div className={styles.controls}>
-                        {(pluginMethods[selectedPlugin] || []).length === 0 ? (
-                          <span className={styles.textMuted}>No methods exposed</span>
-                        ) : (
-                          <select
-                            value={selectedMethod || ''}
-                            onChange={(e) => {
-                              setSelectedMethod(e.target.value);
-                              setPluginResult('');
-                            }}
-                          >
-                            {(pluginMethods[selectedPlugin] || []).map((m) => (
-                              <option key={m} value={m}>
-                                {m}
-                              </option>
-                            ))}
-                          </select>
-                        )}
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Payload input */}
-                  {selectedMethod && (
-                    <div className={styles.row}>
-                      <div className={styles.rowLabel}>Payload (JSON)</div>
-                      <div className={`${styles.controls} ${styles.flex1}`}>
-                        <textarea
-                          placeholder='{"key": "value"}'
-                          value={pluginPayload}
-                          onChange={(e) => setPluginPayload(e.target.value)}
-                          className={styles.pluginPayload}
-                        />
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Invoke button */}
-                  {selectedMethod && (
-                    <div className={styles.row}>
-                      <div className={styles.rowLabel} />
-                      <div className={styles.controls}>
-                        <button
-                          onClick={invokePlugin}
-                          disabled={pluginLoading || !selectedPlugin || !selectedMethod}
-                        >
-                          {pluginLoading ? 'Invoking...' : 'Invoke'}
-                        </button>
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Result display */}
-                  {pluginResult && (
-                    <div className={styles.row}>
-                      <div className={styles.rowLabel}>Result</div>
-                      <div className={`${styles.controls} ${styles.flex1}`}>
-                        <pre className={styles.pluginResult}>{pluginResult}</pre>
-                      </div>
-                    </div>
-                  )}
-                </>
-              )}
-
-              <div className={styles.row}>
-                <div className={styles.rowLabel} />
-                <div className={styles.controls}>
-                  <span className={styles.textMuted}>
-                    Plugins extend explorie with custom functionality.
-                  </span>
-                </div>
-              </div>
             </div>
           )}
 
           {activeTab === 'about' && (
-            <>
-              <div className={styles.section}>
-                <div className={styles.sectionTitle}>Updates</div>
-                <UpdateStatus />
-              </div>
-              <div className={styles.section}>
-                <div className={styles.sectionTitle}>About</div>
-                <div className={styles.row}>
-                  <div className={styles.rowLabel}>Version</div>
-                  <div className={styles.controls}>
-                    <code>
-                      {typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '0.1.0'}
-                    </code>
-                  </div>
-                </div>
-                <div className={styles.row}>
-                  <div className={styles.rowLabel}>Environment</div>
-                  <div className={styles.controls}>
-                    <code>{import.meta.env.MODE}</code>
-                  </div>
+            <div className={styles.section}>
+              <h2 className={styles.sectionTitle}>About</h2>
+              <div className={styles.row}>
+                <div className={styles.rowLabel}>Version</div>
+                <div className={styles.controls}>
+                  <code>{typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '0.1.0'}</code>
                 </div>
               </div>
-            </>
+            </div>
           )}
         </div>
         <div className={styles.footer}>
-          <div>These settings persist locally.</div>
-          <div>
-            <span className={styles.textDimmed}>Press Esc to close</span>
+          <div className={styles.footerStatus} role="status" aria-live="polite">
+            {status || 'Changes apply immediately.'}
+          </div>
+          <div className={styles.footerActions}>
+            <button type="button" onClick={resetToDefaults}>
+              Reset to defaults
+            </button>
+            <span className={styles.textDimmed}>Esc</span>
+            <button type="button" className={styles.footerCloseButton} onClick={onClose}>
+              Close
+            </button>
           </div>
         </div>
       </div>

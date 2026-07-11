@@ -18,7 +18,7 @@
 
   background-color: var(--accent-primary, #7cc7ff);
   color: var(--bg-primary, #1a1a1a);
-  padding: 8px 16px;
+  padding: var(--padding-md) var(--padding-xl);
   font-size: 14px;
   font-weight: 600;
   text-decoration: none;

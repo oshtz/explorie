@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -9,6 +9,11 @@ const PLAYWRIGHT_RELEASE_PORT = '47173';
 const PLAYWRIGHT_RELEASE_BASE_URL = `http://127.0.0.1:${PLAYWRIGHT_RELEASE_PORT}`;
 
 export const DEFAULT_COMMANDS = [
+  {
+    display: 'pnpm install --frozen-lockfile --ignore-scripts',
+    command: 'pnpm',
+    args: ['install', '--frozen-lockfile', '--ignore-scripts'],
+  },
   {
     display: 'pnpm --filter explorie-desktop exec tsc --noEmit',
     command: 'pnpm',
@@ -25,6 +30,11 @@ export const DEFAULT_COMMANDS = [
     args: ['format:check'],
   },
   {
+    display: 'cargo metadata --locked --format-version 1',
+    command: 'cargo',
+    args: ['metadata', '--locked', '--format-version', '1'],
+  },
+  {
     display: 'cargo fmt --all -- --check',
     command: 'cargo',
     args: ['fmt', '--all', '--', '--check'],
@@ -35,23 +45,24 @@ export const DEFAULT_COMMANDS = [
     args: ['test', '--workspace'],
   },
   {
-    display:
-      'cargo clippy --workspace --all-targets --all-features -- -D warnings',
+    display: 'cargo clippy --workspace --all-targets --all-features -- -D warnings',
     command: 'cargo',
-    args: [
-      'clippy',
-      '--workspace',
-      '--all-targets',
-      '--all-features',
-      '--',
-      '-D',
-      'warnings',
-    ],
+    args: ['clippy', '--workspace', '--all-targets', '--all-features', '--', '-D', 'warnings'],
+  },
+  {
+    display: 'cargo audit',
+    command: 'cargo',
+    args: ['audit'],
   },
   {
     display: 'pnpm --filter explorie-desktop test',
     command: 'pnpm',
     args: ['--filter', 'explorie-desktop', 'test'],
+  },
+  {
+    display: 'pnpm audit --audit-level=moderate',
+    command: 'pnpm',
+    args: ['audit', '--audit-level=moderate'],
   },
   {
     display: 'pnpm exec playwright test',
@@ -64,20 +75,18 @@ export const DEFAULT_COMMANDS = [
     },
   },
   {
-    display: 'pnpm --filter explorie-desktop build',
-    command: 'pnpm',
-    args: ['--filter', 'explorie-desktop', 'build'],
-  },
-  {
-    display: 'pnpm --filter explorie-desktop exec tauri build --no-bundle',
+    display: 'pnpm --filter explorie-desktop exec -- tauri build --no-bundle -- --locked',
     command: 'pnpm',
     args: [
       '--filter',
       'explorie-desktop',
       'exec',
+      '--',
       'tauri',
       'build',
       '--no-bundle',
+      '--',
+      '--locked',
     ],
   },
   {
@@ -92,30 +101,85 @@ export function tailText(value, maxLines = DEFAULT_TAIL_LINES) {
     return '';
   }
 
-  const text = String(value ?? '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  const text = String(value ?? '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n');
   return text.split('\n').slice(-maxLines).join('\n');
 }
 
 export function getExpectedArtifacts(platform = process.platform) {
   if (platform === 'win32') {
-    return ['apps/desktop/frontend/src-tauri/target/release/explorie-desktop.exe'];
+    return ['target/release/explorie-desktop.exe'];
   }
 
-  if (platform === 'darwin') {
-    return [
-      'apps/desktop/frontend/src-tauri/target/release/explorie-desktop',
-      'apps/desktop/frontend/src-tauri/target/release/bundle/macos/explorie.app',
-    ];
-  }
-
-  return ['apps/desktop/frontend/src-tauri/target/release/explorie-desktop'];
+  return ['target/release/explorie-desktop'];
 }
 
-export function createSpawnInvocation(
-  command,
-  args = [],
+export function validateReleaseContext(context, { tag = null } = {}) {
+  const errors = [];
+  if (context.dirtyBefore !== false) {
+    errors.push(
+      context.dirtyBefore
+        ? 'Working tree is dirty.'
+        : 'Could not prove that the working tree is clean.'
+    );
+  }
+
+  const versions = [
+    ['package.json', context.rootPackageVersion],
+    ['apps/desktop/frontend/package.json', context.desktopPackageVersion],
+    ['apps/desktop/frontend/src-tauri/Cargo.toml', context.tauriPackageVersion],
+  ];
+  for (const [source, version] of versions) {
+    if (!version) errors.push(`Version is missing from ${source}.`);
+  }
+
+  const presentVersions = versions.map(([, version]) => version).filter(Boolean);
+  if (new Set(presentVersions).size > 1) {
+    errors.push(`Version mismatch: ${presentVersions.join(', ')}.`);
+  }
+
+  if (tag) {
+    if (!/^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(tag)) {
+      errors.push(`Release tag ${tag} is not a supported v* semantic version.`);
+    } else if (context.rootPackageVersion && tag !== `v${context.rootPackageVersion}`) {
+      errors.push(
+        `Release tag ${tag} does not match package version v${context.rootPackageVersion}.`
+      );
+    }
+  }
+
+  return errors;
+}
+
+export async function verifyExpectedArtifacts({
+  rootDir = process.cwd(),
   platform = process.platform,
-) {
+} = {}) {
+  const errors = [];
+  for (const relativePath of getExpectedArtifacts(platform)) {
+    try {
+      const artifact = await stat(path.join(rootDir, relativePath));
+      if (!artifact.isFile() || artifact.size === 0) {
+        errors.push(`Release artifact is empty or not a file: ${relativePath}`);
+      }
+    } catch {
+      errors.push(`Release artifact is missing: ${relativePath}`);
+    }
+  }
+  return errors;
+}
+
+function createValidationResult(display, errors) {
+  return {
+    display,
+    exitCode: errors.length === 0 ? 0 : 1,
+    elapsedMs: 0,
+    outputTail: errors.length === 0 ? 'ok' : errors.join('\n'),
+  };
+}
+
+export function createSpawnInvocation(command, args = [], platform = process.platform) {
   if (platform === 'win32' && command === 'pnpm') {
     return {
       command: 'cmd.exe',
@@ -256,6 +320,7 @@ export async function collectReleaseContext({
 
   return {
     generatedAt: generatedAtIso,
+    releaseTag: process.env.RELEASE_TAG || null,
     rootPackageVersion,
     desktopPackageVersion,
     tauriPackageVersion,
@@ -298,10 +363,7 @@ export function runCommand(commandConfig, { cwd = process.cwd(), env = process.e
       });
     }
 
-    const invocation = createSpawnInvocation(
-      commandConfig.command,
-      commandConfig.args ?? [],
-    );
+    const invocation = createSpawnInvocation(commandConfig.command, commandConfig.args ?? []);
     let child;
     try {
       child = spawn(invocation.command, invocation.args, {
@@ -330,8 +392,7 @@ export function runCommand(commandConfig, { cwd = process.cwd(), env = process.e
 }
 
 export function createReleaseReport({ context, commands }) {
-  const failedCommand =
-    commands.find((command) => command.exitCode !== 0) ?? null;
+  const failedCommand = commands.find((command) => command.exitCode !== 0) ?? null;
 
   return {
     generatedAt: context.generatedAt,
@@ -360,14 +421,13 @@ export function renderMarkdownReport(report) {
     '',
     `- Status: ${report.status}`,
     `- Generated: ${report.generatedAt}`,
+    `- Release tag: ${report.context.releaseTag ?? 'none'}`,
     `- Branch: ${report.context.branch ?? 'unknown'}`,
     `- Commit: ${report.context.shortCommit ?? 'unknown'}`,
     `- Dirty before: ${formatBoolean(report.context.dirtyBefore)}`,
     `- Dirty after: ${formatBoolean(report.context.dirtyAfter)}`,
     `- Root package version: ${report.context.rootPackageVersion ?? 'unknown'}`,
-    `- Desktop package version: ${
-      report.context.desktopPackageVersion ?? 'unknown'
-    }`,
+    `- Desktop package version: ${report.context.desktopPackageVersion ?? 'unknown'}`,
     `- Tauri package version: ${report.context.tauriPackageVersion ?? 'unknown'}`,
     `- Platform: ${report.context.os}/${report.context.arch}`,
     `- Node: ${report.context.nodeVersion}`,
@@ -398,7 +458,7 @@ export function renderMarkdownReport(report) {
       '```text',
       command.outputTail || '(no output)',
       '```',
-      '',
+      ''
     );
   });
 
@@ -426,7 +486,7 @@ function timestampBasename(generatedAt) {
 
 export async function writeReleaseReports(
   report,
-  { rootDir = process.cwd(), outputDir = path.join(rootDir, '.release-checks') } = {},
+  { rootDir = process.cwd(), outputDir = path.join(rootDir, '.release-checks') } = {}
 ) {
   await mkdir(outputDir, { recursive: true });
 
@@ -459,13 +519,20 @@ export async function runReleaseCheck({
   generatedAt = new Date(),
   collectContext = collectReleaseContext,
   commandRunner = runCommand,
+  preflightValidator = validateReleaseContext,
+  artifactVerifier = verifyExpectedArtifacts,
   writeReports = writeReleaseReports,
   outputDir,
 } = {}) {
   const context = await collectContext({ rootDir, generatedAt });
-  const commandResults = [];
+  const commandResults = [
+    createValidationResult(
+      'release prerequisites',
+      preflightValidator(context, { tag: context.releaseTag })
+    ),
+  ];
 
-  for (const command of commands) {
+  for (const command of commandResults[0].exitCode === 0 ? commands : []) {
     let result;
     try {
       result = await commandRunner(command, { cwd: rootDir, env: process.env });
@@ -490,10 +557,22 @@ export async function runReleaseCheck({
     }
   }
 
+  if (!commandResults.some((result) => result.exitCode !== 0)) {
+    const artifactErrors = await artifactVerifier({ rootDir, platform: context.os });
+    commandResults.push(createValidationResult('release artifact verification', artifactErrors));
+  }
+
   const dirtyAfter =
-    collectContext === collectReleaseContext
-      ? await getGitDirty(rootDir)
-      : context.dirtyAfter;
+    collectContext === collectReleaseContext ? await getGitDirty(rootDir) : context.dirtyAfter;
+  if (!commandResults.some((result) => result.exitCode !== 0) && dirtyAfter !== false) {
+    commandResults.push(
+      createValidationResult('working tree remained clean', [
+        dirtyAfter
+          ? 'Release checks changed tracked files.'
+          : 'Could not prove that the working tree remained clean.',
+      ])
+    );
+  }
   const report = createReleaseReport({
     context: {
       ...context,
@@ -516,11 +595,18 @@ function isDirectInvocation() {
 
 if (isDirectInvocation()) {
   try {
-    const report = await runReleaseCheck();
-    console.log(
-      `Release check ${report.status}. Report written to .release-checks/latest.md`,
-    );
-    process.exitCode = report.status === 'pass' ? 0 : 1;
+    if (process.argv.includes('--preflight')) {
+      const context = await collectReleaseContext();
+      const errors = validateReleaseContext(context, { tag: context.releaseTag });
+      if (errors.length > 0) {
+        throw new Error(errors.join('\n'));
+      }
+      console.log('Release prerequisites passed.');
+    } else {
+      const report = await runReleaseCheck();
+      console.log(`Release check ${report.status}. Report written to .release-checks/latest.md`);
+      process.exitCode = report.status === 'pass' ? 0 : 1;
+    }
   } catch (error) {
     console.error(error);
     process.exitCode = 1;

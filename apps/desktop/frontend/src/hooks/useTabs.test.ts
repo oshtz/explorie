@@ -127,4 +127,21 @@ describe('useTabs', () => {
     expect(result.current.activeTabId).toBe('tab-a');
     expect(setCurrentPath).toHaveBeenCalledWith('/a');
   });
+
+  it('reorders tabs without changing the active tab', () => {
+    localStorage.setItem(
+      'explorie:tabs',
+      JSON.stringify([
+        { id: 'tab-a', path: '/a' },
+        { id: 'tab-b', path: '/b' },
+      ])
+    );
+    localStorage.setItem('explorie:activeTabId', 'tab-a');
+    const { result } = renderTabs({ currentPath: '/a' });
+
+    act(() => result.current.reorderTabs('tab-a', 'tab-b'));
+
+    expect(result.current.tabs.map((tab) => tab.id)).toEqual(['tab-b', 'tab-a']);
+    expect(result.current.activeTabId).toBe('tab-a');
+  });
 });

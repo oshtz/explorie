@@ -47,13 +47,6 @@ export type ThemeSpec = {
   borderRadius: BorderRadius;
   iconSize: number;
   reduceMotion: boolean;
-  fonts?: ImportedFont[];
-};
-
-export type ImportedFont = {
-  id: string;
-  name: string;
-  href: string;
 };
 
 export type FavoriteItem = {
@@ -125,8 +118,6 @@ export interface FileSlice {
   filterMode: 'all' | 'folders' | 'files';
   showFolderSizes: boolean;
   previewExecutableScripts: boolean;
-  enableDnDLargeLists: boolean;
-  devMockEntries: boolean;
   confirmBeforeDelete: boolean;
   sortKey: SortKey;
   sortDir: SortDir;
@@ -134,6 +125,8 @@ export interface FileSlice {
   editingId: string | null;
   draftNew: { id: string; parentPath: string; name: string } | null;
   clipboard: { mode: 'copy' | 'cut'; items: FileEntry[]; sourcePath: string } | null;
+  selectedPaths: string[];
+  selectionCursorPath: string | null;
   setPathStack: (stack: string[]) => void;
   setFiles: (files: FileEntry[] | ((prev: FileEntry[]) => FileEntry[])) => void;
   setLoading: (loading: boolean) => void;
@@ -144,8 +137,6 @@ export interface FileSlice {
   setFilterMode: (mode: 'all' | 'folders' | 'files') => void;
   setShowFolderSizes: (show: boolean) => void;
   setPreviewExecutableScripts: (allow: boolean) => void;
-  setEnableDnDLargeLists: (v: boolean) => void;
-  setDevMockEntries: (v: boolean) => void;
   setConfirmBeforeDelete: (v: boolean) => void;
   setSort: (key: SortKey) => void;
   setSortDir: (dir: SortDir) => void;
@@ -154,6 +145,9 @@ export interface FileSlice {
   setClipboard: (
     clip: { mode: 'copy' | 'cut'; items: FileEntry[]; sourcePath: string } | null
   ) => void;
+  setSelectedPaths: (paths: string[]) => void;
+  setSelectionCursorPath: (path: string | null) => void;
+  clearSelection: () => void;
 }
 
 export interface UISlice {
@@ -172,14 +166,9 @@ export interface UISlice {
   reduceMotion: boolean;
   highContrast: boolean;
   enableErrorReporting: boolean;
-  importedFonts: ImportedFont[];
   showPreviewPanel: boolean;
   showStatusBar: boolean;
   themes: Record<string, ThemeSpec>;
-  defaultExplorerSupported: boolean;
-  defaultExplorerEnabled: boolean | null;
-  defaultExplorerLoading: boolean;
-  defaultExplorerError: string | null;
   setViewMode: (mode: ViewMode) => void;
   setTheme: (theme: ThemeMode) => void;
   setAccent: (accent: AccentColor) => void;
@@ -195,14 +184,8 @@ export interface UISlice {
   setReduceMotion: (v: boolean) => void;
   setHighContrast: (v: boolean) => void;
   setEnableErrorReporting: (v: boolean) => void;
-  addImportedFont: (font: ImportedFont) => void;
-  removeImportedFont: (id: string) => void;
   setShowPreviewPanel: (show: boolean) => void;
   setShowStatusBar: (show: boolean) => void;
-  refreshDefaultExplorer: () => Promise<boolean | null>;
-  makeDefaultExplorer: () => Promise<void>;
-  revertDefaultExplorer: () => Promise<void>;
-  clearDefaultExplorerError: () => void;
   saveTheme: (name: string, spec?: ThemeSpec) => void;
   deleteTheme: (name: string) => void;
   applyThemeSpec: (spec: ThemeSpec) => void;

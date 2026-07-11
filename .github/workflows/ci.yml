@@ -2,13 +2,16 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
   pull_request:
     branches: [main, dev]
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
 jobs:
   test-frontend:
@@ -22,14 +25,14 @@ jobs:
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
-          version: "9"
+          version: '9'
           run_install: false
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
-          cache: "pnpm"
+          node-version: '20'
+          cache: 'pnpm'
           cache-dependency-path: pnpm-lock.yaml
 
       - name: Install dependencies
@@ -65,7 +68,7 @@ jobs:
 
   test-rust:
     name: Rust Tests & Coverage
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
 
     steps:
       - name: Checkout repository
@@ -80,18 +83,18 @@ jobs:
       - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:
-          workspaces: "./ -> target"
+          workspaces: './ -> target'
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
-      - name: Install system dependencies (Linux)
+      - name: Prepare native dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libglib2.0-dev libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xvfb ffmpeg
+          node scripts/prepare-rclone.mjs
+          node scripts/prepare-winfsp.mjs
 
       - name: Run tests with coverage
-        run: xvfb-run --auto-servernum cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
+        run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
 
       - name: Upload coverage report
         uses: actions/upload-artifact@v4
@@ -101,6 +104,7 @@ jobs:
           retention-days: 30
 
       - name: Coverage summary
+        shell: bash
         run: |
           echo "## Rust Coverage Report" >> $GITHUB_STEP_SUMMARY
           if [ -f lcov.info ]; then
@@ -109,8 +113,8 @@ jobs:
             echo "Coverage report not generated" >> $GITHUB_STEP_SUMMARY
           fi
 
-  lint:
-    name: Lint & Type Check
+  test-e2e:
+    name: Playwright E2E
     runs-on: ubuntu-latest
 
     steps:
@@ -120,14 +124,48 @@ jobs:
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
-          version: "9"
+          version: '9'
           run_install: false
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
-          cache: "pnpm"
+          node-version: '20'
+          cache: 'pnpm'
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Chromium
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Run Playwright on an isolated port
+        env:
+          CI: '1'
+          PLAYWRIGHT_BASE_URL: http://127.0.0.1:47173
+          PLAYWRIGHT_WEB_COMMAND: pnpm --filter explorie-desktop exec vite --host 127.0.0.1 --port 47173 --strictPort
+        run: pnpm exec playwright test
+
+  lint:
+    name: Lint & Type Check
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: '9'
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'pnpm'
           cache-dependency-path: pnpm-lock.yaml
 
       - name: Setup Rust
@@ -136,13 +174,13 @@ jobs:
           toolchain: stable
           components: clippy, rustfmt
 
-      - name: Install system dependencies (Linux)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libglib2.0-dev libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev
-
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      - name: Prepare native dependencies
+        run: |
+          node scripts/prepare-rclone.mjs
+          node scripts/prepare-winfsp.mjs
 
       - name: TypeScript type check
         run: pnpm --filter explorie-desktop exec tsc --noEmit
@@ -159,6 +197,9 @@ jobs:
       - name: Rust clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+      - name: Release workflow tests
+        run: pnpm release:check:test
+
   security:
     name: Security Audit
     runs-on: ubuntu-latest
@@ -170,14 +211,14 @@ jobs:
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
-          version: "9"
+          version: '9'
           run_install: false
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
-          cache: "pnpm"
+          node-version: '20'
+          cache: 'pnpm'
           cache-dependency-path: pnpm-lock.yaml
 
       - name: Setup Rust
@@ -193,10 +234,12 @@ jobs:
 
       - name: Run cargo audit
         run: |
+          set -o pipefail
           echo "## Rust Security Audit" >> $GITHUB_STEP_SUMMARY
-          cargo audit 2>&1 | tee -a $GITHUB_STEP_SUMMARY || true
+          cargo audit 2>&1 | tee -a $GITHUB_STEP_SUMMARY
 
       - name: Run pnpm audit
         run: |
+          set -o pipefail
           echo "## Node.js Security Audit" >> $GITHUB_STEP_SUMMARY
-          pnpm audit --audit-level=moderate 2>&1 | tee -a $GITHUB_STEP_SUMMARY || true
+          pnpm audit --audit-level=moderate 2>&1 | tee -a $GITHUB_STEP_SUMMARY

@@ -132,7 +132,6 @@ test('opens Quick Look from Space and shows the file info drawer', async ({ page
   await expect(quickLook).toBeVisible();
   await expect(quickLook.getByText('MD file')).toBeVisible();
   await expect(quickLook.getByText('1.2 KB')).toBeVisible();
-  await expect(quickLook.getByRole('tablist', { name: 'Preview tabs' })).toHaveCount(0);
   await expect(quickLook).toContainText('Playwright proves preview rendering.');
 
   await quickLook.getByRole('button', { name: 'Show file info' }).click();
@@ -164,7 +163,7 @@ test('navigates into folders and back with the up button', async ({ page }) => {
   await openApp(page);
 
   const rows = tableRows(page);
-  await dblclickRow(rows, 'Projects');
+  await openFolderRow(rows, 'Projects');
 
   await expect(rows.filter({ hasText: 'sprint-notes.txt' })).toHaveCount(1);
 
@@ -180,21 +179,27 @@ test('drags a file onto a folder to move it', async ({ page }) => {
   const targetRow = rows.filter({ hasText: 'Projects' }).first();
 
   const sourceBox = await sourceRow.boundingBox();
-  const targetBox = await targetRow.boundingBox();
   expect(sourceBox).not.toBeNull();
-  expect(targetBox).not.toBeNull();
 
   await page.mouse.move(sourceBox!.x + sourceBox!.width / 2, sourceBox!.y + sourceBox!.height / 2);
   await page.mouse.down();
+  await page.mouse.move(
+    sourceBox!.x + sourceBox!.width / 2 + 8,
+    sourceBox!.y + sourceBox!.height / 2
+  );
+  await expect(page.getByTestId('drag-overlay')).toBeVisible();
+  const targetBox = await targetRow.boundingBox();
+  expect(targetBox).not.toBeNull();
   await page.mouse.move(targetBox!.x + targetBox!.width / 2, targetBox!.y + targetBox!.height / 2, {
     steps: 8,
   });
+  await expect(targetRow).toHaveClass(/dropTargetRow/);
   await page.mouse.up();
 
   await expect(rows.filter({ hasText: 'manifest.json' })).toHaveCount(0);
   await expect(rows).toHaveCount(3);
 
-  await dblclickRow(rows, 'Projects');
+  await openFolderRow(rows, 'Projects');
   await expect(rows.filter({ hasText: 'manifest.json' })).toHaveCount(1);
 });
 
@@ -204,11 +209,10 @@ test('saves a search as a smart folder and reuses it', async ({ page }) => {
   const searchInput = page.getByPlaceholder('Search');
   await searchInput.fill('manifest');
 
-  page.once('dialog', async (dialog) => {
-    await dialog.accept('Manifest Search');
-  });
-
   await page.getByTitle('Save as Smart Folder').click();
+  const saveSearch = page.getByRole('dialog', { name: 'Save search' });
+  await saveSearch.getByRole('textbox', { name: 'Name' }).fill('Manifest Search');
+  await saveSearch.getByRole('button', { name: 'Save' }).click();
   await expect(page.getByLabel('Open Manifest Search')).toBeVisible();
 
   await page.getByTitle('Clear search').click();
@@ -231,7 +235,7 @@ test('saves and loads workspaces from the command palette', async ({ page }) => 
   await manager.getByText('Close', { exact: true }).click();
 
   const rows = tableRows(page);
-  await dblclickRow(rows, 'Projects');
+  await openFolderRow(rows, 'Projects');
   await expect(rows.filter({ hasText: 'sprint-notes.txt' })).toHaveCount(1);
 
   await openWorkspaceManager(page);
@@ -247,7 +251,10 @@ test('opens batch rename preview from the context menu', async ({ page }) => {
   await openApp(page);
 
   await page.getByRole('button', { name: 'Change view mode' }).click();
-  await page.getByRole('menuitemradio', { name: 'Grid' }).click();
+  await page
+    .getByRole('group', { name: 'View options' })
+    .getByRole('button', { name: 'Grid' })
+    .click();
 
   const readmeItem = page.getByLabel('Select file readme.md');
   const manifestItem = page.getByLabel('Select file manifest.json');
@@ -276,7 +283,8 @@ test('opens the create archive dialog from the context menu', async ({ page }) =
     .locator('td')
     .first()
     .click({ button: 'right' });
-  await page.getByText('Compress').click();
+  await page.getByRole('menuitem', { name: 'Advanced' }).click();
+  await page.getByRole('menuitem', { name: 'Compress' }).click();
 
   await expect(page.getByRole('heading', { name: 'Create Archive' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Create Archive' })).toBeEnabled();
@@ -293,7 +301,8 @@ test('shows archive contents when extracting', async ({ page }) => {
     .locator('td')
     .first()
     .click({ button: 'right' });
-  await page.getByText('Extract Here').click();
+  await page.getByRole('menuitem', { name: 'Advanced' }).click();
+  await page.getByRole('menuitem', { name: 'Extract Here' }).click();
 
   await expect(page.getByRole('heading', { name: 'Extract Archive' })).toBeVisible();
   await expect(page.getByText('docs/readme.md')).toBeVisible();
@@ -327,18 +336,19 @@ test('persists settings across reloads', async ({ page }) => {
   await openApp(page);
 
   await page.getByRole('button', { name: 'Settings' }).click();
-  await page.getByRole('tab', { name: 'General' }).click();
+  const settings = page.getByRole('dialog', { name: 'Settings' });
+  await settings.getByRole('button', { name: 'General' }).click();
   const folderSizesToggle = page.getByLabel('Show folder sizes');
   await folderSizesToggle.check();
-  await page.getByRole('button', { name: 'Close settings' }).click();
+  await settings.getByRole('button', { name: 'Close settings' }).click();
 
   await page.reload();
   await expect(page.getByPlaceholder('Search')).toBeVisible();
 
   await page.getByRole('button', { name: 'Settings' }).click();
-  await page.getByRole('tab', { name: 'General' }).click();
+  await settings.getByRole('button', { name: 'General' }).click();
   await expect(page.getByLabel('Show folder sizes')).toBeChecked();
-  await page.getByRole('button', { name: 'Close settings' }).click();
+  await settings.getByRole('button', { name: 'Close settings' }).click();
 });
 
 async function openApp(page: Page) {
@@ -365,9 +375,10 @@ async function clickRow(rows: ReturnType<typeof tableRows>, text: string) {
   await row.locator('td').first().click();
 }
 
-async function dblclickRow(rows: ReturnType<typeof tableRows>, text: string) {
+async function openFolderRow(rows: ReturnType<typeof tableRows>, text: string) {
   const row = rows.filter({ hasText: text }).first();
-  await row.locator('td').first().dblclick();
+  await row.focus();
+  await row.press('Enter');
 }
 
 async function bootstrapExplorie(page: Page) {
@@ -391,6 +402,7 @@ async function bootstrapExplorie(page: Page) {
       }
 
       const encoder = new TextEncoder();
+      const decoder = new TextDecoder();
       const fileContents: Record<string, Uint8Array> = {};
       for (const [filePath, text] of Object.entries(bootstrap.fileContents)) {
         fileContents[normalizePath(filePath)] = encoder.encode(text);
@@ -517,6 +529,60 @@ async function bootstrapExplorie(page: Page) {
         }
       };
 
+      const pathExists = (path: string) => {
+        const normalized = normalizePath(path);
+        return (
+          normalized in fileContents ||
+          normalized in entriesByDir ||
+          findEntry(normalized).entry !== null
+        );
+      };
+      const nextAvailablePath = (path: string) => {
+        const normalized = normalizePath(path);
+        const parent = getParentPath(normalized);
+        const name = getBaseName(normalized);
+        const extensionIndex = name.lastIndexOf('.');
+        const hasExtension = extensionIndex > 0;
+        const stem = hasExtension ? name.slice(0, extensionIndex) : name;
+        const extension = hasExtension ? name.slice(extensionIndex) : '';
+        let suffix = 2;
+        let candidate = `${parent}/${stem} (${suffix})${extension}`;
+        while (pathExists(candidate)) {
+          suffix += 1;
+          candidate = `${parent}/${stem} (${suffix})${extension}`;
+        }
+        return normalizePath(candidate);
+      };
+      const resolveTarget = (source: string, destination: string, policy: string) => {
+        const requested = normalizePath(`${destination}/${getBaseName(source)}`);
+        if (!pathExists(requested)) return requested;
+        if (policy === 'rename') return nextAvailablePath(requested);
+        if (policy === 'replace' && normalizePath(source) !== requested) {
+          removeEntryRecursive(requested);
+          return requested;
+        }
+        throw new Error(`Destination already exists: ${requested}`);
+      };
+      const copyFileEntry = (sourcePath: string, targetPath: string) => {
+        const source = normalizePath(sourcePath);
+        const target = normalizePath(targetPath);
+        const { entry } = findEntry(source);
+        if (!entry) throw new Error(`Source does not exist: ${source}`);
+        if (entry.is_dir) throw new Error('The Playwright native mock only copies files');
+        const targetDir = getParentPath(target);
+        ensureDir(targetDir);
+        entriesByDir[targetDir].push({
+          ...entry,
+          id: nextId(),
+          path: target,
+          name: getBaseName(target),
+          custom: { ...(entry.custom || {}) },
+        });
+        if (fileContents[source]) {
+          fileContents[target] = fileContents[source].slice();
+        }
+      };
+
       const globalWindow = window as Window &
         typeof globalThis & {
           __TAURI_INTERNALS__?: any;
@@ -525,7 +591,26 @@ async function bootstrapExplorie(page: Page) {
         };
       globalWindow.isTauri = true;
       const callbacks = new Map<string, { cb: (...args: any[]) => void; once: boolean }>();
+      const eventListeners = new Map<number, { event: string; handler: string }>();
       let callbackSeq = 0;
+      let eventSeq = 0;
+      let jobSeq = 0;
+      const activeJobs = new Set<string>();
+      const cancelledJobs = new Set<string>();
+
+      globalWindow.__TAURI_EVENT_PLUGIN_INTERNALS__ = {
+        unregisterListener(_event: string, eventId: number) {
+          eventListeners.delete(Number(eventId));
+        },
+      };
+
+      const emitMockEvent = (event: string, payload: Record<string, any>) => {
+        for (const [id, listener] of eventListeners) {
+          if (listener.event === event) {
+            globalWindow[listener.handler]?.({ event, id, payload });
+          }
+        }
+      };
 
       globalWindow.__TAURI_INTERNALS__ = {
         metadata: {
@@ -553,6 +638,14 @@ async function bootstrapExplorie(page: Page) {
               );
             case 'get_dir_size':
               return Promise.resolve(dirSizeMap[normalizedPath || initialPath] || 0);
+            case 'read_text_preview': {
+              const bytes = fileContents[normalizedPath || ''] || encode('');
+              const maxBytes = Math.max(0, Number(optionRecord.maxBytes) || 0);
+              return Promise.resolve({
+                text: decoder.decode(bytes.slice(0, maxBytes)),
+                truncated: bytes.length > maxBytes,
+              });
+            }
             case 'list_system_locations':
               return Promise.resolve(bootstrap.systemLocations);
             case 'list_archive':
@@ -593,14 +686,145 @@ async function bootstrapExplorie(page: Page) {
                 output_dir: normalizePath(optionRecord.outputDir || initialPath),
                 total_bytes: 5_000,
               });
-            case 'is_default_file_manager':
-              return Promise.resolve(false);
-            case 'set_default_file_manager':
-            case 'revert_default_file_manager':
             case 'create_explorie_schema':
             case 'update_custom_fields':
             case 'open_path':
               return Promise.resolve(null);
+            case 'rename_path': {
+              const source = normalizePath(String(optionRecord.sourcePath || ''));
+              const requested = normalizePath(
+                `${getParentPath(source)}/${String(optionRecord.newBaseName || '')}`
+              );
+              const destination = pathExists(requested) ? nextAvailablePath(requested) : requested;
+              renameEntry(source, destination);
+              return Promise.resolve(destination);
+            }
+            case 'delete_path_permanently': {
+              removeEntryRecursive(normalizePath(String(optionRecord.path || '')));
+              return Promise.resolve(null);
+            }
+            case 'create_folder':
+            case 'create_note':
+            case 'create_website_link': {
+              const directory = normalizePath(String(optionRecord.dirPath || ''));
+              const requested = normalizePath(
+                `${directory}/${String(optionRecord.baseName || '')}`
+              );
+              const created = pathExists(requested) ? nextAvailablePath(requested) : requested;
+              if (command === 'create_folder') {
+                upsertDirEntry(created);
+                ensureDir(created);
+              } else {
+                const contents =
+                  command === 'create_note'
+                    ? '# New Note\n'
+                    : `[InternetShortcut]\nURL=${String(optionRecord.url || '')}\n`;
+                const bytes = encode(contents);
+                fileContents[created] = bytes;
+                upsertFileEntry(created, bytes.length);
+              }
+              return Promise.resolve(created);
+            }
+            case 'plugin:event|listen': {
+              const eventId = ++eventSeq;
+              eventListeners.set(eventId, {
+                event: String(optionRecord.event),
+                handler: String(optionRecord.handler),
+              });
+              return Promise.resolve(eventId);
+            }
+            case 'plugin:event|unlisten':
+              eventListeners.delete(Number(optionRecord.eventId));
+              return Promise.resolve(null);
+            case 'start_file_operation': {
+              const request = optionRecord.request || {};
+              const sources = Array.isArray(request.sources)
+                ? request.sources.map((source: unknown) => normalizePath(String(source)))
+                : [];
+              const jobId = `pw-job-${++jobSeq}`;
+              activeJobs.add(jobId);
+
+              setTimeout(() => {
+                const entries = sources.map((source: string) => findEntry(source).entry);
+                const totalBytes = entries.reduce(
+                  (sum: number, entry: Record<string, any> | null) =>
+                    sum + Number(entry?.size || 0),
+                  0
+                );
+                const progress = {
+                  processedEntries: 0,
+                  totalEntries: sources.length,
+                  processedBytes: 0,
+                  totalBytes,
+                  currentPath: sources[0] || null,
+                };
+                emitMockEvent('file-operation', { jobId, state: 'running', progress });
+
+                if (cancelledJobs.has(jobId)) {
+                  activeJobs.delete(jobId);
+                  emitMockEvent('file-operation', { jobId, state: 'cancelled' });
+                  return;
+                }
+
+                try {
+                  const targets: string[] = [];
+                  for (const source of sources) {
+                    if (request.kind === 'trash') {
+                      if (!pathExists(source)) throw new Error(`Source does not exist: ${source}`);
+                      removeEntryRecursive(source);
+                    } else {
+                      if (typeof request.destination !== 'string') {
+                        throw new Error('A destination is required');
+                      }
+                      const target = resolveTarget(
+                        source,
+                        normalizePath(request.destination),
+                        String(request.conflictPolicy || 'error')
+                      );
+                      if (request.kind === 'copy') {
+                        copyFileEntry(source, target);
+                      } else if (request.kind === 'move') {
+                        renameEntry(source, target);
+                      } else {
+                        throw new Error(`Unsupported operation: ${String(request.kind)}`);
+                      }
+                      targets.push(target);
+                    }
+                  }
+                  activeJobs.delete(jobId);
+                  const result = {
+                    processedEntries: sources.length,
+                    processedBytes: totalBytes,
+                    targets,
+                  };
+                  emitMockEvent('file-operation', {
+                    jobId,
+                    state: 'completed',
+                    progress: {
+                      ...progress,
+                      processedEntries: sources.length,
+                      processedBytes: totalBytes,
+                      currentPath: sources.at(-1) || null,
+                    },
+                    result,
+                  });
+                } catch (error) {
+                  activeJobs.delete(jobId);
+                  emitMockEvent('file-operation', {
+                    jobId,
+                    state: 'failed',
+                    error: error instanceof Error ? error.message : String(error),
+                  });
+                }
+              }, 0);
+
+              return Promise.resolve(jobId);
+            }
+            case 'cancel_file_operation': {
+              const jobId = String(optionRecord.jobId || '');
+              if (activeJobs.has(jobId)) cancelledJobs.add(jobId);
+              return Promise.resolve(activeJobs.has(jobId));
+            }
           }
 
           if (command === 'plugin:fs|read_text_file' || command === 'plugin:fs|read_file') {
@@ -640,59 +864,6 @@ async function bootstrapExplorie(page: Page) {
               children: entry.is_dir ? [] : undefined,
             }));
             return Promise.resolve(entries);
-          }
-
-          if (command === 'plugin:fs|mkdir') {
-            const key = normalizedPath || optionRecord.path;
-            if (typeof key === 'string') {
-              upsertDirEntry(key);
-              ensureDir(key);
-            }
-            return Promise.resolve(null);
-          }
-
-          if (command === 'plugin:fs|rename') {
-            const from = optionRecord.from || optionRecord.oldPath || optionRecord.path;
-            const to = optionRecord.to || optionRecord.newPath;
-            if (typeof from === 'string' && typeof to === 'string') {
-              renameEntry(from, to);
-            }
-            return Promise.resolve(null);
-          }
-
-          if (command === 'plugin:fs|remove') {
-            const key = normalizedPath || optionRecord.path;
-            if (typeof key === 'string') {
-              removeEntryRecursive(key);
-            }
-            return Promise.resolve(null);
-          }
-
-          if (command === 'plugin:fs|write_file' || command === 'plugin:fs|write_text_file') {
-            const key = normalizedPath || optionRecord.path;
-            const payload =
-              options instanceof Uint8Array || Array.isArray(options)
-                ? options
-                : (optionRecord.contents ??
-                  optionRecord.data ??
-                  optionRecord.bytes ??
-                  optionRecord.content ??
-                  '');
-            let bytes: Uint8Array;
-            if (typeof payload === 'string') {
-              bytes = encode(payload);
-            } else if (payload instanceof Uint8Array) {
-              bytes = payload;
-            } else if (Array.isArray(payload)) {
-              bytes = new Uint8Array(payload);
-            } else {
-              bytes = encode(String(payload));
-            }
-            if (typeof key === 'string') {
-              fileContents[normalizePath(key)] = bytes;
-              upsertFileEntry(key, bytes.length);
-            }
-            return Promise.resolve(null);
           }
 
           if (command.startsWith('plugin:fs|')) {

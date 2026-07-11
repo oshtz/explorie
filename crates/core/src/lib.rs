@@ -45,19 +45,20 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
-use std::fs;
-use std::io;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 use std::time::SystemTime;
 
 use rayon::prelude::*;
-use tracing::{debug, warn};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
 pub mod archive;
 pub use archive::*;
+mod file_operations;
+pub use file_operations::*;
 
 /// Represents a file or directory entry in explorie.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,6 +97,8 @@ struct CustomFieldsCache {
 }
 
 static CUSTOM_FIELDS_CACHE: OnceLock<RwLock<CustomFieldsCache>> = OnceLock::new();
+// ponytail: one process-wide lock; use per-directory locks only after measured contention.
+static CUSTOM_FIELDS_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn custom_fields_cache() -> &'static RwLock<CustomFieldsCache> {
     CUSTOM_FIELDS_CACHE.get_or_init(|| {
@@ -106,15 +109,29 @@ fn custom_fields_cache() -> &'static RwLock<CustomFieldsCache> {
     })
 }
 
-/// Load custom fields from .explorie.json file in a directory
-fn load_custom_fields(dir_path: &Path) -> HashMap<String, HashMap<String, serde_json::Value>> {
+fn custom_fields_write_lock() -> &'static Mutex<()> {
+    CUSTOM_FIELDS_WRITE_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn invalidate_custom_fields_cache(path: &Path) {
+    let mut cache = custom_fields_cache()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    cache.entries.remove(path);
+    cache.order.retain(|cached| cached != path);
+}
+
+/// Load custom fields from .explorie.json file in a directory.
+///
+/// Invalid metadata is returned to the caller instead of being treated as an
+/// empty schema; silently doing that would allow the next update to erase it.
+fn load_custom_fields(
+    dir_path: &Path,
+) -> io::Result<HashMap<String, HashMap<String, serde_json::Value>>> {
     let explorie_json_path = dir_path.join(".explorie.json");
     if !explorie_json_path.exists() {
-        if let Ok(mut cache) = custom_fields_cache().write() {
-            cache.entries.remove(&explorie_json_path);
-            cache.order.retain(|path| path != &explorie_json_path);
-        }
-        return HashMap::new();
+        invalidate_custom_fields_cache(&explorie_json_path);
+        return Ok(HashMap::new());
     }
 
     let modified = fs::metadata(&explorie_json_path)
@@ -123,33 +140,20 @@ fn load_custom_fields(dir_path: &Path) -> HashMap<String, HashMap<String, serde_
 
     if let Ok(cache) = custom_fields_cache().read()
         && let Some(entry) = cache.entries.get(&explorie_json_path)
+        && modified.is_some()
         && entry.modified == modified
     {
-        return entry.fields.clone();
+        return Ok(entry.fields.clone());
     }
 
+    let content = fs::read_to_string(&explorie_json_path)?;
     let parsed: HashMap<String, HashMap<String, serde_json::Value>> =
-        match fs::read_to_string(&explorie_json_path) {
-            Ok(content) => match serde_json::from_str(&content) {
-                Ok(json) => json,
-                Err(e) => {
-                    warn!(
-                        path = ?explorie_json_path,
-                        error = %e,
-                        "Error parsing .explorie.json"
-                    );
-                    return HashMap::new();
-                }
-            },
-            Err(e) => {
-                debug!(
-                    path = ?explorie_json_path,
-                    error = %e,
-                    "Could not read .explorie.json (may not exist)"
-                );
-                return HashMap::new();
-            }
-        };
+        serde_json::from_str(&content).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Invalid {}: {error}", explorie_json_path.display()),
+            )
+        })?;
 
     if let Ok(mut cache) = custom_fields_cache().write() {
         if cache.entries.len() >= CUSTOM_FIELDS_CACHE_LIMIT
@@ -168,7 +172,76 @@ fn load_custom_fields(dir_path: &Path) -> HashMap<String, HashMap<String, serde_
         );
     }
 
-    parsed
+    Ok(parsed)
+}
+
+#[cfg(windows)]
+fn atomic_replace(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::iter;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let source: Vec<u16> = source
+        .as_os_str()
+        .encode_wide()
+        .chain(iter::once(0))
+        .collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(iter::once(0))
+        .collect();
+    let result = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn atomic_replace(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(source, destination)
+}
+
+fn write_custom_fields_atomic(
+    dir_path: &Path,
+    fields: &HashMap<String, HashMap<String, serde_json::Value>>,
+) -> io::Result<()> {
+    let destination = dir_path.join(".explorie.json");
+    let temporary = dir_path.join(format!(".explorie.{}.tmp", Uuid::new_v4()));
+    let bytes = serde_json::to_vec_pretty(fields)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        drop(file);
+        atomic_replace(&temporary, &destination)?;
+        invalidate_custom_fields_cache(&destination);
+
+        #[cfg(unix)]
+        fs::File::open(dir_path)?.sync_all()?;
+
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 /// Check if a file has extended attributes (macOS xattrs, Windows ADS).
@@ -259,22 +332,77 @@ fn has_extended_attributes(path: &Path) -> bool {
 /// println!("Total size: {} bytes", size);
 /// ```
 pub fn dir_size(path: &Path) -> io::Result<u64> {
-    if path.is_file() {
-        return Ok(fs::metadata(path).map(|md| md.len()).unwrap_or(0));
+    let root_metadata = fs::symlink_metadata(path)?;
+    if is_link_metadata(&root_metadata) {
+        return Ok(0);
+    }
+    if root_metadata.is_file() {
+        return Ok(root_metadata.len());
     }
 
-    let total = WalkDir::new(path)
-        .into_iter()
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| {
-            let ft = entry.file_type();
-            !ft.is_symlink() && ft.is_file()
-        })
-        .par_bridge()
-        .map(|entry| entry.metadata().map(|md| md.len()).unwrap_or(0))
-        .sum();
+    let mut total: u64 = 0;
+    let mut entries = WalkDir::new(path).follow_links(false).into_iter();
+    while let Some(entry) = entries.next() {
+        let entry = entry.map_err(io::Error::other)?;
+        let metadata = entry.path().symlink_metadata()?;
+        if is_link_metadata(&metadata) {
+            if metadata.is_dir() {
+                entries.skip_current_dir();
+            }
+        } else if metadata.is_file() {
+            total = total.saturating_add(metadata.len());
+        }
+    }
 
     Ok(total)
+}
+
+/// Return the recursive entry count and byte size without following links.
+pub fn dir_info(path: &Path) -> io::Result<(u64, u64)> {
+    let metadata = fs::symlink_metadata(path)?;
+    if is_link_metadata(&metadata) || !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "directory info requires a real directory",
+        ));
+    }
+    fs::read_dir(path)?;
+
+    let mut count = 0;
+    let mut size = 0;
+    let mut entries = WalkDir::new(path).follow_links(false).into_iter();
+    let _ = entries.next();
+    while let Some(entry) = entries.next() {
+        let entry = entry.map_err(io::Error::other)?;
+        count += 1;
+        let metadata = entry.path().symlink_metadata()?;
+        if is_link_metadata(&metadata) {
+            if metadata.is_dir() {
+                entries.skip_current_dir();
+            }
+        } else if metadata.is_file() {
+            size += metadata.len();
+        }
+    }
+    Ok((count, size))
+}
+
+fn is_link_metadata(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }
 
 /// List all files and directories in the given path.
@@ -317,10 +445,10 @@ pub fn dir_size(path: &Path) -> io::Result<u64> {
 /// ```
 pub fn list_dir_with_sizes(path: &Path, calc_dir_size: bool) -> io::Result<Vec<FileEntry>> {
     // Load custom fields from .explorie.json if it exists
-    let custom_fields = load_custom_fields(path);
-    let dir_entries: Vec<fs::DirEntry> = fs::read_dir(path)?.collect::<Result<_, _>>()?;
+    let custom_fields = load_custom_fields(path)?;
+    let dir_entries: Vec<fs::DirEntry> = fs::read_dir(path)?.collect::<io::Result<_>>()?;
 
-    let results: Vec<Option<FileEntry>> = dir_entries
+    let results: Vec<io::Result<Option<FileEntry>>> = dir_entries
         .into_par_iter()
         .map(|entry| -> io::Result<Option<FileEntry>> {
             let file_name = entry.file_name();
@@ -357,20 +485,20 @@ pub fn list_dir_with_sizes(path: &Path, calc_dir_size: bool) -> io::Result<Vec<F
             // Check for extended attributes
             let has_xattrs = has_extended_attributes(&entry.path());
 
-            // Get regular metadata (follows links)
-            let metadata = entry.metadata()?;
+            // Use link metadata throughout so dangling links remain listable and
+            // directory links are never traversed as real directories.
+            let metadata = symlink_meta;
             let file_type = metadata.file_type();
-            let is_dir = file_type.is_dir();
+            let is_dir = !is_symlink && !is_junction && file_type.is_dir();
 
             // Calculate size - don't follow symlinks/junctions for size calculation
             let size = if is_symlink || is_junction {
                 // For links, just use the link's own size
-                symlink_meta.len()
+                metadata.len()
             } else if file_type.is_file() {
                 metadata.len()
             } else if is_dir && calc_dir_size {
-                // Compute recursive directory size; ignore errors by treating as 0
-                dir_size(&entry.path()).unwrap_or(0)
+                dir_size(&entry.path())?
             } else {
                 0
             };
@@ -414,9 +542,14 @@ pub fn list_dir_with_sizes(path: &Path, calc_dir_size: bool) -> io::Result<Vec<F
                 has_xattrs,
             }))
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect();
 
-    Ok(results.into_iter().flatten().collect())
+    Ok(results
+        .into_iter()
+        .collect::<io::Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect())
 }
 
 /// List directory contents without calculating folder sizes.
@@ -466,10 +599,10 @@ pub fn create_explorie_schema(
     dir_path: &Path,
     fields: HashMap<String, HashMap<String, serde_json::Value>>,
 ) -> io::Result<()> {
-    let explorie_json_path = dir_path.join(".explorie.json");
-    let json_content = serde_json::to_string_pretty(&fields)?;
-    fs::write(explorie_json_path, json_content)?;
-    Ok(())
+    let _guard = custom_fields_write_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    write_custom_fields_atomic(dir_path, &fields)
 }
 
 /// Update custom fields for a specific file in `.explorie.json`.
@@ -509,25 +642,28 @@ pub fn update_custom_fields(
     custom_fields: HashMap<String, serde_json::Value>,
 ) -> io::Result<()> {
     let explorie_json_path = dir_path.join(".explorie.json");
+    let _guard = custom_fields_write_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     // Load existing schema or create empty one
-    let mut schema = if explorie_json_path.exists() {
-        match fs::read_to_string(&explorie_json_path) {
-            Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-            Err(_) => HashMap::new(),
-        }
-    } else {
-        HashMap::new()
-    };
+    let mut schema: HashMap<String, HashMap<String, serde_json::Value>> =
+        if explorie_json_path.exists() {
+            let content = fs::read_to_string(&explorie_json_path)?;
+            serde_json::from_str(&content).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Invalid {}: {error}", explorie_json_path.display()),
+                )
+            })?
+        } else {
+            HashMap::new()
+        };
 
     // Update the fields for this file
     schema.insert(file_name.to_string(), custom_fields);
 
-    // Write back to disk
-    let json_content = serde_json::to_string_pretty(&schema)?;
-    fs::write(explorie_json_path, json_content)?;
-
-    Ok(())
+    write_custom_fields_atomic(dir_path, &schema)
 }
 
 #[cfg(test)]
@@ -605,7 +741,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn test_dir_size_permission_denied() {
+    fn recursive_inspection_reports_unreadable_entries() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp_dir = TempDir::new().unwrap();
@@ -625,12 +761,25 @@ mod tests {
         perms.set_mode(0o000);
         fs::set_permissions(&blocked_dir, perms).unwrap();
 
-        let size = dir_size(root).unwrap();
-        assert_eq!(size, 2);
+        // Elevated test runners can still read mode-000 directories.
+        if fs::read_dir(&blocked_dir).is_ok() {
+            let mut restore = fs::metadata(&blocked_dir).unwrap().permissions();
+            restore.set_mode(0o755);
+            fs::set_permissions(&blocked_dir, restore).unwrap();
+            return;
+        }
+
+        let size_result = dir_size(root);
+        let info_result = dir_info(root);
+        let listing_result = list_dir_with_sizes(root, true);
 
         let mut restore = fs::metadata(&blocked_dir).unwrap().permissions();
         restore.set_mode(0o755);
         fs::set_permissions(&blocked_dir, restore).unwrap();
+
+        assert!(size_result.is_err());
+        assert!(info_result.is_err());
+        assert!(listing_result.is_err());
     }
 
     #[cfg(unix)]
@@ -643,11 +792,11 @@ mod tests {
         let data_dir = root.join("data");
         fs::create_dir(&data_dir).unwrap();
 
-        let file_path = data_dir.join("file.txt");
-        fs::write(&file_path, b"abc").unwrap();
-
         let link_path = data_dir.join("loop");
         symlink(root, &link_path).unwrap();
+
+        let file_path = data_dir.join("file.txt");
+        fs::write(&file_path, b"abc").unwrap();
 
         let size = dir_size(root).unwrap();
         assert_eq!(size, 3);

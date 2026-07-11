@@ -4,7 +4,7 @@ import styles from './SecureDeleteDialog.module.css';
 import { Icon } from './Icon';
 import type { FileEntry } from '../store/types';
 import { formatBytes } from '../operationQueueStore';
-import { isTrashPath, getTrashPath } from '../utils/trash';
+import { createFocusTrap } from '../utils/accessibility';
 
 export interface SecureDeleteDialogProps {
   /** Whether the dialog is open */
@@ -38,27 +38,9 @@ export function SecureDeleteDialog({
   onDontAskAgainChange,
 }: SecureDeleteDialogProps) {
   const dialogRef = useRef<HTMLDivElement>(null);
-  const confirmButtonRef = useRef<HTMLButtonElement>(null);
+  const focusTrapRef = useRef<ReturnType<typeof createFocusTrap> | null>(null);
   const [dontAskAgain, setDontAskAgain] = useState(false);
   const [dirInfoMap, setDirInfoMap] = useState<Map<string, DirInfo>>(new Map());
-  const [trashPath, setTrashPath] = useState<string | null>(null);
-
-  // Determine if any files are from trash (permanent delete only)
-  const filesInTrash = useMemo(() => {
-    if (!trashPath) return [];
-    return files.filter((f) => isTrashPath(f.path, trashPath));
-  }, [files, trashPath]);
-
-  const allInTrash = filesInTrash.length === files.length && files.length > 0;
-  const someInTrash = filesInTrash.length > 0 && filesInTrash.length < files.length;
-
-  // Get trash path on mount
-  useEffect(() => {
-    if (!open) return;
-    getTrashPath()
-      .then(setTrashPath)
-      .catch(() => setTrashPath(null));
-  }, [open]);
 
   // Load directory info for non-empty folders
   useEffect(() => {
@@ -119,11 +101,15 @@ export function SecureDeleteDialog({
     };
   }, [open, files]);
 
-  // Focus the confirm button when dialog opens
   useEffect(() => {
-    if (open && confirmButtonRef.current) {
-      confirmButtonRef.current.focus();
-    }
+    if (!open || !dialogRef.current) return;
+    const trap = createFocusTrap(dialogRef.current);
+    focusTrapRef.current = trap;
+    trap.activate();
+    return () => {
+      focusTrapRef.current = null;
+      trap.deactivate();
+    };
   }, [open]);
 
   // Handle escape key
@@ -220,13 +206,14 @@ export function SecureDeleteDialog({
         aria-modal="true"
         aria-labelledby="secure-delete-title"
         aria-describedby="secure-delete-desc"
+        onKeyDown={(e) => focusTrapRef.current?.handleKeyDown(e)}
       >
         <div className={styles.header}>
           <h2 id="secure-delete-title" className={styles.title}>
             <span className={styles.warningIcon}>
               <Icon name="alert" size={18} />
             </span>
-            {allInTrash ? 'Permanently Delete' : 'Delete Items'}
+            Delete Items
           </h2>
         </div>
 
@@ -276,8 +263,6 @@ export function SecureDeleteDialog({
             {files.slice(0, 10).map((file) => {
               const name = file.name || file.path.split(/[/\\]/).pop() || file.path;
               const info = file.is_dir ? dirInfoMap.get(file.path) : null;
-              const inTrash = trashPath ? isTrashPath(file.path, trashPath) : false;
-
               return (
                 <div key={file.id || file.path} className={styles.fileItem}>
                   <Icon name={file.is_dir ? 'folder' : 'file'} size={14} />
@@ -293,7 +278,6 @@ export function SecureDeleteDialog({
                   {!file.is_dir && file.size !== undefined && file.size > 0 && (
                     <span className={styles.fileSize}>{formatBytes(file.size)}</span>
                   )}
-                  {inTrash && <span className={styles.trashBadge}>In Trash</span>}
                 </div>
               );
             })}
@@ -303,7 +287,7 @@ export function SecureDeleteDialog({
           </div>
 
           {/* Warnings */}
-          {hasNonEmptyDirs && !allInTrash && (
+          {hasNonEmptyDirs && (
             <div className={styles.warning}>
               <Icon name="alert" size={14} />
               <span>
@@ -312,29 +296,11 @@ export function SecureDeleteDialog({
             </div>
           )}
 
-          {someInTrash && (
-            <div className={styles.warning}>
-              <Icon name="alert" size={14} />
-              <span>
-                {filesInTrash.length} {filesInTrash.length === 1 ? 'item is' : 'items are'} already
-                in Trash and will be permanently deleted.
-              </span>
-            </div>
-          )}
-
           {/* Info about trash */}
-          {!allInTrash && (
-            <p id="secure-delete-desc" className={styles.description}>
-              Items moved to Trash can be restored later. Use "Delete Permanently" to bypass Trash.
-            </p>
-          )}
-
-          {allInTrash && (
-            <p id="secure-delete-desc" className={styles.descriptionWarning}>
-              These items are already in Trash. Deleting them will remove them permanently and
-              cannot be undone.
-            </p>
-          )}
+          <p id="secure-delete-desc" className={styles.description}>
+            Items moved to the operating system Trash can be restored later. Use "Delete
+            Permanently" to bypass Trash.
+          </p>
 
           {showDontAskAgain && (
             <label className={styles.checkboxLabel}>
@@ -353,19 +319,16 @@ export function SecureDeleteDialog({
           <button className={styles.cancelButton} onClick={onCancel}>
             Cancel
           </button>
-          {!allInTrash && (
-            <button
-              ref={confirmButtonRef}
-              className={styles.trashButton}
-              onClick={handleMoveToTrash}
-              disabled={isLoading}
-            >
-              <Icon name="trash" size={14} />
-              Move to Trash
-            </button>
-          )}
           <button
-            ref={allInTrash ? confirmButtonRef : undefined}
+            data-autofocus
+            className={styles.trashButton}
+            onClick={handleMoveToTrash}
+            disabled={isLoading}
+          >
+            <Icon name="trash" size={14} />
+            Move to Trash
+          </button>
+          <button
             className={styles.deleteButton}
             onClick={handlePermanentDelete}
             disabled={isLoading}

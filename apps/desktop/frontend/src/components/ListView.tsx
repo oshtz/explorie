@@ -8,6 +8,7 @@ import styles from './ListView.module.css';
 import { Icon } from './Icon';
 import { useShallow } from 'zustand/shallow';
 import type { GetSelectedFilesFunction } from '../hooks/useKeyboardClipboard';
+import type { DragStartHandler } from '../hooks/useDragStart';
 
 /**
  * Props for the ListView component.
@@ -25,10 +26,10 @@ interface ListViewProps {
   dragCombineTargetId?: string | null;
   /** Whether a drag operation is currently in progress */
   isDragging?: boolean;
-  /** ID of the item currently being dragged */
-  draggingItemId?: string | null;
+  /** IDs of the items currently being dragged */
+  draggingItemIds?: ReadonlySet<string>;
   /** Callback fired when a drag operation begins */
-  onBeginDrag?: (file: FileEntry) => void;
+  onBeginDrag?: DragStartHandler;
   /** Callback fired when hovering over a folder during drag */
   onHoverFolder?: (file: FileEntry | null) => void;
   /** Callback fired when hovering over the container during drag */
@@ -44,7 +45,7 @@ function ListViewInner({
   onFolderOpen,
   dragCombineTargetId,
   isDragging,
-  draggingItemId,
+  draggingItemIds,
   onBeginDrag,
   onHoverFolder,
   onHoverContainer,
@@ -136,35 +137,40 @@ function ListViewInner({
     onFileSelect?.(file);
   };
 
+  const noMatches = safeFiles.length > 0 && visibleFiles.length === 0;
+
   return (
     <div className={styles.listViewContainer}>
-      {visibleFiles.length > 0 ? (
-        <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
-          <FileTable
-            droppableId={`list:${currentPath}`}
-            files={visibleFiles}
-            sortKey={sortKey as SortKey}
-            sortDir={sortDir as SortDir}
-            onSort={handleSort}
-            onFileSelect={handleFileSelect}
-            onFolderOpen={onFolderOpen}
-            combineTargetId={dragCombineTargetId}
-            showFolderSizesEnabled={showFolderSizesEnabled}
-            isDragging={isDragging}
-            draggingItemId={draggingItemId}
-            onBeginDrag={onBeginDrag}
-            onHoverFolder={onHoverFolder}
-            onHoverContainer={onHoverContainer}
-            getSelectedFilesRef={getSelectedFilesRef}
-          />
-        </div>
-      ) : (
-        <div className={styles.emptyState}>
+      <FileTable
+        droppableId={`list:${currentPath}`}
+        files={visibleFiles}
+        sortKey={sortKey as SortKey}
+        sortDir={sortDir as SortDir}
+        onSort={handleSort}
+        onFileSelect={handleFileSelect}
+        onFolderOpen={onFolderOpen}
+        combineTargetId={dragCombineTargetId}
+        showFolderSizesEnabled={showFolderSizesEnabled}
+        isDragging={isDragging}
+        draggingItemIds={draggingItemIds}
+        onBeginDrag={onBeginDrag}
+        onHoverFolder={onHoverFolder}
+        onHoverContainer={onHoverContainer}
+        getSelectedFilesRef={getSelectedFilesRef}
+      />
+      {visibleFiles.length === 0 && (
+        <div className={styles.emptyState} role="status">
           <div className={styles.emptyStateIcon}>
-            <Icon name="folder" size={20} />
+            <Icon name={noMatches ? 'search' : 'folder'} size={20} />
           </div>
-          <div className={styles.emptyStateText}>This folder is empty</div>
-          <div className={styles.emptyStateSubtext}>Drop files here or use the create button</div>
+          <div className={styles.emptyStateText}>
+            {noMatches ? 'No matching files' : 'This folder is empty'}
+          </div>
+          <div className={styles.emptyStateSubtext}>
+            {noMatches
+              ? 'Clear the search or filters to see other items'
+              : 'Drop files here or use the create button'}
+          </div>
         </div>
       )}
     </div>

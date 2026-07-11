@@ -4,6 +4,7 @@ import { FilePreviewer } from './FilePreviewer';
 import { Icon } from './Icon';
 import styles from './QuickLookModal.module.css';
 import { formatLocalDateTime } from '../utils/date';
+import { createFocusTrap } from '../utils/accessibility';
 
 interface QuickLookModalProps {
   file: FileEntry;
@@ -31,7 +32,20 @@ export function QuickLookModal({ file, files, onClose, onNavigate }: QuickLookMo
   const [isClosing, setIsClosing] = useState(false);
   const [showInfo, setShowInfo] = useState(false);
   const backdropRef = useRef<HTMLDivElement>(null);
+  const modalRef = useRef<HTMLDivElement>(null);
+  const focusTrapRef = useRef<ReturnType<typeof createFocusTrap> | null>(null);
   const titleId = useId();
+
+  useEffect(() => {
+    if (!modalRef.current) return;
+    const trap = createFocusTrap(modalRef.current);
+    focusTrapRef.current = trap;
+    trap.activate();
+    return () => {
+      focusTrapRef.current = null;
+      trap.deactivate();
+    };
+  }, []);
 
   // Find current file index for navigation
   const currentIndex = files.findIndex((f) => f.id === file.id);
@@ -110,7 +124,14 @@ export function QuickLookModal({ file, files, onClose, onNavigate }: QuickLookMo
       className={`${styles.backdrop} ${isClosing ? styles.closing : ''}`}
       onClick={handleBackdropClick}
     >
-      <div className={styles.modal} role="dialog" aria-modal="true" aria-labelledby={titleId}>
+      <div
+        ref={modalRef}
+        className={styles.modal}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        onKeyDown={(e) => focusTrapRef.current?.handleKeyDown(e)}
+      >
         {/* Header */}
         <div className={styles.header}>
           <div className={styles.navigation}>
@@ -156,6 +177,7 @@ export function QuickLookModal({ file, files, onClose, onNavigate }: QuickLookMo
               <Icon name="info" size={18} />
             </button>
             <button
+              data-autofocus
               className={styles.closeButton}
               onClick={handleClose}
               aria-label="Close"

@@ -5,6 +5,7 @@
   display: flex;
   align-items: center;
   justify-content: center;
+  padding: var(--padding-lg);
   z-index: 1000;
   animation: fadeIn 0.15s ease-out;
 }
@@ -21,11 +22,11 @@
 .overlay {
   width: 100%;
   max-width: 720px;
-  max-height: 80vh;
+  max-height: calc(100vh - var(--padding-2xl));
   background: var(--bg-primary);
   border: 1px solid var(--border-primary);
   border-radius: var(--border-radius-lg, 8px);
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+  box-shadow: var(--overlay-shadow);
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -47,7 +48,7 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 16px 20px;
+  padding: var(--padding-lg) var(--padding-xl);
   border-bottom: 1px solid var(--border-primary);
 }
 
@@ -62,8 +63,8 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 28px;
-  height: 28px;
+  width: var(--command-size-md);
+  height: var(--command-size-md);
   padding: 0;
   background: transparent;
   border: none;
@@ -83,9 +84,9 @@
 .searchWrapper {
   display: flex;
   align-items: center;
-  padding: 12px 20px;
+  padding: var(--padding-lg) var(--padding-xl);
   border-bottom: 1px solid var(--border-primary);
-  gap: 10px;
+  gap: var(--padding-md);
 }
 
 .searchIcon {
@@ -110,13 +111,13 @@
 .content {
   flex: 1;
   overflow-y: auto;
-  padding: 16px 20px;
+  padding: var(--padding-xl);
 }
 
 .grid {
   display: grid;
   grid-template-columns: repeat(2, 1fr);
-  gap: 20px;
+  gap: var(--padding-xl);
 }
 
 @media (max-width: 600px) {
@@ -128,7 +129,7 @@
 .category {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--padding-md);
 }
 
 .categoryTitle {
@@ -143,15 +144,15 @@
 .shortcuts {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: var(--padding-sm);
 }
 
 .shortcutItem {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
-  padding: 6px 8px;
+  gap: var(--padding-lg);
+  padding: var(--padding-sm) var(--padding-md);
   border-radius: var(--border-radius-sm, 4px);
   transition: background 0.1s;
 }
@@ -169,7 +170,7 @@
 
 .keys {
   font-size: calc(11px * var(--font-scale, 1));
-  padding: 3px 8px;
+  padding: var(--padding-xs) var(--padding-md);
   background: var(--bg-tertiary, var(--bg-secondary));
   border: 1px solid var(--border-primary);
   border-radius: 4px;
@@ -180,7 +181,7 @@
 }
 
 .noResults {
-  padding: 40px 20px;
+  padding: var(--padding-2xl) var(--padding-xl);
   text-align: center;
   color: var(--fg-tertiary);
   font-size: calc(14px * var(--font-scale, 1));
@@ -189,7 +190,7 @@
 .footer {
   display: flex;
   justify-content: center;
-  padding: 10px 20px;
+  padding: var(--padding-md) var(--padding-xl);
   border-top: 1px solid var(--border-primary);
   background: var(--bg-secondary);
   font-size: calc(11px * var(--font-scale, 1));
@@ -203,7 +204,7 @@
   border: 1px solid var(--border-primary);
   border-radius: 3px;
   font-family: var(--font-mono);
-  font-size: calc(10px * var(--font-scale, 1));
+  font-size: calc(11px * var(--font-scale, 1));
 }
 
 .footer {

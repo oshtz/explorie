@@ -4,34 +4,17 @@
   padding: var(--padding-sm) var(--padding-md);
   gap: var(--padding-md);
   color: var(--fg-primary);
-  min-height: 40px;
+  min-height: 44px;
   min-width: 0;
 }
 
-.appName {
-  font-family: var(--font-mono);
-  font-size: calc(14px * var(--font-scale));
-  font-weight: 600;
-  color: var(--fg-primary);
-  letter-spacing: 0.04em;
-  margin-right: var(--padding-md);
-  user-select: none;
-}
-
-.appIcon {
-  display: inline-block;
-  height: 20px;
-  width: auto;
-  image-rendering: pixelated;
-  margin-right: var(--padding-md);
-}
-
 .upButton {
+  display: inline-grid;
+  place-items: center;
   background: none;
   border: none;
   color: var(--fg-secondary);
   font-size: calc(16px * var(--font-scale));
-  /* margin-right: 12px; */ /* Use gap instead */
   cursor: pointer;
   opacity: 0.9;
   width: var(--command-size-md);
@@ -62,6 +45,16 @@
   text-overflow: ellipsis;
 }
 
+.syncthingBadge {
+  flex: 0 0 auto;
+  padding: var(--padding-xs) var(--padding-sm);
+  color: var(--accent-primary);
+  background: var(--bg-selected-soft);
+  border: 1px solid var(--state-selected-outline);
+  font-size: calc(10px * var(--font-scale));
+  white-space: nowrap;
+}
+
 .spacer {
   flex: 1;
   min-width: var(--padding-sm);
@@ -79,7 +72,9 @@
   border: 1px solid var(--border-primary);
   border-radius: 0;
   min-height: var(--control-height-md);
-  padding: 4px 44px 4px 8px;
+  padding: var(--padding-sm)
+    calc(var(--command-size-sm) + var(--command-size-sm) + var(--padding-sm)) var(--padding-sm)
+    var(--padding-md);
   font-size: calc(12px * var(--font-scale));
   outline: none;
   width: 100%;
@@ -117,7 +112,9 @@
   color: var(--fg-tertiary);
   font-size: calc(11px * var(--font-scale));
   cursor: pointer;
-  padding: 2px;
+  width: var(--command-size-sm);
+  height: var(--command-size-sm);
+  padding: 0;
   line-height: 1;
   display: flex;
   align-items: center;
@@ -130,11 +127,11 @@
 }
 
 .searchClearButton {
-  right: 26px;
+  right: calc(var(--command-size-sm) + var(--padding-xs));
 }
 
 .searchSaveButton {
-  right: 8px;
+  right: var(--padding-xs);
   color: var(--fg-tertiary);
 }
 
@@ -151,6 +148,8 @@
 }
 
 .controlButton {
+  display: inline-grid;
+  place-items: center;
   font-size: calc(14px * var(--font-scale));
   color: var(--fg-secondary);
   cursor: pointer;
@@ -177,8 +176,8 @@
 
 .popover {
   position: absolute;
-  top: 28px;
-  left: 0;
+  top: calc(100% + var(--padding-sm));
+  right: 0;
   background: var(--bg-elevated);
   border: 1px solid var(--border-primary);
   border-radius: 0;
@@ -189,12 +188,17 @@
   box-shadow: var(--panel-shadow);
 }
 
+.createPopover {
+  right: auto;
+  left: 0;
+}
+
 .popoverItem {
   display: flex;
   align-items: center;
   gap: var(--padding-sm);
-  min-height: 26px;
-  padding: 4px var(--padding-md);
+  min-height: var(--control-height-md);
+  padding: var(--padding-sm) var(--padding-md);
   cursor: pointer;
   color: var(--fg-primary);
   background: none;
@@ -202,6 +206,8 @@
   border: none;
   font-size: calc(12px * var(--font-scale));
   white-space: nowrap;
+  width: 100%;
+  text-align: left;
 }
 
 .popoverItem:hover {
@@ -222,13 +228,13 @@
 .popoverDivider {
   height: 1px;
   background: var(--border-primary);
-  margin: 2px 0;
+  margin: var(--padding-xs) 0;
 }
 
 /* History dropdown for back/forward buttons */
 .historyPopover {
   position: absolute;
-  top: 24px;
+  top: calc(100% + var(--padding-sm));
   left: 0;
   background: var(--bg-elevated);
   border: 1px solid var(--border-primary);
@@ -251,7 +257,7 @@
 .popoverLabel {
   font-size: calc(10px * var(--font-scale));
   color: var(--fg-tertiary);
-  padding: 6px var(--padding-md) 2px;
+  padding: var(--padding-md) var(--padding-md) var(--padding-xs);
   text-transform: uppercase;
   letter-spacing: 0.05em;
   font-weight: 600;
@@ -259,19 +265,15 @@
 
 /* Popover slider container */
 .popoverSlider {
-  padding: 4px var(--padding-md) 8px;
+  padding: var(--padding-sm) var(--padding-md) var(--padding-md);
 }
 
-@media (max-width: 760px) {
+@container file-surface (max-width: 900px) {
   .topBar {
     align-items: flex-start;
     flex-wrap: wrap;
     gap: var(--padding-sm);
     padding: var(--padding-sm);
-  }
-
-  .appIcon {
-    margin-right: 0;
   }
 
   .spacer {

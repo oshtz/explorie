@@ -7,17 +7,10 @@ import type { FileEntry } from '../store';
 
 const mocks = vi.hoisted(() => ({
   invoke: vi.fn(),
-  getTrashPath: vi.fn(),
 }));
 
 vi.mock('@tauri-apps/api/core', () => ({
   invoke: mocks.invoke,
-}));
-
-vi.mock('../utils/trash', () => ({
-  getTrashPath: () => mocks.getTrashPath(),
-  isTrashPath: (path: string, trashPath: string) =>
-    path.replace(/\\/g, '/').toLowerCase().startsWith(trashPath.toLowerCase()),
 }));
 
 function fileEntry(overrides: Partial<FileEntry> = {}): FileEntry {
@@ -35,7 +28,6 @@ function fileEntry(overrides: Partial<FileEntry> = {}): FileEntry {
 
 describe('SecureDeleteDialog', () => {
   beforeEach(() => {
-    mocks.getTrashPath.mockResolvedValue('/trash');
     mocks.invoke.mockResolvedValue({ count: 3, size: 4096 });
   });
 
@@ -112,7 +104,7 @@ describe('SecureDeleteDialog', () => {
     expect(onConfirm).toHaveBeenCalledWith(true);
   });
 
-  it('forces permanent delete messaging for items already in trash and handles dismissal', async () => {
+  it('does not infer Trash state from a filesystem path and handles dismissal', async () => {
     const user = userEvent.setup();
     const onCancel = vi.fn();
     const onConfirm = vi.fn();
@@ -124,10 +116,9 @@ describe('SecureDeleteDialog', () => {
 
     render(<SecureDeleteDialog open files={[trashed]} onConfirm={onConfirm} onCancel={onCancel} />);
 
-    expect(await screen.findByText('Permanently Delete')).toBeInTheDocument();
-    expect(screen.getByText('In Trash')).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /move to trash/i })).not.toBeInTheDocument();
-    expect(screen.getByText(/cannot be undone/i)).toBeInTheDocument();
+    expect(screen.getByText('Delete Items')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /move to trash/i })).toBeInTheDocument();
+    expect(screen.getByText(/operating system Trash can be restored/i)).toBeInTheDocument();
 
     await user.click(screen.getByRole('button', { name: /delete permanently/i }));
     expect(onConfirm).toHaveBeenCalledWith(true);

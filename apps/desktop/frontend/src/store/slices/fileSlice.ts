@@ -1,8 +1,6 @@
 import type { StateCreator } from 'zustand';
 import type { FileSlice, StoreState } from '../types';
 
-const isDevBuild = typeof import.meta !== 'undefined' && !!import.meta.env?.DEV;
-
 export const createFileSlice: StateCreator<StoreState, [], [], FileSlice> = (set) => ({
   files: [],
   loading: false,
@@ -57,8 +55,6 @@ export const createFileSlice: StateCreator<StoreState, [], [], FileSlice> = (set
     } catch {}
     return false;
   })(),
-  enableDnDLargeLists: false,
-  devMockEntries: false,
   confirmBeforeDelete: (() => {
     try {
       if (typeof window !== 'undefined') {
@@ -90,10 +86,15 @@ export const createFileSlice: StateCreator<StoreState, [], [], FileSlice> = (set
   editingId: null,
   draftNew: null,
   clipboard: null,
+  selectedPaths: [],
+  selectionCursorPath: null,
   setPathStack: (stack) => set({ pathStack: stack }),
   setEditingId: (id) => set({ editingId: id }),
   setDraftNew: (draft) => set({ draftNew: draft }),
   setClipboard: (clip) => set({ clipboard: clip }),
+  setSelectedPaths: (paths) => set({ selectedPaths: [...new Set(paths)] }),
+  setSelectionCursorPath: (path) => set({ selectionCursorPath: path }),
+  clearSelection: () => set({ selectedPaths: [], selectionCursorPath: null }),
   setFiles: (files) =>
     set((state) => ({
       files: typeof files === 'function' ? files(state.files) : files,
@@ -140,11 +141,6 @@ export const createFileSlice: StateCreator<StoreState, [], [], FileSlice> = (set
       }
     } catch {}
     set({ previewExecutableScripts: allow });
-  },
-  setEnableDnDLargeLists: (v) => set({ enableDnDLargeLists: v }),
-  setDevMockEntries: (v) => {
-    if (!isDevBuild) return;
-    set({ devMockEntries: v });
   },
   setConfirmBeforeDelete: (v) => {
     try {

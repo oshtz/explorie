@@ -1,7 +1,9 @@
-import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import styles from './GoToFolderDialog.module.css';
 import { basename, normalizePathForCompare } from '../utils/path';
+import { createFocusTrap } from '../utils/accessibility';
+import { Icon } from './Icon';
 
 interface GoToFolderDialogProps {
   open: boolean;
@@ -14,22 +16,8 @@ interface Suggestion {
   path: string;
   name: string;
   isDir: boolean;
-  type: 'autocomplete' | 'recent' | 'env';
+  type: 'autocomplete' | 'recent';
 }
-
-// Common environment variables for different platforms
-const COMMON_ENV_VARS = [
-  { var: '%USERPROFILE%', desc: 'User home (Windows)', platform: 'win32' },
-  { var: '%APPDATA%', desc: 'App data (Windows)', platform: 'win32' },
-  { var: '%LOCALAPPDATA%', desc: 'Local app data (Windows)', platform: 'win32' },
-  { var: '%PROGRAMFILES%', desc: 'Program Files (Windows)', platform: 'win32' },
-  { var: '%TEMP%', desc: 'Temp folder (Windows)', platform: 'win32' },
-  { var: '%DESKTOP%', desc: 'Desktop (Windows)', platform: 'win32' },
-  { var: '%DOCUMENTS%', desc: 'Documents (Windows)', platform: 'win32' },
-  { var: '$HOME', desc: 'User home (Unix)', platform: 'unix' },
-  { var: '$USER', desc: 'Username (Unix)', platform: 'unix' },
-  { var: '~', desc: 'User home (Unix shorthand)', platform: 'unix' },
-];
 
 // Load recent paths from localStorage
 function loadRecentPaths(): string[] {
@@ -65,59 +53,15 @@ function addToRecentPaths(path: string): void {
   saveRecentPaths(updated);
 }
 
-// Expand environment variables in path
-async function expandEnvironmentVariables(path: string): Promise<string> {
-  let expanded = path;
-
-  // Handle ~ for home directory (Unix-style)
-  if (expanded.startsWith('~')) {
-    try {
-      const home = await invoke<string>('get_home_dir');
-      expanded = expanded.replace(/^~/, home);
-    } catch {
-      // Fallback: try common Windows user profile
-      expanded = expanded.replace(/^~/, '%USERPROFILE%');
-    }
-  }
-
-  // Handle Windows environment variables like %USERPROFILE%
-  const winEnvMatches = expanded.match(/%([^%]+)%/g);
-  if (winEnvMatches) {
-    for (const match of winEnvMatches) {
-      const varName = match.slice(1, -1);
-      try {
-        const value = await invoke<string>('get_env_var', { name: varName });
-        if (value) {
-          expanded = expanded.replace(match, value);
-        }
-      } catch {
-        // Leave as-is if variable not found
-      }
-    }
-  }
-
-  // Handle Unix environment variables like $HOME
-  const unixEnvMatches = expanded.match(/\$([A-Za-z_][A-Za-z0-9_]*)/g);
-  if (unixEnvMatches) {
-    for (const match of unixEnvMatches) {
-      const varName = match.slice(1);
-      try {
-        const value = await invoke<string>('get_env_var', { name: varName });
-        if (value) {
-          expanded = expanded.replace(match, value);
-        }
-      } catch {
-        // Leave as-is if variable not found
-      }
-    }
-  }
-
-  return expanded;
+async function expandHome(path: string): Promise<string> {
+  if (path !== '~' && !path.startsWith('~/') && !path.startsWith('~\\')) return path;
+  const home = await invoke<string>('get_home_dir');
+  return `${home}${path.slice(1)}`;
 }
 
 /**
  * GoToFolderDialog - Modal for navigating to a specific folder path
- * Features: autocomplete, environment variables, recent paths
+ * Features: autocomplete, home expansion, recent paths
  * Triggered by Ctrl+G
  */
 export function GoToFolderDialog({
@@ -133,12 +77,20 @@ export function GoToFolderDialog({
   const [selectedSuggestionIndex, setSelectedSuggestionIndex] = useState(-1);
   const [showSuggestions, setShowSuggestions] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const focusTrapRef = useRef<ReturnType<typeof createFocusTrap> | null>(null);
   const suggestionsRef = useRef<HTMLDivElement>(null);
 
-  // Determine platform
-  const isWindows = useMemo(() => {
-    return typeof navigator !== 'undefined' && /windows/i.test(navigator.userAgent);
-  }, []);
+  useEffect(() => {
+    if (!open || !dialogRef.current) return;
+    const trap = createFocusTrap(dialogRef.current);
+    focusTrapRef.current = trap;
+    trap.activate();
+    return () => {
+      focusTrapRef.current = null;
+      trap.deactivate();
+    };
+  }, [open]);
 
   // Focus input when dialog opens
   useEffect(() => {
@@ -189,27 +141,8 @@ export function GoToFolderDialog({
         return;
       }
 
-      // Check if typing an environment variable
-      const envMatch = value.match(/(%[^%]*$)|(\$[A-Za-z_][A-Za-z0-9_]*$)|(^\$)$|(^~$)/);
-      if (envMatch) {
-        const envVars = COMMON_ENV_VARS.filter((e) =>
-          isWindows ? e.platform === 'win32' : e.platform === 'unix'
-        )
-          .filter((e) => e.var.toLowerCase().startsWith(value.toLowerCase()) || value === '~')
-          .map((e) => ({
-            path: e.var,
-            name: `${e.var} - ${e.desc}`,
-            isDir: true,
-            type: 'env' as const,
-          }));
-        setSuggestions(envVars);
-        setShowSuggestions(envVars.length > 0);
-        return;
-      }
-
       try {
-        // Expand environment variables first
-        const expandedPath = await expandEnvironmentVariables(value);
+        const expandedPath = await expandHome(value);
 
         // Get parent directory for autocomplete
         const lastSep = Math.max(expandedPath.lastIndexOf('/'), expandedPath.lastIndexOf('\\'));
@@ -261,7 +194,7 @@ export function GoToFolderDialog({
         setShowSuggestions(false);
       }
     },
-    [currentPath, isWindows]
+    [currentPath]
   );
 
   // Debounced autocomplete
@@ -287,8 +220,7 @@ export function GoToFolderDialog({
       setShowSuggestions(false);
 
       try {
-        // Expand environment variables
-        const expandedPath = await expandEnvironmentVariables(inputValue.trim());
+        const expandedPath = await expandHome(inputValue.trim());
 
         // Try to list files at the path to validate it exists
         await invoke('list_files', { path: expandedPath, calc_dir_size: false });
@@ -334,29 +266,12 @@ export function GoToFolderDialog({
     setSelectedSuggestionIndex(-1);
   }, []);
 
-  const handleSelectSuggestion = useCallback(
-    (suggestion: Suggestion) => {
-      if (suggestion.type === 'env') {
-        // For env vars, replace from the $ or % character
-        const lastEnvStart = Math.max(
-          inputValue.lastIndexOf('%'),
-          inputValue.lastIndexOf('$'),
-          inputValue === '~' ? 0 : -1
-        );
-        if (lastEnvStart >= 0) {
-          setInputValue(inputValue.slice(0, lastEnvStart) + suggestion.path);
-        } else {
-          setInputValue(suggestion.path);
-        }
-      } else {
-        setInputValue(suggestion.path);
-      }
-      setShowSuggestions(false);
-      setSelectedSuggestionIndex(-1);
-      inputRef.current?.focus();
-    },
-    [inputValue]
-  );
+  const handleSelectSuggestion = useCallback((suggestion: Suggestion) => {
+    setInputValue(suggestion.path);
+    setShowSuggestions(false);
+    setSelectedSuggestionIndex(-1);
+    inputRef.current?.focus();
+  }, []);
 
   const handleInputKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLInputElement>) => {
@@ -402,13 +317,36 @@ export function GoToFolderDialog({
 
   return (
     <div className={styles.backdrop} onClick={handleBackdropClick}>
-      <div className={styles.dialog}>
-        <h2 className={styles.title}>Go to Folder</h2>
+      <div
+        ref={dialogRef}
+        className={styles.dialog}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="go-to-folder-title"
+        onKeyDown={(e) => focusTrapRef.current?.handleKeyDown(e)}
+      >
+        <h2 id="go-to-folder-title" className={styles.title}>
+          Go to Folder
+        </h2>
         <form onSubmit={handleSubmit}>
           <div className={styles.inputContainer}>
+            <label className={styles.inputLabel} htmlFor="go-to-folder-input">
+              Folder path
+            </label>
             <input
+              id="go-to-folder-input"
               ref={inputRef}
+              data-autofocus
               type="text"
+              role="combobox"
+              aria-autocomplete="list"
+              aria-expanded={showSuggestions && suggestions.length > 0}
+              aria-controls="go-to-folder-suggestions"
+              aria-activedescendant={
+                selectedSuggestionIndex >= 0
+                  ? `go-to-folder-suggestion-${selectedSuggestionIndex}`
+                  : undefined
+              }
               className={`${styles.input} ${error ? styles.inputError : ''}`}
               value={inputValue}
               onChange={handleInputChange}
@@ -423,24 +361,27 @@ export function GoToFolderDialog({
 
             {/* Suggestions dropdown */}
             {showSuggestions && suggestions.length > 0 && (
-              <div className={styles.suggestions} ref={suggestionsRef}>
+              <div
+                id="go-to-folder-suggestions"
+                className={styles.suggestions}
+                ref={suggestionsRef}
+                role="listbox"
+                aria-label="Folder suggestions"
+              >
                 {suggestions.map((suggestion, index) => (
                   <div
+                    id={`go-to-folder-suggestion-${index}`}
                     key={`${suggestion.type}-${suggestion.path}`}
+                    role="option"
+                    aria-selected={index === selectedSuggestionIndex}
                     className={`${styles.suggestionItem} ${index === selectedSuggestionIndex ? styles.suggestionSelected : ''}`}
                     onClick={() => handleSelectSuggestion(suggestion)}
                     onMouseEnter={() => setSelectedSuggestionIndex(index)}
                   >
                     <span className={styles.suggestionIcon}>
-                      {suggestion.type === 'recent'
-                        ? '🕒'
-                        : suggestion.type === 'env'
-                          ? '📍'
-                          : '📁'}
+                      <Icon name={suggestion.type === 'recent' ? 'clock' : 'folder'} size={12} />
                     </span>
-                    <span className={styles.suggestionText}>
-                      {suggestion.type === 'env' ? suggestion.name : suggestion.path}
-                    </span>
+                    <span className={styles.suggestionText}>{suggestion.path}</span>
                     {suggestion.type === 'recent' && (
                       <span className={styles.suggestionBadge}>Recent</span>
                     )}
@@ -455,9 +396,7 @@ export function GoToFolderDialog({
               cancel
             </span>
             <br />
-            <span className={styles.hintSecondary}>
-              Supports: {isWindows ? '%USERPROFILE%, %APPDATA%' : '~, $HOME'} and more
-            </span>
+            <span className={styles.hintSecondary}>Supports: ~ for your home folder</span>
           </div>
           <div className={styles.actions}>
             <button type="button" className={styles.cancelButton} onClick={onClose}>

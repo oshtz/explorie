@@ -1,5 +1,5 @@
 import React from 'react';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { SettingsPanel } from './SettingsPanel';
@@ -8,9 +8,8 @@ type MockState = Record<string, unknown>;
 
 const mocks = vi.hoisted(() => {
   const data = {
-    invoke: vi.fn(),
-    reportError: vi.fn(),
     state: {} as MockState,
+    invoke: vi.fn(),
     useFileStore: undefined as unknown as ((
       selector?: (state: MockState) => unknown
     ) => unknown) & {
@@ -26,24 +25,16 @@ const mocks = vi.hoisted(() => {
   return data;
 });
 
-vi.mock('@tauri-apps/api/core', () => ({
-  invoke: mocks.invoke,
-}));
-
 vi.mock('../store', () => ({
   useFileStore: mocks.useFileStore,
 }));
 
-vi.mock('../utils/errorReporter', () => ({
-  reportError: mocks.reportError,
+vi.mock('@tauri-apps/api/core', () => ({
+  invoke: mocks.invoke,
 }));
 
 vi.mock('./Icon', () => ({
   Icon: ({ name }: { name: string }) => <span data-testid={`icon-${name}`} />,
-}));
-
-vi.mock('./UpdateStatus', () => ({
-  UpdateStatus: () => <div data-testid="update-status" />,
 }));
 
 function storeSetter(key: string) {
@@ -74,17 +65,14 @@ function createStoreState(overrides: MockState = {}): MockState {
       mocks.state.font = 'custom';
       mocks.state.fontCustom = value;
     }),
-    importedFonts: [],
-    addImportedFont: vi.fn((font: unknown) => {
-      mocks.state.importedFonts = [...(mocks.state.importedFonts as unknown[]), font];
-    }),
-    removeImportedFont: vi.fn(),
     borderRadius: 0,
     setBorderRadius: storeSetter('borderRadius'),
     iconSize: 14,
     setIconSize: storeSetter('iconSize'),
     reduceMotion: false,
     setReduceMotion: storeSetter('reduceMotion'),
+    highContrast: false,
+    setHighContrast: storeSetter('highContrast'),
     listRowHeight: 34,
     setListRowHeight: storeSetter('listRowHeight'),
     gridMinWidth: 140,
@@ -97,20 +85,8 @@ function createStoreState(overrides: MockState = {}): MockState {
     setShowStatusBar: storeSetter('showStatusBar'),
     showFolderSizes: false,
     setShowFolderSizes: storeSetter('showFolderSizes'),
-    enableDnDLargeLists: false,
-    setEnableDnDLargeLists: storeSetter('enableDnDLargeLists'),
     previewExecutableScripts: false,
     setPreviewExecutableScripts: storeSetter('previewExecutableScripts'),
-    devMockEntries: false,
-    setDevMockEntries: storeSetter('devMockEntries'),
-    defaultExplorerSupported: false,
-    defaultExplorerEnabled: null,
-    defaultExplorerLoading: false,
-    defaultExplorerError: null,
-    refreshDefaultExplorer: vi.fn(async () => null),
-    makeDefaultExplorer: vi.fn(async () => {}),
-    revertDefaultExplorer: vi.fn(async () => {}),
-    clearDefaultExplorerError: vi.fn(),
     confirmBeforeDelete: true,
     setConfirmBeforeDelete: storeSetter('confirmBeforeDelete'),
     enableErrorReporting: false,
@@ -138,10 +114,17 @@ describe('SettingsPanel', () => {
   beforeEach(() => {
     vi.useRealTimers();
     window.localStorage.clear();
-    mocks.invoke.mockReset();
-    mocks.invoke.mockResolvedValue([]);
-    mocks.reportError.mockReset();
     mocks.state = createStoreState();
+    mocks.invoke.mockReset();
+    mocks.invoke.mockImplementation((command: string) => {
+      if (command === 'get_system_integration_status') {
+        return Promise.resolve({ supported: true, enabled: false });
+      }
+      if (command === 'set_system_integration') {
+        return Promise.resolve({ supported: true, enabled: true });
+      }
+      return Promise.reject(new Error(`Unexpected command: ${command}`));
+    });
   });
 
   afterEach(() => {
@@ -158,31 +141,60 @@ describe('SettingsPanel', () => {
 
     expect(screen.getByRole('dialog', { name: 'Settings' })).toBeVisible();
     await user.click(screen.getByRole('button', { name: /close settings/i }));
+    await user.click(screen.getByRole('button', { name: 'Close' }));
     fireEvent.mouseDown(container.firstElementChild as Element);
     fireEvent.keyDown(document, { key: 'Escape' });
 
-    expect(onClose).toHaveBeenCalledTimes(3);
+    expect(onClose).toHaveBeenCalledTimes(4);
   });
 
-  it('exposes preferences-style vertical settings navigation', () => {
+  it('exposes clear section navigation', () => {
     renderPanel();
 
-    const tablist = screen.getByRole('tablist', { name: 'Settings Tabs' });
+    const navigation = screen.getByRole('navigation', { name: 'Settings sections' });
+    const sectionButtons = navigation.querySelectorAll('button');
 
-    expect(tablist).toHaveAttribute('aria-orientation', 'vertical');
-    expect(screen.getAllByRole('tab')).toHaveLength(6);
+    expect(sectionButtons).toHaveLength(5);
+    expect(screen.getByRole('button', { name: 'General' })).toHaveAttribute('aria-current', 'page');
+  });
+
+  it('does not expose prototype controls', async () => {
+    const { user } = renderPanel();
+
+    expect(screen.queryByRole('button', { name: 'Plugins' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Advanced' })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('checkbox', { name: /Drag and drop on large lists/i })
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole('checkbox', { name: /Preview executable scripts/i })).toBeVisible();
+    expect(screen.queryByText('Environment')).not.toBeInTheDocument();
+    expect(screen.queryByText('Dev: mock entries')).not.toBeInTheDocument();
+    expect(screen.queryByText('Default explorer')).not.toBeInTheDocument();
+  });
+
+  it('opts into reversible Windows folder integration', async () => {
+    const { user } = renderPanel();
+
+    await user.click(screen.getByRole('button', { name: 'System Integration' }));
+    const checkbox = await screen.findByRole('checkbox', { name: /Open folders with Explorie/i });
+    await user.click(checkbox);
+
+    expect(mocks.invoke).toHaveBeenCalledWith('set_system_integration', { enabled: true });
+    expect(checkbox).toBeChecked();
+    expect(screen.getByRole('status')).toHaveTextContent('Windows integration enabled');
   });
 
   it('updates general settings from checkbox controls', async () => {
     const { user } = renderPanel();
 
-    await user.click(screen.getByRole('tab', { name: 'General' }));
+    await user.click(screen.getByRole('button', { name: 'General' }));
     await user.click(screen.getByLabelText(/Right preview panel/i));
     await user.click(screen.getByLabelText(/Show hidden files/i));
     await user.click(screen.getByLabelText(/Show status bar/i));
     await user.click(screen.getByLabelText(/Show folder sizes/i));
     await user.click(screen.getByLabelText(/Confirm before delete/i));
     await user.click(screen.getByLabelText(/Error reporting/i));
+    await user.click(screen.getByLabelText(/Preview executable scripts/i));
 
     expect(mocks.state.setShowPreviewPanel).toHaveBeenCalledWith(true);
     expect(mocks.state.setShowHidden).toHaveBeenCalledWith(true);
@@ -190,11 +202,14 @@ describe('SettingsPanel', () => {
     expect(mocks.state.setShowFolderSizes).toHaveBeenCalledWith(true);
     expect(mocks.state.setConfirmBeforeDelete).toHaveBeenCalledWith(false);
     expect(mocks.state.setEnableErrorReporting).toHaveBeenCalledWith(true);
+    expect(mocks.state.setPreviewExecutableScripts).toHaveBeenCalledWith(true);
+    expect(screen.getByText(/nothing is sent/i)).toBeVisible();
   });
 
-  it('updates appearance choices and imports a Google font by family name', async () => {
+  it('updates appearance choices without exposing remote font imports', async () => {
     const { user } = renderPanel();
 
+    await user.click(screen.getByRole('button', { name: 'Appearance' }));
     await user.click(screen.getByTitle('Light'));
     await user.click(screen.getByRole('button', { name: 'green' }));
     fireEvent.change(screen.getByTitle('Pick custom accent'), {
@@ -204,9 +219,8 @@ describe('SettingsPanel', () => {
     fireEvent.change(screen.getAllByRole('slider')[0], { target: { value: '1.12' } });
     fireEvent.change(screen.getAllByRole('slider')[1], { target: { value: '40' } });
     fireEvent.change(screen.getAllByRole('slider')[2], { target: { value: '180' } });
-
-    await user.type(screen.getByPlaceholderText('Family name (e.g., Inter)'), 'Inter');
-    await user.click(screen.getByRole('button', { name: 'Add' }));
+    await user.click(screen.getByLabelText('Reduce motion'));
+    await user.click(screen.getByLabelText('High contrast'));
 
     expect(mocks.state.setTheme).toHaveBeenCalledWith('light');
     expect(mocks.state.setAccent).toHaveBeenCalledWith('green');
@@ -215,15 +229,11 @@ describe('SettingsPanel', () => {
     expect(mocks.state.setUiScale).toHaveBeenCalledWith(1.12);
     expect(mocks.state.setListRowHeight).toHaveBeenCalledWith(40);
     expect(mocks.state.setGridMinWidth).toHaveBeenCalledWith(180);
-    expect(mocks.state.addImportedFont).toHaveBeenCalledWith(
-      expect.objectContaining({
-        name: 'Inter',
-        href: 'https://fonts.googleapis.com/css2?family=Inter:wght@400;700&display=swap',
-      })
-    );
-    expect(mocks.state.setFont).toHaveBeenCalledWith('custom');
-    expect(mocks.state.setFontCustom).toHaveBeenCalledWith('Inter');
-    expect(screen.getByText('Manage fonts')).toBeVisible();
+    expect(mocks.state.setReduceMotion).toHaveBeenCalledWith(true);
+    expect(mocks.state.setHighContrast).toHaveBeenCalledWith(true);
+    expect(screen.queryByText('Import font')).not.toBeInTheDocument();
+    expect(screen.queryByPlaceholderText(/Google Fonts/i)).not.toBeInTheDocument();
+    expect(screen.getByLabelText('UI scale')).toHaveAttribute('max', '1.4');
   });
 
   it('saves, applies, and imports theme presets', async () => {
@@ -246,14 +256,14 @@ describe('SettingsPanel', () => {
       },
     });
 
-    await user.click(screen.getByRole('tab', { name: 'Themes' }));
-    await user.type(screen.getByPlaceholderText('Theme name'), 'Default');
+    await user.click(screen.getByRole('button', { name: 'Themes' }));
+    await user.type(screen.getByLabelText('Theme name'), 'Default');
     await user.click(screen.getByRole('button', { name: 'Save' }));
 
     expect(await screen.findByText('Name "Default" is reserved')).toBeVisible();
 
-    await user.clear(screen.getByPlaceholderText('Theme name'));
-    await user.type(screen.getByPlaceholderText('Theme name'), 'Night Shift');
+    await user.clear(screen.getByLabelText('Theme name'));
+    await user.type(screen.getByLabelText('Theme name'), 'Night Shift');
     await user.click(screen.getByRole('button', { name: 'Save' }));
     expect(mocks.state.saveTheme).toHaveBeenCalledWith('Night Shift');
 
@@ -266,26 +276,23 @@ describe('SettingsPanel', () => {
     );
     expect(mocks.state.deleteTheme).toHaveBeenCalledWith('Solarized');
 
-    fireEvent.change(
-      screen.getByPlaceholderText('Paste JSON for a theme spec or a map of themes'),
-      {
-        target: {
-          value: JSON.stringify({
-            theme: 'dark',
-            accent: 'purple',
-            accentCustom: '#b39ddb',
-            density: 'compact',
-            uiScale: 1,
-            listRowHeight: 32,
-            gridMinWidth: 160,
-            font: 'mono',
-            borderRadius: 8,
-            iconSize: 16,
-            reduceMotion: true,
-          }),
-        },
-      }
-    );
+    fireEvent.change(screen.getByLabelText('Theme JSON'), {
+      target: {
+        value: JSON.stringify({
+          theme: 'dark',
+          accent: 'purple',
+          accentCustom: '#b39ddb',
+          density: 'compact',
+          uiScale: 1,
+          listRowHeight: 32,
+          gridMinWidth: 160,
+          font: 'mono',
+          borderRadius: 8,
+          iconSize: 16,
+          reduceMotion: true,
+        }),
+      },
+    });
     await user.click(screen.getByRole('button', { name: 'Import' }));
 
     expect(mocks.state.saveTheme).toHaveBeenCalledWith(
@@ -293,66 +300,33 @@ describe('SettingsPanel', () => {
       expect.objectContaining({ accent: 'purple' })
     );
     expect(await screen.findByText('Imported as: Night Shift')).toBeVisible();
+
+    (mocks.state.saveTheme as ReturnType<typeof vi.fn>).mockClear();
+    fireEvent.change(screen.getByLabelText('Theme JSON'), {
+      target: {
+        value: JSON.stringify({
+          Valid: themeSpecForTest(),
+          Invalid: { ...themeSpecForTest(), accent: 'javascript:' },
+        }),
+      },
+    });
+    await user.click(screen.getByRole('button', { name: 'Import' }));
+    expect(mocks.state.saveTheme).not.toHaveBeenCalled();
+    expect(await screen.findByText(/contains an invalid name or theme/i)).toBeVisible();
   });
 
-  it('runs default explorer actions when the integration is available', async () => {
-    const { user } = renderPanel({
-      defaultExplorerSupported: true,
-      defaultExplorerEnabled: false,
-      refreshDefaultExplorer: vi.fn(async () => false),
-      makeDefaultExplorer: vi.fn(async () => {}),
-      revertDefaultExplorer: vi.fn(async () => {}),
-    });
-
-    await waitFor(() => expect(mocks.state.refreshDefaultExplorer).toHaveBeenCalledTimes(1));
-    await user.click(screen.getByRole('tab', { name: 'Advanced' }));
-
-    expect(screen.getByText('Windows Explorer is currently the default explorer.')).toBeVisible();
-    await user.click(screen.getByRole('button', { name: 'Make explorie default' }));
-
-    expect(mocks.state.clearDefaultExplorerError).toHaveBeenCalled();
-    expect(mocks.state.makeDefaultExplorer).toHaveBeenCalledTimes(1);
-    expect(await screen.findByText('explorie is now the default file manager.')).toBeVisible();
-  });
-
-  it('loads plugin metadata and invokes the selected plugin method', async () => {
-    mocks.invoke.mockImplementation(async (command: string, payload?: unknown) => {
-      if (command === 'list_plugins') return ['info'];
-      if (command === 'get_plugin_methods') return ['describe'];
-      if (command === 'call_plugin') {
-        return {
-          ok: true,
-          payload,
-        };
-      }
-      throw new Error(`Unexpected command ${command}`);
-    });
-
+  it('resets every exposed setting and reports completion', async () => {
     const { user } = renderPanel();
-    await user.click(screen.getByRole('tab', { name: 'Plugins' }));
 
-    expect(await screen.findByDisplayValue('info')).toBeVisible();
-    expect(await screen.findByDisplayValue('describe')).toBeVisible();
+    await user.click(screen.getByRole('button', { name: 'Reset to defaults' }));
 
-    fireEvent.change(screen.getByPlaceholderText('{"key": "value"}'), {
-      target: { value: '{bad' },
-    });
-    await user.click(screen.getByRole('button', { name: 'Invoke' }));
-    expect(await screen.findByText('Error: Invalid JSON payload')).toBeVisible();
-
-    fireEvent.change(screen.getByPlaceholderText('{"key": "value"}'), {
-      target: { value: '{"answer":42}' },
-    });
-    await user.click(screen.getByRole('button', { name: 'Invoke' }));
-
-    await waitFor(() =>
-      expect(mocks.invoke).toHaveBeenCalledWith('call_plugin', {
-        plugin: 'info',
-        method: 'describe',
-        payload: { answer: 42 },
-      })
-    );
-    expect(await screen.findByText(/"ok": true/)).toBeVisible();
+    expect(mocks.state.setFontCustom).toHaveBeenCalledWith('');
+    expect(mocks.state.setShowStatusBar).toHaveBeenCalledWith(true);
+    expect(mocks.state.setConfirmBeforeDelete).toHaveBeenCalledWith(true);
+    expect(mocks.state.setEnableErrorReporting).toHaveBeenCalledWith(false);
+    expect(mocks.state.setListRowHeight).toHaveBeenCalledWith(34);
+    expect(mocks.state.setGridMinWidth).toHaveBeenCalledWith(140);
+    expect(screen.getByRole('status')).toHaveTextContent('Settings restored to defaults');
   });
 });
 
@@ -360,4 +334,21 @@ function withinElement(element: HTMLElement, name: string) {
   return Array.from(element.querySelectorAll('button')).find(
     (button) => button.textContent === name
   ) as HTMLButtonElement;
+}
+
+function themeSpecForTest() {
+  return {
+    theme: 'dark',
+    accent: 'blue',
+    accentCustom: '#7cc7ff',
+    density: 'comfortable',
+    uiScale: 1,
+    listRowHeight: 34,
+    gridMinWidth: 140,
+    font: 'mono',
+    fontCustom: '',
+    borderRadius: 0,
+    iconSize: 14,
+    reduceMotion: false,
+  };
 }

@@ -1,5 +1,5 @@
+import { isTauri } from '@tauri-apps/api/core';
 import { useOperationQueueStore } from '../operationQueueStore';
-import { isTauriRuntime } from '../services/updater';
 import { useFileStore } from '../store';
 import { useUndoRedoStore } from '../undoRedoStore';
 import { getErrorReports } from './errorReporter';
@@ -337,7 +337,7 @@ function readGitHash(): string {
 
 function safeIsTauriRuntime(): boolean {
   try {
-    return isTauriRuntime();
+    return isTauri();
   } catch {
     return false;
   }

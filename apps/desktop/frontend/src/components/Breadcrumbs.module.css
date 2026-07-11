@@ -1,15 +1,15 @@
 .breadcrumbsContainer {
   display: flex;
   align-items: center;
-  gap: 2px;
+  gap: var(--padding-xs);
   min-width: 0;
   flex: 1 1 540px;
-  max-width: min(54vw, 720px);
+  max-width: min(54%, 720px);
   min-height: var(--control-height-md);
   overflow-x: auto;
   overflow-y: hidden;
   overscroll-behavior-x: contain;
-  padding: 2px 6px;
+  padding: var(--padding-xs) var(--padding-sm);
   border-radius: var(--border-radius);
   cursor: text;
   scrollbar-width: none;
@@ -27,7 +27,7 @@
   flex: 0 0 auto;
   background: none;
   border: none;
-  padding: 2px 6px;
+  padding: var(--padding-xs) var(--padding-sm);
   margin: 0;
   font-size: calc(12px * var(--font-scale));
   font-weight: 500;
@@ -36,7 +36,7 @@
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  max-width: clamp(120px, 14vw, 260px);
+  max-width: clamp(120px, 30%, 260px);
   border-radius: var(--border-radius);
   transition:
     background 0.1s ease,
@@ -52,7 +52,7 @@
   color: var(--fg-primary);
   flex-shrink: 0;
   font-weight: 600;
-  max-width: clamp(180px, 22vw, 360px);
+  max-width: clamp(180px, 45%, 360px);
 }
 
 .segmentCurrent:hover {
@@ -62,7 +62,7 @@
 
 .segmentRoot {
   flex: 0 0 auto;
-  padding: 2px 4px;
+  padding: var(--padding-xs) var(--padding-sm);
   min-width: auto;
   max-width: 32px;
 }
@@ -80,7 +80,7 @@
   background: var(--bg-primary);
   border: 1px solid var(--accent-primary);
   border-radius: var(--border-radius);
-  padding: 4px 8px;
+  padding: var(--padding-sm) var(--padding-md);
   font-size: calc(12px * var(--font-scale));
   font-family: var(--font-mono);
   color: var(--fg-primary);
@@ -98,17 +98,17 @@
   font-style: italic;
 }
 
-@media (max-width: 760px) {
+@container file-surface (max-width: 760px) {
   .breadcrumbsContainer {
     flex: 1 1 100%;
     max-width: 100%;
   }
 
   .segment {
-    max-width: clamp(84px, 26vw, 180px);
+    max-width: clamp(84px, 32%, 180px);
   }
 
   .segmentCurrent {
-    max-width: clamp(120px, 38vw, 240px);
+    max-width: clamp(120px, 48%, 240px);
   }
 }

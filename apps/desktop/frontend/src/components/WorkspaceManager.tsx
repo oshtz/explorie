@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { useFileStore } from '../store';
 import type { Workspace, WorkspaceTab } from '../store';
 import { Icon } from './Icon';
+import { createFocusTrap } from '../utils/accessibility';
 import styles from './WorkspaceManager.module.css';
 
 interface WorkspaceManagerProps {
@@ -45,6 +46,19 @@ export function WorkspaceManager({
   } | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const focusTrapRef = useRef<ReturnType<typeof createFocusTrap> | null>(null);
+
+  useEffect(() => {
+    if (!open || !dialogRef.current) return;
+    const trap = createFocusTrap(dialogRef.current);
+    focusTrapRef.current = trap;
+    trap.activate();
+    return () => {
+      focusTrapRef.current = null;
+      trap.deactivate();
+    };
+  }, [open]);
 
   // Get sorted workspace list
   const workspaceList = useMemo(() => {
@@ -249,9 +263,18 @@ export function WorkspaceManager({
 
   return (
     <div className={styles.backdrop} onClick={handleBackdropClick} onKeyDown={handleKeyDown}>
-      <div className={styles.dialog} role="dialog" aria-label="Workspace Manager">
+      <div
+        ref={dialogRef}
+        className={styles.dialog}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="workspace-manager-title"
+        onKeyDown={(e) => focusTrapRef.current?.handleKeyDown(e)}
+      >
         <div className={styles.header}>
-          <h2 className={styles.title}>Workspaces</h2>
+          <h2 id="workspace-manager-title" className={styles.title}>
+            Workspace Manager
+          </h2>
           <button className={styles.closeButton} onClick={onClose} aria-label="Close">
             <Icon name="x" />
           </button>
@@ -263,6 +286,7 @@ export function WorkspaceManager({
             <div className={styles.saveSectionTitle}>Save Current Workspace</div>
             <div className={styles.saveRow}>
               <input
+                data-autofocus
                 type="text"
                 className={styles.input}
                 value={newWorkspaceName}
