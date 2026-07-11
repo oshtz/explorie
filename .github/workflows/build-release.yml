@@ -380,8 +380,27 @@ jobs:
           APPLE_SIGNING_AVAILABLE: ${{ steps.signing.outputs.available }}
         run: |
           set -euo pipefail
-          app="target/release/bundle/macos/explorie.app"
-          test -d "$app"
+          shopt -s nullglob
+          dmgs=(target/release/bundle/dmg/*.dmg)
+          if [ "${#dmgs[@]}" -ne 1 ]; then
+            echo "Expected exactly one DMG, found ${#dmgs[@]}."
+            exit 1
+          fi
+
+          mount_point=$(mktemp -d)
+          hdiutil attach "${dmgs[0]}" -nobrowse -readonly -mountpoint "$mount_point" >/dev/null
+          cleanup() {
+            hdiutil detach "$mount_point" -quiet || true
+            rmdir "$mount_point" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          apps=("$mount_point"/*.app)
+          if [ "${#apps[@]}" -ne 1 ]; then
+            echo "Expected exactly one app in the DMG."
+            exit 1
+          fi
+          app="${apps[0]}"
           helper="$app/Contents/Resources/explorie-mountd"
           rclone="$app/Contents/MacOS/rclone"
           rclone_license="$app/Contents/Resources/licenses/rclone-COPYING"
@@ -406,18 +425,14 @@ jobs:
             codesign -d --verbose=4 "$app" 2>&1 | grep -Fx "TeamIdentifier=$APPLE_TEAM_ID"
           fi
 
-          shopt -s nullglob
-          dmgs=(target/release/bundle/dmg/*.dmg)
-          if [ "${#dmgs[@]}" -ne 1 ]; then
-            echo "Expected exactly one DMG, found ${#dmgs[@]}."
-            exit 1
-          fi
           if [ "$GITHUB_REF_TYPE" = "tag" ]; then
             xcrun stapler validate "$app"
             xcrun stapler validate "${dmgs[0]}"
             spctl --assess --type execute --verbose=2 "$app"
             spctl --assess --type open --context context:primary-signature --verbose=2 "${dmgs[0]}"
           fi
+          cleanup
+          trap - EXIT
 
           version=$(node -p "require('./package.json').version")
           mkdir -p release-artifacts/macos
