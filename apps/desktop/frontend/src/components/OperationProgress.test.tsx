@@ -1,19 +1,21 @@
 import React from 'react';
-import { act, cleanup, render, screen } from '@testing-library/react';
+import { cleanup, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+const invoke = vi.hoisted(() => vi.fn());
+vi.mock('@tauri-apps/api/core', () => ({ invoke }));
+
 import { OperationProgress } from './OperationProgress';
 import type { FileOperation } from '../operationQueueStore';
 import { useOperationQueueStore } from '../operationQueueStore';
 
-const initialOperationState = useOperationQueueStore.getState();
-
 function operation(overrides: Partial<FileOperation> = {}): FileOperation {
   return {
-    id: overrides.id ?? 'op-1',
-    type: overrides.type ?? 'copy',
-    status: overrides.status ?? 'running',
-    items: overrides.items ?? [
+    id: 'job-1',
+    type: 'copy',
+    status: 'running',
+    items: [
       {
         sourcePath: '/root/report.txt',
         destPath: '/backup/report.txt',
@@ -22,100 +24,58 @@ function operation(overrides: Partial<FileOperation> = {}): FileOperation {
         isDir: false,
       },
     ],
-    destinationPath: overrides.destinationPath,
-    totalBytes: overrides.totalBytes ?? 200,
-    processedBytes: overrides.processedBytes ?? 50,
-    totalItems: overrides.totalItems ?? 2,
-    processedItems: overrides.processedItems ?? 1,
-    currentItem: overrides.currentItem,
-    startedAt: overrides.startedAt,
-    completedAt: overrides.completedAt,
-    estimatedTimeRemaining: overrides.estimatedTimeRemaining,
-    speed: overrides.speed,
-    error: overrides.error,
-    failedItems: overrides.failedItems ?? [],
-    conflictResolution: overrides.conflictResolution ?? 'ask',
-    conflicts: overrides.conflicts ?? [],
-    abortController: overrides.abortController,
+    destinationPath: '/backup',
+    totalBytes: 200,
+    processedBytes: 50,
+    totalItems: 2,
+    processedItems: 1,
+    currentItem: 'report.txt',
+    startedAt: Date.now(),
+    conflictResolution: 'ask',
+    ...overrides,
   };
 }
 
 describe('OperationProgress', () => {
   beforeEach(() => {
-    useOperationQueueStore.setState(
-      {
-        ...initialOperationState,
-        operations: [],
-        showProgressPanel: false,
-        maxConcurrent: 2,
-      },
-      true
-    );
+    vi.clearAllMocks();
+    invoke.mockResolvedValue(true);
+    useOperationQueueStore.setState({ operations: [], showProgressPanel: false });
   });
 
-  afterEach(() => {
-    cleanup();
-  });
+  afterEach(cleanup);
 
   it('does not render when the progress panel is closed or empty', () => {
     const { container } = render(<OperationProgress />);
     expect(container).toBeEmptyDOMElement();
   });
 
-  it('shows running progress and dispatches pause, resume, cancel, and minimize actions', async () => {
+  it('shows native progress and delegates cancellation', async () => {
     const user = userEvent.setup();
-    useOperationQueueStore.setState({
-      showProgressPanel: true,
-      operations: [
-        operation({
-          currentItem: 'report.txt',
-          destinationPath: '/backup',
-          speed: 1024,
-          estimatedTimeRemaining: 65_000,
-        }),
-      ],
-    });
-
+    useOperationQueueStore.setState({ showProgressPanel: true, operations: [operation()] });
     render(<OperationProgress />);
 
-    expect(screen.getByText('Operations')).toBeInTheDocument();
     expect(screen.getByText('1 active')).toBeInTheDocument();
     expect(screen.getByText('25%')).toBeInTheDocument();
-    expect(screen.getByText('1 KB/s')).toBeInTheDocument();
-    expect(screen.getByText('1m 5s left')).toBeInTheDocument();
     expect(screen.getByText('report.txt')).toBeInTheDocument();
+    expect(screen.getByRole('region', { name: 'File operations' })).toBeVisible();
+    expect(screen.queryByRole('button', { name: 'Close operations' })).not.toBeInTheDocument();
 
-    await user.click(screen.getByTitle('Pause'));
-    expect(useOperationQueueStore.getState().operations[0].status).toBe('paused');
-
-    await user.click(screen.getByTitle('Resume'));
-    expect(useOperationQueueStore.getState().operations[0].status).toBe('running');
-
-    await user.click(screen.getByTitle('Minimize'));
-    expect(screen.getByText('1 operation in progress')).toBeInTheDocument();
-
-    await user.click(screen.getByText('1 operation in progress'));
-    await user.click(screen.getByTitle('Cancel'));
-    expect(useOperationQueueStore.getState().operations[0].status).toBe('cancelled');
+    await user.click(screen.getByRole('button', { name: 'Minimize operations' }));
+    await user.click(screen.getByRole('button', { name: /expand operations: 1 in progress/i }));
+    await user.click(screen.getByRole('button', { name: 'Cancel copy operation' }));
+    expect(invoke).toHaveBeenCalledWith('cancel_file_operation', { jobId: 'job-1' });
   });
 
-  it('shows failed and completed operations with retry, dismiss, clear, and close actions', async () => {
+  it('shows terminal operations and supports dismiss and close', async () => {
     const user = userEvent.setup();
     useOperationQueueStore.setState({
       showProgressPanel: true,
       operations: [
+        operation({ id: 'failed', status: 'failed', type: 'delete', error: 'Denied' }),
+        operation({ id: 'cancelled', status: 'cancelled', processedBytes: 20 }),
         operation({
-          id: 'failed-op',
-          status: 'failed',
-          type: 'delete',
-          totalBytes: 0,
-          processedBytes: 0,
-          totalItems: 1,
-          processedItems: 0,
-          error: 'Permission denied',
-        }),
-        operation({
-          id: 'done-op',
+          id: 'done',
           status: 'completed',
           type: 'move',
           processedBytes: 4096,
@@ -125,41 +85,43 @@ describe('OperationProgress', () => {
         }),
       ],
     });
-
     render(<OperationProgress />);
 
-    expect(screen.getByText('Done')).toBeInTheDocument();
     expect(screen.getByText('Operation failed')).toBeInTheDocument();
-    expect(screen.getByText('Permission denied')).toBeInTheDocument();
-    expect(screen.getByText('Complete')).toBeInTheDocument();
+    expect(screen.getByText('Denied')).toBeInTheDocument();
+    expect(screen.getAllByText('Cancelled')).toHaveLength(2);
     expect(screen.getByText('4 KB')).toBeInTheDocument();
+    expect(screen.getAllByRole('alert').length).toBeGreaterThan(0);
 
     await user.click(screen.getByRole('button', { name: /dismiss/i }));
-    expect(useOperationQueueStore.getState().operations.map((op) => op.id)).toEqual(['done-op']);
-
-    act(() => {
-      useOperationQueueStore.setState({
-        operations: [
-          operation({ id: 'failed-op', status: 'failed', error: 'Still blocked' }),
-          operation({ id: 'done-op', status: 'completed', processedBytes: 4096 }),
-        ],
-      });
-    });
-
-    await user.click(screen.getByTitle('Retry'));
-    expect(useOperationQueueStore.getState().operations[0].status).toBe('running');
-
-    await user.click(screen.getByTitle('Clear completed'));
-    expect(useOperationQueueStore.getState().operations.map((op) => op.id)).toEqual(['failed-op']);
-
-    act(() => {
-      useOperationQueueStore.setState({
-        showProgressPanel: true,
-        operations: [operation({ id: 'pending-op', status: 'pending' })],
-      });
-    });
-
-    await user.click(screen.getByTitle('Close'));
+    expect(useOperationQueueStore.getState().operations.map((item) => item.id)).toEqual([
+      'cancelled',
+      'done',
+    ]);
+    await user.click(screen.getByRole('button', { name: 'Close operations' }));
     expect(useOperationQueueStore.getState().showProgressPanel).toBe(false);
+  });
+
+  it('clears completed operations', async () => {
+    const user = userEvent.setup();
+    useOperationQueueStore.setState({
+      showProgressPanel: true,
+      operations: [operation({ status: 'completed', processedBytes: 200 })],
+    });
+    render(<OperationProgress />);
+
+    await user.click(screen.getByRole('button', { name: 'Clear finished operations' }));
+    expect(useOperationQueueStore.getState().operations).toEqual([]);
+  });
+
+  it('clamps invalid progress to the accessible range', () => {
+    useOperationQueueStore.setState({
+      showProgressPanel: true,
+      operations: [operation({ processedBytes: 500, totalBytes: 200 })],
+    });
+    render(<OperationProgress />);
+
+    expect(screen.getByRole('progressbar')).toHaveAttribute('aria-valuenow', '100');
+    expect(screen.getByText('100%')).toBeInTheDocument();
   });
 });

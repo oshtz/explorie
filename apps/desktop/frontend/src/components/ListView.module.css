@@ -6,6 +6,7 @@
   flex-direction: column;
   flex: 1;
   min-height: 0; /* allow inner scroll container to size properly */
+  position: relative;
 }
 
 /* If we need any additional styles specific to ListView */
@@ -32,7 +33,7 @@
   color: var(--fg-secondary);
   border: 1px solid var(--border-primary);
   border-radius: 0;
-  padding: 2px 6px;
+  padding: var(--padding-xs) var(--padding-sm);
   font-size: calc(12px * var(--font-scale));
   cursor: pointer;
   outline: none;
@@ -50,11 +51,13 @@
 }
 
 .emptyState {
+  position: absolute;
+  inset: calc(var(--command-size-md) + 1px) 0 0;
+  pointer-events: none;
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  height: 100%;
   min-height: var(--empty-state-min-height);
   color: var(--fg-tertiary);
   text-align: center;

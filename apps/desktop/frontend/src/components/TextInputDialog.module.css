@@ -1,0 +1,69 @@
+.backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 5000;
+  display: grid;
+  place-items: center;
+  padding: var(--padding-lg);
+  background: rgba(0, 0, 0, 0.48);
+}
+
+.dialog {
+  width: min(360px, 100%);
+  padding: var(--padding-xl);
+  color: var(--fg-primary);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-secondary);
+  border-radius: var(--border-radius-md);
+  box-shadow: var(--panel-shadow);
+}
+
+.dialog h2 {
+  margin: 0 0 var(--padding-lg);
+  font-size: var(--font-size-md);
+}
+
+.dialog form,
+.dialog label {
+  display: grid;
+  gap: var(--padding-sm);
+}
+
+.dialog input {
+  width: 100%;
+  min-height: var(--control-height-md);
+  box-sizing: border-box;
+  padding-inline: var(--padding-md);
+  color: var(--fg-primary);
+  background: var(--bg-sunken);
+  border: 1px solid var(--border-secondary);
+}
+
+.dialog input:focus {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 1px;
+}
+
+.error {
+  margin: 0;
+  color: var(--accent-red);
+  font-size: var(--font-size-sm);
+}
+
+.actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--padding-md);
+  margin-top: var(--padding-lg);
+}
+
+.actions button {
+  min-height: var(--control-height-md);
+  padding-inline: var(--padding-lg);
+}
+
+.primary {
+  color: var(--accent-contrast, white);
+  background: var(--accent-primary);
+  border-color: var(--accent-primary);
+}

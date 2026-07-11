@@ -4,7 +4,6 @@ import { readFile as readBinaryFile } from '@tauri-apps/plugin-fs';
 import type { FileEntry } from '../store';
 import { useFileStore } from '../store';
 import { Preview } from './Preview';
-import { readTextFile } from '../utils/fs';
 import { getCachedPreview, setCachedPreview } from '../utils/previewCache';
 import { formatErrorMessage } from '../utils/errorMessages';
 import { normalizePath } from '../utils/path';
@@ -64,6 +63,13 @@ type PreviewArtifact = {
   tool: string;
 };
 
+type TextPreview = {
+  text: string;
+  truncated: boolean;
+};
+
+const TEXT_PREVIEW_LIMIT = 128 * 1024;
+
 /**
  * FilePreviewer: handles loading and previewing files
  * Accepts an onClose prop to allow closing the preview panel.
@@ -74,7 +80,6 @@ export function FilePreviewer({ file, onClose, variant = 'panel' }: FilePreviewe
 
   const [dataUrl, setDataUrl] = React.useState<string | undefined>(undefined);
   const [textContent, setTextContent] = React.useState<string | undefined>(undefined);
-  const [fullText, setFullText] = React.useState<string | undefined>(undefined);
   const [isTruncated, setIsTruncated] = React.useState<boolean>(false);
   const [fileType, setFileType] = React.useState<string>('');
   const [error, setError] = React.useState<string | undefined>(undefined);
@@ -157,7 +162,6 @@ export function FilePreviewer({ file, onClose, variant = 'panel' }: FilePreviewe
     setDataUrl(undefined);
     setTextContent(undefined);
     setError(undefined);
-    setFullText(undefined);
     setIsTruncated(false);
     setArchiveInfo(undefined);
     setExternalTool(undefined);
@@ -251,19 +255,14 @@ export function FilePreviewer({ file, onClose, variant = 'panel' }: FilePreviewe
 
     // Text preview
     if (file.path && isTextExtension(ext)) {
-      readTextFile(file.path)
-        .then((text: string) => {
+      invoke<TextPreview>('read_text_preview', {
+        path: file.path,
+        maxBytes: TEXT_PREVIEW_LIMIT,
+      })
+        .then(({ text, truncated }) => {
           if (cancelled) return;
-          const MAX = 128 * 1024; // 128KB
-          if (text.length > MAX) {
-            setFullText(text);
-            setTextContent(text.slice(0, MAX));
-            setIsTruncated(true);
-          } else {
-            setFullText(text);
-            setTextContent(text);
-            setIsTruncated(false);
-          }
+          setTextContent(text);
+          setIsTruncated(truncated);
           finishLoading();
         })
         .catch((e: unknown) => {
@@ -389,18 +388,8 @@ export function FilePreviewer({ file, onClose, variant = 'panel' }: FilePreviewe
         variant={variant}
       />
       {fileType.startsWith('text') && typeof textContent === 'string' && isTruncated && (
-        <div style={{ display: 'flex', justifyContent: 'center' }}>
-          <button
-            onClick={() => {
-              if (fullText) {
-                setTextContent(fullText);
-                setIsTruncated(false);
-              }
-            }}
-            title="Load full file contents"
-          >
-            Load more
-          </button>
+        <div role="status" style={{ textAlign: 'center' }}>
+          Preview limited to the first 128 KB
         </div>
       )}
     </div>

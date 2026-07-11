@@ -8,6 +8,7 @@
   display: flex;
   align-items: center;
   justify-content: center;
+  padding: var(--padding-lg);
   z-index: 1000;
   animation: fadeIn 0.15s ease;
 }
@@ -25,8 +26,12 @@
   background: var(--bg-elevated);
   border: 1px solid var(--border-primary);
   border-radius: var(--border-radius-lg);
-  min-width: 400px;
+  width: 100%;
   max-width: 540px;
+  max-height: calc(100vh - var(--padding-2xl));
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
   animation: slideIn 0.15s ease;
   box-shadow: var(--overlay-shadow);
 }
@@ -43,7 +48,7 @@
 }
 
 .header {
-  padding: var(--padding-md) var(--padding-lg);
+  padding: var(--padding-lg) var(--padding-xl);
   border-bottom: 1px solid var(--border-primary);
   background: var(--bg-topbar);
   box-shadow: var(--inset-divider);
@@ -66,7 +71,8 @@
 }
 
 .content {
-  padding: var(--padding-lg);
+  padding: var(--padding-xl);
+  overflow-y: auto;
 }
 
 .summary {
@@ -151,15 +157,6 @@
   flex-shrink: 0;
 }
 
-.trashBadge {
-  background: var(--accent-secondary, #f59e0b);
-  color: white;
-  font-size: calc(10px * var(--font-scale));
-  padding: 1px 6px;
-  border-radius: 9999px;
-  flex-shrink: 0;
-}
-
 .moreItems {
   padding: var(--padding-sm) var(--padding-md);
   font-size: calc(11px * var(--font-scale));
@@ -193,14 +190,6 @@
   line-height: 1.5;
 }
 
-.descriptionWarning {
-  margin: 0 0 var(--padding-md) 0;
-  font-size: calc(12px * var(--font-scale));
-  color: var(--fg-error, #f87171);
-  line-height: 1.5;
-  font-weight: 500;
-}
-
 .checkboxLabel {
   display: flex;
   align-items: center;
@@ -218,7 +207,7 @@
   display: flex;
   justify-content: flex-end;
   gap: var(--padding-sm);
-  padding: var(--padding-md) var(--padding-lg);
+  padding: var(--padding-lg) var(--padding-xl);
   border-top: 1px solid var(--border-primary);
   background: var(--bg-topbar);
 }
@@ -277,8 +266,8 @@
 }
 
 .deleteButton:hover:not(:disabled) {
-  background: #ef4444;
-  border-color: #ef4444;
+  background: var(--fg-error);
+  border-color: var(--fg-error);
 }
 
 .deleteButton:focus {

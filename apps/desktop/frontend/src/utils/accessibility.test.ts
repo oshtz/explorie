@@ -142,6 +142,17 @@ describe('accessibility utilities', () => {
     expect(document.activeElement).toBe(opener);
   });
 
+  it('prefers an explicitly marked initial focus target', () => {
+    const modal = document.createElement('div');
+    modal.innerHTML = '<button>First</button><input data-autofocus />';
+    document.body.appendChild(modal);
+
+    const trap = createFocusTrap(modal);
+    trap.activate();
+
+    expect(document.activeElement).toBe(modal.querySelector('input'));
+  });
+
   it('returns ARIA helper props for sortable rows and menus', () => {
     expect(getSortableColumnProps('name', 'name', 'asc')).toEqual({
       'aria-sort': 'ascending',

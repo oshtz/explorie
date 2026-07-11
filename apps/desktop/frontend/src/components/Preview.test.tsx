@@ -184,22 +184,39 @@ describe('Preview', () => {
     expect(screen.getByText('Cannot preview this image (no preview available).')).toBeVisible();
   });
 
-  it('renders markdown preview content while escaping raw HTML', () => {
+  it('renders untrusted markdown as plain text', () => {
+    const markdown =
+      '# Title\n\n**bold** <script>alert(1)</script> [click](javascript:alert(2)) [x](" onmouseover="alert(3))';
     const { container } = render(
       <Preview
         file={previewFile({
           name: 'notes.md',
           path: '/workspace/notes.md',
           type: 'text/markdown',
-          content: '# Title\n\n**bold** <script>alert(1)</script>',
+          content: markdown,
         })}
       />
     );
 
-    expect(screen.getByRole('heading', { name: 'Title' })).toBeVisible();
-    expect(screen.getByText('bold')).toBeVisible();
-    expect(container.querySelector('script')).toBeNull();
-    expect(container).toHaveTextContent('<script>alert(1)</script>');
+    expect(container.querySelector('pre')?.textContent).toBe(markdown);
+    expect(container.querySelector('script, a, [onmouseover]')).toBeNull();
+  });
+
+  it('renders code content without creating an HTML sink', () => {
+    const source = '<img src=x onerror="alert(1)"><button onclick="alert(2)">run</button>';
+    const { container } = render(
+      <Preview
+        file={previewFile({
+          name: 'payload.ts',
+          path: '/workspace/payload.ts',
+          type: 'text/typescript',
+          content: source,
+        })}
+      />
+    );
+
+    expect(container.querySelector('code')?.textContent).toBe(source);
+    expect(container.querySelector('img, [onerror], [onclick]')).toBeNull();
   });
 
   it('respects the executable script preview setting', () => {

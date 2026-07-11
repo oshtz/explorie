@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import styles from './CommandPalette.module.css';
+import { createFocusTrap } from '../utils/accessibility';
 
 export interface Command {
   id: string;
@@ -82,7 +83,20 @@ export function CommandPalette({ open, onClose, commands }: CommandPaletteProps)
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [recentIds, setRecentIds] = useState<string[]>(() => getRecentCommandIds());
   const inputRef = useRef<HTMLInputElement>(null);
+  const paletteRef = useRef<HTMLDivElement>(null);
+  const focusTrapRef = useRef<ReturnType<typeof createFocusTrap> | null>(null);
   const listRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open || !paletteRef.current) return;
+    const trap = createFocusTrap(paletteRef.current);
+    focusTrapRef.current = trap;
+    trap.activate();
+    return () => {
+      focusTrapRef.current = null;
+      trap.deactivate();
+    };
+  }, [open]);
 
   // Get recent commands that exist in the commands list
   const recentCommands = useMemo(() => {
@@ -280,7 +294,17 @@ export function CommandPalette({ open, onClose, commands }: CommandPaletteProps)
 
   return (
     <div className={styles.backdrop} onClick={handleBackdropClick}>
-      <div className={styles.palette} onKeyDown={handleKeyDown}>
+      <div
+        ref={paletteRef}
+        className={styles.palette}
+        role="dialog"
+        aria-modal="true"
+        aria-label="Command palette"
+        onKeyDown={(e) => {
+          focusTrapRef.current?.handleKeyDown(e);
+          handleKeyDown(e);
+        }}
+      >
         <div className={styles.inputWrapper}>
           <svg
             className={styles.searchIcon}
@@ -293,6 +317,7 @@ export function CommandPalette({ open, onClose, commands }: CommandPaletteProps)
           </svg>
           <input
             ref={inputRef}
+            data-autofocus
             type="text"
             className={styles.input}
             placeholder="Type a command or search..."

@@ -1,69 +1,68 @@
-import React, { useCallback } from 'react';
-import styles from './TitleBar.module.css';
-import { Icon } from './Icon';
 import { getCurrentWindow } from '@tauri-apps/api/window';
+import { Icon } from './Icon';
+import styles from './TitleBar.module.css';
 
-function hasTauriInternals(): boolean {
-  return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+export function getTitleBarState(platform: string | undefined, tauri: boolean) {
+  const showTitleBar = platform !== 'macos';
+  return { showTitleBar, showWindowControls: showTitleBar && tauri };
 }
 
-function getTauriWindow() {
-  if (!hasTauriInternals()) return null;
-  try {
-    return getCurrentWindow();
-  } catch {
-    return null;
-  }
-}
-
-export function TitleBar() {
-  const appWindow = getTauriWindow();
-
-  // Manual drag handling for macOS compatibility
-  const handleDragStart = useCallback(
-    (e: React.MouseEvent) => {
-      // Only start drag on left mouse button and not on interactive elements
-      if (e.button !== 0) return;
-      const target = e.target as HTMLElement;
-      if (target.closest('button')) return;
-
-      e.preventDefault();
-      void appWindow?.startDragging();
-    },
-    [appWindow]
-  );
+export function TitleBar({ showWindowControls = true }: { showWindowControls?: boolean }) {
+  const appWindow = showWindowControls ? getCurrentWindow() : null;
 
   return (
-    <div className={styles.titleBar} onMouseDown={handleDragStart}>
-      <div className={styles.left}>
-        <span className={styles.appName}>explorie</span>
-      </div>
-      <div className={styles.spacer} />
+    <header
+      className={styles.titleBar}
+      data-tauri-drag-region
+      onDoubleClick={(event) => {
+        if (appWindow && !(event.target as HTMLElement).closest('button')) {
+          void appWindow.toggleMaximize();
+        }
+      }}
+    >
+      <img
+        src="/icon-face.png"
+        alt=""
+        aria-hidden="true"
+        draggable="false"
+        className={styles.appIcon}
+        data-tauri-drag-region
+      />
+      <span className={styles.appName} data-tauri-drag-region>
+        explorie
+      </span>
+      <span className={styles.dragRegion} data-tauri-drag-region />
       {appWindow && (
         <div className={styles.windowControls}>
           <button
+            type="button"
             className={styles.windowButton}
+            aria-label="Minimize window"
             title="Minimize"
-            onClick={() => appWindow.minimize()}
+            onClick={() => void appWindow.minimize()}
           >
             <Icon name="minus" />
           </button>
           <button
+            type="button"
             className={styles.windowButton}
-            title="Maximize/Restore"
-            onClick={() => appWindow.toggleMaximize()}
+            aria-label="Maximize or restore window"
+            title="Maximize or restore"
+            onClick={() => void appWindow.toggleMaximize()}
           >
             <Icon name="frame" />
           </button>
           <button
-            className={styles.windowButtonClose}
+            type="button"
+            className={`${styles.windowButton} ${styles.closeButton}`}
+            aria-label="Close window"
             title="Close"
-            onClick={() => appWindow.close()}
+            onClick={() => void appWindow.close()}
           >
             <Icon name="close" />
           </button>
         </div>
       )}
-    </div>
+    </header>
   );
 }

@@ -1,12 +1,8 @@
 import React, { useCallback, useState } from 'react';
 import { Icon } from './Icon';
 import type { FileOperation } from '../operationQueueStore';
-import {
-  useOperationQueueStore,
-  formatBytes,
-  formatTimeRemaining,
-  formatSpeed,
-} from '../operationQueueStore';
+import { useOperationQueueStore, formatBytes } from '../operationQueueStore';
+import { useFileStore } from '../store';
 import styles from './OperationProgress.module.css';
 
 // Helper to get icon for operation type
@@ -18,10 +14,6 @@ function getOperationIcon(type: FileOperation['type']): string {
       return 'move';
     case 'delete':
       return 'trash';
-    case 'compress':
-      return 'archive';
-    case 'extract':
-      return 'unarchive';
     default:
       return 'file';
   }
@@ -36,8 +28,8 @@ function getStatusClass(status: FileOperation['status']): string {
       return styles.operationCompleted;
     case 'failed':
       return styles.operationFailed;
-    case 'paused':
-      return styles.operationPaused;
+    case 'cancelled':
+      return styles.operationCancelled;
     default:
       return '';
   }
@@ -45,24 +37,22 @@ function getStatusClass(status: FileOperation['status']): string {
 
 // Single operation item component
 function OperationItem({ operation }: { operation: FileOperation }) {
-  const pauseOperation = useOperationQueueStore((s) => s.pauseOperation);
-  const resumeOperation = useOperationQueueStore((s) => s.resumeOperation);
   const cancelOperation = useOperationQueueStore((s) => s.cancelOperation);
-  const retryOperation = useOperationQueueStore((s) => s.retryOperation);
   const removeOperation = useOperationQueueStore((s) => s.removeOperation);
 
-  const progress =
+  const rawProgress =
     operation.totalBytes > 0
-      ? Math.round((operation.processedBytes / operation.totalBytes) * 100)
+      ? (operation.processedBytes / operation.totalBytes) * 100
       : operation.totalItems > 0
-        ? Math.round((operation.processedItems / operation.totalItems) * 100)
+        ? (operation.processedItems / operation.totalItems) * 100
         : 0;
+  const progress = Math.min(
+    100,
+    Math.max(0, Number.isFinite(rawProgress) ? Math.round(rawProgress) : 0)
+  );
 
-  const isActive = operation.status === 'running' || operation.status === 'paused';
-  const canPause = operation.status === 'running';
-  const canResume = operation.status === 'paused';
-  const canCancel = isActive || operation.status === 'pending';
-  const canRetry = operation.status === 'failed';
+  const isActive = operation.status === 'running';
+  const canCancel = isActive;
   const canRemove =
     operation.status === 'completed' ||
     operation.status === 'cancelled' ||
@@ -81,41 +71,27 @@ function OperationItem({ operation }: { operation: FileOperation }) {
             {operation.destinationPath && ` → ${operation.destinationPath.split(/[/\\]/).pop()}`}
           </div>
         </div>
+        <span
+          className={styles.operationStatus}
+          role={operation.status === 'failed' ? 'alert' : undefined}
+        >
+          {operation.status === 'running'
+            ? 'In progress'
+            : operation.status === 'completed'
+              ? 'Completed'
+              : operation.status === 'cancelled'
+                ? 'Cancelled'
+                : 'Failed'}
+        </span>
         <div className={styles.operationActions}>
-          {canPause && (
-            <button
-              className={styles.actionButton}
-              onClick={() => pauseOperation(operation.id)}
-              title="Pause"
-            >
-              <Icon name="pause" size={12} />
-            </button>
-          )}
-          {canResume && (
-            <button
-              className={styles.actionButton}
-              onClick={() => resumeOperation(operation.id)}
-              title="Resume"
-            >
-              <Icon name="play" size={12} />
-            </button>
-          )}
           {canCancel && (
             <button
               className={styles.actionButton}
               onClick={() => cancelOperation(operation.id)}
               title="Cancel"
+              aria-label={`Cancel ${operation.type} operation`}
             >
               <Icon name="x" size={12} />
-            </button>
-          )}
-          {canRetry && (
-            <button
-              className={styles.actionButton}
-              onClick={() => retryOperation(operation.id)}
-              title="Retry"
-            >
-              <Icon name="reload" size={12} />
             </button>
           )}
           {canRemove && (
@@ -123,6 +99,7 @@ function OperationItem({ operation }: { operation: FileOperation }) {
               className={styles.actionButton}
               onClick={() => removeOperation(operation.id)}
               title="Remove"
+              aria-label={`Remove ${operation.type} operation`}
             >
               <Icon name="x" size={12} />
             </button>
@@ -131,22 +108,20 @@ function OperationItem({ operation }: { operation: FileOperation }) {
       </div>
 
       {/* Progress bar */}
-      {(isActive || operation.status === 'pending') && (
+      {isActive && (
         <div className={styles.progressSection}>
-          <div className={styles.progressBar}>
+          <div
+            className={styles.progressBar}
+            role="progressbar"
+            aria-label={`${operation.type} progress`}
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={progress}
+          >
             <div className={styles.progressFill} style={{ width: `${progress}%` }} />
           </div>
           <div className={styles.progressStats}>
             <span className={styles.progressPercent}>{progress}%</span>
-            <div className={styles.progressSpeed}>
-              {operation.speed !== undefined && operation.speed > 0 && (
-                <span>{formatSpeed(operation.speed)}</span>
-              )}
-              {operation.estimatedTimeRemaining !== undefined &&
-                operation.estimatedTimeRemaining > 0 && (
-                  <span>{formatTimeRemaining(operation.estimatedTimeRemaining)} left</span>
-                )}
-            </div>
           </div>
         </div>
       )}
@@ -154,13 +129,27 @@ function OperationItem({ operation }: { operation: FileOperation }) {
       {/* Completed progress bar */}
       {operation.status === 'completed' && (
         <div className={styles.progressSection}>
-          <div className={styles.progressBar}>
+          <div
+            className={styles.progressBar}
+            role="progressbar"
+            aria-label={`${operation.type} progress`}
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={100}
+          >
             <div className={styles.progressFill} style={{ width: '100%' }} />
           </div>
           <div className={styles.progressStats}>
-            <span className={styles.progressPercent}>Complete</span>
+            <span className={styles.progressPercent}>Completed</span>
             <span>{formatBytes(operation.processedBytes)}</span>
           </div>
+        </div>
+      )}
+
+      {operation.status === 'cancelled' && (
+        <div className={styles.progressStats}>
+          <span className={styles.progressPercent}>Cancelled</span>
+          <span>{formatBytes(operation.processedBytes)}</span>
         </div>
       )}
 
@@ -169,23 +158,17 @@ function OperationItem({ operation }: { operation: FileOperation }) {
         <div className={styles.currentFile}>{operation.currentItem}</div>
       )}
 
-      {/* Error section with retry option */}
+      {/* Error section */}
       {operation.error && operation.status === 'failed' && (
-        <div className={styles.errorSection}>
+        <div className={styles.errorSection} role="alert">
           <div className={styles.errorHeader}>
             <Icon name="warning-box" size={12} />
             Operation failed
           </div>
           <div className={styles.errorText}>{operation.error}</div>
-          <div className={styles.errorActions}>
-            <button className={styles.retryButton} onClick={() => retryOperation(operation.id)}>
-              <Icon name="reload" size={10} />
-              Retry
-            </button>
-            <button className={styles.dismissButton} onClick={() => removeOperation(operation.id)}>
-              Dismiss
-            </button>
-          </div>
+          <button className={styles.dismissButton} onClick={() => removeOperation(operation.id)}>
+            Dismiss
+          </button>
         </div>
       )}
 
@@ -206,15 +189,14 @@ export function OperationProgress() {
   const showProgressPanel = useOperationQueueStore((s) => s.showProgressPanel);
   const setShowProgressPanel = useOperationQueueStore((s) => s.setShowProgressPanel);
   const clearCompleted = useOperationQueueStore((s) => s.clearCompleted);
+  const showStatusBar = useFileStore((s) => s.showStatusBar);
+  const bottom = showStatusBar ? 'calc(var(--command-size-sm) + 12px)' : '12px';
 
   const [minimized, setMinimized] = useState(false);
 
-  const activeCount = operations.filter(
-    (o) => o.status === 'running' || o.status === 'pending'
-  ).length;
-  const completedCount = operations.filter(
-    (o) => o.status === 'completed' || o.status === 'cancelled'
-  ).length;
+  const activeCount = operations.filter((o) => o.status === 'running').length;
+  const finishedCount = operations.length - activeCount;
+  const failedCount = operations.filter((o) => o.status === 'failed').length;
 
   const handleClose = useCallback(() => {
     setShowProgressPanel(false);
@@ -232,17 +214,27 @@ export function OperationProgress() {
   // Show floating indicator if minimized and has active operations
   if (minimized && activeCount > 0) {
     return (
-      <div className={styles.floatingIndicator} onClick={() => setMinimized(false)}>
+      <button
+        type="button"
+        className={styles.floatingIndicator}
+        style={{ bottom }}
+        onClick={() => setMinimized(false)}
+        aria-label={`Expand operations: ${activeCount} in progress`}
+      >
         <div className={styles.floatingSpinner} />
         <span className={styles.floatingText}>
           {activeCount} operation{activeCount !== 1 ? 's' : ''} in progress
         </span>
-      </div>
+      </button>
     );
   }
 
   return (
-    <div className={`${styles.panel} ${minimized ? styles.minimized : ''}`}>
+    <section
+      className={`${styles.panel} ${minimized ? styles.minimized : ''}`}
+      style={{ bottom }}
+      aria-label="File operations"
+    >
       <div className={styles.header}>
         <div className={styles.headerIcon}>
           <Icon name="loader" size={14} />
@@ -253,15 +245,21 @@ export function OperationProgress() {
             {activeCount} active
           </span>
         )}
-        {activeCount === 0 && completedCount > 0 && (
-          <span className={`${styles.statusBadge} ${styles.statusComplete}`}>Done</span>
+        {activeCount === 0 && failedCount > 0 && (
+          <span className={`${styles.statusBadge} ${styles.statusFailed}`} role="alert">
+            {failedCount} failed
+          </span>
+        )}
+        {activeCount === 0 && failedCount === 0 && finishedCount > 0 && (
+          <span className={`${styles.statusBadge} ${styles.statusComplete}`}>Finished</span>
         )}
         <div className={styles.headerActions}>
-          {completedCount > 0 && (
+          {finishedCount > 0 && (
             <button
               className={styles.headerButton}
               onClick={clearCompleted}
-              title="Clear completed"
+              title="Clear finished"
+              aria-label="Clear finished operations"
             >
               <Icon name="check" size={12} />
             </button>
@@ -270,12 +268,20 @@ export function OperationProgress() {
             className={styles.headerButton}
             onClick={handleToggleMinimize}
             title={minimized ? 'Expand' : 'Minimize'}
+            aria-label={minimized ? 'Expand operations' : 'Minimize operations'}
           >
             <Icon name={minimized ? 'chevron-up' : 'chevron-down'} size={12} />
           </button>
-          <button className={styles.headerButton} onClick={handleClose} title="Close">
-            <Icon name="x" size={12} />
-          </button>
+          {activeCount === 0 && (
+            <button
+              className={styles.headerButton}
+              onClick={handleClose}
+              title="Close"
+              aria-label="Close operations"
+            >
+              <Icon name="x" size={12} />
+            </button>
+          )}
         </div>
       </div>
 
@@ -288,7 +294,7 @@ export function OperationProgress() {
           )}
         </div>
       )}
-    </div>
+    </section>
   );
 }
 

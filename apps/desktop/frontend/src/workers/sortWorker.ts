@@ -82,7 +82,6 @@ function parseToMs(input: unknown): number | null {
   return null;
 }
 
-// eslint-disable-next-line no-restricted-globals
 self.onmessage = (ev: MessageEvent<SortMessage>) => {
   const { files, key, dir } = ev.data || ({} as SortMessage);
   if (!Array.isArray(files)) {

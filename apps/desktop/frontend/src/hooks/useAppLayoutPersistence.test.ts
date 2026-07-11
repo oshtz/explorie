@@ -1,7 +1,7 @@
 import React from 'react';
 import { act, renderHook } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { useAppLayoutPersistence } from './useAppLayoutPersistence';
+import { calculatePaneLayout, useAppLayoutPersistence } from './useAppLayoutPersistence';
 
 function mouseEvent(clientX: number) {
   return {
@@ -57,5 +57,23 @@ describe('useAppLayoutPersistence', () => {
       window.dispatchEvent(new MouseEvent('mousemove', { clientX: 450 }));
     });
     expect(result.current.previewWidth).toBe(410);
+  });
+
+  it('preserves preferred panes while protecting the file surface', () => {
+    expect(calculatePaneLayout(800, 480, 360, true)).toEqual({
+      sidebarWidth: 372,
+      previewWidth: 360,
+      previewVisible: false,
+    });
+    expect(calculatePaneLayout(1024, 220, 360, true)).toEqual({
+      sidebarWidth: 220,
+      previewWidth: 360,
+      previewVisible: true,
+    });
+    expect(calculatePaneLayout(1440, 480, 720, true)).toEqual({
+      sidebarWidth: 480,
+      previewWidth: 524,
+      previewVisible: true,
+    });
   });
 });

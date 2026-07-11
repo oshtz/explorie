@@ -5,7 +5,7 @@ import { useFileStore } from '../store';
 import styles from './GridView.module.css';
 import { Icon } from './Icon';
 import type { IconName } from '../icons';
-import { invoke } from '@tauri-apps/api/core';
+import { convertFileSrc, invoke } from '@tauri-apps/api/core';
 import { createFolderIn, renamePath } from '../utils/fs';
 import type { SortKey, SortDir } from './FileTable';
 import { sortFiles } from './FileTable';
@@ -21,6 +21,8 @@ import { useToast } from './Toast';
 import { deleteWithUndo } from '../utils/fileOperations';
 import { reportError } from '../utils/errorReporter';
 import type { GetSelectedFilesFunction } from '../hooks/useKeyboardClipboard';
+import { useCentralFileSelection } from '../hooks/useCentralFileSelection';
+import type { DragStartHandler } from '../hooks/useDragStart';
 
 const LazyBatchRenameDialog = React.lazy(() =>
   import('./BatchRenameDialog').then((m) => ({ default: m.BatchRenameDialog }))
@@ -48,10 +50,10 @@ interface GridViewProps {
   dragCombineTargetId?: string | null;
   /** Whether a drag operation is currently in progress */
   isDragging?: boolean;
-  /** ID of the item currently being dragged */
-  draggingItemId?: string | null;
+  /** IDs of the items currently being dragged */
+  draggingItemIds?: ReadonlySet<string>;
   /** Callback fired when a drag operation begins */
-  onBeginDrag?: (file: FileEntry) => void;
+  onBeginDrag?: DragStartHandler;
   /** Callback fired when hovering over a folder during drag */
   onHoverFolder?: (file: FileEntry | null) => void;
   /** Callback fired when hovering over the container during drag */
@@ -60,9 +62,67 @@ interface GridViewProps {
   getSelectedFilesRef?: React.MutableRefObject<GetSelectedFilesFunction | null>;
 }
 
-// Grid item gap (constant)
-const GRID_GAP = 12;
 const SORT_WORKER_THRESHOLD = 5000;
+const GRID_THUMBNAIL_EXTENSIONS = new Set([
+  'png',
+  'jpg',
+  'jpeg',
+  'gif',
+  'bmp',
+  'webp',
+  'mp4',
+  'webm',
+  'm4v',
+  'mov',
+  'avi',
+  'mkv',
+  'wmv',
+  'flv',
+  'm2ts',
+  'mts',
+  'mpeg',
+  'mpg',
+  '3gp',
+]);
+const nativeFileIconRequests = new Map<string, Promise<string | undefined>>();
+const nativeThumbnailCache = new Map<string, string>();
+let nativeFileIconQueue = Promise.resolve();
+const nativeThumbnailQueue: Array<{
+  run: () => Promise<string | undefined>;
+  resolve: (value: string | undefined) => void;
+}> = [];
+let activeThumbnailRequests = 0;
+
+function drainThumbnailQueue() {
+  while (activeThumbnailRequests < 4 && nativeThumbnailQueue.length) {
+    const task = nativeThumbnailQueue.shift();
+    if (!task) return;
+    activeThumbnailRequests += 1;
+    void task
+      .run()
+      .then(task.resolve, () => task.resolve(undefined))
+      .finally(() => {
+        activeThumbnailRequests -= 1;
+        drainThumbnailQueue();
+      });
+  }
+}
+
+function scheduleThumbnail(run: () => Promise<string | undefined>) {
+  return new Promise<string | undefined>((resolve) => {
+    nativeThumbnailQueue.push({ run, resolve });
+    drainThumbnailQueue();
+  });
+}
+
+function rememberBounded(
+  cache: Map<string, Promise<string | undefined>>,
+  key: string,
+  request: Promise<string | undefined>
+) {
+  cache.set(key, request);
+  while (cache.size > 128) cache.delete(cache.keys().next().value as string);
+}
 
 // Helper to determine if entry is a directory (prefer explicit flag)
 function isDirectory(file: FileEntry): boolean {
@@ -128,6 +188,116 @@ function getFileIconName(file: FileEntry): IconName {
   }
 }
 
+function getFileExtension(path: string): string {
+  return path.split('.').pop()?.toLowerCase() ?? '';
+}
+
+function toAssetSrc(path: string): string | undefined {
+  try {
+    return convertFileSrc(path, 'asset');
+  } catch {
+    return undefined;
+  }
+}
+
+function loadNativeFileIcon(path: string, key: string): Promise<string | undefined> {
+  const cached = nativeFileIconRequests.get(key);
+  if (cached) return cached;
+
+  const request = nativeFileIconQueue
+    .then(async () => {
+      const iconPath = await invoke<string | null>('get_file_icon', { path });
+      return iconPath ? toAssetSrc(iconPath) : undefined;
+    })
+    .catch(() => undefined);
+  nativeFileIconQueue = request.then(
+    () => undefined,
+    () => undefined
+  );
+  rememberBounded(nativeFileIconRequests, key, request);
+  return request;
+}
+
+function loadNativeThumbnail(
+  path: string,
+  key: string,
+  maxSize: number,
+  signal: AbortSignal
+): Promise<string | undefined> {
+  const cached = nativeThumbnailCache.get(key);
+  if (cached) {
+    nativeThumbnailCache.delete(key);
+    nativeThumbnailCache.set(key, cached);
+    return Promise.resolve(cached);
+  }
+  const request = scheduleThumbnail(async () => {
+    if (signal.aborted) return undefined;
+    const thumbnailPath = await invoke<string | null>('get_file_thumbnail', { path, maxSize });
+    if (signal.aborted || !thumbnailPath) return undefined;
+    const src = toAssetSrc(thumbnailPath);
+    if (!src) return undefined;
+    nativeThumbnailCache.set(key, src);
+    while (nativeThumbnailCache.size > 128) {
+      nativeThumbnailCache.delete(nativeThumbnailCache.keys().next().value as string);
+    }
+    return src;
+  }).catch(() => undefined);
+  return request;
+}
+
+type ThumbnailState = 'loading' | 'loaded' | 'failed';
+
+function GridFileVisual({
+  file,
+  nativeIconSrc,
+  thumbnailSrc,
+  thumbnailState,
+}: {
+  file: FileEntry;
+  nativeIconSrc?: string;
+  thumbnailSrc?: string;
+  thumbnailState?: ThumbnailState;
+}) {
+  const [failed, setFailed] = useState(false);
+  const extension = getFileExtension(file.path);
+  const hasThumbnail = !isDirectory(file) && GRID_THUMBNAIL_EXTENSIONS.has(extension);
+  const src = hasThumbnail ? thumbnailSrc : nativeIconSrc;
+
+  useEffect(() => setFailed(false), [src]);
+
+  if (hasThumbnail && thumbnailState === 'loading') {
+    return <span className={styles.thumbnailLoading} aria-label="Loading thumbnail" />;
+  }
+
+  if (src && !failed) {
+    return (
+      <img
+        className={hasThumbnail ? styles.thumbnail : styles.nativeFileIcon}
+        src={src}
+        alt=""
+        loading="lazy"
+        decoding="async"
+        draggable={false}
+        onError={() => setFailed(true)}
+      />
+    );
+  }
+
+  if (hasThumbnail && (thumbnailState === 'failed' || failed)) {
+    return (
+      <span className={styles.thumbnailFailed} aria-label="Thumbnail unavailable">
+        <Icon name="alert" />
+      </span>
+    );
+  }
+
+  return (
+    <span className={`${styles.fileIcon} ${styles.genericFallback}`} aria-label="Generic file icon">
+      <Icon name={getFileIconName(file)} />
+    </span>
+  );
+}
+
 // Helper to format file size
 function formatBytes(bytes: number, decimals = 1): string {
   if (bytes === 0) return '0 Bytes';
@@ -154,15 +324,13 @@ function GridViewInner({
   onFolderOpen,
   dragCombineTargetId,
   isDragging,
-  draggingItemId,
+  draggingItemIds,
   onBeginDrag,
   onHoverFolder,
   onHoverContainer,
   getSelectedFilesRef,
 }: GridViewProps) {
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [anchorIndex, setAnchorIndex] = useState<number | null>(null);
-  const [cursorIndex, setCursorIndex] = useState<number | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
   // Batch state selectors to reduce re-renders
@@ -199,6 +367,7 @@ function GridViewInner({
   // Calculate grid item dimensions based on gridMinWidth from store
   const gridItemWidth = gridMinWidth;
   const gridItemHeight = Math.round(gridMinWidth * 0.85); // Maintain aspect ratio
+  const gridGap = Math.round((density === 'compact' ? 8 : 12) * uiScale);
 
   // Action selectors (stable references)
   const setEditingId = useFileStore((s) => s.setEditingId);
@@ -328,6 +497,9 @@ function GridViewInner({
     };
   }, [filteredFiles, sortKey, sortDir]);
 
+  const { selectedIds, setSelectedIds, cursorIndex, setCursorIndex } =
+    useCentralFileSelection(sortedFiles);
+
   // Register getSelectedFiles for keyboard clipboard shortcuts
   useEffect(() => {
     if (getSelectedFilesRef) {
@@ -348,7 +520,7 @@ function GridViewInner({
     parentRef: containerRef as React.RefObject<HTMLElement>,
     itemWidth: gridItemWidth,
     itemHeight: gridItemHeight,
-    gap: GRID_GAP,
+    gap: gridGap,
     freeze: isDragging,
   });
 
@@ -360,6 +532,106 @@ function GridViewInner({
     return items;
   }, [virtualRows, getRowItems]);
 
+  const visibleExecutableRequestKey = useMemo(
+    () =>
+      JSON.stringify(
+        visibleItemIndices
+          .map((index) => sortedFiles[index])
+          .filter(
+            (file): file is FileEntry =>
+              Boolean(file) &&
+              !isDirectory(file) &&
+              ['exe', 'lnk'].includes(getFileExtension(file.path))
+          )
+          .map((file) => ({ path: file.path, modified: file.modified }))
+      ),
+    [sortedFiles, visibleItemIndices]
+  );
+  const [nativeIconSrcByPath, setNativeIconSrcByPath] = useState<Record<string, string>>({});
+
+  useEffect(() => {
+    if (document.documentElement.dataset.platform !== 'windows') return;
+    const files = JSON.parse(visibleExecutableRequestKey) as Pick<FileEntry, 'path' | 'modified'>[];
+    let cancelled = false;
+    void Promise.all(
+      files.map(
+        async (file) =>
+          [
+            file.path,
+            await loadNativeFileIcon(file.path, `${file.path}\0${JSON.stringify(file.modified)}`),
+          ] as const
+      )
+    ).then((results) => {
+      if (cancelled) return;
+      setNativeIconSrcByPath((current) => {
+        const next = { ...current };
+        for (const [path, src] of results) {
+          if (src) next[path] = src;
+        }
+        return next;
+      });
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [visibleExecutableRequestKey]);
+
+  const visibleImageRequestKey = useMemo(
+    () =>
+      JSON.stringify(
+        visibleItemIndices
+          .map((index) => sortedFiles[index])
+          .filter(
+            (file): file is FileEntry =>
+              Boolean(file) &&
+              !isDirectory(file) &&
+              GRID_THUMBNAIL_EXTENSIONS.has(getFileExtension(file.path))
+          )
+          .map((file) => ({ path: file.path, modified: file.modified }))
+      ),
+    [sortedFiles, visibleItemIndices]
+  );
+  const [thumbnailByPath, setThumbnailByPath] = useState<
+    Record<string, { src?: string; state: ThumbnailState }>
+  >({});
+
+  useEffect(() => {
+    const images = JSON.parse(visibleImageRequestKey) as Pick<FileEntry, 'path' | 'modified'>[];
+    if (!images.length) return;
+    let cancelled = false;
+    const controller = new AbortController();
+    setThumbnailByPath((current) => {
+      const next = { ...current };
+      for (const image of images) {
+        if (!next[image.path]) next[image.path] = { state: 'loading' };
+      }
+      return next;
+    });
+    const maxSize = Math.min(512, Math.max(128, Math.round(gridMinWidth * 2)));
+    void Promise.all(
+      images.map(async (image) => {
+        const key = `${image.path}\0${JSON.stringify(image.modified)}\0${maxSize}`;
+        return [
+          image.path,
+          await loadNativeThumbnail(image.path, key, maxSize, controller.signal),
+        ] as const;
+      })
+    ).then((results) => {
+      if (cancelled) return;
+      setThumbnailByPath((current) => {
+        const next = { ...current };
+        for (const [path, src] of results) {
+          next[path] = src ? { src, state: 'loaded' } : { state: 'failed' };
+        }
+        return next;
+      });
+    });
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
+  }, [gridMinWidth, visibleImageRequestKey]);
+
   const gridStartOffset = virtualRows.length > 0 ? virtualRows[0].start : 0;
 
   // Marquee selection
@@ -368,8 +640,8 @@ function GridViewInner({
       if (index < 0 || index >= sortedFiles.length) return null;
       const rowIndex = Math.floor(index / columnCount);
       const colIndex = index % columnCount;
-      const rowHeight = gridItemHeight + GRID_GAP;
-      const left = contentOffset.left + colIndex * (gridItemWidth + GRID_GAP);
+      const rowHeight = gridItemHeight + gridGap;
+      const left = contentOffset.left + colIndex * (gridItemWidth + gridGap);
       const top = contentOffset.top + rowIndex * rowHeight;
       return {
         left,
@@ -378,7 +650,7 @@ function GridViewInner({
         bottom: top + gridItemHeight,
       };
     },
-    [sortedFiles.length, columnCount, gridItemWidth, gridItemHeight, contentOffset]
+    [sortedFiles.length, columnCount, gridItemWidth, gridItemHeight, gridGap, contentOffset]
   );
 
   const getItemId = useCallback(
@@ -388,24 +660,27 @@ function GridViewInner({
     [sortedFiles]
   );
 
-  const handleMarqueeSelectionChange = useCallback((ids: Set<string>, additive: boolean) => {
-    if (additive) {
-      // Add to existing selection
-      setSelectedIds((prev) => {
-        const next = new Set(prev);
-        ids.forEach((id) => next.add(id));
-        return next;
-      });
-    } else {
-      setSelectedIds(ids);
-    }
-  }, []);
+  const handleMarqueeSelectionChange = useCallback(
+    (ids: Set<string>, additive: boolean) => {
+      if (additive) {
+        // Add to existing selection
+        setSelectedIds((prev) => {
+          const next = new Set(prev);
+          ids.forEach((id) => next.add(id));
+          return next;
+        });
+      } else {
+        setSelectedIds(ids);
+      }
+    },
+    [setSelectedIds]
+  );
 
   const handleEmptyClick = useCallback(() => {
     setSelectedIds(new Set());
     setAnchorIndex(null);
     setCursorIndex(null);
-  }, []);
+  }, [setCursorIndex, setSelectedIds]);
 
   const marquee = useMarqueeSelection({
     containerRef: containerRef as React.RefObject<HTMLElement>,
@@ -433,7 +708,7 @@ function GridViewInner({
       if (el) el.scrollIntoView({ block: 'nearest' });
       pendingSelectPathRef.current = null;
     }
-  }, [sortedFiles]);
+  }, [setCursorIndex, setSelectedIds, sortedFiles]);
 
   const handleItemClick = useCallback(
     (e: GridSelectionEvent, index: number, file: FileEntry) => {
@@ -461,7 +736,21 @@ function GridViewInner({
       setCursorIndex(index);
       onFileSelect?.(file);
     },
-    [selectedIds, anchorIndex, sortedFiles, onFileSelect]
+    [anchorIndex, onFileSelect, selectedIds, setCursorIndex, setSelectedIds, sortedFiles]
+  );
+
+  const scrollIndexIntoView = useCallback(
+    (index: number) => {
+      const element = containerRef.current;
+      if (!element) return;
+      const top = contentOffset.top + Math.floor(index / columnCount) * (gridItemHeight + gridGap);
+      const bottom = top + gridItemHeight;
+      if (top < element.scrollTop) element.scrollTop = top;
+      else if (bottom > element.scrollTop + element.clientHeight) {
+        element.scrollTop = bottom - element.clientHeight;
+      }
+    },
+    [columnCount, contentOffset.top, gridItemHeight, gridGap]
   );
 
   const handleKeyDown = useCallback(
@@ -483,8 +772,11 @@ function GridViewInner({
           e.preventDefault();
           setEditingId(firstSel);
         }
-      } else if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.key)) {
+      } else if (
+        ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'].includes(e.key)
+      ) {
         e.preventDefault();
+        if (sortedFiles.length === 0) return;
         const perRow = columnCount;
         const current =
           cursorIndex ??
@@ -503,6 +795,12 @@ function GridViewInner({
           case 'ArrowDown':
             nextIdx = Math.min(sortedFiles.length - 1, nextIdx + perRow);
             break;
+          case 'Home':
+            nextIdx = 0;
+            break;
+          case 'End':
+            nextIdx = sortedFiles.length - 1;
+            break;
         }
         if (e.shiftKey) {
           const anchor = anchorIndex ?? cursorIndex ?? nextIdx;
@@ -517,9 +815,20 @@ function GridViewInner({
           setAnchorIndex(nextIdx);
           setCursorIndex(nextIdx);
         }
+        scrollIndexIntoView(nextIdx);
       }
     },
-    [sortedFiles, selectedIds, anchorIndex, cursorIndex, columnCount, setEditingId]
+    [
+      sortedFiles,
+      selectedIds,
+      anchorIndex,
+      cursorIndex,
+      columnCount,
+      setEditingId,
+      setCursorIndex,
+      setSelectedIds,
+      scrollIndexIntoView,
+    ]
   );
 
   // Global ESC handler to clear selection even without focus
@@ -533,7 +842,7 @@ function GridViewInner({
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, []);
+  }, [setCursorIndex, setSelectedIds]);
 
   const handleRename = useCallback(
     async (file: FileEntry, committed: boolean, newName?: string) => {
@@ -562,11 +871,30 @@ function GridViewInner({
           calc_dir_size: false,
         });
         setFiles(withDisplayNames(res));
+      } catch (error) {
+        pendingSelectPathRef.current = null;
+        const index = sortedFiles.findIndex((entry) => entry.id === file.id);
+        setSelectedIds(new Set([file.id]));
+        setAnchorIndex(index >= 0 ? index : null);
+        setCursorIndex(index >= 0 ? index : null);
+        reportError('Rename failed', error, {
+          toast: showToast,
+          context: { path: file.path },
+        });
       } finally {
         setEditingId(null);
       }
     },
-    [currentPath, setDraftNew, setEditingId, setFiles]
+    [
+      currentPath,
+      setCursorIndex,
+      setDraftNew,
+      setEditingId,
+      setFiles,
+      setSelectedIds,
+      showToast,
+      sortedFiles,
+    ]
   );
 
   const performDelete = useCallback(
@@ -587,7 +915,7 @@ function GridViewInner({
         reportError('Delete failed', e, { toast: showToast });
       }
     },
-    [currentPath, setFiles, showToast]
+    [currentPath, setFiles, setSelectedIds, showToast]
   );
 
   const handleDeleteConfirm = useCallback(
@@ -689,7 +1017,7 @@ function GridViewInner({
         throw e;
       }
     },
-    [currentPath, setFiles, showToast]
+    [currentPath, setFiles, setSelectedIds, showToast]
   );
 
   const handleBatchRenameClose = useCallback(() => {
@@ -719,23 +1047,16 @@ function GridViewInner({
     setArchiveDialog({ open: false, mode: 'compress', files: [] });
   }, [currentPath, setFiles]);
 
-  if (sortedFiles.length === 0) {
-    return (
-      <div className={styles.emptyState}>
-        <div className={styles.emptyStateIcon}>
-          <Icon name="folder" size={20} />
-        </div>
-        <div className={styles.emptyStateText}>This folder is empty</div>
-        <div className={styles.emptyStateSubtext}>Drop files here or use the create button</div>
-      </div>
-    );
-  }
+  const noMatches = safeFiles.length > 0 && sortedFiles.length === 0;
 
   return (
     <>
       <div
         className={`${styles.gridContainer} ${isDragging && isOver ? styles.droppableOver : ''}`}
         ref={containerRef}
+        role="listbox"
+        aria-label={`Files in current folder, ${sortedFiles.length} items`}
+        aria-multiselectable="true"
         tabIndex={0}
         onKeyDown={handleKeyDown}
         onContextMenu={(e) => {
@@ -757,6 +1078,21 @@ function GridViewInner({
         }}
         onMouseLeave={() => setIsOver(false)}
       >
+        {sortedFiles.length === 0 && (
+          <div className={styles.emptyState} role="status">
+            <div className={styles.emptyStateIcon}>
+              <Icon name={noMatches ? 'search' : 'folder'} size={20} />
+            </div>
+            <div className={styles.emptyStateText}>
+              {noMatches ? 'No matching files' : 'This folder is empty'}
+            </div>
+            <div className={styles.emptyStateSubtext}>
+              {noMatches
+                ? 'Clear the search or filters to see other items'
+                : 'Drop files here or use the create button'}
+            </div>
+          </div>
+        )}
         {/* Virtualized content container */}
         <div
           style={{
@@ -785,7 +1121,7 @@ function GridViewInner({
               style={{
                 top: gridStartOffset,
                 gridTemplateColumns: `repeat(${columnCount}, ${gridItemWidth}px)`,
-                gap: GRID_GAP,
+                gap: gridGap,
                 gridAutoRows: gridItemHeight,
               }}
             >
@@ -795,7 +1131,7 @@ function GridViewInner({
 
                 const isFolder = isDirectory(file);
                 const fileName = file.path.split(/[/\\]/).pop() || file.path;
-                const isSource = draggingItemId === file.id;
+                const isSource = draggingItemIds?.has(file.id) ?? false;
                 const itemStyle: React.CSSProperties = isFolder
                   ? {
                       backgroundImage:
@@ -820,14 +1156,19 @@ function GridViewInner({
                       width: gridItemWidth,
                       minWidth: gridItemWidth,
                     }}
-                    tabIndex={0}
+                    role="option"
+                    aria-selected={selectedIds.has(file.id)}
+                    tabIndex={cursorIndex === itemIndex ? 0 : -1}
                     aria-label={isFolder ? `Open folder ${fileName}` : `Select file ${fileName}`}
                     onClick={(e) => handleItemClick(e, itemIndex, file)}
                     onDoubleClick={() => {
                       if (isFolder) onFolderOpen?.(file);
                       else
                         invoke('open_path', { path: file.path }).catch((err) =>
-                          console.error('open_path failed', err)
+                          reportError('Open failed', err, {
+                            toast: showToast,
+                            context: { path: file.path },
+                          })
                         );
                     }}
                     onKeyDown={(e) => {
@@ -835,7 +1176,10 @@ function GridViewInner({
                         if (isFolder) onFolderOpen?.(file);
                         else
                           invoke('open_path', { path: file.path }).catch((err) =>
-                            console.error('open_path failed', err)
+                            reportError('Open failed', err, {
+                              toast: showToast,
+                              context: { path: file.path },
+                            })
                           );
                       } else if (e.key === ' ') {
                         handleItemClick(e, itemIndex, file);
@@ -854,15 +1198,24 @@ function GridViewInner({
                       const targetFiles = clickedInSelection
                         ? sortedFiles.filter((f) => selectedIds.has(f.id))
                         : [file];
+                      if (!clickedInSelection) {
+                        setSelectedIds(new Set([file.id]));
+                        setAnchorIndex(itemIndex);
+                        setCursorIndex(itemIndex);
+                        onFileSelect?.(file);
+                      }
                       contextMenu.openForFiles(e, targetFiles, currentPath);
                     }}
                     onMouseLeave={() => {
                       if (isDragging) onHoverFolder?.(null);
                     }}
                   >
-                    <span className={styles.fileIcon}>
-                      <Icon name={getFileIconName(file)} />
-                    </span>
+                    <GridFileVisual
+                      file={file}
+                      nativeIconSrc={nativeIconSrcByPath[file.path]}
+                      thumbnailSrc={thumbnailByPath[file.path]?.src}
+                      thumbnailState={thumbnailByPath[file.path]?.state}
+                    />
                     {editingId === file.id ? (
                       <InlineRenameGrid
                         key={`edit:${file.id}`}

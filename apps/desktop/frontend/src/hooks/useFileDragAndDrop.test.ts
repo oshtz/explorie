@@ -1,16 +1,18 @@
-import { act, renderHook, waitFor } from '@testing-library/react';
+import { act, cleanup, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { FileEntry } from '../store';
-import { useFileDragAndDrop } from './useFileDragAndDrop';
+import { isValidDropTarget, useFileDragAndDrop } from './useFileDragAndDrop';
 
 const mocks = vi.hoisted(() => ({
-  moveToFolder: vi.fn(),
+  moveWithUndoAndConflictResolution: vi.fn(),
+  copyWithUndoAndConflictResolution: vi.fn(),
 }));
 
 const originalVisibilityState = document.visibilityState;
 
-vi.mock('../utils/fs', () => ({
-  moveToFolder: mocks.moveToFolder,
+vi.mock('../utils/fileOperations', () => ({
+  moveWithUndoAndConflictResolution: mocks.moveWithUndoAndConflictResolution,
+  copyWithUndoAndConflictResolution: mocks.copyWithUndoAndConflictResolution,
 }));
 
 function file(name: string, overrides: Partial<FileEntry> = {}): FileEntry {
@@ -32,152 +34,200 @@ function renderDnd(overrides: Partial<Parameters<typeof useFileDragAndDrop>[0]> 
     file('photo.png'),
     file('docs', { path: '/target/docs', is_dir: true }),
     file('song.mp3'),
+    file('elsewhere.txt', { path: '/other/elsewhere.txt' }),
   ];
   const props = {
     files,
-    columnFiles: {
-      '/source': files,
-    },
+    columnFiles: { '/source': files },
     viewMode: 'list' as const,
+    selectedPaths: [] as string[],
+    setSelectedPaths: vi.fn(),
     refreshVisibleViews: vi.fn(async () => {}),
     getParentPath: vi.fn((path: string) => path.split('/').slice(0, -1).join('/') || '/'),
+    showToast: vi.fn(),
+    addFavorite: vi.fn(),
+    onOpenFolder: vi.fn(),
     ...overrides,
   };
 
-  return {
-    props,
-    ...renderHook(() => useFileDragAndDrop(props)),
-  };
+  return { props, ...renderHook(() => useFileDragAndDrop(props)) };
 }
 
 describe('useFileDragAndDrop', () => {
   beforeEach(() => {
-    mocks.moveToFolder.mockReset();
-    mocks.moveToFolder.mockResolvedValue(undefined);
+    mocks.moveWithUndoAndConflictResolution.mockReset();
+    mocks.moveWithUndoAndConflictResolution.mockResolvedValue(true);
+    mocks.copyWithUndoAndConflictResolution.mockReset();
+    mocks.copyWithUndoAndConflictResolution.mockResolvedValue(true);
+    vi.spyOn(window, 'requestAnimationFrame').mockReturnValue(1);
+    vi.spyOn(window, 'cancelAnimationFrame').mockImplementation(() => {});
   });
 
   afterEach(() => {
+    cleanup();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
     Object.defineProperty(document, 'visibilityState', {
       configurable: true,
       value: originalVisibilityState,
     });
   });
 
-  it('begins drags with file-type overlays, tracks hover state, and mouse position', () => {
-    const { result } = renderDnd();
-
+  it('gathers the full selection across folders and tracks the pointer', () => {
+    const { result, props } = renderDnd({
+      selectedPaths: ['/source/photo.png', '/source/song.mp3', '/other/elsewhere.txt'],
+    });
     act(() => {
-      result.current.beginDrag(file('photo.png'));
+      result.current.beginDrag(props.files[0], { x: 12, y: 18 });
     });
 
-    expect(result.current.draggingId).toBe('file:photo.png');
-    expect(result.current.dragOverlay).toEqual({ label: 'photo.png', icon: 'image' });
-
-    act(() => {
-      result.current.handleHoverFolder(file('docs', { is_dir: true }));
-      result.current.handleHoverContainerPath('/target');
+    expect([...result.current.draggingItemIds]).toEqual(['photo.png', 'song.mp3', 'elsewhere.txt']);
+    expect(result.current.dragOverlay).toMatchObject({
+      totalCount: 3,
+      pickupPoint: { x: 12, y: 18 },
+      phase: 'gathering',
     });
 
-    expect(result.current.combineTargetId).toBe('docs');
+    expect(result.current.dragPos).toEqual({ x: 12, y: 18 });
 
-    act(() => {
-      window.dispatchEvent(new MouseEvent('mousemove', { clientX: 20, clientY: 30 }));
-    });
-
-    expect(result.current.dragPos).toEqual({ x: 28, y: 38 });
+    act(() => result.current.handleGatherComplete());
+    expect(result.current.dragOverlay?.phase).toBe('dragging');
   });
 
-  it('moves dragged files into hovered directories and resets drag state', async () => {
+  it('switches to copy while Ctrl or Option is held and shows the operation verb', async () => {
+    const { result, props } = renderDnd({ selectedPaths: ['/source/photo.png'] });
+    act(() => result.current.beginDrag(props.files[0], { x: 10, y: 10 }));
+    act(() => result.current.handleHoverFolder(props.files[1]));
+    act(() =>
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Control', ctrlKey: true }))
+    );
+    expect(result.current.dragOverlay?.operation).toBe('copy');
+    act(() => window.dispatchEvent(new MouseEvent('mouseup')));
+
+    await waitFor(() =>
+      expect(mocks.copyWithUndoAndConflictResolution).toHaveBeenCalledWith(
+        [props.files[0]],
+        '/target/docs',
+        expect.any(Function),
+        props.refreshVisibleViews,
+        { conflictResolution: 'ask' }
+      )
+    );
+  });
+
+  it('pins dragged folders when Favorites is the drop target', () => {
+    const folder = file('projects', { path: '/source/projects', is_dir: true });
+    const addFavorite = vi.fn();
+    const { result } = renderDnd({ files: [folder], selectedPaths: [folder.path], addFavorite });
+
+    act(() => result.current.beginDrag(folder, { x: 3, y: 4 }));
+    act(() => result.current.handleHoverFavorites());
+    act(() => window.dispatchEvent(new MouseEvent('mouseup')));
+
+    expect(addFavorite).toHaveBeenCalledWith(folder.path, folder.name);
+    expect(result.current.dragOverlay?.phase).toBe('dropping');
+  });
+
+  it('opens a hovered folder after the dwell delay', () => {
+    vi.useFakeTimers();
+    const onOpenFolder = vi.fn();
+    const { result, props } = renderDnd({ onOpenFolder });
+    act(() => result.current.beginDrag(props.files[0], { x: 1, y: 1 }));
+    act(() => result.current.handleHoverFolder(props.files[1]));
+
+    act(() => vi.advanceTimersByTime(699));
+    expect(onOpenFolder).not.toHaveBeenCalled();
+    act(() => vi.advanceTimersByTime(1));
+    expect(onOpenFolder).toHaveBeenCalledWith(props.files[1]);
+  });
+
+  it('drags an unselected item alone', () => {
     const { result, props } = renderDnd();
 
     act(() => {
-      result.current.beginDrag(props.files[0]);
-      result.current.handleHoverFolder(props.files[1]);
+      result.current.beginDrag(props.files[1], { x: 5, y: 6 });
+    });
+
+    expect([...result.current.draggingItemIds]).toEqual(['docs']);
+    expect(result.current.dragOverlay?.totalCount).toBe(1);
+  });
+
+  it('moves the selected payload once and clears visual state only after the drop animation', async () => {
+    const { result, props } = renderDnd({
+      selectedPaths: ['/source/photo.png', '/source/song.mp3'],
     });
 
     act(() => {
-      window.dispatchEvent(new MouseEvent('mouseup'));
+      result.current.beginDrag(props.files[0], { x: 10, y: 10 });
     });
+    act(() => result.current.handleHoverFolder(props.files[1]));
+    act(() => window.dispatchEvent(new MouseEvent('mouseup')));
 
     await waitFor(() =>
-      expect(mocks.moveToFolder).toHaveBeenCalledWith('/source/photo.png', '/target/docs')
+      expect(mocks.moveWithUndoAndConflictResolution).toHaveBeenCalledWith(
+        [props.files[0], props.files[2]],
+        '/target/docs',
+        expect.any(Function),
+        props.refreshVisibleViews,
+        { conflictResolution: 'ask' }
+      )
     );
-    await waitFor(() => expect(props.refreshVisibleViews).toHaveBeenCalledTimes(1));
+    expect(result.current.dragOverlay?.phase).toBe('dropping');
+    expect(result.current.draggingItemIds.size).toBe(2);
 
-    await waitFor(() => expect(result.current.draggingId).toBeNull());
+    act(() => result.current.handleDragAnimationComplete());
     expect(result.current.dragOverlay).toBeNull();
+    expect(result.current.draggingItemIds.size).toBe(0);
     expect(result.current.dndEpoch).toBe(1);
   });
 
-  it('moves to hovered container paths and skips moves to the same parent', async () => {
-    const { result, props, rerender } = renderDnd();
+  it('rejects same-folder, self, and descendant targets and returns ghosts to their origins', () => {
+    const folder = file('folder', { path: '/source/folder', is_dir: true });
+    const nested = file('nested', { path: '/source/folder/nested', is_dir: true });
+    const getParentPath = (path: string) => path.split('/').slice(0, -1).join('/') || '/';
 
-    act(() => {
-      result.current.beginDrag(props.files[2]);
-    });
+    expect(isValidDropTarget('/source', [folder], getParentPath)).toBe(false);
+    expect(isValidDropTarget('/source/folder', [folder], getParentPath)).toBe(false);
+    expect(isValidDropTarget('/source/folder/nested', [folder], getParentPath)).toBe(false);
 
-    act(() => {
-      result.current.handleHoverContainerPath('/music');
-    });
+    const { result } = renderDnd({ files: [folder, nested], getParentPath });
+    act(() => result.current.beginDrag(folder, { x: 1, y: 2 }));
+    act(() => result.current.handleHoverFolder(nested));
+    expect(result.current.combineTargetId).toBeNull();
 
-    act(() => {
-      window.dispatchEvent(new MouseEvent('pointerup'));
-    });
-
-    await waitFor(() =>
-      expect(mocks.moveToFolder).toHaveBeenCalledWith('/source/song.mp3', '/music')
-    );
-
-    mocks.moveToFolder.mockClear();
-
-    act(() => {
-      rerender();
-      result.current.beginDrag(props.files[2]);
-    });
-
-    act(() => {
-      result.current.handleHoverContainerPath('/source');
-    });
-
-    act(() => {
-      window.dispatchEvent(new MouseEvent('blur'));
-    });
-
-    await waitFor(() => expect(props.refreshVisibleViews).toHaveBeenCalledTimes(2));
-    expect(mocks.moveToFolder).not.toHaveBeenCalled();
+    act(() => window.dispatchEvent(new MouseEvent('pointerup')));
+    expect(result.current.dragOverlay?.phase).toBe('returning');
+    expect(mocks.moveWithUndoAndConflictResolution).not.toHaveBeenCalled();
   });
 
-  it('finds column-mode files, refreshes on move errors, and handles hidden-tab cleanup', async () => {
+  it('finds column-mode targets, refreshes after move errors, and handles hidden-tab release', async () => {
     const refreshVisibleViews = vi.fn(async () => {});
-    mocks.moveToFolder.mockRejectedValueOnce(new Error('move failed'));
-    const columnFile = file('clip.mp4', { path: '/columns/clip.mp4' });
+    mocks.moveWithUndoAndConflictResolution.mockRejectedValueOnce(new Error('move failed'));
+    const clip = file('clip.mp4', { path: '/columns/clip.mp4' });
     const target = file('videos', { path: '/videos', is_dir: true });
     const { result } = renderDnd({
       files: [],
-      columnFiles: {
-        '/columns': [columnFile, target],
-      },
+      columnFiles: { '/columns': [clip, target] },
       viewMode: 'column',
+      selectedPaths: ['/columns/clip.mp4'],
       refreshVisibleViews,
     });
 
-    act(() => {
-      result.current.beginDrag(columnFile);
-      result.current.handleHoverFolder(target);
-    });
-
-    Object.defineProperty(document, 'visibilityState', {
-      configurable: true,
-      value: 'hidden',
-    });
-    act(() => {
-      document.dispatchEvent(new Event('visibilitychange'));
-    });
+    act(() => result.current.beginDrag(clip, { x: 4, y: 8 }));
+    act(() => result.current.handleHoverFolder(target));
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' });
+    act(() => document.dispatchEvent(new Event('visibilitychange')));
 
     await waitFor(() =>
-      expect(mocks.moveToFolder).toHaveBeenCalledWith('/columns/clip.mp4', '/videos')
+      expect(mocks.moveWithUndoAndConflictResolution).toHaveBeenCalledWith(
+        [clip],
+        '/videos',
+        expect.any(Function),
+        refreshVisibleViews,
+        { conflictResolution: 'ask' }
+      )
     );
     await waitFor(() => expect(refreshVisibleViews).toHaveBeenCalledTimes(1));
-    await waitFor(() => expect(result.current.draggingId).toBeNull());
+    expect(result.current.dragOverlay?.phase).toBe('dropping');
   });
 });

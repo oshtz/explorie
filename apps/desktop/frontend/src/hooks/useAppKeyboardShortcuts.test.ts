@@ -26,6 +26,14 @@ function ShortcutHarness(props: Partial<Parameters<typeof useAppKeyboardShortcut
     redo: vi.fn(),
     increaseThumbnailSize: vi.fn(),
     decreaseThumbnailSize: vi.fn(),
+    deleteSelection: vi.fn(),
+    goUp: vi.fn(),
+    refresh: vi.fn(),
+    setViewMode: vi.fn(),
+    toggleHidden: vi.fn(),
+    activateTabOffset: vi.fn(),
+    focusSearch: vi.fn(),
+    typeToSelect: vi.fn(),
     ...props,
   });
   return React.createElement('input', { 'aria-label': 'editable' });
@@ -98,5 +106,60 @@ describe('useAppKeyboardShortcuts', () => {
 
     expect(increaseThumbnailSize).toHaveBeenCalledTimes(1);
     expect(decreaseThumbnailSize).toHaveBeenCalledTimes(1);
+  });
+
+  it('dispatches the shortcuts advertised by the overlay and type-to-select', () => {
+    const deleteSelection = vi.fn();
+    const goUp = vi.fn();
+    const refresh = vi.fn();
+    const setViewMode = vi.fn();
+    const toggleHidden = vi.fn();
+    const activateTabOffset = vi.fn();
+    const focusSearch = vi.fn();
+    const typeToSelect = vi.fn();
+    render(
+      React.createElement(ShortcutHarness, {
+        deleteSelection,
+        goUp,
+        refresh,
+        setViewMode,
+        toggleHidden,
+        activateTabOffset,
+        focusSearch,
+        typeToSelect,
+      })
+    );
+
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Delete' }));
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Backspace' }));
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'F5' }));
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: '2', ctrlKey: true }));
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'h', ctrlKey: true }));
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', ctrlKey: true }));
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'f', ctrlKey: true }));
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'r' }));
+
+    expect(deleteSelection).toHaveBeenCalledOnce();
+    expect(goUp).toHaveBeenCalledOnce();
+    expect(refresh).toHaveBeenCalledOnce();
+    expect(setViewMode).toHaveBeenCalledWith('grid');
+    expect(toggleHidden).toHaveBeenCalledOnce();
+    expect(activateTabOffset).toHaveBeenCalledWith(1);
+    expect(focusSearch).toHaveBeenCalledOnce();
+    expect(typeToSelect).toHaveBeenCalledWith('r');
+  });
+
+  it('does not dispatch app shortcuts behind a modal', () => {
+    const addTab = vi.fn();
+    render(React.createElement(ShortcutHarness, { addTab }));
+
+    const modal = document.createElement('div');
+    modal.setAttribute('aria-modal', 'true');
+    document.body.appendChild(modal);
+
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 't', ctrlKey: true }));
+
+    expect(addTab).not.toHaveBeenCalled();
+    modal.remove();
   });
 });

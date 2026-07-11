@@ -85,8 +85,6 @@ describe('TopBar', () => {
       showFolderSizes: false,
       sortKey: 'name',
       sortDir: 'asc',
-      enableDnDLargeLists: false,
-      devMockEntries: false,
       filterMode: 'all',
       searchQuery: '',
       pathStack: ['/root'],
@@ -101,13 +99,16 @@ describe('TopBar', () => {
 
   it('saves the current search as a smart folder', async () => {
     const user = userEvent.setup();
-    vi.spyOn(window, 'prompt').mockReturnValue('Manifest Search');
 
     renderTopBar();
 
     const searchInput = screen.getByRole('textbox', { name: /search files and folders/i });
     await user.type(searchInput, 'manifest');
     await user.click(screen.getByRole('button', { name: /save search as smart folder/i }));
+    const nameInput = screen.getByRole('textbox', { name: 'Name' });
+    await user.clear(nameInput);
+    await user.type(nameInput, 'Manifest Search');
+    await user.click(screen.getByRole('button', { name: 'Save' }));
 
     const smartFolders = useFileStore.getState().getSmartFolderList();
     expect(smartFolders).toHaveLength(1);
@@ -131,16 +132,29 @@ describe('TopBar', () => {
     renderTopBar();
 
     await user.click(screen.getByRole('button', { name: /change view mode/i }));
-    await user.click(screen.getByRole('menuitemradio', { name: /grid/i }));
+    await user.click(screen.getByRole('button', { name: /grid/i }));
     expect(useFileStore.getState().viewMode).toBe('grid');
 
     await user.click(screen.getByRole('button', { name: /filter options/i }));
-    await user.click(screen.getByRole('menuitemradio', { name: /files/i }));
+    await user.click(screen.getByRole('button', { name: /files/i }));
     expect(useFileStore.getState().filterMode).toBe('files');
 
     await user.click(screen.getByRole('button', { name: /more options/i }));
-    await user.click(screen.getByRole('menuitemcheckbox', { name: /show folder sizes/i }));
+    await user.click(screen.getByRole('button', { name: /show folder sizes/i }));
     await waitFor(() => expect(useFileStore.getState().showFolderSizes).toBe(true));
+  });
+
+  it('closes an open popover with Escape and restores trigger focus', async () => {
+    const user = userEvent.setup();
+    renderTopBar();
+
+    const viewButton = screen.getByRole('button', { name: /change view mode/i });
+    await user.click(viewButton);
+    expect(screen.getByRole('group', { name: /view options/i })).toBeInTheDocument();
+
+    await user.keyboard('{Escape}');
+    expect(screen.queryByRole('group', { name: /view options/i })).not.toBeInTheDocument();
+    expect(viewButton).toHaveFocus();
   });
 
   it('runs navigation controls and selects history entries from context menus', async () => {
@@ -172,14 +186,14 @@ describe('TopBar', () => {
     expect(onUp).toHaveBeenCalledTimes(1);
 
     fireEvent.contextMenu(screen.getByRole('button', { name: /go back/i }));
-    await user.click(screen.getByRole('menuitem', { name: /go back to beta/i }));
+    await user.click(screen.getByRole('button', { name: /go back to beta/i }));
     expect(onBackHistorySelect).toHaveBeenCalledWith(0);
-    expect(screen.queryByRole('menu', { name: /navigation history/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('group', { name: /navigation history/i })).not.toBeInTheDocument();
 
     fireEvent.contextMenu(screen.getByRole('button', { name: /go forward/i }));
-    await user.click(screen.getByRole('menuitem', { name: /go forward to delta/i }));
+    await user.click(screen.getByRole('button', { name: /go forward to delta/i }));
     expect(onForwardHistorySelect).toHaveBeenCalledWith(1);
-    expect(screen.queryByRole('menu', { name: /forward history/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('group', { name: /forward history/i })).not.toBeInTheDocument();
   });
 
   it('starts an inline folder draft from the create menu', async () => {
@@ -189,7 +203,7 @@ describe('TopBar', () => {
     renderTopBar();
 
     await user.click(screen.getByRole('button', { name: /create new item/i }));
-    await user.click(screen.getByRole('menuitem', { name: /new folder/i }));
+    await user.click(screen.getByRole('button', { name: /new folder/i }));
 
     expect(useFileStore.getState().draftNew).toEqual({
       id: 'draft:12345',
@@ -197,7 +211,7 @@ describe('TopBar', () => {
       name: 'New Folder',
     });
     expect(useFileStore.getState().editingId).toBe('draft:12345');
-    expect(screen.queryByRole('menu', { name: /create options/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('group', { name: /create options/i })).not.toBeInTheDocument();
   });
 
   it('creates notes and website links then refreshes the current folder', async () => {
@@ -212,12 +226,10 @@ describe('TopBar', () => {
         custom: {},
       },
     ]);
-    vi.spyOn(window, 'prompt').mockReturnValue('https://example.com');
-
     renderTopBar();
 
     await user.click(screen.getByRole('button', { name: /create new item/i }));
-    await user.click(screen.getByRole('menuitem', { name: /new note/i }));
+    await user.click(screen.getByRole('button', { name: /new note/i }));
 
     expect(createNoteIn).toHaveBeenCalledWith('/root');
     await waitFor(() =>
@@ -231,10 +243,16 @@ describe('TopBar', () => {
     ]);
 
     await user.click(screen.getByRole('button', { name: /create new item/i }));
-    await user.click(screen.getByRole('menuitem', { name: /new website link/i }));
+    await user.click(screen.getByRole('button', { name: /new website link/i }));
+    const urlInput = screen.getByRole('textbox', { name: 'Website URL' });
+    await user.clear(urlInput);
+    await user.type(urlInput, 'https://example.com');
+    await user.click(screen.getByRole('button', { name: 'Create' }));
 
-    expect(createWebsiteLinkIn).toHaveBeenCalledWith('/root', 'https://example.com');
-    expect(invoke).toHaveBeenCalledTimes(2);
+    await waitFor(() =>
+      expect(createWebsiteLinkIn).toHaveBeenCalledWith('/root', 'https://example.com')
+    );
+    await waitFor(() => expect(invoke).toHaveBeenCalledTimes(3));
   });
 
   it('updates sort, theme, hidden files, and clears search from keyboard', async () => {
@@ -250,19 +268,20 @@ describe('TopBar', () => {
     expect(useFileStore.getState().searchQuery).toBe('');
 
     await user.click(screen.getByRole('button', { name: /sort options/i }));
-    await user.click(screen.getByRole('menuitemradio', { name: /size/i }));
+    await user.click(screen.getByRole('button', { name: /size/i }));
     expect(useFileStore.getState().sortKey).toBe('size');
     expect(useFileStore.getState().sortDir).toBe('asc');
 
     await user.click(screen.getByRole('button', { name: /sort options/i }));
-    await user.click(screen.getByRole('menuitemradio', { name: /size/i }));
+    await user.click(screen.getByRole('button', { name: /size/i }));
     expect(useFileStore.getState().sortDir).toBe('desc');
 
     await user.click(screen.getByRole('button', { name: /change view mode/i }));
-    await user.click(screen.getByRole('menuitemcheckbox', { name: /show hidden files/i }));
+    await user.click(screen.getByRole('button', { name: /show hidden files/i }));
     expect(useFileStore.getState().showHidden).toBe(true);
 
-    await user.click(screen.getByRole('button', { name: /switch to light theme/i }));
+    await user.click(screen.getByRole('button', { name: /more options/i }));
+    await user.click(screen.getByRole('button', { name: /use light theme/i }));
     expect(useFileStore.getState().theme).toBe('light');
   });
 
@@ -276,5 +295,31 @@ describe('TopBar', () => {
     expect(screen.getByText('/')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /go back/i })).toBeDisabled();
     expect(screen.getByRole('button', { name: /go to parent folder/i })).toBeDisabled();
+  });
+
+  it('recognizes Syncthing folders and conflict copies', async () => {
+    vi.mocked(invoke).mockImplementation(async (command) =>
+      command === 'get_syncthing_root' ? '/root' : []
+    );
+    useFileStore.setState({
+      files: [
+        {
+          id: 'conflict',
+          path: '/root/report.sync-conflict-20260711-120000.md',
+          name: 'report.sync-conflict-20260711-120000.md',
+          size: 1,
+          modified: 1,
+          is_dir: false,
+          custom: {},
+        },
+      ],
+    });
+
+    renderTopBar();
+
+    expect(await screen.findByText('Syncthing · 1 conflict')).toHaveAttribute(
+      'title',
+      'Synced by Syncthing: /root'
+    );
   });
 });

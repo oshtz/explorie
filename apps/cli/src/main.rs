@@ -1,7 +1,5 @@
-use explorie_core::{FileEntry, list_dir, list_dir_with_sizes};
+use explorie_core::{FileEntry, list_dir_with_sizes};
 use explorie_ffmpeg_wrapper::FfmpegTask;
-use explorie_plugin_host::{Plugin, PluginHost};
-use serde_json::{Value, json};
 use std::{env, error::Error, path::PathBuf, process};
 
 fn main() {
@@ -23,11 +21,6 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     enum Mode {
         List,
-        PluginCall {
-            plugin: String,
-            method: String,
-            payload: Option<Value>,
-        },
         FfmpegPreview {
             input: String,
             output: String,
@@ -51,17 +44,6 @@ fn run() -> Result<(), Box<dyn Error>> {
             "--version" | "-V" => {
                 print_version();
                 return Ok(());
-            }
-            "plugin-call" => {
-                let plugin = args.next().ok_or("plugin-call requires a plugin name")?;
-                let method = args.next().ok_or("plugin-call requires a method name")?;
-                let payload = args.next().map(|p| serde_json::from_str(&p)).transpose()?;
-                mode = Mode::PluginCall {
-                    plugin,
-                    method,
-                    payload,
-                };
-                break;
             }
             "ffmpeg-preview" => {
                 let input = args.next().ok_or("ffmpeg-preview requires an input path")?;
@@ -117,17 +99,6 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     match mode {
         Mode::List => perform_listing(target_path, with_sizes)?,
-        Mode::PluginCall {
-            plugin,
-            method,
-            payload,
-        } => {
-            let host = build_plugin_host();
-            let value = host
-                .call(&plugin, &method, payload)
-                .map_err(|e| format!("plugin error: {e}"))?;
-            println!("{}", serde_json::to_string_pretty(&value)?);
-        }
         Mode::FfmpegPreview {
             input,
             output,
@@ -233,79 +204,17 @@ fn print_usage() {
     println!("{}", usage_line());
     println!("Subcommands:");
     println!("  explorie [--with-sizes] [path]     List directory contents (default)");
-    println!("  explorie plugin-call <plugin> <method> [json]   Call a registered plugin");
     println!(
         "  explorie ffmpeg-preview <input> <output> [--copy-audio] [--copy-video] [--vf expr] [--af expr] [--binary path]"
     );
 }
 
 fn usage_line() -> String {
-    "Usage: explorie [--with-sizes] [path] | plugin-call ... | ffmpeg-preview ...".to_string()
+    "Usage: explorie [--with-sizes] [path] | ffmpeg-preview ...".to_string()
 }
 
 fn print_version() {
     println!("explorie-cli {}", env!("CARGO_PKG_VERSION"));
-}
-
-fn build_plugin_host() -> PluginHost {
-    let host = PluginHost::new();
-    let _ = host.register(InfoPlugin);
-    host
-}
-
-struct InfoPlugin;
-
-impl Plugin for InfoPlugin {
-    fn name(&self) -> &str {
-        "info"
-    }
-
-    fn invoke(
-        &self,
-        method: &str,
-        payload: Option<Value>,
-    ) -> Result<Value, explorie_plugin_host::PluginError> {
-        match method {
-            "ping" => Ok(json!({ "ok": true })),
-            "summary" => {
-                let path = payload
-                    .as_ref()
-                    .and_then(|v| v.get("path"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(".");
-                let entries = list_dir(PathBuf::from(path).as_path()).map_err(|e| {
-                    explorie_plugin_host::PluginError::Invocation {
-                        plugin: self.name().into(),
-                        method: method.into(),
-                        message: e.to_string(),
-                    }
-                })?;
-                let mut dirs = 0usize;
-                let mut files = 0usize;
-                for e in &entries {
-                    if e.is_dir {
-                        dirs += 1;
-                    } else {
-                        files += 1;
-                    }
-                }
-                Ok(json!({
-                    "path": path,
-                    "entries": entries.len(),
-                    "dirs": dirs,
-                    "files": files
-                }))
-            }
-            other => Err(explorie_plugin_host::PluginError::MethodNotFound {
-                plugin: self.name().into(),
-                method: other.into(),
-            }),
-        }
-    }
-
-    fn methods(&self) -> &[&'static str] {
-        &["ping", "summary"]
-    }
 }
 
 #[cfg(test)]

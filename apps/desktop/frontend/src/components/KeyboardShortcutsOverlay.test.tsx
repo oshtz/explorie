@@ -81,18 +81,12 @@ describe('KeyboardShortcutsOverlay', () => {
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
-  it('closes on Escape or non-modifier global keys but keeps modifier-only keys open', () => {
+  it('closes on Escape without intercepting unrelated keys', () => {
     const { onClose } = renderOverlay();
 
-    fireEvent.keyDown(window, { key: 'Shift' });
-    fireEvent.keyDown(window, { key: 'Control' });
+    fireEvent.keyDown(screen.getByPlaceholderText('Search shortcuts...'), { key: 'a' });
     expect(onClose).not.toHaveBeenCalled();
-
-    fireEvent.keyDown(window, { key: 'a' });
-    expect(onClose).toHaveBeenCalledTimes(1);
-
-    onClose.mockClear();
     fireEvent.keyDown(screen.getByPlaceholderText('Search shortcuts...'), { key: 'Escape' });
-    expect(onClose).toHaveBeenCalled();
+    expect(onClose).toHaveBeenCalledTimes(1);
   });
 });

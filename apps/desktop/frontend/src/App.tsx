@@ -1,10 +1,9 @@
 import React, { useEffect, useState, useCallback, useMemo, useRef } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import { invoke, isTauri } from '@tauri-apps/api/core';
 import { useFileStore } from './store';
 import { ListView } from './components/ListView';
 import { ColumnView } from './components/ColumnView';
 import { GridView } from './components/GridView';
-import { Icon } from './components/Icon';
 import { FilePreviewer } from './components/FilePreviewer';
 import { QuickLookModal } from './components/QuickLookModal';
 import { StatusBar } from './components/StatusBar';
@@ -15,27 +14,30 @@ import { useShallow } from 'zustand/shallow';
 import { useInitialPath } from './hooks/useInitialPath';
 import { ToastProvider, useToast } from './components/Toast';
 import { useUndoRedoStore, useCanUndo, useCanRedo } from './undoRedoStore';
-import type { FileOperation } from './operationQueueStore';
-import { useOperationQueueStore, formatBytes } from './operationQueueStore';
 import { OperationProgress } from './components/OperationProgress';
-import { AutoUpdater } from './components/AutoUpdater';
 import { getParentPath as getParentPathUtil, normalizePath } from './utils/path';
 import { runSmartFolderSearch } from './utils/smartFolderSearch';
-import type { IconName } from './icons';
-import type { SortDir, SortKey } from './components/FileTable';
+import { sortFiles, type SortDir, type SortKey } from './components/FileTable';
 import { useTabs } from './hooks/useTabs';
 import { useWorkspaceManager } from './hooks/useWorkspaceManager';
 import { useFileDragAndDrop } from './hooks/useFileDragAndDrop';
 import { useNavigationHandlers } from './hooks/useNavigationHandlers';
 import { useAppCommands } from './hooks/useAppCommands';
 import { useAppKeyboardShortcuts } from './hooks/useAppKeyboardShortcuts';
-import { useAppLayoutPersistence } from './hooks/useAppLayoutPersistence';
+import { calculatePaneLayout, useAppLayoutPersistence } from './hooks/useAppLayoutPersistence';
 import { useQuickLookController } from './hooks/useQuickLookController';
 import { formatErrorMessage } from './utils/errorMessages';
-import { isTauriRuntime } from './services/updater';
+import { DragOverlay } from './components/DragOverlay';
+import { deleteWithUndo } from './utils/fileOperations';
+import { chooseFolder } from './utils/folderPicker';
 
 const MAX_CONCURRENT_DIR_SIZE_REQUESTS = 4;
 const isDevBuild = import.meta.env.DEV;
+const LazySecureDeleteDialog = React.lazy(() =>
+  import('./components/SecureDeleteDialog').then((module) => ({
+    default: module.SecureDeleteDialog,
+  }))
+);
 type CssVariableStyle<K extends string> = React.CSSProperties & Record<K, string>;
 
 function createDevMockEntries(basePath: string): FileEntry[] {
@@ -51,7 +53,6 @@ function createDevMockEntries(basePath: string): FileEntry[] {
     custom: i % 15 === 0 ? { status: i % 30 === 0 ? 'Done' : 'In Progress' } : {},
   }));
 }
-
 // Extend window type for explorie globals
 interface ExplorieWindow extends Window {
   __explorieInflightSizes?: Map<string, Promise<number>>;
@@ -115,11 +116,10 @@ async function fetchDirSizesConcurrent(
   await Promise.all(Array.from({ length: workerCount }, runWorker));
 }
 
-import { InfoBox } from './components/InfoBox';
 import { Sidebar } from './components/Sidebar';
 import { SettingsPanel } from './components/SettingsPanel';
 import { TopBar } from './components/TopBar';
-import { TitleBar } from './components/TitleBar';
+import { getTitleBarState, TitleBar } from './components/TitleBar';
 import { TabsBar } from './components/TabsBar';
 import { ErrorBoundary, InlineErrorBoundary } from './components/ErrorBoundary';
 import { CommandPalette } from './components/CommandPalette';
@@ -133,6 +133,8 @@ import { useCrashRecovery } from './hooks/useCrashRecovery';
 import { RecoveryBanner } from './components/RecoveryBanner';
 import { useKeyboardClipboardManager } from './hooks/useKeyboardClipboard';
 import { DebugPanel } from './components/DebugPanel';
+import { TextInputDialog } from './components/TextInputDialog';
+import { FolderLoadErrorState, StartupLocationState } from './components/LocationRecoveryState';
 import type { WorkspaceTab, FileEntry } from './store';
 
 // Main App with ToastProvider wrapper
@@ -143,57 +145,16 @@ export default function App() {
     </ToastProvider>
   );
 }
-
 // Inner App content that can use toast hook
 function AppContent() {
+  const tauri = isTauri();
+  const { showTitleBar, showWindowControls } = getTitleBarState(
+    document.documentElement.dataset.platform,
+    tauri
+  );
+
   // Toast for notifications
   const { show: showToast } = useToast();
-
-  // Operation queue notification setup
-  const setOnOperationComplete = useOperationQueueStore((s) => s.setOnOperationComplete);
-
-  // Connect operation completion to toast notifications
-  const retryOperation = useOperationQueueStore((s) => s.retryOperation);
-  useEffect(() => {
-    const handleOperationComplete = (operation: FileOperation) => {
-      const typeLabels: Record<string, string> = {
-        copy: 'Copy',
-        move: 'Move',
-        delete: 'Delete',
-        compress: 'Compress',
-        extract: 'Extract',
-      };
-      const typeLabel = typeLabels[operation.type] || operation.type;
-      const itemCount = operation.totalItems;
-      const itemLabel = itemCount === 1 ? 'item' : 'items';
-
-      if (operation.status === 'completed') {
-        const sizeStr =
-          operation.processedBytes > 0 ? ` (${formatBytes(operation.processedBytes)})` : '';
-        showToast(`${typeLabel} completed: ${itemCount} ${itemLabel}${sizeStr}`, {
-          type: 'success',
-        });
-      } else if (operation.status === 'failed') {
-        // Show error toast with retry action
-        showToast(`${typeLabel} failed: ${operation.error || 'Unknown error'}`, {
-          type: 'error',
-          action: {
-            label: 'Retry',
-            onClick: () => retryOperation(operation.id),
-          },
-          duration: 8000, // Give more time to see retry option
-        });
-      } else if (operation.status === 'cancelled') {
-        showToast(`${typeLabel} cancelled`, { type: 'warning' });
-      }
-    };
-
-    setOnOperationComplete(handleOperationComplete);
-
-    return () => {
-      setOnOperationComplete(null);
-    };
-  }, [showToast, setOnOperationComplete, retryOperation]);
 
   // Undo/Redo state
   const canUndo = useCanUndo();
@@ -216,7 +177,6 @@ function AppContent() {
     showFolderSizes,
     sortKey,
     sortDir,
-    devMockEntries,
   } = useFileStore(
     useShallow((s) => ({
       files: s.files,
@@ -233,7 +193,6 @@ function AppContent() {
       showFolderSizes: s.showFolderSizes,
       sortKey: s.sortKey,
       sortDir: s.sortDir,
-      devMockEntries: s.devMockEntries,
     }))
   );
 
@@ -248,6 +207,10 @@ function AppContent() {
   const setShowPreviewPanel = useFileStore((s) => s.setShowPreviewPanel);
   const setShowStatusBar = useFileStore((s) => s.setShowStatusBar);
   const addFavorite = useFileStore((s) => s.addFavorite);
+  const selectedPaths = useFileStore((s) => s.selectedPaths);
+  const selectionCursorPath = useFileStore((s) => s.selectionCursorPath);
+  const setSelectedPaths = useFileStore((s) => s.setSelectedPaths);
+  const setSelectionCursorPath = useFileStore((s) => s.setSelectionCursorPath);
   const activeSmartFolderId = useFileStore((s) => s.activeSmartFolderId);
   const smartFolders = useFileStore((s) => s.smartFolders);
   const setActiveSmartFolderId = useFileStore((s) => s.setActiveSmartFolderId);
@@ -260,7 +223,7 @@ function AppContent() {
   }, [viewMode]);
 
   const activeSmartFolder = activeSmartFolderId ? smartFolders[activeSmartFolderId] : null;
-  const shouldUseDevMockEntries = isDevBuild && (!isTauriRuntime() || devMockEntries);
+  const shouldUseDevMockEntries = isDevBuild && !tauri;
 
   useEffect(() => {
     if (activeSmartFolderId && !activeSmartFolder) {
@@ -284,12 +247,43 @@ function AppContent() {
     sidebarWidth,
     setSidebarWidth,
     previewWidth,
+    setPreviewWidth,
     handleSidebarResizeStart,
     handlePreviewResizeStart,
   } = useAppLayoutPersistence(styles.sidebarResizing);
+  const appBodyRef = useRef<HTMLDivElement>(null);
+  const [appBodyWidth, setAppBodyWidth] = useState(() =>
+    typeof window === 'undefined' ? 1024 : window.innerWidth
+  );
+
+  useEffect(() => {
+    const element = appBodyRef.current;
+    if (!element) return;
+
+    const updateWidth = () => {
+      const width = element.getBoundingClientRect().width;
+      if (width > 0) setAppBodyWidth(width);
+    };
+    updateWidth();
+
+    if (typeof ResizeObserver === 'undefined') {
+      window.addEventListener('resize', updateWidth);
+      return () => window.removeEventListener('resize', updateWidth);
+    }
+
+    const observer = new ResizeObserver(updateWidth);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
 
   // Current path for active tab (persisted via hook)
-  const { currentPath, setCurrentPath, initializing: pathInitializing } = useInitialPath();
+  const {
+    currentPath,
+    setCurrentPath,
+    initializing: pathInitializing,
+    initializationError,
+    retryInitialization,
+  } = useInitialPath();
   const currentPathRef = useRef(currentPath);
   useEffect(() => {
     currentPathRef.current = currentPath;
@@ -298,6 +292,14 @@ function AppContent() {
   // Selected file for preview
   const [selectedFile, setSelectedFile] = useState<FileEntry | null>(null);
   const previewPanelVisible = showPreviewPanel && !!selectedFile;
+  const paneLayout = useMemo(
+    () => calculatePaneLayout(appBodyWidth, sidebarWidth, previewWidth, previewPanelVisible),
+    [appBodyWidth, previewPanelVisible, previewWidth, sidebarWidth]
+  );
+
+  useEffect(() => {
+    setSelectedFile(null);
+  }, [currentPath, activeSmartFolderId]);
 
   const {
     tabs,
@@ -309,6 +311,7 @@ function AppContent() {
     addTab,
     closeTab,
     activateTab,
+    reorderTabs,
   } = useTabs({
     currentPath,
     setCurrentPath,
@@ -370,6 +373,16 @@ function AppContent() {
   // Map of path -> files for column/hybrid view
   const [columnFiles, setColumnFiles] = useState<{ [path: string]: FileEntry[] }>({});
 
+  useEffect(() => {
+    const visible = viewMode === 'column' ? Object.values(columnFiles).flat() : files;
+    const selected = new Set(selectedPaths);
+    const next =
+      visible.find((file) => file.path === selectionCursorPath && selected.has(file.path)) ??
+      visible.find((file) => selected.has(file.path)) ??
+      null;
+    setSelectedFile(next);
+  }, [columnFiles, files, selectedPaths, selectionCursorPath, viewMode]);
+
   const quickLook = useQuickLookController({
     files,
     columnFiles,
@@ -385,9 +398,6 @@ function AppContent() {
     setSelectedFile,
   });
 
-  // Info box visibility
-  const [showInfoBox, setShowInfoBox] = useState(false);
-
   // Column view state can be extended here if needed
 
   // Settings panel visibility
@@ -395,6 +405,8 @@ function AppContent() {
 
   // Go to Folder dialog visibility
   const [goToFolderOpen, setGoToFolderOpen] = useState(false);
+  const [choosingFolder, setChoosingFolder] = useState(false);
+  const [folderPickerError, setFolderPickerError] = useState<string | null>(null);
 
   // Command Palette visibility
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
@@ -404,9 +416,12 @@ function AppContent() {
 
   // Workspace Manager visibility
   const [workspaceManagerOpen, setWorkspaceManagerOpen] = useState(false);
+  const [workspaceNameDialogOpen, setWorkspaceNameDialogOpen] = useState(false);
 
   // Debug Panel visibility
   const [debugPanelOpen, setDebugPanelOpen] = useState(false);
+  const [shortcutDeleteFiles, setShortcutDeleteFiles] = useState<FileEntry[]>([]);
+  const typeSelectRef = useRef({ value: '', at: 0 });
 
   // Thumbnail size shortcuts
   const { increase: increaseThumbnailSize, decrease: decreaseThumbnailSize } =
@@ -551,15 +566,24 @@ function AppContent() {
   const uiScale = useFileStore((s) => s.uiScale);
   useEffect(() => {
     const root = document.documentElement;
+    const baseXs = 2;
     const baseSm = density === 'compact' ? 3 : 4;
     const baseMd = density === 'compact' ? 6 : 8;
     const baseLg = density === 'compact' ? 9 : 12;
+    const baseXl = density === 'compact' ? 12 : 16;
+    const base2xl = density === 'compact' ? 18 : 24;
+    const xs = Math.round(baseXs * uiScale * 100) / 100;
     const sm = Math.round(baseSm * uiScale * 100) / 100;
     const md = Math.round(baseMd * uiScale * 100) / 100;
     const lg = Math.round(baseLg * uiScale * 100) / 100;
+    const xl = Math.round(baseXl * uiScale * 100) / 100;
+    const xxl = Math.round(base2xl * uiScale * 100) / 100;
+    root.style.setProperty('--padding-xs', `${xs}px`);
     root.style.setProperty('--padding-sm', `${sm}px`);
     root.style.setProperty('--padding-md', `${md}px`);
     root.style.setProperty('--padding-lg', `${lg}px`);
+    root.style.setProperty('--padding-xl', `${xl}px`);
+    root.style.setProperty('--padding-2xl', `${xxl}px`);
     root.style.setProperty('--ui-scale', String(uiScale));
     root.style.setProperty('--font-scale', String(uiScale));
   }, [density, uiScale]);
@@ -587,24 +611,6 @@ function AppContent() {
     }
     root.style.setProperty('--font-base', val);
   }, [font, fontCustom]);
-
-  // Inject imported Google Fonts
-  const importedFonts = useFileStore((s) => s.importedFonts);
-  useEffect(() => {
-    const head = document.head;
-    // Remove previous injected links
-    document
-      .querySelectorAll('link[data-explorie-font="true"]')
-      .forEach((n) => n.parentElement?.removeChild(n));
-    for (const f of importedFonts || []) {
-      const link = document.createElement('link');
-      link.rel = 'stylesheet';
-      link.href = f.href;
-      link.setAttribute('data-explorie-font', 'true');
-      link.setAttribute('data-explorie-font-id', f.id);
-      head.appendChild(link);
-    }
-  }, [importedFonts]);
 
   // Border radius effect
   const borderRadius = useFileStore((s) => s.borderRadius);
@@ -696,7 +702,6 @@ function AppContent() {
     showFolderSizes,
     pathInitializing,
     activeSmartFolder,
-    devMockEntries,
     shouldUseDevMockEntries,
   ]);
 
@@ -742,7 +747,6 @@ function AppContent() {
 
           // Fetch only new paths
           for (const path of pathsToFetch) {
-            // eslint-disable-next-line no-await-in-loop
             const result = shouldUseDevMockEntries
               ? createDevMockEntries(path)
               : await invoke<FileEntry[]>('list_files', { path, calc_dir_size: false });
@@ -877,49 +881,56 @@ function AppContent() {
 
   // Refresh currently visible views (list/grid or column)
   const refreshVisibleViews = useCallback(async () => {
-    if (viewMode === 'list' || viewMode === 'grid') {
-      const refreshed = activeSmartFolder
-        ? await runSmartFolderSearch(activeSmartFolder.criteria)
-        : shouldUseDevMockEntries
-          ? createDevMockEntries(currentPath)
-          : await invoke<FileEntry[]>('list_files', { path: currentPath, calc_dir_size: false });
-      setFiles(
-        refreshed.map((e) => ({
-          ...e,
-          name: e.name ?? (e.path.split(/[/\\]/).pop() || e.path),
-        }))
-      );
-      if (showFolderSizes) {
-        void fetchDirSizesConcurrent(
-          refreshed,
-          (entry, size) => {
-            setFiles((prev) => prev.map((f) => (f.id === entry.id ? { ...f, size } : f)));
-          },
-          () => false
+    setLoading(true);
+    setError(null);
+    try {
+      if (viewMode === 'list' || viewMode === 'grid') {
+        const refreshed = activeSmartFolder
+          ? await runSmartFolderSearch(activeSmartFolder.criteria)
+          : shouldUseDevMockEntries
+            ? createDevMockEntries(currentPath)
+            : await invoke<FileEntry[]>('list_files', { path: currentPath, calc_dir_size: false });
+        setFiles(
+          refreshed.map((e) => ({
+            ...e,
+            name: e.name ?? (e.path.split(/[/\\]/).pop() || e.path),
+          }))
         );
-      }
-    } else {
-      const refreshed: { [path: string]: FileEntry[] } = {};
-      for (const path of pathStack) {
-        // eslint-disable-next-line no-await-in-loop
-        const res = shouldUseDevMockEntries
-          ? createDevMockEntries(path)
-          : await invoke<FileEntry[]>('list_files', { path, calc_dir_size: false });
-        refreshed[path] = res;
         if (showFolderSizes) {
           void fetchDirSizesConcurrent(
-            res,
+            refreshed,
             (entry, size) => {
-              setColumnFiles((prev) => ({
-                ...prev,
-                [path]: (prev[path] || []).map((f) => (f.id === entry.id ? { ...f, size } : f)),
-              }));
+              setFiles((prev) => prev.map((f) => (f.id === entry.id ? { ...f, size } : f)));
             },
             () => false
           );
         }
+      } else {
+        const refreshed: { [path: string]: FileEntry[] } = {};
+        for (const path of pathStack) {
+          const res = shouldUseDevMockEntries
+            ? createDevMockEntries(path)
+            : await invoke<FileEntry[]>('list_files', { path, calc_dir_size: false });
+          refreshed[path] = res;
+          if (showFolderSizes) {
+            void fetchDirSizesConcurrent(
+              res,
+              (entry, size) => {
+                setColumnFiles((prev) => ({
+                  ...prev,
+                  [path]: (prev[path] || []).map((f) => (f.id === entry.id ? { ...f, size } : f)),
+                }));
+              },
+              () => false
+            );
+          }
+        }
+        setColumnFiles(refreshed);
       }
-      setColumnFiles(refreshed);
+    } catch (refreshError) {
+      setError(formatErrorMessage(refreshError));
+    } finally {
+      setLoading(false);
     }
   }, [
     viewMode,
@@ -927,15 +938,33 @@ function AppContent() {
     pathStack,
     showFolderSizes,
     setFiles,
+    setError,
+    setLoading,
     activeSmartFolder,
     shouldUseDevMockEntries,
   ]);
 
   // Helper: get parent directory of a path (supports Windows + POSIX)
   const getParentPath = useCallback((p: string): string => getParentPathUtil(p), []);
+  const handleDragOpenFolder = useCallback(
+    (folder: FileEntry) => {
+      clearActiveSmartFolder();
+      setCurrentPath(folder.path);
+      if (viewMode === 'column') setPathStack(buildPathStackFromPath(folder.path));
+    },
+    [clearActiveSmartFolder, setCurrentPath, setPathStack, viewMode]
+  );
+  const handleDragOpenPath = useCallback(
+    (path: string) => {
+      clearActiveSmartFolder();
+      setCurrentPath(path);
+      if (viewMode === 'column') setPathStack(buildPathStackFromPath(path));
+    },
+    [clearActiveSmartFolder, setCurrentPath, setPathStack, viewMode]
+  );
 
   const {
-    draggingId,
+    draggingItemIds,
     combineTargetId,
     dragOverlay,
     dragPos,
@@ -943,12 +972,20 @@ function AppContent() {
     beginDrag,
     handleHoverFolder,
     handleHoverContainerPath,
+    handleHoverFavorites,
+    handleGatherComplete,
+    handleDragAnimationComplete,
   } = useFileDragAndDrop({
     files,
     columnFiles,
     viewMode,
+    selectedPaths,
+    setSelectedPaths,
     refreshVisibleViews,
     getParentPath,
+    showToast,
+    addFavorite,
+    onOpenFolder: handleDragOpenFolder,
   });
 
   // Keyboard clipboard shortcuts (Ctrl+C, Ctrl+X, Ctrl+V)
@@ -1033,15 +1070,40 @@ function AppContent() {
   }, [showToast]);
 
   const handleSaveWorkspace = useCallback(() => {
-    const name = window.prompt('Enter workspace name:');
-    if (!name?.trim()) return;
-    const workspaceTabs: WorkspaceTab[] = tabsRef.current.map((t) => ({ id: t.id, path: t.path }));
-    useFileStore.getState().saveWorkspace(name.trim(), workspaceTabs, activeTabIdRef.current);
-  }, [activeTabIdRef, tabsRef]);
+    setWorkspaceNameDialogOpen(true);
+  }, []);
 
   const handleRefreshFromPalette = useCallback(() => {
     void refreshVisibleViewsRef.current();
   }, []);
+
+  const navigateToChosenFolder = useCallback(
+    (path: string) => {
+      clearActiveSmartFolder();
+      setError(null);
+      setFolderPickerError(null);
+      setCurrentPath(path);
+      if (viewMode === 'column') {
+        setPathStack(buildPathStackFromPath(path));
+      }
+    },
+    [clearActiveSmartFolder, setCurrentPath, setError, setPathStack, viewMode]
+  );
+
+  const handleChooseFolder = useCallback(async () => {
+    setChoosingFolder(true);
+    setFolderPickerError(null);
+    try {
+      const selectedPath = await chooseFolder(currentPath || undefined);
+      if (selectedPath) {
+        navigateToChosenFolder(selectedPath);
+      }
+    } catch (pickerError) {
+      setFolderPickerError(formatErrorMessage(pickerError));
+    } finally {
+      setChoosingFolder(false);
+    }
+  }, [currentPath, navigateToChosenFolder]);
 
   const handleGoToFolderFromPalette = useCallback(() => {
     setGoToFolderOpen(true);
@@ -1126,12 +1188,90 @@ function AppContent() {
   }, []);
 
   const handleToggleDebugPanelShortcut = useCallback(() => {
-    setDebugPanelOpen((prev) => !prev);
+    if (isDevBuild) setDebugPanelOpen((prev) => !prev);
   }, []);
 
   const handleToggleShortcutsOverlayShortcut = useCallback(() => {
     setShortcutsOverlayOpen((prev) => !prev);
   }, []);
+
+  const deleteSelectedFiles = useCallback(
+    async (targets: FileEntry[], permanent = false) => {
+      const success = await deleteWithUndo(targets, showToast, refreshVisibleViews, { permanent });
+      if (success) {
+        setSelectedPaths([]);
+        setSelectionCursorPath(null);
+      }
+    },
+    [refreshVisibleViews, setSelectedPaths, setSelectionCursorPath, showToast]
+  );
+
+  const handleDeleteSelection = useCallback(() => {
+    const targets = getSelectedFilesRef.current?.() ?? [];
+    if (!targets.length) return;
+    if (useFileStore.getState().confirmBeforeDelete) setShortcutDeleteFiles(targets);
+    else void deleteSelectedFiles(targets);
+  }, [deleteSelectedFiles, getSelectedFilesRef]);
+
+  const handleActivateTabOffset = useCallback(
+    (offset: number) => {
+      const current = tabs.findIndex((tab) => tab.id === activeTabId);
+      if (current < 0 || tabs.length < 2) return;
+      const next = (current + offset + tabs.length) % tabs.length;
+      activateTab(tabs[next].id);
+    },
+    [activateTab, activeTabId, tabs]
+  );
+
+  const handleFocusSearch = useCallback(() => {
+    document.getElementById('explorie-search-input')?.focus();
+  }, []);
+
+  const handleTypeToSelect = useCallback(
+    (key: string) => {
+      const now = Date.now();
+      const previous = now - typeSelectRef.current.at < 750 ? typeSelectRef.current.value : '';
+      const value = `${previous}${key}`.toLocaleLowerCase();
+      typeSelectRef.current = { value, at: now };
+      const source =
+        viewMode === 'column' ? (columnFiles[pathStack[pathStack.length - 1]] ?? []) : files;
+      const query = searchQuery.trim().toLocaleLowerCase();
+      const candidates = sortFiles(
+        source.filter((file) => {
+          const name = file.name ?? file.path.split(/[/\\]/).pop() ?? file.path;
+          if (!showHidden && (file.hidden || name.startsWith('.'))) return false;
+          if (filterMode === 'folders' && !file.is_dir) return false;
+          if (filterMode === 'files' && file.is_dir) return false;
+          return !query || name.toLocaleLowerCase().includes(query);
+        }),
+        sortKey as SortKey,
+        sortDir as SortDir
+      );
+      const find = (prefix: string) =>
+        candidates.find((file) =>
+          (file.name ?? file.path.split(/[/\\]/).pop() ?? file.path)
+            .toLocaleLowerCase()
+            .startsWith(prefix)
+        );
+      const match = find(value) ?? (value.length > 1 ? find(key.toLocaleLowerCase()) : undefined);
+      if (!match) return;
+      setSelectedPaths([match.path]);
+      setSelectionCursorPath(match.path);
+    },
+    [
+      columnFiles,
+      files,
+      filterMode,
+      pathStack,
+      searchQuery,
+      setSelectedPaths,
+      setSelectionCursorPath,
+      showHidden,
+      sortDir,
+      sortKey,
+      viewMode,
+    ]
+  );
 
   useAppKeyboardShortcuts({
     activeTabId,
@@ -1155,29 +1295,45 @@ function AppContent() {
     redo: redoAction,
     increaseThumbnailSize,
     decreaseThumbnailSize,
+    deleteSelection: handleDeleteSelection,
+    goUp: handlePaletteGoUp,
+    refresh: handleRefreshFromPalette,
+    setViewMode,
+    toggleHidden: handleToggleHidden,
+    activateTabOffset: handleActivateTabOffset,
+    focusSearch: handleFocusSearch,
+    typeToSelect: handleTypeToSelect,
   });
 
   const appBodyStyle: CssVariableStyle<'--sidebar-width'> = {
-    '--sidebar-width': `${sidebarWidth}px`,
+    '--sidebar-width': `${paneLayout.sidebarWidth}px`,
   };
+  const waitingForInitialPath = pathInitializing && !currentPath && !activeSmartFolder;
+  const startupBlocked = !pathInitializing && !currentPath && !activeSmartFolder;
 
   return (
     <>
       <SkipLinks />
-      <AutoUpdater />
-      <div className={styles.appContainer} role="application" aria-label="explorie File Manager">
-        <div className={styles.titleBarContainer}>
-          <InlineErrorBoundary name="TitleBar">
-            <TitleBar />
-          </InlineErrorBoundary>
-        </div>
-        <div className={styles.appBody} style={appBodyStyle}>
+      <div className={styles.appContainer}>
+        {showTitleBar && (
+          <div className={styles.titleBarContainer}>
+            <InlineErrorBoundary name="TitleBar">
+              <TitleBar showWindowControls={showWindowControls} />
+            </InlineErrorBoundary>
+          </div>
+        )}
+        <div ref={appBodyRef} className={styles.appBody} style={appBodyStyle}>
           <InlineErrorBoundary name="Sidebar">
             <nav id="main-navigation" aria-label="Main navigation">
               <Sidebar
+                currentPath={currentPath}
                 recents={recents}
                 onSelectLocation={setCurrentPath}
                 onOpenSettings={() => setSettingsOpen(true)}
+                fileDragActive={draggingItemIds.size > 0}
+                onFileDragHoverPath={handleHoverContainerPath}
+                onFileDragHoverFavorites={handleHoverFavorites}
+                onFileDragOpenPath={handleDragOpenPath}
               />
             </nav>
           </InlineErrorBoundary>
@@ -1186,7 +1342,22 @@ function AppContent() {
             role="separator"
             aria-orientation="vertical"
             aria-label="Resize sidebar"
+            aria-valuemin={160}
+            aria-valuemax={480}
+            aria-valuenow={paneLayout.sidebarWidth}
+            aria-valuetext={
+              paneLayout.sidebarWidth === sidebarWidth
+                ? `${sidebarWidth} pixels`
+                : `${paneLayout.sidebarWidth} pixels; preferred ${sidebarWidth}`
+            }
+            tabIndex={0}
             onMouseDown={handleSidebarResizeStart}
+            onKeyDown={(event) => {
+              const delta = event.key === 'ArrowLeft' ? -10 : event.key === 'ArrowRight' ? 10 : 0;
+              if (!delta) return;
+              event.preventDefault();
+              setSidebarWidth(Math.min(480, Math.max(160, sidebarWidth + delta)));
+            }}
           />
           <main id="main-content" className={styles.mainArea} aria-label="File browser">
             <div className={styles.mainContent}>
@@ -1234,6 +1405,9 @@ function AppContent() {
                     onActivate={activateTab}
                     onClose={closeTab}
                     onAdd={addTab}
+                    onReorder={reorderTabs}
+                    fileDragActive={draggingItemIds.size > 0}
+                    onFileDragHover={handleHoverContainerPath}
                   />
                 </div>
                 {/* Crash recovery banner */}
@@ -1248,10 +1422,37 @@ function AppContent() {
                     />
                   </InlineErrorBoundary>
                 )}
-                {showInfoBox && <InfoBox onClose={() => setShowInfoBox(false)} />}
-                {loading && <p className={styles.loadingMessage}>Loading files…</p>}
-                {error && <p className={styles.errorMessage}>Error: {error}</p>}
-                {!loading && !error && (
+                {waitingForInitialPath && (
+                  <div className={styles.loadingMessage} role="status" aria-live="polite">
+                    Finding a folder…
+                  </div>
+                )}
+                {startupBlocked && (
+                  <StartupLocationState
+                    initializationError={initializationError}
+                    choosingFolder={choosingFolder}
+                    pickerError={folderPickerError}
+                    onChooseFolder={() => void handleChooseFolder()}
+                    onEnterPath={() => setGoToFolderOpen(true)}
+                    onRetryInitialization={retryInitialization}
+                  />
+                )}
+                {!waitingForInitialPath && !startupBlocked && loading && (
+                  <div className={styles.loadingMessage} role="status" aria-live="polite">
+                    Loading files…
+                  </div>
+                )}
+                {!waitingForInitialPath && !startupBlocked && error && (
+                  <FolderLoadErrorState
+                    path={currentPath}
+                    error={error}
+                    choosingFolder={choosingFolder}
+                    pickerError={folderPickerError}
+                    onRetry={handleRefreshFromPalette}
+                    onChooseFolder={() => void handleChooseFolder()}
+                  />
+                )}
+                {!waitingForInitialPath && !startupBlocked && !loading && !error && (
                   <ErrorBoundary name="FileView">
                     <div id="file-list" aria-label="File list" role="region">
                       {viewMode === 'list' && (
@@ -1262,8 +1463,8 @@ function AppContent() {
                           files={files}
                           onFileSelect={handleSelectFile}
                           onFolderOpen={listOnFolderOpen}
-                          isDragging={!!draggingId}
-                          draggingItemId={draggingId ? draggingId.replace(/^file:/, '') : null}
+                          isDragging={draggingItemIds.size > 0}
+                          draggingItemIds={draggingItemIds}
                           onBeginDrag={beginDrag}
                           onHoverFolder={handleHoverFolder}
                           onHoverContainer={(path) => handleHoverContainerPath(path)}
@@ -1279,12 +1480,12 @@ function AppContent() {
                           onColumnBack={handleColumnBack}
                           onFileSelect={setSelectedFile}
                           dragCombineTargetId={combineTargetId}
-                          draggingItemId={draggingId ? draggingId.replace(/^file:/, '') : null}
+                          draggingItemIds={draggingItemIds}
                           onBeginDrag={beginDrag}
                           onHoverContainerPath={handleHoverContainerPath}
                           onHoverFolder={handleHoverFolder}
-                          previewWidth={previewWidth}
-                          previewVisible={previewPanelVisible}
+                          previewWidth={paneLayout.previewWidth}
+                          previewVisible={paneLayout.previewVisible}
                           getSelectedFilesRef={getSelectedFilesRef}
                         />
                       )}
@@ -1297,29 +1498,54 @@ function AppContent() {
                           files={files}
                           onFileSelect={handleSelectFile}
                           onFolderOpen={gridOnFolderOpen}
-                          isDragging={!!draggingId}
-                          draggingItemId={draggingId ? draggingId.replace(/^file:/, '') : null}
+                          isDragging={draggingItemIds.size > 0}
+                          draggingItemIds={draggingItemIds}
                           onBeginDrag={beginDrag}
                           onHoverFolder={handleHoverFolder}
                           onHoverContainer={(path) => handleHoverContainerPath(path)}
                           getSelectedFilesRef={getSelectedFilesRef}
                         />
                       )}
-                      <DragOverlay overlay={dragOverlay} pos={dragPos} />
+                      <DragOverlay
+                        overlay={dragOverlay}
+                        position={dragPos}
+                        reduceMotion={reduceMotion}
+                        onGatherComplete={handleGatherComplete}
+                        onExitComplete={handleDragAnimationComplete}
+                      />
                     </div>
                   </ErrorBoundary>
                 )}
               </div>
-              {previewPanelVisible && (
+              {paneLayout.previewVisible && (
                 <>
                   <div
                     className={styles.previewResizer}
                     role="separator"
                     aria-orientation="vertical"
                     aria-label="Resize preview panel"
+                    aria-valuemin={280}
+                    aria-valuemax={720}
+                    aria-valuenow={paneLayout.previewWidth}
+                    aria-valuetext={
+                      paneLayout.previewWidth === previewWidth
+                        ? `${previewWidth} pixels`
+                        : `${paneLayout.previewWidth} pixels; preferred ${previewWidth}`
+                    }
+                    tabIndex={0}
                     onMouseDown={handlePreviewResizeStart}
+                    onKeyDown={(event) => {
+                      const delta =
+                        event.key === 'ArrowLeft' ? 10 : event.key === 'ArrowRight' ? -10 : 0;
+                      if (!delta) return;
+                      event.preventDefault();
+                      setPreviewWidth(Math.min(720, Math.max(280, previewWidth + delta)));
+                    }}
                   />
-                  <div className={styles.previewPanel} style={{ width: `${previewWidth}px` }}>
+                  <div
+                    className={styles.previewPanel}
+                    style={{ width: `${paneLayout.previewWidth}px` }}
+                  >
                     {selectedFile && (
                       <ErrorBoundary name="Preview">
                         <FilePreviewer
@@ -1352,11 +1578,7 @@ function AppContent() {
         open={goToFolderOpen}
         currentPath={currentPath}
         onNavigate={(path) => {
-          clearActiveSmartFolder();
-          setCurrentPath(path);
-          if (viewMode === 'column') {
-            setPathStack(buildPathStackFromPath(path));
-          }
+          navigateToChosenFolder(path);
         }}
         onClose={() => setGoToFolderOpen(false)}
       />
@@ -1398,10 +1620,43 @@ function AppContent() {
           getSidebarState={getSidebarState}
         />
       </InlineErrorBoundary>
-      {/* Debug Panel */}
-      <InlineErrorBoundary name="DebugPanel">
-        <DebugPanel open={debugPanelOpen} onClose={() => setDebugPanelOpen(false)} />
-      </InlineErrorBoundary>
+      <TextInputDialog
+        open={workspaceNameDialogOpen}
+        title="Save workspace"
+        label="Workspace name"
+        submitLabel="Save"
+        validate={(value) => (!value ? 'Workspace name is required' : null)}
+        onCancel={() => setWorkspaceNameDialogOpen(false)}
+        onSubmit={(name) => {
+          const workspaceTabs: WorkspaceTab[] = tabsRef.current.map((tab) => ({
+            id: tab.id,
+            path: tab.path,
+          }));
+          useFileStore.getState().saveWorkspace(name, workspaceTabs, activeTabIdRef.current);
+          setWorkspaceNameDialogOpen(false);
+        }}
+      />
+      {isDevBuild && (
+        <InlineErrorBoundary name="DebugPanel">
+          <DebugPanel open={debugPanelOpen} onClose={() => setDebugPanelOpen(false)} />
+        </InlineErrorBoundary>
+      )}
+      <React.Suspense fallback={null}>
+        <LazySecureDeleteDialog
+          open={shortcutDeleteFiles.length > 0}
+          files={shortcutDeleteFiles}
+          showDontAskAgain
+          onDontAskAgainChange={(checked) => {
+            if (checked) useFileStore.getState().setConfirmBeforeDelete(false);
+          }}
+          onCancel={() => setShortcutDeleteFiles([])}
+          onConfirm={(permanent) => {
+            const targets = shortcutDeleteFiles;
+            setShortcutDeleteFiles([]);
+            void deleteSelectedFiles(targets, permanent);
+          }}
+        />
+      </React.Suspense>
       {/* Operation Progress Panel */}
       <InlineErrorBoundary name="OperationProgress">
         <OperationProgress />
@@ -1432,27 +1687,5 @@ function ConflictResolutionDialogConnected() {
       onResolve={resolveConflict}
       onCancel={cancelAll}
     />
-  );
-}
-
-function DragOverlay({
-  overlay,
-  pos,
-}: {
-  overlay: { label: string; icon: string } | null;
-  pos: { x: number; y: number };
-}) {
-  if (!overlay) return null;
-  const overlayStyle: CssVariableStyle<'--drag-x' | '--drag-y'> = {
-    '--drag-x': `${pos.x}px`,
-    '--drag-y': `${pos.y}px`,
-  };
-  return (
-    <div className={styles.dragOverlay} style={overlayStyle}>
-      <span>
-        <Icon name={overlay.icon as IconName} />
-      </span>
-      <span>{overlay.label}</span>
-    </div>
   );
 }

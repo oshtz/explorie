@@ -3,6 +3,7 @@ import styles from './ConflictResolutionDialog.module.css';
 import { Icon } from './Icon';
 import { formatBytes } from '../operationQueueStore';
 import { formatLocalDateTime } from '../utils/date';
+import { createFocusTrap } from '../utils/accessibility';
 import type { ConflictAction, ConflictInfo } from '../conflictResolutionStore';
 
 export type { ConflictAction, ConflictInfo };
@@ -38,7 +39,19 @@ export function ConflictResolutionDialog({
   onCancel,
 }: ConflictResolutionDialogProps) {
   const dialogRef = useRef<HTMLDivElement>(null);
+  const focusTrapRef = useRef<ReturnType<typeof createFocusTrap> | null>(null);
   const [applyToAll, setApplyToAll] = useState(false);
+
+  useEffect(() => {
+    if (!open || !dialogRef.current) return;
+    const trap = createFocusTrap(dialogRef.current);
+    focusTrapRef.current = trap;
+    trap.activate();
+    return () => {
+      focusTrapRef.current = null;
+      trap.deactivate();
+    };
+  }, [open, conflict?.sourcePath]);
 
   // Reset applyToAll when dialog opens with a new conflict
   useEffect(() => {
@@ -108,6 +121,7 @@ export function ConflictResolutionDialog({
         role="alertdialog"
         aria-modal="true"
         aria-labelledby="conflict-dialog-title"
+        onKeyDown={(e) => focusTrapRef.current?.handleKeyDown(e)}
       >
         <div className={styles.header}>
           <div className={styles.headerContent}>
@@ -189,6 +203,7 @@ export function ConflictResolutionDialog({
         <div className={styles.footer}>
           <div className={styles.actionButtons}>
             <button
+              data-autofocus
               className={styles.actionButton}
               onClick={() => handleAction('skip')}
               title="Skip this file and continue with the next"

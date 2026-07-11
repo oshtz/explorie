@@ -1,8 +1,8 @@
 .banner {
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 10px 16px;
+  gap: var(--padding-lg);
+  padding: var(--padding-md) var(--padding-xl);
   background: var(--bg-secondary, #1a1a1a);
   border-bottom: 1px solid var(--border-color, #333);
   animation: slideIn 0.2s ease-out;
@@ -51,7 +51,7 @@
 .details {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: var(--padding-md);
   font-size: 12px;
   color: var(--text-secondary, #888);
 }
@@ -78,12 +78,12 @@
 .actions {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--padding-md);
   flex-shrink: 0;
 }
 
 .dismissButton {
-  padding: 6px 12px;
+  padding: var(--padding-sm) var(--padding-lg);
   font-size: 12px;
   font-weight: 500;
   color: var(--text-secondary, #888);
@@ -103,8 +103,8 @@
 .recoverButton {
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 6px 12px;
+  gap: var(--padding-sm);
+  padding: var(--padding-sm) var(--padding-lg);
   font-size: 12px;
   font-weight: 500;
   color: var(--bg-primary, #0d0d0d);

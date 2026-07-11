@@ -18,6 +18,52 @@ interface State {
   error: Error | null;
 }
 
+interface RootErrorBoundaryProps {
+  children: ReactNode;
+  onRestart?: () => void;
+}
+
+export class RootErrorBoundary extends Component<RootErrorBoundaryProps, State> {
+  constructor(props: RootErrorBoundaryProps) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+
+  static getDerivedStateFromError(error: Error): State {
+    return { hasError: true, error };
+  }
+
+  componentDidCatch(error: Error, errorInfo: ErrorInfo): void {
+    console.error('RootErrorBoundary caught an app error:', error, errorInfo);
+  }
+
+  handleRestart = (): void => {
+    if (this.props.onRestart) {
+      this.props.onRestart();
+      return;
+    }
+    window.location.reload();
+  };
+
+  render(): ReactNode {
+    if (!this.state.hasError) return this.props.children;
+
+    return (
+      <main className={styles.rootErrorContainer} role="alert">
+        <Icon name="alert" size={32} />
+        <h1 className={styles.rootErrorTitle}>Explorie couldn’t start</h1>
+        <p className={styles.rootErrorMessage}>
+          {this.state.error?.message || 'An unexpected error occurred while loading the app.'}
+        </p>
+        <button className={styles.retryButton} onClick={this.handleRestart}>
+          <Icon name="reload" size={14} />
+          <span>Restart Explorie</span>
+        </button>
+      </main>
+    );
+  }
+}
+
 /**
  * Error Boundary component that catches JavaScript errors anywhere in its
  * child component tree, logs those errors, and displays a fallback UI.

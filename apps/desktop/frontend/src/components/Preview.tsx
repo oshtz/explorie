@@ -1,11 +1,10 @@
-import React, { useEffect, useId, useMemo, useState } from 'react';
+import React, { useEffect, useId, useState } from 'react';
 import type { FileEntry } from '../store';
 import { useFileStore } from '../store';
 import { CustomFieldsEditor } from './CustomFieldsEditor';
 import { FinderTags } from './FinderTags';
 import styles from './Preview.module.css';
 import { formatLocalDateTime } from '../utils/date';
-import { highlightCode, resolveHighlightLanguage } from '../utils/highlight';
 import { areFinderTagsAvailable } from '../services/finderIntegration';
 
 // Interface for the preview file type (from App.tsx FilePreviewer)
@@ -177,21 +176,6 @@ export function Preview({
   const textContent =
     previewFile?.content && typeof previewFile.content === 'string' ? previewFile.content : null;
 
-  const highlightLanguage = useMemo(() => {
-    return resolveHighlightLanguage({ ext, mime: previewFile?.type });
-  }, [ext, previewFile?.type]);
-
-  const highlightedContent = useMemo(() => {
-    if (!textContent) return null;
-    if (!highlightLanguage || highlightLanguage === 'plaintext') return null;
-    try {
-      return highlightCode(textContent, highlightLanguage);
-    } catch (error) {
-      console.warn('Highlight.js failed to render', error);
-      return null;
-    }
-  }, [textContent, highlightLanguage]);
-
   // Early return AFTER all hooks have been called
   if (!file) return null;
 
@@ -325,52 +309,13 @@ export function Preview({
       );
     }
 
-    // Markdown preview (basic renderer without external deps)
+    // Markdown preview is intentionally plain text: local files are untrusted input.
     if (['md', 'markdown'].includes(ext || '')) {
       const md = previewFile?.content || '';
-      const escapeHtml = (s: string) =>
-        s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-      // Very small subset: headings, bold/italic, code fences, inline code, links, paragraphs
-      const renderMarkdown = (src: string) => {
-        let out = escapeHtml(src);
-        // Code fences
-        out = out.replace(
-          /```([\s\S]*?)```/g,
-          (_m, p1) => `<pre><code>${p1.replace(/\n/g, '<br/>')}</code></pre>`
-        );
-        // Headings # .. ######
-        out = out
-          .replace(/^######\s+(.*)$/gm, '<h6>$1</h6>')
-          .replace(/^#####\s+(.*)$/gm, '<h5>$1</h5>')
-          .replace(/^####\s+(.*)$/gm, '<h4>$1</h4>')
-          .replace(/^###\s+(.*)$/gm, '<h3>$1</h3>')
-          .replace(/^##\s+(.*)$/gm, '<h2>$1</h2>')
-          .replace(/^#\s+(.*)$/gm, '<h1>$1</h1>');
-        // Bold and italic
-        out = out
-          .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
-          .replace(/\*(.*?)\*/g, '<em>$1</em>');
-        // Inline code
-        out = out.replace(/`([^`]+)`/g, '<code>$1</code>');
-        // Links [text](url)
-        out = out.replace(
-          /\[([^\]]+)\]\(([^)]+)\)/g,
-          '<a href="$2" target="_blank" rel="noreferrer noopener">$1<\/a>'
-        );
-        // Simple paragraphs: double newlines to paragraphs, single to <br>
-        out = out
-          .split(/\n\n+/)
-          .map((p) => `<p>${p.replace(/\n/g, '<br/>')}</p>`)
-          .join('');
-        return out;
-      };
       return (
-        <div
-          className={styles.previewMarkdown}
-          dangerouslySetInnerHTML={{
-            __html: md ? renderMarkdown(md) : '<p><em>Empty markdown file</em></p>',
-          }}
-        />
+        <div className={styles.previewText}>
+          <pre>{md || 'Empty markdown file'}</pre>
+        </div>
       );
     }
 
@@ -380,7 +325,7 @@ export function Preview({
       if (isLoading) return null;
       return renderUnsupportedPreview('Script previews are disabled for executable files.', [
         `${fileName} (${fileType || extKey || 'unknown'})`,
-        'Enable this in Settings > Advanced.',
+        'Enable this in Settings > General.',
       ]);
     }
 
@@ -388,22 +333,13 @@ export function Preview({
       textContent &&
       (previewFile?.type?.startsWith('text/') ||
         (extKey && TEXTUAL_EXTENSIONS.has(extKey)) ||
-        highlightLanguage ||
         (previewExecutableScripts && EXECUTABLE_SCRIPT_EXTENSIONS.has(extKey)))
     ) {
-      if (highlightedContent) {
-        return (
-          <div className={styles.previewCode}>
-            <pre className="hljs">
-              <code dangerouslySetInnerHTML={{ __html: highlightedContent }} />
-            </pre>
-          </div>
-        );
-      }
-
       return (
-        <div className={styles.previewText}>
-          <pre>{textContent}</pre>
+        <div className={styles.previewCode}>
+          <pre>
+            <code>{textContent}</code>
+          </pre>
         </div>
       );
     }

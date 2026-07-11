@@ -1,158 +1,215 @@
 // Prevents a terminal window from appearing on Windows
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod remote_drives;
+
 use explorie_core::archive::{
     ArchiveFormat, ArchiveInfo, ArchiveProgress, CompressOptions, CompressionLevel,
     create_archive_with_progress, extract_archive, is_archive, list_archive_contents,
 };
-use explorie_ffmpeg_wrapper::FfmpegTask;
-use explorie_plugin_host::{Plugin, PluginError, PluginHost};
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::collections::HashMap;
+use std::ffi::OsString;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
-#[cfg(any(target_os = "windows", target_os = "macos"))]
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+use remote_drives::{
+    DisconnectResult, RemoteDriveEnvironment, RemoteDriveManager, RemoteDriveProfile,
+    RemoteDriveStatus,
+};
+
+#[derive(Default)]
+struct FileOperationJobs {
+    next_id: AtomicU64,
+    cancellations: Mutex<HashMap<String, Arc<AtomicBool>>>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FileOperationEvent {
+    job_id: String,
+    state: &'static str,
+    progress: Option<explorie_core::FileOperationProgress>,
+    result: Option<explorie_core::FileOperationResult>,
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TextPreview {
+    text: String,
+    truncated: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SystemIntegrationStatus {
+    supported: bool,
+    enabled: bool,
+}
+
+fn launch_directory_from_args(args: impl IntoIterator<Item = OsString>) -> Option<String> {
+    args.into_iter()
+        .skip(1)
+        .map(PathBuf::from)
+        .find(|path| path.is_dir())
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+fn get_launch_path() -> Option<String> {
+    launch_directory_from_args(std::env::args_os())
+}
+
 #[cfg(target_os = "windows")]
-mod default_file_manager {
+mod windows_integration {
     use std::io;
+    use std::os::windows::process::CommandExt;
     use std::path::Path;
-    use winreg::RegKey;
-    use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
+    use std::process::Command;
 
-    const HANDLER_VALUE: &str = "explorie";
-    const HANDLER_LABEL: &str = "explorie";
-    const TARGET_CLASSES: [&str; 3] = ["Directory", "Drive", "Folder"];
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    const MENU_KEYS: [(&str, &str); 3] = [
+        (r"HKCU\Software\Classes\Directory\shell\Explorie", "%1"),
+        (r"HKCU\Software\Classes\Drive\shell\Explorie", "%1"),
+        (
+            r"HKCU\Software\Classes\Directory\Background\shell\Explorie",
+            "%V",
+        ),
+    ];
 
-    fn shell_path(target: &str) -> String {
-        format!("Software\\Classes\\{}\\shell", target)
+    fn reg() -> Command {
+        let mut command = Command::new("reg.exe");
+        command.creation_flags(CREATE_NO_WINDOW);
+        command
     }
 
-    fn command_value(exe: &Path) -> String {
-        let display = exe.to_string_lossy();
-        format!("\"{}\" \"%1\"", display)
+    fn run(command: &mut Command) -> io::Result<()> {
+        let output = command.output()?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other(
+                String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            ))
+        }
     }
 
-    pub fn is_default() -> io::Result<bool> {
-        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-        for class in TARGET_CLASSES {
-            let path = shell_path(class);
-            let key = match hkcu.open_subkey_with_flags(&path, KEY_READ) {
-                Ok(k) => k,
-                Err(_) => return Ok(false),
-            };
-            match key.get_value::<String, _>("") {
-                Ok(value) if value.eq_ignore_ascii_case(HANDLER_VALUE) => {}
-                _ => return Ok(false),
+    fn key_exists(key: &str) -> io::Result<bool> {
+        Ok(reg().args(["query", key]).status()?.success())
+    }
+
+    fn add_value(key: &str, name: Option<&str>, value: &str) -> io::Result<()> {
+        let mut command = reg();
+        command.args(["add", key]);
+        if let Some(name) = name {
+            command.args(["/v", name]);
+        } else {
+            command.arg("/ve");
+        }
+        run(command.args(["/d", value, "/f"]))
+    }
+
+    fn remove() -> io::Result<()> {
+        for (key, _) in MENU_KEYS {
+            if key_exists(key)? {
+                run(reg().args(["delete", key, "/f"]))?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn enabled() -> io::Result<bool> {
+        for (key, _) in MENU_KEYS {
+            if !key_exists(key)? {
+                return Ok(false);
             }
         }
         Ok(true)
     }
 
-    pub fn set_default() -> io::Result<()> {
-        let exe = std::env::current_exe()?;
-        let command = command_value(&exe);
-        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-
-        for class in TARGET_CLASSES {
-            let path = shell_path(class);
-            let (shell_key, _) = hkcu.create_subkey(&path)?;
-            shell_key.set_value("", &HANDLER_VALUE)?;
-
-            let (handler_key, _) = shell_key.create_subkey(HANDLER_VALUE)?;
-            handler_key.set_value("", &HANDLER_LABEL)?;
-            let _ = handler_key.delete_value("DelegateExecute");
-            let (command_key, _) = handler_key.create_subkey("command")?;
-            command_key.set_value("", &command)?;
+    pub fn set_enabled(enabled: bool) -> io::Result<()> {
+        if !enabled {
+            return remove();
         }
 
+        let executable = std::env::current_exe()?;
+        let icon = executable.to_string_lossy();
+        for (key, path_argument) in MENU_KEYS {
+            let result = (|| {
+                add_value(key, None, "Open in Explorie")?;
+                add_value(key, Some("Icon"), &icon)?;
+                add_value(
+                    &format!(r"{key}\command"),
+                    None,
+                    &shell_command(&executable, path_argument),
+                )
+            })();
+            if let Err(error) = result {
+                let _ = remove();
+                return Err(error);
+            }
+        }
         Ok(())
     }
 
-    pub fn revert_default() -> io::Result<()> {
-        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    fn shell_command(executable: &Path, path_argument: &str) -> String {
+        format!(r#""{}" "{}""#, executable.display(), path_argument)
+    }
 
-        for class in TARGET_CLASSES {
-            let path = shell_path(class);
-            if let Ok(shell_key) = hkcu.open_subkey_with_flags(&path, KEY_READ | KEY_WRITE) {
-                if let Ok(value) = shell_key.get_value::<String, _>("")
-                    && value.eq_ignore_ascii_case(HANDLER_VALUE)
-                {
-                    let _ = shell_key.delete_value("");
-                }
-                let _ = shell_key.delete_subkey_all(HANDLER_VALUE);
-            }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn shell_command_quotes_executable_and_folder() {
+            assert_eq!(
+                shell_command(Path::new(r"C:\Program Files\Explorie\explorie.exe"), "%1"),
+                r#""C:\Program Files\Explorie\explorie.exe" "%1""#
+            );
         }
-
-        Ok(())
     }
 }
 
-// --- Plugin host wiring ---
-static PLUGIN_HOST: OnceLock<PluginHost> = OnceLock::new();
+#[tauri::command]
+fn get_system_integration_status() -> Result<SystemIntegrationStatus, String> {
+    #[cfg(target_os = "windows")]
+    {
+        windows_integration::enabled()
+            .map(|enabled| SystemIntegrationStatus {
+                supported: true,
+                enabled,
+            })
+            .map_err(|error| error.to_string())
+    }
 
-fn plugin_host() -> &'static PluginHost {
-    PLUGIN_HOST.get_or_init(|| {
-        let host = PluginHost::new();
-        let _ = host.register(InfoPlugin);
-        host
+    #[cfg(not(target_os = "windows"))]
+    Ok(SystemIntegrationStatus {
+        supported: false,
+        enabled: false,
     })
 }
 
-struct InfoPlugin;
-
-impl Plugin for InfoPlugin {
-    fn name(&self) -> &str {
-        "info"
+#[tauri::command]
+fn set_system_integration(enabled: bool) -> Result<SystemIntegrationStatus, String> {
+    #[cfg(target_os = "windows")]
+    {
+        windows_integration::set_enabled(enabled).map_err(|error| error.to_string())?;
+        get_system_integration_status()
     }
 
-    fn invoke(&self, method: &str, payload: Option<Value>) -> Result<Value, PluginError> {
-        match method {
-            "ping" => Ok(json!({ "ok": true })),
-            "summary" => {
-                let path = payload
-                    .as_ref()
-                    .and_then(|v| v.get("path"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(".");
-                let entries = explorie_core::list_dir(Path::new(path)).map_err(|e| {
-                    PluginError::Invocation {
-                        plugin: self.name().into(),
-                        method: method.into(),
-                        message: e.to_string(),
-                    }
-                })?;
-                let mut dirs = 0usize;
-                let mut files = 0usize;
-                for e in &entries {
-                    if e.is_dir {
-                        dirs += 1;
-                    } else {
-                        files += 1;
-                    }
-                }
-                Ok(json!({
-                    "path": path,
-                    "entries": entries.len(),
-                    "dirs": dirs,
-                    "files": files
-                }))
-            }
-            other => Err(PluginError::MethodNotFound {
-                plugin: self.name().into(),
-                method: other.into(),
-            }),
-        }
-    }
-
-    fn methods(&self) -> &[&'static str] {
-        &["ping", "summary"]
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = enabled;
+        Err("System integration is currently available only on Windows.".to_string())
     }
 }
 
@@ -169,6 +226,121 @@ async fn list_files(
     .await
     .map_err(|e| e.to_string())?
     .map_err(|e| e.to_string())
+}
+
+fn find_syncthing_root(path: &Path) -> Option<PathBuf> {
+    path.ancestors()
+        .find(|ancestor| ancestor.join(".stfolder").exists())
+        .map(Path::to_path_buf)
+}
+
+#[tauri::command]
+async fn get_syncthing_root(path: String) -> Option<String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        find_syncthing_root(Path::new(&path)).map(|root| root.to_string_lossy().into_owned())
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+#[tauri::command]
+fn get_remote_drive_environment(
+    app: AppHandle,
+    manager: tauri::State<'_, RemoteDriveManager>,
+) -> RemoteDriveEnvironment {
+    manager.environment(&app)
+}
+
+#[tauri::command]
+fn list_rclone_remotes(
+    app: AppHandle,
+    manager: tauri::State<'_, RemoteDriveManager>,
+) -> Result<Vec<String>, String> {
+    manager.list_remotes(&app)
+}
+
+#[tauri::command]
+async fn install_winfsp(app: AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || remote_drives::install_winfsp(&app))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn configure_rclone(
+    app: AppHandle,
+    manager: tauri::State<'_, RemoteDriveManager>,
+) -> Result<(), String> {
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || manager.configure_remotes(&app))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn connect_remote_drive(
+    app: AppHandle,
+    manager: tauri::State<'_, RemoteDriveManager>,
+    profile: RemoteDriveProfile,
+) -> Result<RemoteDriveStatus, String> {
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || manager.connect(&app, profile))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn disconnect_remote_drive(
+    app: AppHandle,
+    manager: tauri::State<'_, RemoteDriveManager>,
+    id: String,
+    force: bool,
+) -> Result<DisconnectResult, String> {
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || manager.disconnect(&app, &id, force))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn force_remote_drive_shutdown(
+    app: AppHandle,
+    manager: tauri::State<'_, RemoteDriveManager>,
+) -> Result<(), String> {
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        manager.disconnect_all(&app);
+        app.exit(0);
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn get_remote_drive_statuses(
+    manager: tauri::State<'_, RemoteDriveManager>,
+) -> Vec<RemoteDriveStatus> {
+    manager.statuses()
+}
+
+#[tauri::command]
+fn register_remote_drive_helper() -> Result<String, String> {
+    remote_drives::register_macos_helper()
+}
+
+#[tauri::command]
+fn unregister_remote_drive_helper(
+    app: AppHandle,
+    manager: tauri::State<'_, RemoteDriveManager>,
+) -> Result<(), String> {
+    manager.disconnect_all(&app);
+    remote_drives::unregister_macos_helper()
+}
+
+#[tauri::command]
+fn open_remote_drive_helper_settings() -> Result<(), String> {
+    remote_drives::open_macos_helper_settings()
 }
 
 #[tauri::command]
@@ -211,12 +383,6 @@ struct DiskInfo {
 }
 
 #[derive(Serialize)]
-struct FfmpegPreview {
-    binary: String,
-    args: Vec<String>,
-}
-
-#[derive(Serialize)]
 struct PreviewArtifact {
     kind: String,
     path: String,
@@ -225,7 +391,9 @@ struct PreviewArtifact {
 }
 
 #[tauri::command]
-fn list_system_locations() -> Result<SystemLocations, String> {
+fn list_system_locations(
+    remote_drives: tauri::State<'_, RemoteDriveManager>,
+) -> Result<SystemLocations, String> {
     use dirs::*;
     use sysinfo::Disks;
 
@@ -241,6 +409,7 @@ fn list_system_locations() -> Result<SystemLocations, String> {
     let drives = disks
         .iter()
         .map(|d| d.mount_point().to_string_lossy().to_string())
+        .filter(|path| !remote_drives.is_mount_root(Path::new(path)))
         .collect();
 
     Ok(SystemLocations {
@@ -291,23 +460,6 @@ fn get_disk_info(path: String) -> Result<DiskInfo, String> {
 }
 
 #[tauri::command]
-fn list_plugins() -> Result<Vec<String>, String> {
-    Ok(plugin_host().list())
-}
-
-#[tauri::command]
-fn call_plugin(plugin: String, method: String, payload: Option<Value>) -> Result<Value, String> {
-    plugin_host()
-        .call(&plugin, &method, payload)
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-fn get_plugin_methods(plugin: String) -> Result<Vec<String>, String> {
-    plugin_host().methods(&plugin).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
 async fn get_dir_size(path: String) -> Result<u64, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let p = std::path::Path::new(&path);
@@ -328,31 +480,527 @@ struct DirInfo {
 #[tauri::command]
 async fn get_dir_info(path: String) -> Result<DirInfo, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let p = std::path::Path::new(&path);
-        let mut count: u64 = 0;
-        let mut size: u64 = 0;
-
-        fn walk_dir(path: &Path, count: &mut u64, size: &mut u64) {
-            if let Ok(entries) = std::fs::read_dir(path) {
-                for entry in entries.filter_map(|e| e.ok()) {
-                    *count += 1;
-                    let entry_path = entry.path();
-                    if let Ok(metadata) = entry.metadata() {
-                        if metadata.is_dir() {
-                            walk_dir(&entry_path, count, size);
-                        } else {
-                            *size += metadata.len();
-                        }
-                    }
-                }
-            }
-        }
-
-        walk_dir(p, &mut count, &mut size);
+        let (count, size) = explorie_core::dir_info(Path::new(&path)).map_err(|e| e.to_string())?;
         Ok(DirInfo { count, size })
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+fn emit_file_operation(app: &AppHandle, event: FileOperationEvent) {
+    let _ = app.emit("file-operation", event);
+}
+
+#[tauri::command]
+fn start_file_operation(
+    app: AppHandle,
+    jobs: tauri::State<'_, FileOperationJobs>,
+    remote_drives: tauri::State<'_, RemoteDriveManager>,
+    request: explorie_core::FileOperationRequest,
+) -> Result<String, String> {
+    if request
+        .sources
+        .iter()
+        .any(|source| remote_drives.is_mount_root(source))
+    {
+        return Err("Refusing to mutate a managed remote-drive root".to_string());
+    }
+    let job_id = format!(
+        "{}-{}",
+        std::process::id(),
+        jobs.next_id.fetch_add(1, Ordering::Relaxed)
+    );
+    let cancelled = Arc::new(AtomicBool::new(false));
+    jobs.cancellations
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(job_id.clone(), Arc::clone(&cancelled));
+
+    let task_job_id = job_id.clone();
+    let task_app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let progress_app = task_app.clone();
+        let progress_job_id = task_job_id.clone();
+        let operation = tauri::async_runtime::spawn_blocking(move || {
+            explorie_core::perform_file_operation(request, &cancelled, |progress| {
+                emit_file_operation(
+                    &progress_app,
+                    FileOperationEvent {
+                        job_id: progress_job_id.clone(),
+                        state: "running",
+                        progress: Some(progress),
+                        result: None,
+                        error: None,
+                    },
+                );
+            })
+        })
+        .await;
+
+        task_app
+            .state::<FileOperationJobs>()
+            .cancellations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&task_job_id);
+
+        let event = match operation {
+            Ok(Ok(result)) => FileOperationEvent {
+                job_id: task_job_id,
+                state: "completed",
+                progress: None,
+                result: Some(result),
+                error: None,
+            },
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::Interrupted => {
+                FileOperationEvent {
+                    job_id: task_job_id,
+                    state: "cancelled",
+                    progress: None,
+                    result: None,
+                    error: None,
+                }
+            }
+            Ok(Err(error)) => FileOperationEvent {
+                job_id: task_job_id,
+                state: "failed",
+                progress: None,
+                result: None,
+                error: Some(error.to_string()),
+            },
+            Err(error) => FileOperationEvent {
+                job_id: task_job_id,
+                state: "failed",
+                progress: None,
+                result: None,
+                error: Some(error.to_string()),
+            },
+        };
+        emit_file_operation(&task_app, event);
+    });
+
+    Ok(job_id)
+}
+
+#[tauri::command]
+fn cancel_file_operation(jobs: tauri::State<'_, FileOperationJobs>, job_id: String) -> bool {
+    let jobs = jobs
+        .cancellations
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(cancelled) = jobs.get(&job_id) {
+        cancelled.store(true, Ordering::Relaxed);
+        true
+    } else {
+        false
+    }
+}
+
+fn read_text_preview_impl(path: &Path, max_bytes: u64) -> Result<TextPreview, String> {
+    const MAX_TEXT_PREVIEW_BYTES: u64 = 8 * 1024 * 1024;
+    let limit = max_bytes.min(MAX_TEXT_PREVIEW_BYTES);
+    let mut bytes = Vec::with_capacity(limit.min(128 * 1024) as usize);
+    File::open(path)
+        .map_err(|error| error.to_string())?
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    let truncated = bytes.len() as u64 > limit;
+    bytes.truncate(limit as usize);
+    Ok(TextPreview {
+        text: String::from_utf8_lossy(&bytes).into_owned(),
+        truncated,
+    })
+}
+
+#[tauri::command]
+async fn read_text_preview(path: String, max_bytes: u64) -> Result<TextPreview, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        read_text_preview_impl(Path::new(&path), max_bytes)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+fn metadata_is_link(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+fn validate_file_name(name: &str) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("File name cannot be empty".to_string());
+    }
+    if name == "." || name == ".." {
+        return Err("File name cannot be . or ..".to_string());
+    }
+    if name.contains(['/', '\\']) {
+        return Err("File name cannot contain path separators".to_string());
+    }
+    if name.chars().any(char::is_control) {
+        return Err("File name cannot contain control characters".to_string());
+    }
+
+    #[cfg(windows)]
+    {
+        if name.contains(['<', '>', ':', '"', '|', '?', '*']) {
+            return Err("File name contains invalid Windows characters".to_string());
+        }
+        if name.ends_with(['.', ' ']) {
+            return Err("File name cannot end with a period or space".to_string());
+        }
+        let base = name
+            .split('.')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_uppercase();
+        let reserved = matches!(base.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+            || base
+                .strip_prefix("COM")
+                .or_else(|| base.strip_prefix("LPT"))
+                .is_some_and(|number| {
+                    matches!(number, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+                });
+        if reserved {
+            return Err("File name is reserved on Windows".to_string());
+        }
+    }
+
+    Ok(name.to_string())
+}
+
+fn ensure_extension(name: &str, extension: &str) -> String {
+    if name
+        .to_ascii_lowercase()
+        .ends_with(&extension.to_ascii_lowercase())
+    {
+        name.to_string()
+    } else {
+        format!("{name}{extension}")
+    }
+}
+
+fn validate_no_link_ancestors(path: &Path) -> Result<(), String> {
+    let mut ancestors: Vec<&Path> = path.ancestors().collect();
+    ancestors.reverse();
+    for ancestor in ancestors {
+        let metadata = fs::symlink_metadata(ancestor).map_err(|error| error.to_string())?;
+        if metadata_is_link(&metadata) {
+            return Err(format!(
+                "Refusing to traverse a symbolic link or junction: {}",
+                ancestor.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_real_directory(path: &Path) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err("Directory path must be absolute".to_string());
+    }
+    validate_no_link_ancestors(path)?;
+    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if metadata_is_link(&metadata) || !metadata.is_dir() {
+        return Err("Destination must be a real directory".to_string());
+    }
+    Ok(())
+}
+
+fn mount_check_path(path: &Path, canonical: io::Result<PathBuf>) -> Result<PathBuf, String> {
+    match canonical {
+        Ok(path) => Ok(path),
+        #[cfg(windows)]
+        Err(error) if error.raw_os_error() == Some(1005) => Ok(path.to_path_buf()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn ensure_not_mount_root(path: &Path) -> Result<(), String> {
+    use sysinfo::Disks;
+
+    let canonical = mount_check_path(path, fs::canonicalize(path))?;
+    if canonical.parent().is_none() {
+        return Err("Refusing to mutate a filesystem root".to_string());
+    }
+    let disks = Disks::new_with_refreshed_list();
+    if disks.iter().any(|disk| {
+        mount_check_path(disk.mount_point(), fs::canonicalize(disk.mount_point()))
+            .is_ok_and(|mount| mount == canonical)
+    }) {
+        return Err("Refusing to mutate a mounted volume root".to_string());
+    }
+    Ok(())
+}
+
+fn suffixed_name(base_name: &str, number: u32, preserve_extension: bool) -> OsString {
+    if number == 1 {
+        return OsString::from(base_name);
+    }
+    if !preserve_extension {
+        return OsString::from(format!("{base_name} ({number})"));
+    }
+
+    let path = Path::new(base_name);
+    let stem = path.file_stem().unwrap_or(path.as_os_str());
+    let mut name = OsString::from(stem);
+    name.push(format!(" ({number})"));
+    if let Some(extension) = path.extension() {
+        name.push(".");
+        name.push(extension);
+    }
+    name
+}
+
+fn create_unique_path(
+    parent: &Path,
+    base_name: &str,
+    preserve_extension: bool,
+    mut create: impl FnMut(&Path) -> io::Result<()>,
+) -> Result<PathBuf, String> {
+    for number in 1..=9_999 {
+        let candidate = parent.join(suffixed_name(base_name, number, preserve_extension));
+        match fs::symlink_metadata(&candidate) {
+            Ok(_) => continue,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        match create(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Err("Could not find a unique file name".to_string())
+}
+
+fn write_new_text_file(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let result = (|| {
+        let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+        file.write_all(contents)?;
+        file.sync_all()
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(path);
+    }
+    result
+}
+
+#[tauri::command]
+fn rename_path(
+    remote_drives: tauri::State<'_, RemoteDriveManager>,
+    source_path: String,
+    new_base_name: String,
+) -> Result<String, String> {
+    if remote_drives.is_mount_root(Path::new(&source_path)) {
+        return Err("Refusing to rename a managed remote-drive root".to_string());
+    }
+    rename_path_impl(source_path, new_base_name)
+}
+
+fn rename_path_impl(source_path: String, new_base_name: String) -> Result<String, String> {
+    let source = PathBuf::from(source_path);
+    if !source.is_absolute() {
+        return Err("Source path must be absolute".to_string());
+    }
+    let metadata = fs::symlink_metadata(&source).map_err(|error| error.to_string())?;
+    if !metadata_is_link(&metadata) {
+        ensure_not_mount_root(&source)?;
+    }
+    if !metadata_is_link(&metadata) && !metadata.is_file() && !metadata.is_dir() {
+        return Err("Unsupported filesystem entry".to_string());
+    }
+    let parent = source
+        .parent()
+        .ok_or_else(|| "Cannot rename a filesystem root".to_string())?;
+    validate_real_directory(parent)?;
+    let name = validate_file_name(&new_base_name)?;
+    let destination = create_unique_path(parent, &name, true, |candidate| {
+        explorie_core::rename_noreplace(&source, candidate)
+    })?;
+    Ok(destination.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+fn create_folder(dir_path: String, base_name: String) -> Result<String, String> {
+    let directory = PathBuf::from(dir_path);
+    validate_real_directory(&directory)?;
+    let name = validate_file_name(&base_name)?;
+    let path = create_unique_path(&directory, &name, false, |candidate| {
+        fs::create_dir(candidate)
+    })?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+fn create_note(dir_path: String, base_name: String) -> Result<String, String> {
+    let directory = PathBuf::from(dir_path);
+    validate_real_directory(&directory)?;
+    let name = validate_file_name(&ensure_extension(&base_name, ".md"))?;
+    let path = create_unique_path(&directory, &name, true, |candidate| {
+        write_new_text_file(candidate, b"# New Note\n")
+    })?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+fn create_website_link(dir_path: String, base_name: String, url: String) -> Result<String, String> {
+    let directory = PathBuf::from(dir_path);
+    validate_real_directory(&directory)?;
+    let name = validate_file_name(&ensure_extension(&base_name, ".url"))?;
+    let url = url.trim();
+    if url.chars().any(char::is_control) {
+        return Err("Website URL cannot contain control characters".to_string());
+    }
+    let normalized = url.to_ascii_lowercase();
+    if !normalized.starts_with("https://") && !normalized.starts_with("http://") {
+        return Err("Website URL must use http or https".to_string());
+    }
+    let contents = format!("[InternetShortcut]\nURL={url}\n");
+    let path = create_unique_path(&directory, &name, true, |candidate| {
+        write_new_text_file(candidate, contents.as_bytes())
+    })?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeleteEntryKind {
+    File,
+    Directory,
+    Link,
+}
+
+fn delete_entry_kind(metadata: &fs::Metadata) -> io::Result<DeleteEntryKind> {
+    if metadata_is_link(metadata) {
+        Ok(DeleteEntryKind::Link)
+    } else if metadata.is_file() {
+        Ok(DeleteEntryKind::File)
+    } else if metadata.is_dir() {
+        Ok(DeleteEntryKind::Directory)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "special filesystem entries cannot be permanently deleted",
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn same_device(root: &fs::Metadata, candidate: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    root.dev() == candidate.dev()
+}
+
+#[cfg(not(unix))]
+fn same_device(_root: &fs::Metadata, _candidate: &fs::Metadata) -> bool {
+    true
+}
+
+fn collect_delete_entries(
+    path: &Path,
+    root_metadata: &fs::Metadata,
+    entries: &mut Vec<(PathBuf, DeleteEntryKind)>,
+) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    let kind = delete_entry_kind(&metadata)?;
+    if kind != DeleteEntryKind::Link && !same_device(root_metadata, &metadata) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to cross a mounted filesystem at {}",
+                path.display()
+            ),
+        ));
+    }
+    entries.push((path.to_path_buf(), kind));
+    if kind == DeleteEntryKind::Directory {
+        for child in fs::read_dir(path)? {
+            collect_delete_entries(&child?.path(), root_metadata, entries)?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_link(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(file_error) => fs::remove_dir(path).map_err(|_| file_error),
+    }
+}
+
+fn remove_planned_entry(path: &Path, expected: DeleteEntryKind) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    let actual = delete_entry_kind(&metadata)?;
+    if actual != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "filesystem entry changed during deletion: {}",
+                path.display()
+            ),
+        ));
+    }
+    match actual {
+        DeleteEntryKind::File => fs::remove_file(path),
+        DeleteEntryKind::Directory => fs::remove_dir(path),
+        DeleteEntryKind::Link => remove_link(path),
+    }
+}
+
+fn delete_path_permanently_impl(path: &Path, recursive: bool) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err("Delete path must be absolute".to_string());
+    }
+    if let Some(parent) = path.parent() {
+        validate_no_link_ancestors(parent)?;
+    }
+    let root_metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    let root_kind = delete_entry_kind(&root_metadata).map_err(|error| error.to_string())?;
+    if root_kind != DeleteEntryKind::Link {
+        ensure_not_mount_root(path)?;
+    }
+    if root_kind != DeleteEntryKind::Directory || !recursive {
+        return remove_planned_entry(path, root_kind).map_err(|error| error.to_string());
+    }
+
+    // Preflight the complete tree before the first irreversible deletion.
+    let mut entries = Vec::new();
+    collect_delete_entries(path, &root_metadata, &mut entries)
+        .map_err(|error| error.to_string())?;
+    for (entry, kind) in entries.into_iter().rev() {
+        remove_planned_entry(&entry, kind).map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn delete_path_permanently(
+    remote_drives: tauri::State<'_, RemoteDriveManager>,
+    path: String,
+    recursive: bool,
+) -> Result<(), String> {
+    if remote_drives.is_mount_root(Path::new(&path)) {
+        return Err("Refusing to delete a managed remote-drive root".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        delete_path_permanently_impl(Path::new(&path), recursive)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -611,10 +1259,20 @@ fn open_with_app(path: String, app_name: String) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+#[tauri::command]
+fn open_with_app(path: String, _app_name: String) -> Result<(), String> {
+    Command::new("rundll32.exe")
+        .args(["shell32.dll,OpenAs_RunDLL", &path])
+        .spawn()
+        .map_err(|err| format!("Failed to open Windows Open with: {err}"))?;
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 #[tauri::command]
 fn open_with_app(_path: String, _app_name: String) -> Result<(), String> {
-    Err("Open With is only available on macOS.".to_string())
+    Err("Open With is unavailable on this platform.".to_string())
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -740,43 +1398,20 @@ fn get_apps_for_file(path: String) -> Result<Vec<AppInfo>, String> {
     Ok(apps)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+#[tauri::command]
+fn get_apps_for_file(_path: String) -> Result<Vec<AppInfo>, String> {
+    Ok(vec![AppInfo {
+        name: "Choose another app…".to_string(),
+        path: String::new(),
+        bundle_id: None,
+    }])
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 #[tauri::command]
 fn get_apps_for_file(_path: String) -> Result<Vec<AppInfo>, String> {
     Ok(Vec::new())
-}
-
-#[tauri::command]
-fn ffmpeg_preview(
-    input: String,
-    output: String,
-    copy_audio: Option<bool>,
-    copy_video: Option<bool>,
-    video_filters: Option<Vec<String>>,
-    audio_filters: Option<Vec<String>>,
-) -> Result<FfmpegPreview, String> {
-    let mut task = FfmpegTask::new(&input, &output);
-    if copy_audio.unwrap_or(false) {
-        task = task.copy_audio(true);
-    }
-    if copy_video.unwrap_or(false) {
-        task = task.copy_video(true);
-    }
-    if let Some(filters) = video_filters {
-        for f in filters {
-            task = task.add_video_filter(f);
-        }
-    }
-    if let Some(filters) = audio_filters {
-        for f in filters {
-            task = task.add_audio_filter(f);
-        }
-    }
-    let cmd = task.build();
-    Ok(FfmpegPreview {
-        binary: cmd.binary.to_string_lossy().to_string(),
-        args: cmd.args,
-    })
 }
 
 fn path_extension_lower(path: &Path) -> String {
@@ -809,6 +1444,271 @@ fn is_external_image_preview(path: &Path) -> bool {
 
 fn preview_cache_dir() -> PathBuf {
     std::env::temp_dir().join("explorie-preview-cache")
+}
+
+#[cfg(target_os = "windows")]
+fn file_icon_cache_path(path: &Path) -> Result<PathBuf, String> {
+    use std::hash::{Hash, Hasher};
+
+    let metadata = path
+        .metadata()
+        .map_err(|err| format!("Failed to inspect executable: {err}"))?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.to_string_lossy()
+        .to_ascii_lowercase()
+        .hash(&mut hasher);
+    metadata.len().hash(&mut hasher);
+    metadata.modified().ok().hash(&mut hasher);
+    Ok(preview_cache_dir().join(format!("file-icon-{:016x}.png", hasher.finish())))
+}
+
+#[cfg(target_os = "windows")]
+fn get_file_icon_impl(path: String) -> Result<Option<String>, String> {
+    let path = PathBuf::from(path);
+    if !path.is_file() || !matches!(path_extension_lower(&path).as_str(), "exe" | "lnk") {
+        return Ok(None);
+    }
+
+    let output = file_icon_cache_path(&path)?;
+    if output.metadata().is_ok_and(|metadata| metadata.len() > 0) {
+        return Ok(Some(output.to_string_lossy().to_string()));
+    }
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("Failed to create preview cache directory: {err}"))?;
+    }
+
+    // Keep user-controlled paths out of the command string; PowerShell reads them from env vars.
+    let script = r#"Add-Type -AssemblyName System.Drawing
+$icon = [System.Drawing.Icon]::ExtractAssociatedIcon($env:EXPLORIE_ICON_INPUT)
+if ($null -eq $icon) { exit 2 }
+try {
+  $bitmap = $icon.ToBitmap()
+  try { $bitmap.Save($env:EXPLORIE_ICON_OUTPUT, [System.Drawing.Imaging.ImageFormat]::Png) }
+  finally { $bitmap.Dispose() }
+} finally { $icon.Dispose() }"#;
+    let status = Command::new("powershell.exe")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            script,
+        ])
+        .env("EXPLORIE_ICON_INPUT", &path)
+        .env("EXPLORIE_ICON_OUTPUT", &output)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|err| format!("Failed to extract file icon: {err}"))?;
+
+    if status.success() && output.metadata().is_ok_and(|metadata| metadata.len() > 0) {
+        Ok(Some(output.to_string_lossy().to_string()))
+    } else {
+        let _ = std::fs::remove_file(output);
+        Ok(None)
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn get_file_icon_impl(_path: String) -> Result<Option<String>, String> {
+    Ok(None)
+}
+
+#[tauri::command]
+async fn get_file_icon(path: String) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || get_file_icon_impl(path))
+        .await
+        .map_err(|err| err.to_string())?
+}
+
+fn thumbnail_cache_path(path: &Path, max_size: u32) -> Result<PathBuf, String> {
+    use std::hash::{Hash, Hasher};
+
+    let metadata = path
+        .metadata()
+        .map_err(|err| format!("Failed to inspect file: {err}"))?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.to_string_lossy().hash(&mut hasher);
+    metadata.len().hash(&mut hasher);
+    metadata.modified().ok().hash(&mut hasher);
+    max_size.hash(&mut hasher);
+    Ok(preview_cache_dir().join(format!("thumbnail-{:016x}.png", hasher.finish())))
+}
+
+fn prune_thumbnail_cache() {
+    const MAX_ENTRIES: usize = 256;
+    const MAX_BYTES: u64 = 128 * 1024 * 1024;
+
+    let Ok(entries) = std::fs::read_dir(preview_cache_dir()) else {
+        return;
+    };
+    let mut cached: Vec<(PathBuf, std::time::SystemTime, u64)> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            if !name.to_string_lossy().starts_with("thumbnail-") {
+                return None;
+            }
+            let metadata = entry.metadata().ok()?;
+            Some((
+                entry.path(),
+                metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
+                metadata.len(),
+            ))
+        })
+        .collect();
+    cached.sort_by_key(|(_, modified, _)| *modified);
+    let mut total_bytes = cached.iter().map(|(_, _, size)| *size).sum::<u64>();
+    while cached.len() > MAX_ENTRIES || total_bytes > MAX_BYTES {
+        let (path, _, size) = cached.remove(0);
+        if std::fs::remove_file(path).is_ok() {
+            total_bytes = total_bytes.saturating_sub(size);
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn generate_native_thumbnail(input: &Path, output: &Path, max_size: u32) -> Result<(), String> {
+    let script = r#"Add-Type -AssemblyName System.Drawing
+$image = [System.Drawing.Image]::FromFile($env:EXPLORIE_THUMB_INPUT)
+try {
+  $scale = [Math]::Min(1.0, [Math]::Min($env:EXPLORIE_THUMB_SIZE / $image.Width, $env:EXPLORIE_THUMB_SIZE / $image.Height))
+  $width = [Math]::Max(1, [int]($image.Width * $scale))
+  $height = [Math]::Max(1, [int]($image.Height * $scale))
+  $bitmap = New-Object System.Drawing.Bitmap($width, $height)
+  try {
+    $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+    try {
+      $graphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+      $graphics.DrawImage($image, 0, 0, $width, $height)
+    } finally { $graphics.Dispose() }
+    $bitmap.Save($env:EXPLORIE_THUMB_OUTPUT, [System.Drawing.Imaging.ImageFormat]::Png)
+  } finally { $bitmap.Dispose() }
+} finally { $image.Dispose() }"#;
+    let status = Command::new("powershell.exe")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            script,
+        ])
+        .env("EXPLORIE_THUMB_INPUT", input)
+        .env("EXPLORIE_THUMB_OUTPUT", output)
+        .env("EXPLORIE_THUMB_SIZE", max_size.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|err| format!("Failed to start native thumbnailer: {err}"))?;
+    status
+        .success()
+        .then_some(())
+        .ok_or_else(|| "Windows could not decode this image".to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn generate_native_thumbnail(input: &Path, output: &Path, max_size: u32) -> Result<(), String> {
+    let status = Command::new("sips")
+        .args(["-s", "format", "png", "-Z", &max_size.to_string()])
+        .arg(input)
+        .arg("--out")
+        .arg(output)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|err| format!("Failed to start native thumbnailer: {err}"))?;
+    status
+        .success()
+        .then_some(())
+        .ok_or_else(|| "macOS could not decode this image".to_string())
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn generate_native_thumbnail(_input: &Path, _output: &Path, _max_size: u32) -> Result<(), String> {
+    Err("Native thumbnails are unavailable on this platform".to_string())
+}
+
+fn is_video_thumbnail(path: &Path) -> bool {
+    matches!(
+        path_extension_lower(path).as_str(),
+        "mp4"
+            | "webm"
+            | "m4v"
+            | "mov"
+            | "avi"
+            | "mkv"
+            | "wmv"
+            | "flv"
+            | "m2ts"
+            | "mts"
+            | "mpeg"
+            | "mpg"
+            | "3gp"
+    )
+}
+
+fn generate_video_thumbnail(input: &Path, output: &Path, max_size: u32) -> Result<(), String> {
+    let tool = first_available_tool(&["ffmpeg"], "-version")
+        .ok_or_else(|| "Install FFmpeg to generate video thumbnails.".to_string())?;
+    let filter =
+        format!("thumbnail,scale={max_size}:{max_size}:force_original_aspect_ratio=decrease");
+    let status = Command::new(tool)
+        .args(["-y", "-i"])
+        .arg(input)
+        .args(["-frames:v", "1", "-vf", &filter])
+        .arg(output)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|err| format!("Failed to run FFmpeg thumbnail generation: {err}"))?;
+    status
+        .success()
+        .then_some(())
+        .ok_or_else(|| "FFmpeg could not generate a video thumbnail".to_string())
+}
+
+fn get_file_thumbnail_impl(path: String, max_size: u32) -> Result<Option<String>, String> {
+    let input = PathBuf::from(path);
+    if !input.is_file() {
+        return Ok(None);
+    }
+    let extension = path_extension_lower(&input);
+    let is_image = matches!(
+        extension.as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "tif" | "tiff"
+    );
+    if !is_image && !is_video_thumbnail(&input) {
+        return Ok(None);
+    }
+    let max_size = max_size.clamp(64, 512);
+    let output = thumbnail_cache_path(&input, max_size)?;
+    if output.metadata().is_ok_and(|metadata| metadata.len() > 0) {
+        return Ok(Some(output.to_string_lossy().to_string()));
+    }
+    std::fs::create_dir_all(preview_cache_dir())
+        .map_err(|err| format!("Failed to create thumbnail cache: {err}"))?;
+    let result = if is_image {
+        generate_native_thumbnail(&input, &output, max_size)
+    } else {
+        generate_video_thumbnail(&input, &output, max_size)
+    };
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&output);
+        return Err(error);
+    }
+    if !output.metadata().is_ok_and(|metadata| metadata.len() > 0) {
+        return Err("Native thumbnailer produced an empty image".to_string());
+    }
+    prune_thumbnail_cache();
+    Ok(Some(output.to_string_lossy().to_string()))
+}
+
+#[tauri::command]
+async fn get_file_thumbnail(path: String, max_size: u32) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || get_file_thumbnail_impl(path, max_size))
+        .await
+        .map_err(|err| err.to_string())?
 }
 
 fn sanitize_preview_stem(path: &Path) -> String {
@@ -989,71 +1889,11 @@ async fn generate_preview_artifact(path: String) -> Result<PreviewArtifact, Stri
         .map_err(|err| err.to_string())?
 }
 
-#[cfg(target_os = "windows")]
-#[tauri::command]
-fn is_default_file_manager() -> Result<bool, String> {
-    default_file_manager::is_default().map_err(|e| e.to_string())
-}
-
-#[cfg(not(target_os = "windows"))]
-#[tauri::command]
-fn is_default_file_manager() -> Result<bool, String> {
-    Ok(false)
-}
-
-#[cfg(target_os = "windows")]
-#[tauri::command]
-fn set_default_file_manager() -> Result<(), String> {
-    default_file_manager::set_default().map_err(|e| e.to_string())
-}
-
-#[cfg(not(target_os = "windows"))]
-#[tauri::command]
-fn set_default_file_manager() -> Result<(), String> {
-    Err("Setting the default file manager is only supported on Windows.".into())
-}
-
-#[cfg(target_os = "windows")]
-#[tauri::command]
-fn revert_default_file_manager() -> Result<(), String> {
-    default_file_manager::revert_default().map_err(|e| e.to_string())
-}
-
-#[cfg(not(target_os = "windows"))]
-#[tauri::command]
-fn revert_default_file_manager() -> Result<(), String> {
-    Err("Reverting the default file manager is only supported on Windows.".into())
-}
-
 #[tauri::command]
 fn get_home_dir() -> Result<String, String> {
     dirs::home_dir()
         .map(|p| p.to_string_lossy().to_string())
         .ok_or_else(|| "Could not determine home directory".into())
-}
-
-#[tauri::command]
-fn get_env_var(name: String) -> Result<String, String> {
-    std::env::var(&name).map_err(|_| format!("Environment variable '{}' not found", name))
-}
-
-#[cfg(target_os = "windows")]
-fn escape_powershell_literal(value: &str) -> String {
-    value.replace('\'', "''")
-}
-
-#[cfg(target_os = "macos")]
-fn escape_bash_literal(value: &str) -> String {
-    value.replace('\'', "'\\''")
-}
-
-fn resolve_update_path(app: &AppHandle, update_path: &str) -> Result<PathBuf, String> {
-    let path = PathBuf::from(update_path);
-    if path.is_absolute() {
-        return Ok(path);
-    }
-    let base = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
-    Ok(base.join(path))
 }
 
 #[tauri::command]
@@ -1064,164 +1904,6 @@ fn get_platform() -> String {
 #[tauri::command]
 fn get_app_version(app: AppHandle) -> String {
     app.package_info().version.to_string()
-}
-
-#[tauri::command]
-fn apply_update(app: AppHandle, update_path: String) -> Result<(), String> {
-    if cfg!(debug_assertions) {
-        return Err("Auto-update is disabled in dev builds.".to_string());
-    }
-
-    let update_file = resolve_update_path(&app, &update_path)?;
-    if !update_file.exists() {
-        return Err("Update file not found.".to_string());
-    }
-
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    {
-        Err("Auto-update is not supported on this platform.".to_string())
-    }
-
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
-    {
-        let backup_dir = app
-            .path()
-            .app_local_data_dir()
-            .map_err(|e| e.to_string())?
-            .join("explorie-backups");
-        std::fs::create_dir_all(&backup_dir).map_err(|e| e.to_string())?;
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|e| e.to_string())?
-            .as_secs();
-
-        let current_exe = std::env::current_exe().map_err(|err| err.to_string())?;
-        let pid = std::process::id();
-
-        #[cfg(target_os = "windows")]
-        {
-            let source = escape_powershell_literal(update_file.to_string_lossy().as_ref());
-            let target = escape_powershell_literal(current_exe.to_string_lossy().as_ref());
-            let exe_name = current_exe
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("explorie.exe");
-            let backup_path = backup_dir.join(format!("{timestamp}-{exe_name}"));
-            let backup = escape_powershell_literal(backup_path.to_string_lossy().as_ref());
-            let script = format!(
-                "$procId = {pid}; $source = '{source}'; $target = '{target}'; $backup = '{backup}'; \
-                 while (Get-Process -Id $procId -ErrorAction SilentlyContinue) {{ Start-Sleep -Milliseconds 200 }}; \
-                 if (Test-Path $target) {{ Copy-Item -Force $target $backup }}; \
-                 Move-Item -Force $source $target; Start-Process $target",
-                pid = pid,
-                source = source,
-                target = target,
-                backup = backup,
-            );
-
-            Command::new("powershell")
-                .args([
-                    "-NoProfile",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-Command",
-                    &script,
-                ])
-                .spawn()
-                .map_err(|err| err.to_string())?;
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            let app_bundle = current_exe
-                .parent()
-                .and_then(|p| p.parent())
-                .and_then(|p| p.parent())
-                .ok_or("Could not determine app bundle path")?;
-
-            let source = escape_bash_literal(update_file.to_string_lossy().as_ref());
-            let target = escape_bash_literal(app_bundle.to_string_lossy().as_ref());
-            let bundle_name = app_bundle
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("explorie.app");
-            let backup_path = backup_dir.join(format!("{timestamp}-{bundle_name}"));
-            let backup = escape_bash_literal(backup_path.to_string_lossy().as_ref());
-
-            let script = format!(
-                r#"pid={}
-source='{}'
-target='{}'
-backup='{}'
-
-while kill -0 $pid 2>/dev/null; do sleep 0.2; done
-if [ -e "$target" ]; then
-  rm -rf "$backup"
-  mv -f "$target" "$backup"
-fi
-mv -f "$source" "$target"
-open "$target"
-"#,
-                pid, source, target, backup
-            );
-
-            Command::new("bash")
-                .args(["-c", &script])
-                .spawn()
-                .map_err(|err| err.to_string())?;
-        }
-
-        app.exit(0);
-        Ok(())
-    }
-}
-
-#[cfg(target_os = "macos")]
-#[tauri::command]
-fn extract_app_zip(app: AppHandle, zip_path: String) -> Result<String, String> {
-    let zip_file = resolve_update_path(&app, &zip_path)?;
-    if !zip_file.exists() {
-        return Err("Update file not found.".to_string());
-    }
-    let parent = zip_file.parent().ok_or("Invalid zip path")?;
-
-    let zip_str = zip_file.to_string_lossy();
-    let parent_str = parent.to_string_lossy();
-    let status = Command::new("ditto")
-        .args(["-xk", zip_str.as_ref(), parent_str.as_ref()])
-        .status()
-        .map_err(|e| e.to_string())?;
-
-    if !status.success() {
-        return Err("Failed to extract update".to_string());
-    }
-
-    let mut app_path = None;
-    let entries = std::fs::read_dir(parent).map_err(|e| e.to_string())?;
-    for entry in entries {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let path = entry.path();
-        let is_app = path
-            .extension()
-            .and_then(|s| s.to_str())
-            .map(|s| s.eq_ignore_ascii_case("app"))
-            .unwrap_or(false);
-        if is_app {
-            app_path = Some(path);
-            break;
-        }
-    }
-
-    let app_path = app_path.ok_or("Extracted app not found".to_string())?;
-    let _ = std::fs::remove_file(zip_file);
-
-    Ok(app_path.to_string_lossy().to_string())
-}
-
-#[cfg(not(target_os = "macos"))]
-#[tauri::command]
-fn extract_app_zip(_app: AppHandle, _zip_path: String) -> Result<String, String> {
-    Err("This command is only available on macOS".to_string())
 }
 
 // --- Archive operations ---
@@ -1360,14 +2042,50 @@ fn main() {
 
     info!("Starting explorie desktop application");
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            if let Some(path) = launch_directory_from_args(args.into_iter().map(OsString::from)) {
+                let _ = app.emit("open-path", path);
+            }
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
+        .manage(FileOperationJobs::default())
+        .manage(RemoteDriveManager::default())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .invoke_handler(tauri::generate_handler![
             list_files,
+            get_syncthing_root,
             list_system_locations,
+            get_launch_path,
+            get_system_integration_status,
+            set_system_integration,
+            get_remote_drive_environment,
+            list_rclone_remotes,
+            install_winfsp,
+            configure_rclone,
+            connect_remote_drive,
+            disconnect_remote_drive,
+            force_remote_drive_shutdown,
+            get_remote_drive_statuses,
+            register_remote_drive_helper,
+            unregister_remote_drive_helper,
+            open_remote_drive_helper_settings,
             get_dir_size,
             get_dir_info,
             get_disk_info,
+            start_file_operation,
+            cancel_file_operation,
+            read_text_preview,
+            rename_path,
+            create_folder,
+            create_note,
+            create_website_link,
+            delete_path_permanently,
             create_explorie_schema,
             update_custom_fields,
             open_path,
@@ -1378,78 +2096,96 @@ fn main() {
             get_finder_tag_colors,
             open_with_app,
             get_apps_for_file,
-            list_plugins,
-            call_plugin,
-            get_plugin_methods,
-            ffmpeg_preview,
+            get_file_icon,
+            get_file_thumbnail,
             generate_preview_artifact,
-            is_default_file_manager,
-            set_default_file_manager,
-            revert_default_file_manager,
             get_home_dir,
-            get_env_var,
             get_platform,
             get_app_version,
-            apply_update,
-            extract_app_zip,
             // Archive operations
             compress_files,
             extract_archive_cmd,
             list_archive,
             check_is_archive,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    app.run(|app_handle, event| {
+        if let tauri::RunEvent::ExitRequested { api, .. } = event
+            && !app_handle
+                .state::<RemoteDriveManager>()
+                .disconnect_all_if_clean(app_handle)
+        {
+            api.prevent_exit();
+        }
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn ffmpeg_preview_builds_command_with_filters_and_copy_flags() {
-        let preview = ffmpeg_preview(
-            "input clip.mov".to_string(),
-            "out.webm".to_string(),
-            Some(true),
-            Some(false),
-            Some(vec!["scale=1280:-2".to_string(), "fps=30".to_string()]),
-            Some(vec!["volume=0.8".to_string()]),
-        )
-        .expect("preview should build");
+    struct TestDir(PathBuf);
 
-        assert_eq!(preview.binary, "ffmpeg");
+    impl TestDir {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "explorie-mutation-test-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn launch_path_uses_only_an_existing_directory_argument() {
+        let directory = TestDir::new();
+        let args = [
+            OsString::from("explorie.exe"),
+            OsString::from("missing-folder"),
+            directory.0.clone().into_os_string(),
+        ];
+
         assert_eq!(
-            preview.args,
-            vec![
-                "-y",
-                "-i",
-                "input clip.mov",
-                "-vf",
-                "scale=1280:-2,fps=30",
-                "-c:a",
-                "copy",
-                "-af",
-                "volume=0.8",
-                "out.webm"
-            ]
+            launch_directory_from_args(args),
+            Some(directory.0.to_string_lossy().into_owned())
         );
     }
 
     #[test]
-    fn ffmpeg_preview_defaults_optional_flags_to_transcode_args() {
-        let preview = ffmpeg_preview(
-            "input.mp4".to_string(),
-            "output.mp4".to_string(),
-            None,
-            None,
-            None,
-            None,
-        )
-        .expect("preview should build");
+    fn syncthing_root_is_found_from_a_descendant() {
+        let directory = TestDir::new();
+        let child = directory.0.join("nested").join("folder");
+        fs::create_dir_all(&child).unwrap();
+        fs::create_dir(directory.0.join(".stfolder")).unwrap();
 
-        assert_eq!(preview.binary, "ffmpeg");
-        assert_eq!(preview.args, vec!["-y", "-i", "input.mp4", "output.mp4"]);
+        assert_eq!(find_syncthing_root(&child), Some(directory.0.clone()));
+        assert_eq!(find_syncthing_root(directory.0.parent().unwrap()), None);
+    }
+
+    #[test]
+    fn text_preview_reads_only_the_requested_prefix() {
+        let path = std::env::temp_dir().join(format!(
+            "explorie-text-preview-test-{}.txt",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"abcdef").unwrap();
+
+        let preview = read_text_preview_impl(&path, 4).unwrap();
+        let _ = std::fs::remove_file(path);
+
+        assert_eq!(preview.text, "abcd");
+        assert!(preview.truncated);
     }
 
     #[test]
@@ -1498,5 +2234,140 @@ mod tests {
         assert!(path_string.contains("explorie-preview-cache"));
         assert!(path_string.ends_with("Quarterly_Report.pdf"));
         assert!(!path_string.contains("Quarterly Report.docx.pdf"));
+    }
+
+    #[test]
+    fn native_file_icons_ignore_unsupported_files() {
+        assert_eq!(get_file_icon_impl("notes.txt".to_string()).unwrap(), None);
+    }
+
+    #[test]
+    fn native_thumbnail_cache_keys_include_source_metadata_and_bounds() {
+        let temp = TestDir::new();
+        let image = temp.0.join("photo.jpg");
+        fs::write(&image, b"first").unwrap();
+        let small = thumbnail_cache_path(&image, 128).unwrap();
+        let large = thumbnail_cache_path(&image, 256).unwrap();
+        assert_ne!(small, large);
+        assert!(
+            small
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("thumbnail-")
+        );
+
+        fs::write(&image, b"changed image contents").unwrap();
+        assert_ne!(small, thumbnail_cache_path(&image, 128).unwrap());
+    }
+
+    #[test]
+    fn grid_thumbnail_routes_video_extensions() {
+        for path in ["clip.mp4", "clip.webm", "clip.mov", "clip.avi", "clip.mkv"] {
+            assert!(is_video_thumbnail(Path::new(path)));
+        }
+        assert!(!is_video_thumbnail(Path::new("photo.jpg")));
+    }
+
+    #[test]
+    fn native_mutations_validate_names_and_never_overwrite() {
+        let temp = TestDir::new();
+        let existing = temp.0.join("report.txt");
+        let source = temp.0.join("draft.txt");
+        fs::write(&existing, b"existing").unwrap();
+        fs::write(&source, b"draft").unwrap();
+
+        let renamed = PathBuf::from(
+            rename_path_impl(
+                source.to_string_lossy().into_owned(),
+                "report.txt".to_string(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(renamed.file_name().unwrap(), "report (2).txt");
+        assert_eq!(fs::read(&existing).unwrap(), b"existing");
+        assert_eq!(fs::read(&renamed).unwrap(), b"draft");
+
+        let folder =
+            create_folder(temp.0.to_string_lossy().into_owned(), "Project".to_string()).unwrap();
+        assert!(Path::new(&folder).is_dir());
+        let note = create_note(
+            temp.0.to_string_lossy().into_owned(),
+            "Meeting Notes".to_string(),
+        )
+        .unwrap();
+        assert_eq!(fs::read_to_string(note).unwrap(), "# New Note\n");
+        let link = create_website_link(
+            temp.0.to_string_lossy().into_owned(),
+            "Explorie".to_string(),
+            "https://example.com".to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(link).unwrap(),
+            "[InternetShortcut]\nURL=https://example.com\n"
+        );
+
+        assert!(validate_file_name("../escape").is_err());
+        assert!(
+            create_website_link(
+                temp.0.to_string_lossy().into_owned(),
+                "unsafe".to_string(),
+                "https://example.com\nIconFile=bad".to_string(),
+            )
+            .is_err()
+        );
+        assert!(
+            create_website_link(
+                temp.0.to_string_lossy().into_owned(),
+                "unsafe".to_string(),
+                "javascript:alert(1)".to_string(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn filesystem_roots_are_rejected() {
+        #[cfg(windows)]
+        let root = Path::new("C:\\");
+        #[cfg(unix)]
+        let root = Path::new("/");
+
+        assert!(ensure_not_mount_root(root).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unrecognized_windows_volumes_use_lexical_paths_for_mount_checks() {
+        let path = Path::new(r"R:\file.txt");
+        assert_eq!(
+            mount_check_path(path, Err(io::Error::from_raw_os_error(1005))).unwrap(),
+            path
+        );
+        assert!(mount_check_path(path, Err(io::Error::from_raw_os_error(5))).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permanent_delete_unlinks_symlinks_without_following_them() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TestDir::new();
+        let outside = temp.0.join("outside");
+        let source = temp.0.join("source");
+        fs::create_dir(&outside).unwrap();
+        fs::create_dir(&source).unwrap();
+        fs::write(outside.join("keep.txt"), b"keep").unwrap();
+        symlink(&outside, source.join("link")).unwrap();
+        let alias = temp.0.join("outside-alias");
+        symlink(&outside, &alias).unwrap();
+
+        assert!(delete_path_permanently_impl(&alias.join("keep.txt"), false).is_err());
+
+        delete_path_permanently_impl(&source, true).unwrap();
+
+        assert!(!source.exists());
+        assert_eq!(fs::read(outside.join("keep.txt")).unwrap(), b"keep");
     }
 }

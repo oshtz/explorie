@@ -2,7 +2,6 @@
 resolver = "3"
 members = [
     "crates/core",
-    "crates/plugin-host",
     "crates/ffmpeg-wrapper",
     "apps/cli",
     "apps/desktop/frontend/src-tauri"

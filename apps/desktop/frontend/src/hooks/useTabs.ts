@@ -122,6 +122,19 @@ export function useTabs({
     [tabs, setSelectedFile, clearActiveSmartFolder, setCurrentPath]
   );
 
+  const reorderTabs = useCallback((fromId: string, toId: string) => {
+    if (fromId === toId) return;
+    setTabs((current) => {
+      const from = current.findIndex((tab) => tab.id === fromId);
+      const to = current.findIndex((tab) => tab.id === toId);
+      if (from < 0 || to < 0) return current;
+      const next = [...current];
+      const [moved] = next.splice(from, 1);
+      next.splice(to, 0, moved);
+      return next;
+    });
+  }, []);
+
   return {
     tabs,
     setTabs,
@@ -132,5 +145,6 @@ export function useTabs({
     addTab,
     closeTab,
     activateTab,
+    reorderTabs,
   };
 }

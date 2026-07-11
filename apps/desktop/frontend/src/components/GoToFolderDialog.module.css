@@ -6,7 +6,7 @@
   display: flex;
   align-items: flex-start;
   justify-content: center;
-  padding-top: 15vh;
+  padding: max(var(--padding-lg), 15vh) var(--padding-lg) var(--padding-lg);
   animation: fadeIn 0.1s ease-out;
 }
 
@@ -22,10 +22,12 @@
 .dialog {
   width: 100%;
   max-width: 560px;
+  max-height: calc(100vh - 24px);
+  overflow-y: auto;
   background: var(--bg-elevated);
   border: 1px solid var(--border-primary);
   border-radius: var(--border-radius-lg, 8px);
-  padding: 20px;
+  padding: var(--padding-xl);
   box-shadow: var(--overlay-shadow);
   animation: slideIn 0.15s ease-out;
 }
@@ -42,19 +44,26 @@
 }
 
 .title {
-  margin: 0 0 16px 0;
+  margin: 0 0 var(--padding-xl);
   font-size: 16px;
   font-weight: 500;
   color: var(--fg-title);
 }
 
 .inputContainer {
-  margin-bottom: 12px;
+  margin-bottom: var(--padding-lg);
+}
+
+.inputLabel {
+  display: block;
+  margin-bottom: var(--padding-xs);
+  color: var(--fg-secondary);
+  font-size: calc(12px * var(--font-scale, 1));
 }
 
 .input {
   width: 100%;
-  padding: 10px 14px;
+  padding: var(--padding-md) var(--padding-lg);
   font-size: 14px;
   font-family: var(--font-mono, monospace);
   color: var(--fg-primary);
@@ -77,31 +86,31 @@
 }
 
 .inputError {
-  border-color: #ff6b6b;
+  border-color: var(--fg-error);
 }
 
 .inputError:focus {
-  border-color: #ff6b6b;
+  border-color: var(--fg-error);
   box-shadow: 0 0 0 2px rgba(255, 107, 107, 0.2);
 }
 
 .errorText {
   display: block;
-  margin-top: 6px;
+  margin-top: var(--padding-sm);
   font-size: 12px;
-  color: #ff6b6b;
+  color: var(--fg-error);
 }
 
 .hint {
-  margin-bottom: 16px;
+  margin-bottom: var(--padding-xl);
   font-size: 12px;
   color: var(--fg-tertiary);
 }
 
 .hint kbd {
   display: inline-block;
-  padding: 2px 6px;
-  margin: 0 2px;
+  padding: var(--padding-xs) var(--padding-sm);
+  margin: 0 var(--padding-xs);
   background: var(--bg-secondary);
   border: 1px solid var(--border-primary);
   border-radius: 0;
@@ -112,12 +121,12 @@
 .actions {
   display: flex;
   justify-content: flex-end;
-  gap: 8px;
+  gap: var(--padding-md);
 }
 
 .cancelButton,
 .goButton {
-  padding: 8px 16px;
+  padding: var(--padding-md) var(--padding-xl);
   font-size: 13px;
   font-weight: 500;
   border: none;
@@ -169,8 +178,8 @@
 .suggestionItem {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 8px 12px;
+  gap: var(--padding-md);
+  padding: var(--padding-md) var(--padding-lg);
   cursor: pointer;
   transition: background 0.1s;
 }
@@ -198,8 +207,8 @@
 
 .suggestionBadge {
   flex-shrink: 0;
-  padding: 2px 6px;
-  font-size: 10px;
+  padding: var(--padding-xs) var(--padding-sm);
+  font-size: 11px;
   font-weight: 500;
   text-transform: uppercase;
   background: var(--bg-secondary);

@@ -60,14 +60,6 @@ export default defineConfig(async ({ mode }) => {
             if (id.includes('/react') || id.includes('\\react')) return 'react';
             if (id.includes('/zustand') || id.includes('\\zustand')) return 'zustand';
             if (id.includes('/@tauri-apps/') || id.includes('\\@tauri-apps\\')) return 'tauri';
-            if (
-              id.includes('/highlight.js/') ||
-              id.includes('\\highlight.js\\') ||
-              id.includes('/diff/') ||
-              id.includes('\\diff\\')
-            ) {
-              return 'syntax';
-            }
             return undefined;
           },
         },

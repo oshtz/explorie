@@ -2,10 +2,13 @@ import * as React from 'react';
 import type { FileEntry } from '../store';
 
 interface UseDragStartOptions {
-  onBeginDrag?: (file: FileEntry) => void;
+  onBeginDrag?: DragStartHandler;
   threshold?: number; // pixels before starting drag
   isEnabled?: boolean; // allow opt-out while already dragging
 }
+
+export type DragPoint = { x: number; y: number };
+export type DragStartHandler = (file: FileEntry, point: DragPoint) => void;
 
 export function useDragStart({
   onBeginDrag,
@@ -39,10 +42,20 @@ export function useDragStart({
         const dy = Math.abs(ev.clientY - p.startY);
         if (dx >= threshold || dy >= threshold) {
           p.started = true;
-          if (p.file && onBeginDrag) onBeginDrag(p.file);
+          if (p.file && onBeginDrag) {
+            onBeginDrag(p.file, { x: ev.clientX, y: ev.clientY });
+          }
         }
       };
       const cleanup = () => {
+        if (pendingRef.current?.started) {
+          const suppressClick = (event: MouseEvent) => {
+            event.preventDefault();
+            event.stopImmediatePropagation();
+          };
+          window.addEventListener('click', suppressClick, { capture: true, once: true });
+          window.setTimeout(() => window.removeEventListener('click', suppressClick, true), 0);
+        }
         window.removeEventListener('mousemove', handleMove);
         window.removeEventListener('mouseup', cleanup);
         pendingRef.current = null;

@@ -1,0 +1,11 @@
+{
+  "bundle": {
+    "macOS": {
+      "minimumSystemVersion": "13.0",
+      "files": {
+        "Resources/explorie-mountd": "macos/build/explorie-mountd",
+        "Library/LaunchDaemons/com.omershatz.explorie.mountd.plist": "macos/com.omershatz.explorie.mountd.plist"
+      }
+    }
+  }
+}

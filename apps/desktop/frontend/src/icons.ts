@@ -24,6 +24,8 @@ export function resolveIcon(name: IconName): string {
 
   // alias map for common names we use in UI
   const aliasMap: Record<string, string> = {
+    star: 'bookmark',
+    x: 'close',
     close: 'x',
     times: 'x',
     settings: 'sliders',

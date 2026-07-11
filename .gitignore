@@ -73,6 +73,7 @@ target/
 **/src-tauri/target/
 **/src-tauri/gen/
 **/target/**/bundle/
+apps/desktop/frontend/src-tauri/binaries/rclone-*
 
 # Tests / Coverage
 .release-checks/

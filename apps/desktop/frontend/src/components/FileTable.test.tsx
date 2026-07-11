@@ -10,19 +10,20 @@ const mocks = vi.hoisted(() => ({
   contextActionFile: null as FileEntry | null,
   contextActionFiles: [] as FileEntry[],
   contextOpenForEmpty: vi.fn(),
-  contextOpenForFile: vi.fn(),
+  contextOpenForFiles: vi.fn(),
   deleteWithUndo: vi.fn(),
   createFolderIn: vi.fn(),
   invoke: vi.fn(),
   pushUndo: vi.fn(),
   renamePath: vi.fn(),
   reportError: vi.fn(),
+  virtualRowCountOverride: null as number | null,
 }));
 
 vi.mock('../hooks/useVirtualRows', () => ({
   useVirtualRows: ({ count, estimateSize = 34 }: { count: number; estimateSize?: number }) => ({
     totalSize: count * estimateSize,
-    virtualRows: Array.from({ length: count }, (_, index) => ({
+    virtualRows: Array.from({ length: mocks.virtualRowCountOverride ?? count }, (_, index) => ({
       index,
       start: index * estimateSize,
       size: estimateSize,
@@ -32,9 +33,13 @@ vi.mock('../hooks/useVirtualRows', () => ({
 }));
 
 vi.mock('../hooks/useDragStart', () => ({
-  useDragStart: ({ onBeginDrag }: { onBeginDrag?: (file: FileEntry) => void }) => ({
+  useDragStart: ({
+    onBeginDrag,
+  }: {
+    onBeginDrag?: (file: FileEntry, point: { x: number; y: number }) => void;
+  }) => ({
     onMouseDown: (_event: React.MouseEvent, file: FileEntry) => {
-      onBeginDrag?.(file);
+      onBeginDrag?.(file, { x: 0, y: 0 });
     },
   }),
 }));
@@ -102,7 +107,7 @@ vi.mock('./ContextMenu', async () => {
     useContextMenu: () => ({
       state: { open: false },
       openForEmpty: mocks.contextOpenForEmpty,
-      openForFile: mocks.contextOpenForFile,
+      openForFiles: mocks.contextOpenForFiles,
       close: vi.fn(),
     }),
   };
@@ -292,6 +297,7 @@ describe('FileTable', () => {
     mocks.batchActionFiles = [];
     mocks.contextActionFile = null;
     mocks.contextActionFiles = [];
+    mocks.virtualRowCountOverride = null;
     globalThis.ResizeObserver = MockResizeObserver as typeof ResizeObserver;
     mocks.createFolderIn.mockResolvedValue('/root/New Folder');
     mocks.deleteWithUndo.mockResolvedValue(true);
@@ -400,6 +406,38 @@ describe('FileTable', () => {
     expect(within(archiveRow).getByLabelText('Tag: storage')).toBeInTheDocument();
   });
 
+  it('uses keyboard-accessible buttons for sorting', () => {
+    const onSort = vi.fn();
+    render(
+      <FileTable
+        droppableId="list:/root"
+        files={[makeFile({ id: 'file', path: '/root/file.txt' })]}
+        sortKey="name"
+        sortDir="asc"
+        onSort={onSort}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Name' }));
+    expect(onSort).toHaveBeenCalledWith('name');
+  });
+
+  it('ignores stale virtual rows while a file list shrinks', () => {
+    mocks.virtualRowCountOverride = 2;
+
+    render(
+      <FileTable
+        droppableId="list:/root"
+        files={[makeFile({ id: 'remaining', path: '/root/remaining.txt', name: 'remaining.txt' })]}
+        sortKey="name"
+        sortDir="asc"
+        onSort={vi.fn()}
+      />
+    );
+
+    expect(screen.getByRole('row', { name: /file: remaining\.txt/i })).toBeInTheDocument();
+  });
+
   it('selects, toggles, ranges, clears, and exposes selected files', async () => {
     const getSelectedFilesRef = React.createRef<(() => FileEntry[]) | null>();
     const onFileSelect = vi.fn();
@@ -447,6 +485,19 @@ describe('FileTable', () => {
 
     fireEvent.keyDown(table, { key: 'Escape' });
     await waitFor(() => expect(getSelectedFilesRef.current?.()).toEqual([]));
+
+    Object.defineProperty(table, 'clientHeight', { configurable: true, value: 68 });
+    fireEvent.keyDown(table, { key: 'End' });
+    await waitFor(() =>
+      expect(getSelectedFilesRef.current?.().map((file) => file.id)).toEqual(['c'])
+    );
+    expect(table.scrollTop).toBeGreaterThan(0);
+
+    fireEvent.keyDown(table, { key: 'Home' });
+    await waitFor(() =>
+      expect(getSelectedFilesRef.current?.().map((file) => file.id)).toEqual(['a'])
+    );
+    expect(table.scrollTop).toBe(0);
   });
 
   it('opens folders through double click and opens files through Enter and double click', () => {
@@ -477,11 +528,35 @@ describe('FileTable', () => {
     expect(mocks.invoke).toHaveBeenCalledTimes(2);
   });
 
-  it('opens file and empty-space context menus with the current container path', () => {
+  it('reports file-open failures to the user', async () => {
+    mocks.invoke.mockRejectedValueOnce(new Error('denied'));
+    render(
+      <FileTable
+        droppableId="list:/root"
+        files={[makeFile({ id: 'file', path: '/root/notes.md', name: 'notes.md' })]}
+        sortKey="name"
+        sortDir="asc"
+        onSort={vi.fn()}
+      />
+    );
+
+    fireEvent.doubleClick(screen.getByRole('row', { name: /file: notes\.md/i }));
+    await waitFor(() =>
+      expect(mocks.reportError).toHaveBeenCalledWith(
+        'Open failed',
+        expect.any(Error),
+        expect.objectContaining({ context: { path: '/root/notes.md' } })
+      )
+    );
+  });
+
+  it('preserves multi-selection for item context menus and opens empty-space paste', () => {
     useFileStore.setState({ clipboard: { mode: 'copy', items: [], sourcePath: '/root' } });
+    const onFileSelect = vi.fn();
     const files = [
       makeFile({ id: 'a', path: '/root/a.txt', name: 'a.txt' }),
       makeFile({ id: 'b', path: '/root/b.txt', name: 'b.txt' }),
+      makeFile({ id: 'c', path: '/root/c.txt', name: 'c.txt' }),
     ];
     const { container } = render(
       <FileTable
@@ -490,11 +565,26 @@ describe('FileTable', () => {
         sortKey="name"
         sortDir="asc"
         onSort={vi.fn()}
+        onFileSelect={onFileSelect}
       />
     );
 
+    fireEvent.click(screen.getByRole('row', { name: /file: a\.txt/i }));
+    fireEvent.click(screen.getByRole('row', { name: /file: b\.txt/i }), { ctrlKey: true });
     fireEvent.contextMenu(screen.getByRole('row', { name: /file: b\.txt/i }));
-    expect(mocks.contextOpenForFile).toHaveBeenCalledWith(expect.any(Object), files[1], '/root');
+    expect(mocks.contextOpenForFiles).toHaveBeenLastCalledWith(
+      expect.any(Object),
+      [files[0], files[1]],
+      '/root'
+    );
+
+    fireEvent.contextMenu(screen.getByRole('row', { name: /file: c\.txt/i }));
+    expect(mocks.contextOpenForFiles).toHaveBeenLastCalledWith(
+      expect.any(Object),
+      [files[2]],
+      '/root'
+    );
+    expect(onFileSelect).toHaveBeenLastCalledWith(files[2]);
 
     fireEvent.contextMenu(getTableContainer(container));
     expect(mocks.contextOpenForEmpty).toHaveBeenCalledWith(expect.any(Object), '/root');
@@ -525,6 +615,35 @@ describe('FileTable', () => {
       expect(mocks.renamePath).toHaveBeenCalledWith('/root/original.txt', 'renamed.txt')
     );
     expect(mocks.invoke).not.toHaveBeenCalledWith('open_path', { path: '/root/original.txt' });
+  });
+
+  it('reports rename failures and keeps the original file selected', async () => {
+    const file = makeFile({ id: 'file', path: '/root/original.txt', name: 'original.txt' });
+    mocks.renamePath.mockRejectedValueOnce(new Error('denied'));
+    useFileStore.setState({ editingId: 'file' });
+
+    render(
+      <FileTable
+        droppableId="list:/root"
+        files={[file]}
+        sortKey="name"
+        sortDir="asc"
+        onSort={vi.fn()}
+      />
+    );
+
+    const input = screen.getByLabelText('Rename file');
+    fireEvent.change(input, { target: { value: 'blocked.txt' } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+
+    await waitFor(() =>
+      expect(mocks.reportError).toHaveBeenCalledWith(
+        'Rename failed',
+        expect.any(Error),
+        expect.objectContaining({ context: { path: '/root/original.txt' } })
+      )
+    );
+    expect(screen.getByRole('row', { name: /original\.txt, selected/i })).toBeInTheDocument();
   });
 
   it('creates draft folders from inline rename without opening the draft row', async () => {

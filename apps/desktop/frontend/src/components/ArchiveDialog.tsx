@@ -1,9 +1,10 @@
-import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import type { FileEntry } from '../store';
 import { Icon } from './Icon';
 import { formatErrorMessage } from '../utils/errorMessages';
+import { createFocusTrap } from '../utils/accessibility';
 import styles from './ArchiveDialog.module.css';
 
 type ArchiveMode = 'compress' | 'extract';
@@ -108,6 +109,19 @@ export function ArchiveDialog({
   const [archiveInfo, setArchiveInfo] = useState<ArchiveInfo | null>(null);
   const [loadingInfo, setLoadingInfo] = useState(false);
   const [entrySearch, setEntrySearch] = useState('');
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const focusTrapRef = useRef<ReturnType<typeof createFocusTrap> | null>(null);
+
+  useEffect(() => {
+    if (!open || !dialogRef.current) return;
+    const trap = createFocusTrap(dialogRef.current);
+    focusTrapRef.current = trap;
+    trap.activate();
+    return () => {
+      focusTrapRef.current = null;
+      trap.deactivate();
+    };
+  }, [open]);
 
   // Load archive info for extraction preview
   const loadArchiveInfo = useCallback(async (path: string) => {
@@ -254,13 +268,28 @@ export function ArchiveDialog({
 
   return (
     <div className={styles.backdrop} onClick={handleBackdropClick}>
-      <div className={styles.dialog}>
+      <div
+        ref={dialogRef}
+        className={styles.dialog}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="archive-dialog-title"
+        onKeyDown={(e) => {
+          focusTrapRef.current?.handleKeyDown(e);
+          if (e.key === 'Escape' && !processing) {
+            e.preventDefault();
+            onClose();
+          }
+        }}
+      >
         <div className={styles.header}>
           <div className={styles.headerIcon}>
             <Icon name={isCompress ? 'archive' : 'unarchive'} />
           </div>
           <div>
-            <h2 className={styles.title}>{isCompress ? 'Create Archive' : 'Extract Archive'}</h2>
+            <h2 id="archive-dialog-title" className={styles.title}>
+              {isCompress ? 'Create Archive' : 'Extract Archive'}
+            </h2>
             <span className={styles.subtitle}>
               {isCompress
                 ? `${files.length} item${files.length !== 1 ? 's' : ''} selected`
@@ -323,6 +352,7 @@ export function ArchiveDialog({
                 <>
                   <div className={styles.archiveSearch}>
                     <input
+                      aria-label="Search archive contents"
                       type="text"
                       className={`${styles.input} ${styles.archiveSearchInput}`}
                       value={entrySearch}
@@ -370,8 +400,12 @@ export function ArchiveDialog({
             {isCompress && (
               <>
                 <div className={styles.field}>
-                  <label className={styles.label}>Archive Name</label>
+                  <label className={styles.label} htmlFor="archive-name">
+                    Archive Name
+                  </label>
                   <input
+                    id="archive-name"
+                    data-autofocus
                     type="text"
                     className={styles.input}
                     value={archiveName}
@@ -383,8 +417,11 @@ export function ArchiveDialog({
 
                 <div className={styles.fieldRow}>
                   <div className={styles.field}>
-                    <label className={styles.label}>Format</label>
+                    <label className={styles.label} htmlFor="archive-format">
+                      Format
+                    </label>
                     <select
+                      id="archive-format"
                       className={styles.select}
                       value={format}
                       onChange={(e) => setFormat(e.target.value as ArchiveFormat)}
@@ -397,8 +434,11 @@ export function ArchiveDialog({
                     </select>
                   </div>
                   <div className={styles.field}>
-                    <label className={styles.label}>Compression</label>
+                    <label className={styles.label} htmlFor="archive-compression">
+                      Compression
+                    </label>
                     <select
+                      id="archive-compression"
                       className={styles.select}
                       value={compressionLevel}
                       onChange={(e) => setCompressionLevel(e.target.value as CompressionLevel)}
@@ -415,9 +455,13 @@ export function ArchiveDialog({
             )}
 
             <div className={styles.field}>
-              <label className={styles.label}>{isCompress ? 'Save To' : 'Extract To'}</label>
+              <label className={styles.label} htmlFor="archive-output-dir">
+                {isCompress ? 'Save To' : 'Extract To'}
+              </label>
               <div className={styles.pathField}>
                 <input
+                  id="archive-output-dir"
+                  data-autofocus={!isCompress || undefined}
                   type="text"
                   className={`${styles.input} ${styles.pathInput}`}
                   value={outputDir}

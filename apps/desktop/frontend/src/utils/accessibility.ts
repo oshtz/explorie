@@ -207,8 +207,9 @@ export function createFocusTrap(container: HTMLElement): {
     activate: () => {
       previouslyFocused = document.activeElement as HTMLElement;
       const focusable = getFocusableElements(container);
-      if (focusable.length > 0) {
-        focusable[0].focus();
+      const initial = container.querySelector<HTMLElement>('[data-autofocus]') ?? focusable[0];
+      if (initial) {
+        initial.focus();
       }
     },
     deactivate: () => {
@@ -320,7 +321,7 @@ export function getMenuButtonProps(
  * Check if user prefers reduced motion
  */
 export function prefersReducedMotion(): boolean {
-  if (typeof window === 'undefined') return false;
+  if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return false;
   return window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 }
 

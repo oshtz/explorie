@@ -1,8 +1,8 @@
 .appContainer {
   display: flex;
-  flex-direction: column; /* vertical: TitleBar on top, body below */
+  flex-direction: column;
   height: 100vh;
-  width: 100vw;
+  width: 100%;
   box-sizing: border-box;
   background: var(--bg-sunken);
   color: var(--fg-primary);
@@ -14,19 +14,46 @@
   flex: 1;
   min-height: 0; /* allow children to shrink */
   min-width: 0;
+  container-name: app-shell;
+  container-type: inline-size;
+}
+
+.titleBarContainer {
+  position: relative;
+  z-index: 200;
+  flex: 0 0 auto;
 }
 
 /* Thin vertical handle between sidebar and main area */
 .sidebarResizer {
-  width: 4px;
+  position: relative;
+  width: 8px;
   cursor: col-resize;
   background: transparent;
   flex: 0 0 auto;
   height: 100%;
 }
 
-.sidebarResizer:hover {
-  background: var(--state-selected-outline);
+.sidebarResizer::after,
+.previewResizer::after {
+  content: '';
+  position: absolute;
+  inset: 0 auto 0 3px;
+  width: 1px;
+  background: var(--border-primary);
+}
+
+.sidebarResizer:hover::after,
+.previewResizer:hover::after,
+.sidebarResizer:focus-visible::after,
+.previewResizer:focus-visible::after {
+  background: var(--accent-primary);
+}
+
+.sidebarResizer:focus-visible,
+.previewResizer:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: -2px;
 }
 
 .sidebarResizing *,
@@ -43,7 +70,9 @@
   box-sizing: border-box;
   background: var(--bg-primary);
   overflow: hidden;
-  min-width: 0; /* Prevent flexbox overflow issues */
+  min-width: 420px;
+  container-name: main-area;
+  container-type: inline-size;
 }
 
 .mainContent {
@@ -54,35 +83,29 @@
 }
 
 .contentWrapper {
-  flex: 3;
+  flex: 1 1 auto;
   display: flex;
   flex-direction: column;
   padding: var(--padding-md);
-  min-width: 0;
+  min-width: 420px;
   height: 100%;
   box-sizing: border-box;
   overflow: hidden; /* avoid nested scroll parents for DnD; inner views scroll */
   position: relative;
   background: var(--bg-primary);
-  box-shadow:
-    var(--inset-divider),
-    inset 1px 0 0 rgba(255, 255, 255, 0.018);
+  box-shadow: var(--inset-divider);
+  container-name: file-surface;
+  container-type: inline-size;
 }
 
 .topBarContainer {
   position: sticky;
-  top: 0; /* sticky within content area, below TitleBar */
+  top: 0;
   z-index: 100;
   background: var(--bg-topbar);
   border-bottom: 1px solid var(--border-primary);
   box-shadow: var(--inset-divider);
   margin-bottom: var(--padding-md);
-}
-
-.titleBarContainer {
-  position: sticky;
-  top: 0;
-  z-index: 200; /* above header */
 }
 
 .previewPanel {
@@ -91,7 +114,6 @@
   max-width: 720px;
   height: 100%;
   background: var(--bg-elevated);
-  border-left: 1px solid var(--border-primary);
   padding: var(--padding-sm);
   box-sizing: border-box;
   overflow: hidden;
@@ -99,35 +121,29 @@
   flex-direction: column;
   min-height: 0;
   gap: var(--padding-sm);
-  box-shadow:
-    inset 1px 0 0 var(--border-subtle),
-    var(--inset-divider);
+  box-shadow: var(--inset-divider);
 }
 
 .previewResizer {
-  width: 4px;
+  position: relative;
+  width: 8px;
   cursor: col-resize;
   background: transparent;
   flex: 0 0 auto;
   height: 100%;
 }
 
-.previewResizer:hover {
-  background: var(--state-selected-outline);
-}
-
 .loadingMessage {
-  padding: var(--padding-sm);
+  display: grid;
+  flex: 1;
+  min-height: var(--empty-state-min-height);
+  margin: 0;
+  padding: var(--padding-lg);
+  place-items: center;
   text-align: center;
   color: var(--fg-secondary);
-}
-
-.errorMessage {
-  padding: var(--padding-sm);
-  text-align: center;
-  color: var(--accent-red); /* Use variable */
-  background-color: transparent;
-  border-left: 2px solid var(--accent-red);
+  background: var(--bg-sunken);
+  border: 1px solid var(--border-primary);
 }
 
 /* File list container - needs to fill available space */
@@ -139,19 +155,92 @@
   overflow: hidden;
 }
 
-/* Drag overlay clone */
+/* Pointer-following drag pile. Children own pickup/drop animations. */
 .dragOverlay {
   position: fixed;
   top: 0;
   left: 0;
-  transform: translate(var(--drag-x, 0px), var(--drag-y, 0px));
+  width: 208px;
+  height: 64px;
+  transform: translate3d(var(--drag-x, 0px), var(--drag-y, 0px), 0);
   pointer-events: none;
   z-index: 10000;
-  padding: 6px 8px;
-  background: var(--bg-selected);
-  border: 1px solid var(--border-secondary);
-  box-shadow: var(--panel-shadow);
+  contain: layout style;
+  will-change: transform;
+}
+
+.dragChip {
+  position: absolute;
+  top: 0;
+  left: 0;
   display: flex;
+  width: 208px;
+  height: 44px;
+  box-sizing: border-box;
+  padding: 8px 10px;
   align-items: center;
   gap: 8px;
+  color: var(--fg-title);
+  background: color-mix(in srgb, var(--bg-elevated) 92%, var(--accent-primary) 8%);
+  border: 1px solid var(--border-secondary);
+  box-shadow: var(--panel-shadow);
+  border-radius: 9px;
+  backdrop-filter: blur(14px) saturate(1.2);
+  will-change: transform, opacity, filter;
+}
+
+.dragChipIcon {
+  display: grid;
+  flex: 0 0 24px;
+  width: 24px;
+  height: 24px;
+  place-items: center;
+  color: var(--accent-primary);
+}
+
+.dragChipLabel {
+  min-width: 0;
+  overflow: hidden;
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dragCount {
+  display: grid;
+  flex: 0 0 auto;
+  min-width: 22px;
+  height: 22px;
+  margin-left: auto;
+  padding-inline: 5px;
+  box-sizing: border-box;
+  place-items: center;
+  color: var(--accent-contrast, white);
+  background: var(--accent-primary);
+  border: 1px solid color-mix(in srgb, var(--accent-primary) 72%, white 28%);
+  border-radius: 999px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.24);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.dragOperation {
+  display: grid;
+  position: absolute;
+  right: -7px;
+  bottom: -7px;
+  min-width: 36px;
+  height: 20px;
+  padding-inline: 6px;
+  place-items: center;
+  color: var(--accent-contrast, white);
+  background: var(--accent-primary);
+  border: 2px solid var(--bg-elevated);
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+  text-transform: capitalize;
 }

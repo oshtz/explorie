@@ -1,4 +1,4 @@
-import React, { useRef, useEffect, useCallback, useState, useId } from 'react';
+import React, { useRef, useEffect, useLayoutEffect, useCallback, useState, useId } from 'react';
 import type { FileEntry } from '../store';
 import { useFileStore } from '../store';
 import { Icon } from './Icon';
@@ -12,7 +12,6 @@ import { useOperationQueueStore } from '../operationQueueStore';
 import { useToast } from './Toast';
 import type { Toast } from './Toast';
 import { basename, normalizePathForCompare } from '../utils/path';
-import { copyPathToDir, deletePath, moveToFolder } from '../utils/fs';
 import { reportError } from '../utils/errorReporter';
 import type { AppInfo } from '../services/finderIntegration';
 import {
@@ -32,6 +31,8 @@ export interface ContextMenuState {
   files: FileEntry[];
   /** The container path where the context menu was opened */
   containerPath: string;
+  /** Element that should regain focus when the menu closes */
+  focusTarget?: HTMLElement | null;
 }
 
 export const initialContextMenuState: ContextMenuState = {
@@ -40,6 +41,7 @@ export const initialContextMenuState: ContextMenuState = {
   y: 0,
   files: [],
   containerPath: '',
+  focusTarget: null,
 };
 
 interface ContextMenuProps {
@@ -174,6 +176,28 @@ export function ContextMenu({
   const [openWithAvailable, setOpenWithAvailable] = useState(false);
   const [openWithApps, setOpenWithApps] = useState<AppInfo[]>([]);
   const [openWithExpanded, setOpenWithExpanded] = useState(false);
+  const [advancedExpanded, setAdvancedExpanded] = useState(false);
+  const [position, setPosition] = useState({ x: state.x, y: state.y });
+
+  useLayoutEffect(() => {
+    if (!state.open || !menuRef.current) return;
+    const gutter = 8;
+    const rect = menuRef.current.getBoundingClientRect();
+    const maxX = Math.max(gutter, window.innerWidth - rect.width - gutter);
+    const maxY = Math.max(gutter, window.innerHeight - rect.height - gutter);
+    setPosition({
+      x: Math.min(Math.max(gutter, state.x), maxX),
+      y: Math.min(Math.max(gutter, state.y), maxY),
+    });
+  }, [state.open, state.x, state.y, openWithExpanded, openWithApps.length, advancedExpanded]);
+
+  useEffect(() => {
+    if (!state.open) return;
+    const focusTarget = state.focusTarget;
+    return () => {
+      if (focusTarget?.isConnected) focusTarget.focus({ preventScroll: true });
+    };
+  }, [state.open, state.focusTarget]);
 
   // Check if Quick Look and Open With are available (macOS only)
   useEffect(() => {
@@ -229,11 +253,12 @@ export function ContextMenu({
     if (!state.open || !menuRef.current) return;
 
     setFocusedIndex(0);
+    setAdvancedExpanded(false);
     const items = menuRef.current.querySelectorAll<HTMLElement>('[role="menuitem"]');
     if (items.length > 0) {
       items[0].focus();
     }
-  }, [state.open]);
+  }, [state.open, state.files]);
 
   // Keyboard navigation for menu items
   const handleKeyDown = useCallback(
@@ -329,16 +354,7 @@ export function ContextMenu({
     }
 
     try {
-      // Use undo-enabled delete if showToast is available
-      if (showToast && onRefresh) {
-        await deleteWithUndo(state.files, showToast, onRefresh);
-      } else {
-        // Fallback to basic delete
-        for (const file of state.files) {
-          await deletePath(file.path, true);
-        }
-        await onRefresh?.();
-      }
+      await deleteWithUndo(state.files, showToast ?? (() => {}), onRefresh ?? (() => {}));
     } catch (e) {
       reportError('Delete failed', e, { toast: showToast });
     }
@@ -357,39 +373,25 @@ export function ContextMenu({
     const conflictResolution = storeResolution === 'rename' ? 'keepBoth' : storeResolution;
 
     try {
-      // Use conflict-aware operations if showToast is available
-      if (showToast && onRefresh) {
-        if (clipboard.mode === 'cut') {
-          await moveWithUndoAndConflictResolution(
-            clipboard.items,
-            state.containerPath,
-            showToast,
-            onRefresh,
-            { conflictResolution: conflictResolution as 'skip' | 'replace' | 'keepBoth' | 'ask' }
-          );
-          setClipboard(null);
-        } else if (clipboard.mode === 'copy') {
-          await copyWithUndoAndConflictResolution(
-            clipboard.items,
-            state.containerPath,
-            showToast,
-            onRefresh,
-            { conflictResolution: conflictResolution as 'skip' | 'replace' | 'keepBoth' | 'ask' }
-          );
-        }
-      } else {
-        // Fallback to basic operations (no conflict resolution UI)
-        if (clipboard.mode === 'cut') {
-          for (const item of clipboard.items) {
-            await moveToFolder(item.path, state.containerPath);
-          }
-          setClipboard(null);
-        } else if (clipboard.mode === 'copy') {
-          for (const item of clipboard.items) {
-            await copyPathToDir(item.path, state.containerPath);
-          }
-        }
-        await onRefresh?.();
+      const notify = showToast ?? (() => {});
+      const refresh = onRefresh ?? (() => {});
+      if (clipboard.mode === 'cut') {
+        await moveWithUndoAndConflictResolution(
+          clipboard.items,
+          state.containerPath,
+          notify,
+          refresh,
+          { conflictResolution: conflictResolution as 'skip' | 'replace' | 'keepBoth' | 'ask' }
+        );
+        setClipboard(null);
+      } else if (clipboard.mode === 'copy') {
+        await copyWithUndoAndConflictResolution(
+          clipboard.items,
+          state.containerPath,
+          notify,
+          refresh,
+          { conflictResolution: conflictResolution as 'skip' | 'replace' | 'keepBoth' | 'ask' }
+        );
       }
     } catch (e) {
       reportError('Paste failed', e, { toast: showToast });
@@ -514,6 +516,16 @@ export function ContextMenu({
   const isSingleArchive = state.files.length === 1 && isArchiveFile(state.files[0]);
   const canCompress = hasFiles && onCompress;
   const canExtract = isSingleArchive && onExtract;
+  const canCompare =
+    !!onCompare &&
+    ((state.files.length === 1 && !state.files[0].is_dir && isTextFile(state.files[0])) ||
+      (state.files.length === 2 && state.files.every((file) => !file.is_dir && isTextFile(file))));
+  const fileManagerName =
+    document.documentElement.dataset.platform === 'macos'
+      ? 'Finder'
+      : document.documentElement.dataset.platform === 'windows'
+        ? 'Explorer'
+        : 'File Manager';
 
   // Don't render if nothing to show
   if (!hasFiles && !showPaste) return null;
@@ -523,7 +535,7 @@ export function ContextMenu({
       ref={menuRef}
       id={menuId}
       className={styles.contextMenu}
-      style={{ left: state.x, top: state.y }}
+      style={{ left: position.x, top: position.y }}
       role="menu"
       aria-label={
         hasFiles
@@ -623,7 +635,7 @@ export function ContextMenu({
                 <span className={styles.contextIcon} aria-hidden="true">
                   <Icon name="folder-open" />
                 </span>
-                Reveal in File Manager
+                Show in {fileManagerName}
               </div>
               {/* Quick Look - macOS only */}
               {quickLookAvailable && !state.files[0]?.is_dir && (
@@ -718,114 +730,142 @@ export function ContextMenu({
             </>
           )}
 
-          {/* Archive operations */}
-          {(canCompress || canExtract) && <div className={styles.separator} role="separator" />}
-
-          {/* Compress - available for any selection */}
-          {canCompress && (
-            <div
-              className={styles.contextItem}
-              role="menuitem"
-              tabIndex={-1}
-              onClick={handleCompress}
-              onKeyDown={(e) => e.key === 'Enter' && handleCompress()}
-            >
-              <span className={styles.contextIcon} aria-hidden="true">
-                <Icon name="archive" />
-              </span>
-              Compress{isMultiple ? ` (${state.files.length})` : ''}
-            </div>
-          )}
-
-          {/* Extract - only for archive files */}
-          {canExtract && (
-            <div
-              className={styles.contextItem}
-              role="menuitem"
-              tabIndex={-1}
-              onClick={handleExtract}
-              onKeyDown={(e) => e.key === 'Enter' && handleExtract()}
-            >
-              <span className={styles.contextIcon} aria-hidden="true">
-                <Icon name="unarchive" />
-              </span>
-              Extract Here
-            </div>
-          )}
-
-          {/* Compare operations - for text files */}
-          {onCompare && (
+          {(canCompress || canExtract || canCompare) && (
             <>
-              {/* Compare two selected files directly */}
-              {state.files.length === 2 &&
-                !state.files[0].is_dir &&
-                !state.files[1].is_dir &&
-                isTextFile(state.files[0]) &&
-                isTextFile(state.files[1]) && (
-                  <>
-                    <div className={styles.separator} role="separator" />
+              <div className={styles.separator} role="separator" />
+              <div
+                className={styles.contextItem}
+                role="menuitem"
+                tabIndex={-1}
+                onClick={() => setAdvancedExpanded((value) => !value)}
+                onKeyDown={(event) =>
+                  event.key === 'Enter' && setAdvancedExpanded((value) => !value)
+                }
+                aria-haspopup="true"
+                aria-expanded={advancedExpanded}
+              >
+                <span className={styles.contextIcon} aria-hidden="true">
+                  <Icon name="settings" />
+                </span>
+                Advanced
+                <span className={styles.submenuArrow} aria-hidden="true">
+                  <Icon name={advancedExpanded ? 'chevron-down' : 'chevron-right'} size={12} />
+                </span>
+              </div>
+              {advancedExpanded && (
+                <div className={styles.submenu} role="group" aria-label="Advanced actions">
+                  {/* Compress - available for any selection */}
+                  {canCompress && (
                     <div
                       className={styles.contextItem}
                       role="menuitem"
                       tabIndex={-1}
-                      onClick={handleCompareTwoFiles}
-                      onKeyDown={(e) => e.key === 'Enter' && handleCompareTwoFiles()}
+                      onClick={handleCompress}
+                      onKeyDown={(e) => e.key === 'Enter' && handleCompress()}
                     >
                       <span className={styles.contextIcon} aria-hidden="true">
-                        <Icon name="git-compare" />
+                        <Icon name="archive" />
                       </span>
-                      Compare Files
-                    </div>
-                  </>
-                )}
-
-              {/* Single file compare options */}
-              {state.files.length === 1 && !state.files[0].is_dir && isTextFile(state.files[0]) && (
-                <>
-                  <div className={styles.separator} role="separator" />
-                  {/* If there's a compare target and it's different from current file */}
-                  {compareTarget && compareTarget.id !== state.files[0].id ? (
-                    <>
-                      <div
-                        className={styles.contextItem}
-                        role="menuitem"
-                        tabIndex={-1}
-                        onClick={handleCompareWith}
-                        onKeyDown={(e) => e.key === 'Enter' && handleCompareWith()}
-                      >
-                        <span className={styles.contextIcon} aria-hidden="true">
-                          <Icon name="git-compare" />
-                        </span>
-                        Compare with "{compareTarget.name || basename(compareTarget.path)}"
-                      </div>
-                      <div
-                        className={styles.contextItem}
-                        role="menuitem"
-                        tabIndex={-1}
-                        onClick={handleMarkForCompare}
-                        onKeyDown={(e) => e.key === 'Enter' && handleMarkForCompare()}
-                      >
-                        <span className={styles.contextIcon} aria-hidden="true">
-                          <Icon name="crosshair" />
-                        </span>
-                        Mark for Compare (replace)
-                      </div>
-                    </>
-                  ) : (
-                    <div
-                      className={styles.contextItem}
-                      role="menuitem"
-                      tabIndex={-1}
-                      onClick={handleMarkForCompare}
-                      onKeyDown={(e) => e.key === 'Enter' && handleMarkForCompare()}
-                    >
-                      <span className={styles.contextIcon} aria-hidden="true">
-                        <Icon name="crosshair" />
-                      </span>
-                      Mark for Compare
+                      Compress{isMultiple ? ` (${state.files.length})` : ''}
                     </div>
                   )}
-                </>
+
+                  {/* Extract - only for archive files */}
+                  {canExtract && (
+                    <div
+                      className={styles.contextItem}
+                      role="menuitem"
+                      tabIndex={-1}
+                      onClick={handleExtract}
+                      onKeyDown={(e) => e.key === 'Enter' && handleExtract()}
+                    >
+                      <span className={styles.contextIcon} aria-hidden="true">
+                        <Icon name="unarchive" />
+                      </span>
+                      Extract Here
+                    </div>
+                  )}
+
+                  {/* Compare operations - for text files */}
+                  {canCompare && (
+                    <>
+                      {/* Compare two selected files directly */}
+                      {state.files.length === 2 &&
+                        !state.files[0].is_dir &&
+                        !state.files[1].is_dir &&
+                        isTextFile(state.files[0]) &&
+                        isTextFile(state.files[1]) && (
+                          <>
+                            <div className={styles.separator} role="separator" />
+                            <div
+                              className={styles.contextItem}
+                              role="menuitem"
+                              tabIndex={-1}
+                              onClick={handleCompareTwoFiles}
+                              onKeyDown={(e) => e.key === 'Enter' && handleCompareTwoFiles()}
+                            >
+                              <span className={styles.contextIcon} aria-hidden="true">
+                                <Icon name="git-compare" />
+                              </span>
+                              Compare Files
+                            </div>
+                          </>
+                        )}
+
+                      {/* Single file compare options */}
+                      {state.files.length === 1 &&
+                        !state.files[0].is_dir &&
+                        isTextFile(state.files[0]) && (
+                          <>
+                            <div className={styles.separator} role="separator" />
+                            {/* If there's a compare target and it's different from current file */}
+                            {compareTarget && compareTarget.id !== state.files[0].id ? (
+                              <>
+                                <div
+                                  className={styles.contextItem}
+                                  role="menuitem"
+                                  tabIndex={-1}
+                                  onClick={handleCompareWith}
+                                  onKeyDown={(e) => e.key === 'Enter' && handleCompareWith()}
+                                >
+                                  <span className={styles.contextIcon} aria-hidden="true">
+                                    <Icon name="git-compare" />
+                                  </span>
+                                  Compare with "{compareTarget.name || basename(compareTarget.path)}
+                                  "
+                                </div>
+                                <div
+                                  className={styles.contextItem}
+                                  role="menuitem"
+                                  tabIndex={-1}
+                                  onClick={handleMarkForCompare}
+                                  onKeyDown={(e) => e.key === 'Enter' && handleMarkForCompare()}
+                                >
+                                  <span className={styles.contextIcon} aria-hidden="true">
+                                    <Icon name="crosshair" />
+                                  </span>
+                                  Mark for Compare (replace)
+                                </div>
+                              </>
+                            ) : (
+                              <div
+                                className={styles.contextItem}
+                                role="menuitem"
+                                tabIndex={-1}
+                                onClick={handleMarkForCompare}
+                                onKeyDown={(e) => e.key === 'Enter' && handleMarkForCompare()}
+                              >
+                                <span className={styles.contextIcon} aria-hidden="true">
+                                  <Icon name="crosshair" />
+                                </span>
+                                Mark for Compare
+                              </div>
+                            )}
+                          </>
+                        )}
+                    </>
+                  )}
+                </div>
               )}
             </>
           )}
@@ -866,19 +906,18 @@ export function useContextMenu() {
       y: e.clientY,
       files,
       containerPath,
+      focusTarget:
+        e.currentTarget instanceof HTMLElement
+          ? e.currentTarget
+          : document.activeElement instanceof HTMLElement
+            ? document.activeElement
+            : null,
     });
   }, []);
 
   const close = useCallback(() => {
     setState((prev) => ({ ...prev, open: false }));
   }, []);
-
-  const openForFile = useCallback(
-    (e: React.MouseEvent, file: FileEntry, containerPath: string) => {
-      open(e, [file], containerPath);
-    },
-    [open]
-  );
 
   const openForFiles = useCallback(
     (e: React.MouseEvent, files: FileEntry[], containerPath: string) => {
@@ -898,7 +937,6 @@ export function useContextMenu() {
     state,
     open,
     close,
-    openForFile,
     openForFiles,
     openForEmpty,
   };

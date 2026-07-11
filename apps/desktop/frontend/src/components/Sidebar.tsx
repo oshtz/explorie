@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState, useCallback } from 'react';
+import React, { useEffect, useState, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import styles from './Sidebar.module.css'; // Import CSS Module
 import { Icon } from './Icon';
@@ -6,20 +6,31 @@ import type { IconName } from '../icons';
 import type { SystemLocations } from '../hooks/useInitialPath';
 import type { FavoriteItem, SmartFolder } from '../store';
 import { useFileStore } from '../store';
-import { basename } from '../utils/path';
-import { buildTrashPath, ensureTrashDirForHome } from '../utils/trash';
+import { basename, normalizePathForCompare } from '../utils/path';
 import { reportError } from '../utils/errorReporter';
+import { RemoteDrivesSection } from './RemoteDrivesSection';
 
 export function Sidebar({
   onSelectLocation,
   recents,
   onOpenSettings,
+  currentPath,
+  fileDragActive = false,
+  onFileDragHoverPath,
+  onFileDragHoverFavorites,
+  onFileDragOpenPath,
 }: {
   recents?: string[];
   onSelectLocation?: (path: string) => void;
   onOpenSettings?: () => void;
+  currentPath?: string;
+  fileDragActive?: boolean;
+  onFileDragHoverPath?: (path: string | null) => void;
+  onFileDragHoverFavorites?: () => void;
+  onFileDragOpenPath?: (path: string) => void;
 }) {
   const [locations, setLocations] = useState<SystemLocations | null>(null);
+  const [locationsError, setLocationsError] = useState<string | null>(null);
   const [recentsExpanded, setRecentsExpanded] = useState<boolean>(() => {
     try {
       if (typeof window !== 'undefined') {
@@ -31,19 +42,20 @@ export function Sidebar({
     return true;
   });
 
-  useEffect(() => {
+  const loadLocations = useCallback(() => {
+    setLocations(null);
+    setLocationsError(null);
     invoke<SystemLocations>('list_system_locations')
       .then(setLocations)
-      .catch(() => setLocations(null));
+      .catch((error) => {
+        const formatted = reportError('Failed to load system locations', error);
+        setLocationsError(formatted.message);
+      });
   }, []);
 
-  const defaultExplorerSupported = useFileStore((s) => s.defaultExplorerSupported);
-  const defaultExplorerEnabled = useFileStore((s) => s.defaultExplorerEnabled);
-  const defaultExplorerLoading = useFileStore((s) => s.defaultExplorerLoading);
-  const defaultExplorerError = useFileStore((s) => s.defaultExplorerError);
-  const refreshDefaultExplorer = useFileStore((s) => s.refreshDefaultExplorer);
-  const makeDefaultExplorer = useFileStore((s) => s.makeDefaultExplorer);
-  const clearDefaultExplorerError = useFileStore((s) => s.clearDefaultExplorerError);
+  useEffect(() => {
+    loadLocations();
+  }, [loadLocations]);
 
   // User favorites
   const favorites = useFileStore((s) => s.favorites);
@@ -57,11 +69,33 @@ export function Sidebar({
   const setSearchQuery = useFileStore((s) => s.setSearchQuery);
   const setFilterMode = useFileStore((s) => s.setFilterMode);
   const setActiveSmartFolderId = useFileStore((s) => s.setActiveSmartFolderId);
+  const activeSmartFolderId = useFileStore((s) => s.activeSmartFolderId);
   const setViewMode = useFileStore((s) => s.setViewMode);
 
   // Drag and drop state for favorites reordering
   const [draggedFavIndex, setDraggedFavIndex] = useState<number | null>(null);
   const [dragOverIndex, setDragOverIndex] = useState<number | null>(null);
+  const [favoritesFileDropOver, setFavoritesFileDropOver] = useState(false);
+  const fileHoverTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const clearFileHover = useCallback(() => {
+    if (fileHoverTimerRef.current) clearTimeout(fileHoverTimerRef.current);
+    fileHoverTimerRef.current = null;
+  }, []);
+
+  useEffect(() => () => clearFileHover(), [clearFileHover]);
+
+  const handleFileHoverPath = useCallback(
+    (path: string | null) => {
+      if (!fileDragActive) return;
+      clearFileHover();
+      onFileDragHoverPath?.(path);
+      if (path) {
+        fileHoverTimerRef.current = setTimeout(() => onFileDragOpenPath?.(path), 700);
+      }
+    },
+    [clearFileHover, fileDragActive, onFileDragHoverPath, onFileDragOpenPath]
+  );
 
   // Inline editing state for favorite renaming
   const [editingFavPath, setEditingFavPath] = useState<string | null>(null);
@@ -192,6 +226,26 @@ export function Sidebar({
     setDragOverIndex(null);
   }, []);
 
+  const handleFavoriteKeyDown = useCallback(
+    (index: number, event: React.KeyboardEvent) => {
+      if (!event.altKey || (event.key !== 'ArrowUp' && event.key !== 'ArrowDown')) return;
+      const target = Math.min(
+        favorites.length - 1,
+        Math.max(0, index + (event.key === 'ArrowUp' ? -1 : 1))
+      );
+      if (target === index) return;
+      event.preventDefault();
+      const next = [...favorites];
+      const [moved] = next.splice(index, 1);
+      next.splice(target, 0, moved);
+      reorderFavorites(next);
+      requestAnimationFrame(() => {
+        document.querySelector<HTMLElement>(`[data-favorite-index="${target}"]`)?.focus();
+      });
+    },
+    [favorites, reorderFavorites]
+  );
+
   // Inline edit handlers for favorite renaming
   const handleStartRename = useCallback((fav: FavoriteItem) => {
     setEditingFavPath(fav.path);
@@ -224,22 +278,6 @@ export function Sidebar({
     [handleConfirmRename, handleCancelRename]
   );
 
-  useEffect(() => {
-    if (!defaultExplorerSupported) return;
-    refreshDefaultExplorer().catch((err) => {
-      reportError('Failed to check default explorer status', err, { warning: true });
-    });
-  }, [defaultExplorerSupported, refreshDefaultExplorer]);
-
-  const handleMakeDefaultExplorer = async () => {
-    clearDefaultExplorerError();
-    try {
-      await makeDefaultExplorer();
-    } catch (err) {
-      reportError('Failed to set as default explorer', err);
-    }
-  };
-
   // Persist recents collapsed/expanded state
   useEffect(() => {
     try {
@@ -254,6 +292,10 @@ export function Sidebar({
     onSelectLocation?.(path);
   };
 
+  const normalizedCurrentPath = currentPath ? normalizePathForCompare(currentPath) : '';
+  const isCurrentPath = (path: string) =>
+    normalizedCurrentPath !== '' && normalizePathForCompare(path) === normalizedCurrentPath;
+
   // Helper component for location items
   const LocationItem = ({
     path,
@@ -265,49 +307,53 @@ export function Sidebar({
     label: string;
     icon: IconName;
     onClick?: (path: string) => void | Promise<void>;
-  }) => (
-    <button
-      className={styles.locationItem}
-      aria-label={`Go to ${label}`}
-      onClick={() => {
-        void onClick?.(path);
-      }}
-    >
-      <span className={styles.locationIcon}>
-        <Icon name={icon} />
-      </span>
-      {label}
-    </button>
-  );
-
-  const trashPath = useMemo(() => {
-    if (!locations?.home) return null;
-    return buildTrashPath(locations.home);
-  }, [locations?.home]);
-
-  const handleSelectTrash = useCallback(
-    async (_path: string) => {
-      if (!locations?.home) return;
-      const trashDir = await ensureTrashDirForHome(locations.home);
-      if (trashDir) {
-        setActiveSmartFolderId(null);
-        onSelectLocation?.(trashDir);
-      }
-    },
-    [locations?.home, onSelectLocation, setActiveSmartFolderId]
-  );
+  }) => {
+    const isCurrent = isCurrentPath(path);
+    return (
+      <button
+        className={`${styles.locationItem} ${isCurrent ? styles.locationItemActive : ''}`}
+        aria-label={`Go to ${label}`}
+        aria-current={isCurrent ? 'page' : undefined}
+        title={path}
+        onClick={() => {
+          void onClick?.(path);
+        }}
+        onMouseEnter={() => handleFileHoverPath(path)}
+        onMouseLeave={() => handleFileHoverPath(null)}
+      >
+        <span className={styles.locationIcon}>
+          <Icon name={icon} />
+        </span>
+        <span className={styles.locationLabel}>{label}</span>
+      </button>
+    );
+  };
 
   return (
     <div className={styles.sidebar}>
       <div className={styles.scrollRegion}>
         {/* App logo/title removed per design */}
         {/* User Favorites Section */}
-        <div className={styles.section}>
+        <div
+          className={`${styles.section} ${favoritesFileDropOver ? styles.favoritesDropTarget : ''}`}
+          onMouseLeave={() => {
+            if (!fileDragActive) return;
+            setFavoritesFileDropOver(false);
+            onFileDragHoverPath?.(null);
+          }}
+        >
           <button
             className={styles.sectionTitle}
             aria-expanded={favoritesExpanded}
             aria-controls="favorites-list"
             onClick={() => setFavoritesExpanded((v) => !v)}
+            onMouseEnter={() => {
+              if (!fileDragActive) return;
+              clearFileHover();
+              setFavoritesFileDropOver(true);
+              onFileDragHoverFavorites?.();
+            }}
+            onMouseLeave={() => setFavoritesFileDropOver(false)}
           >
             <Icon name={favoritesExpanded ? 'arrow-down' : 'arrow-right'} size={12} />
             Favorites
@@ -319,7 +365,7 @@ export function Sidebar({
                   <div
                     key={fav.path}
                     className={`${styles.favoriteItemWrapper} ${draggedFavIndex === index ? styles.dragging : ''} ${dragOverIndex === index ? styles.dragOver : ''}`}
-                    draggable={editingFavPath !== fav.path}
+                    draggable={!fileDragActive && editingFavPath !== fav.path}
                     onDragStart={(e) => handleFavDragStart(index, e)}
                     onDragOver={(e) => handleFavDragOver(index, e)}
                     onDragLeave={handleFavDragLeave}
@@ -343,8 +389,9 @@ export function Sidebar({
                       </div>
                     ) : (
                       <button
-                        className={styles.locationItem}
+                        className={`${styles.locationItem} ${isCurrentPath(fav.path) ? styles.locationItemActive : ''}`}
                         aria-label={`Go to ${fav.name}`}
+                        aria-current={isCurrentPath(fav.path) ? 'page' : undefined}
                         onClick={() => handleSelect(fav.path)}
                         onDoubleClick={(e) => {
                           e.preventDefault();
@@ -352,11 +399,15 @@ export function Sidebar({
                           handleStartRename(fav);
                         }}
                         title="Double-click to rename"
+                        data-favorite-index={index}
+                        onKeyDown={(event) => handleFavoriteKeyDown(index, event)}
+                        onMouseEnter={() => handleFileHoverPath(fav.path)}
+                        onMouseLeave={() => handleFileHoverPath(null)}
                       >
                         <span className={styles.locationIcon}>
                           <Icon name="star" />
                         </span>
-                        {fav.name}
+                        <span className={styles.locationLabel}>{fav.name}</span>
                       </button>
                     )}
                     <button
@@ -370,7 +421,15 @@ export function Sidebar({
                   </div>
                 ))
               ) : (
-                <div className={styles.loadingText}>
+                <div
+                  className={styles.loadingText}
+                  onMouseEnter={() => {
+                    if (!fileDragActive) return;
+                    setFavoritesFileDropOver(true);
+                    onFileDragHoverFavorites?.();
+                  }}
+                  onMouseLeave={() => setFavoritesFileDropOver(false)}
+                >
                   No favorites yet.
                   <br />
                   <span className={styles.hintText}>Use Ctrl+D to bookmark folders</span>
@@ -397,15 +456,16 @@ export function Sidebar({
                 {smartFolderList.map((sf) => (
                   <div key={sf.id} className={styles.favoriteItemWrapper}>
                     <button
-                      className={styles.locationItem}
+                      className={`${styles.locationItem} ${activeSmartFolderId === sf.id ? styles.locationItemActive : ''}`}
                       aria-label={`Open ${sf.name}`}
+                      aria-current={activeSmartFolderId === sf.id ? 'page' : undefined}
                       onClick={() => handleSmartFolderClick(sf)}
                       title={`Search: ${sf.criteria.namePattern || 'all'} in ${sf.criteria.searchPaths?.join(', ') || 'all locations'}`}
                     >
                       <span className={styles.locationIcon}>
                         <Icon name="search" />
                       </span>
-                      {sf.name}
+                      <span className={styles.locationLabel}>{sf.name}</span>
                     </button>
                     <button
                       className={styles.removeFavoriteBtn}
@@ -517,20 +577,21 @@ export function Sidebar({
                     onClick={handleSelect}
                   />
                 )}
-                {trashPath && (
-                  <LocationItem
-                    path={trashPath}
-                    label="Trash"
-                    icon="trash"
-                    onClick={handleSelectTrash}
-                  />
-                )}
               </>
+            ) : locationsError ? (
+              <div className={styles.locationsError} role="alert">
+                <span>Locations unavailable</span>
+                <button type="button" onClick={loadLocations}>
+                  Retry
+                </button>
+              </div>
             ) : (
               <div className={styles.loadingText}>Loading…</div>
             )}
           </div>
         </div>
+
+        <RemoteDrivesSection onSelectLocation={handleSelect} />
 
         {/* Drives Section */}
         <div className={styles.section}>
@@ -550,6 +611,8 @@ export function Sidebar({
               ) : (
                 <div className={styles.loadingText}>No drives found</div>
               )
+            ) : locationsError ? (
+              <div className={styles.loadingText}>Drives unavailable</div>
             ) : (
               <div className={styles.loadingText}>Loading…</div>
             )}
@@ -560,22 +623,6 @@ export function Sidebar({
       <div className={styles.sidebarFooter}>
         {/* Bottom Controls */}
         <div className={styles.bottomControls}>
-          {defaultExplorerSupported && defaultExplorerEnabled === false && (
-            <button
-              className={`${styles.controlButton} ${styles.makeDefaultButton}`}
-              onClick={handleMakeDefaultExplorer}
-              disabled={defaultExplorerLoading}
-              aria-busy={defaultExplorerLoading}
-            >
-              <Icon name={defaultExplorerLoading ? 'loader' : 'chevrons-horizontal'} />{' '}
-              {defaultExplorerLoading ? 'Setting\u2026' : 'Make explorie default'}
-            </button>
-          )}
-          {defaultExplorerSupported && defaultExplorerError && (
-            <div className={styles.defaultExplorerError} role="status">
-              {defaultExplorerError}
-            </div>
-          )}
           <button className={styles.controlButton} onClick={onOpenSettings} aria-haspopup="dialog">
             <Icon name="sliders" /> Settings
           </button>

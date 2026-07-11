@@ -48,7 +48,7 @@ describe('useDragStart', () => {
     window.dispatchEvent(new MouseEvent('mousemove', { clientX: 30, clientY: 30 }));
 
     expect(onBeginDrag).toHaveBeenCalledTimes(1);
-    expect(onBeginDrag).toHaveBeenCalledWith(draggedFile);
+    expect(onBeginDrag).toHaveBeenCalledWith(draggedFile, { x: 19, y: 14 });
   });
 
   it('ignores disabled, non-left-button, and mouseup-before-threshold starts', () => {
@@ -94,5 +94,19 @@ describe('useDragStart', () => {
     window.dispatchEvent(new MouseEvent('mousemove', { clientX: 100, clientY: 100 }));
 
     expect(onBeginDrag).not.toHaveBeenCalled();
+  });
+
+  it('suppresses the synthetic click that follows a completed drag', () => {
+    const { result } = renderHook(() => useDragStart({ onBeginDrag: vi.fn(), threshold: 5 }));
+
+    act(() => {
+      result.current.onMouseDown(mouseDownEvent(), file());
+    });
+    window.dispatchEvent(new MouseEvent('mousemove', { clientX: 20, clientY: 20 }));
+    window.dispatchEvent(new MouseEvent('mouseup'));
+
+    const click = new MouseEvent('click', { bubbles: true, cancelable: true });
+    window.dispatchEvent(click);
+    expect(click.defaultPrevented).toBe(true);
   });
 });

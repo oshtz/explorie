@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File};
+use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Component, Path, PathBuf};
-use walkdir::WalkDir;
+use uuid::Uuid;
+use walkdir::{DirEntry, WalkDir};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
@@ -21,6 +22,7 @@ pub enum ArchiveFormat {
 }
 
 fn validate_archive_entry_path(entry_path: &Path) -> io::Result<()> {
+    let mut saw_normal_component = false;
     for component in entry_path.components() {
         match component {
             Component::Prefix(_) | Component::RootDir | Component::ParentDir => {
@@ -31,6 +33,7 @@ fn validate_archive_entry_path(entry_path: &Path) -> io::Result<()> {
             }
             Component::CurDir => continue,
             Component::Normal(name) => {
+                saw_normal_component = true;
                 let name = name.to_string_lossy();
                 if name.contains('\0') {
                     return Err(io::Error::new(
@@ -47,6 +50,15 @@ fn validate_archive_entry_path(entry_path: &Path) -> io::Result<()> {
                         ));
                     }
                     let upper = trimmed.to_ascii_uppercase();
+                    if name.chars().any(|character| {
+                        character.is_control()
+                            || matches!(character, '<' | '>' | ':' | '"' | '|' | '?' | '*')
+                    }) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Invalid archive: unsafe Windows filename",
+                        ));
+                    }
                     let base = upper.split('.').next().unwrap_or("");
                     if matches!(base, "CON" | "PRN" | "AUX" | "NUL") {
                         return Err(io::Error::new(
@@ -68,7 +80,576 @@ fn validate_archive_entry_path(entry_path: &Path) -> io::Result<()> {
             }
         }
     }
+    if saw_normal_component {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid archive: empty entry path",
+        ))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ArchiveSourceKind {
+    File,
+    Directory,
+}
+
+fn metadata_is_link_or_reparse(metadata: &Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+
+    #[cfg(not(windows))]
+    false
+}
+
+fn link_or_reparse_error(path: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "Archive operations do not follow symbolic links or junctions: {}",
+            path.display()
+        ),
+    )
+}
+
+fn ensure_no_link_ancestors(path: &Path) -> io::Result<()> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut ancestors: Vec<&Path> = absolute.ancestors().collect();
+    ancestors.reverse();
+
+    for ancestor in ancestors {
+        match fs::symlink_metadata(ancestor) {
+            Ok(metadata) if metadata_is_link_or_reparse(&metadata) => {
+                return Err(link_or_reparse_error(ancestor));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
     Ok(())
+}
+
+fn classify_source(path: &Path) -> io::Result<ArchiveSourceKind> {
+    ensure_no_link_ancestors(path)?;
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata_is_link_or_reparse(&metadata) {
+        return Err(link_or_reparse_error(path));
+    }
+    if metadata.is_file() {
+        Ok(ArchiveSourceKind::File)
+    } else if metadata.is_dir() {
+        Ok(ArchiveSourceKind::Directory)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("Unsupported archive source type: {}", path.display()),
+        ))
+    }
+}
+
+fn classify_walk_entry(entry: &DirEntry) -> io::Result<ArchiveSourceKind> {
+    let path = entry.path();
+    let metadata = fs::symlink_metadata(path)?;
+    if entry.file_type().is_symlink() || metadata_is_link_or_reparse(&metadata) {
+        return Err(link_or_reparse_error(path));
+    }
+    if entry.file_type().is_file() {
+        Ok(ArchiveSourceKind::File)
+    } else if entry.file_type().is_dir() {
+        Ok(ArchiveSourceKind::Directory)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("Unsupported archive source type: {}", path.display()),
+        ))
+    }
+}
+
+fn open_regular_file_without_links(path: &Path) -> io::Result<File> {
+    ensure_no_link_ancestors(path)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if metadata_is_link_or_reparse(&metadata) {
+        return Err(link_or_reparse_error(path));
+    }
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Archive source is not a regular file: {}", path.display()),
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn file_has_multiple_hard_links(path: &Path) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    Ok(fs::symlink_metadata(path)?.nlink() > 1)
+}
+
+#[cfg(windows)]
+fn file_has_multiple_hard_links(path: &Path) -> io::Result<bool> {
+    use std::mem::MaybeUninit;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let file = open_regular_file_without_links(path)?;
+    let mut information = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+    let result =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle(), information.as_mut_ptr()) };
+    if result == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(unsafe { information.assume_init() }.nNumberOfLinks > 1)
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn file_has_multiple_hard_links(_path: &Path) -> io::Result<bool> {
+    Ok(false)
+}
+
+fn archive_source_name(path: &Path) -> io::Result<String> {
+    path.file_name()
+        .filter(|name| !name.is_empty())
+        .map(|name| name.to_string_lossy().into_owned())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Archive source has no filename: {}", path.display()),
+            )
+        })
+}
+
+fn ensure_output_outside_sources(sources: &[PathBuf], output_path: &Path) -> io::Result<()> {
+    let (output, _) = resolve_sibling_target(output_path, false)?;
+    for source in sources {
+        let kind = classify_source(source)?;
+        let source = fs::canonicalize(source)?;
+        if output == source || (kind == ArchiveSourceKind::Directory && output.starts_with(&source))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Archive output must not be one of its sources or inside a source directory: {}",
+                    output.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn resolve_sibling_target(path: &Path, create_parent: bool) -> io::Result<(PathBuf, PathBuf)> {
+    let name = path
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Destination has no filename: {}", path.display()),
+            )
+        })?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+
+    ensure_no_link_ancestors(parent)?;
+    if create_parent {
+        fs::create_dir_all(parent)?;
+        ensure_no_link_ancestors(parent)?;
+    }
+    let parent = fs::canonicalize(parent)?;
+    ensure_no_link_ancestors(&parent)?;
+    Ok((parent.join(name), parent))
+}
+
+fn temporary_sibling(parent: &Path, target: &Path, role: &str) -> io::Result<PathBuf> {
+    let name = target
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_default();
+    for _ in 0..16 {
+        let candidate = parent.join(format!(".{name}.explorie-{role}-{}.tmp", Uuid::new_v4()));
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "Could not allocate a unique archive staging path",
+    ))
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+fn with_atomic_archive_output<T>(
+    output_path: &Path,
+    build: impl FnOnce(File) -> io::Result<T>,
+) -> io::Result<T> {
+    let (target, parent) = resolve_sibling_target(output_path, false)?;
+    ensure_no_link_ancestors(&target)?;
+    if let Ok(metadata) = fs::symlink_metadata(&target) {
+        if metadata_is_link_or_reparse(&metadata) {
+            return Err(link_or_reparse_error(&target));
+        }
+        if !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Archive output is not a regular file: {}", target.display()),
+            ));
+        }
+    }
+
+    let temporary = temporary_sibling(&parent, &target, "create")?;
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    let result = (|| {
+        let value = build(file)?;
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&temporary)?
+            .sync_all()?;
+        ensure_no_link_ancestors(&target)?;
+        super::atomic_replace(&temporary, &target)?;
+        if let Err(error) = sync_directory(&parent) {
+            tracing::warn!(path = %parent.display(), %error, "failed to sync archive output directory");
+        }
+        Ok(value)
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn ensure_safe_extraction_path(root: &Path, entry_path: &Path) -> io::Result<PathBuf> {
+    validate_archive_entry_path(entry_path)?;
+    let destination = root.join(entry_path);
+    if !destination.starts_with(root) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid archive: path traversal attempt detected",
+        ));
+    }
+    ensure_no_link_ancestors(&destination)?;
+    Ok(destination)
+}
+
+fn validate_tree_without_links(root: &Path) -> io::Result<()> {
+    for entry in WalkDir::new(root).follow_links(false) {
+        let entry = entry.map_err(io::Error::other)?;
+        classify_walk_entry(&entry)?;
+    }
+    Ok(())
+}
+
+fn remove_staging_directory(path: &Path) {
+    if let Err(error) = fs::remove_dir_all(path)
+        && error.kind() != io::ErrorKind::NotFound
+    {
+        tracing::warn!(path = %path.display(), %error, "failed to remove archive staging directory");
+    }
+}
+
+#[derive(Debug)]
+enum ExtractionMergeAction {
+    Added {
+        destination: PathBuf,
+        staging: PathBuf,
+    },
+    Replaced {
+        destination: PathBuf,
+        staging: PathBuf,
+        backup: PathBuf,
+    },
+}
+
+fn validate_extraction_merge(staging: &Path, output: &Path) -> io::Result<()> {
+    for entry in fs::read_dir(staging)? {
+        let entry = entry?;
+        let staged_path = entry.path();
+        let staged_metadata = fs::symlink_metadata(&staged_path)?;
+        if metadata_is_link_or_reparse(&staged_metadata) {
+            return Err(link_or_reparse_error(&staged_path));
+        }
+        let destination = output.join(entry.file_name());
+        ensure_no_link_ancestors(&destination)?;
+        match fs::symlink_metadata(&destination) {
+            Ok(destination_metadata) => {
+                if metadata_is_link_or_reparse(&destination_metadata) {
+                    return Err(link_or_reparse_error(&destination));
+                }
+                if staged_metadata.is_dir() && destination_metadata.is_dir() {
+                    validate_extraction_merge(&staged_path, &destination)?;
+                } else if !staged_metadata.is_file() || !destination_metadata.is_file() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!(
+                            "Archive entry type conflicts with existing destination: {}",
+                            destination.display()
+                        ),
+                    ));
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn merge_extracted_directory(
+    staging: &Path,
+    output: &Path,
+    output_root: &Path,
+    backup_root: &Path,
+    actions: &mut Vec<ExtractionMergeAction>,
+) -> io::Result<()> {
+    let staged_entries = fs::read_dir(staging)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<io::Result<Vec<_>>>()?;
+
+    for staged_path in staged_entries {
+        let name = staged_path.file_name().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Staged archive entry has no filename",
+            )
+        })?;
+        let destination = output.join(name);
+        ensure_no_link_ancestors(&destination)?;
+        match fs::symlink_metadata(&destination) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                fs::rename(&staged_path, &destination)?;
+                actions.push(ExtractionMergeAction::Added {
+                    destination,
+                    staging: staged_path,
+                });
+            }
+            Err(error) => return Err(error),
+            Ok(destination_metadata) => {
+                let staged_metadata = fs::symlink_metadata(&staged_path)?;
+                if staged_metadata.is_dir() && destination_metadata.is_dir() {
+                    merge_extracted_directory(
+                        &staged_path,
+                        &destination,
+                        output_root,
+                        backup_root,
+                        actions,
+                    )?;
+                    fs::remove_dir(&staged_path)?;
+                } else {
+                    let relative = destination
+                        .strip_prefix(output_root)
+                        .map_err(io::Error::other)?;
+                    let backup = backup_root.join(relative);
+                    if let Some(parent) = backup.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fs::rename(&destination, &backup)?;
+                    if let Err(error) = fs::rename(&staged_path, &destination) {
+                        return match fs::rename(&backup, &destination) {
+                            Ok(()) => Err(error),
+                            Err(restore_error) => Err(io::Error::other(format!(
+                                "Failed to merge extracted entry ({error}); failed to restore {} ({restore_error})",
+                                destination.display()
+                            ))),
+                        };
+                    }
+                    actions.push(ExtractionMergeAction::Replaced {
+                        destination,
+                        staging: staged_path,
+                        backup,
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn rollback_extraction_merge(actions: &[ExtractionMergeAction]) -> io::Result<()> {
+    let mut errors = Vec::new();
+    for action in actions.iter().rev() {
+        let (destination, staging, backup) = match action {
+            ExtractionMergeAction::Added {
+                destination,
+                staging,
+            } => (destination, staging, None),
+            ExtractionMergeAction::Replaced {
+                destination,
+                staging,
+                backup,
+            } => (destination, staging, Some(backup)),
+        };
+        if let Some(parent) = staging.parent()
+            && let Err(error) = fs::create_dir_all(parent)
+        {
+            errors.push(format!("create {}: {error}", parent.display()));
+            continue;
+        }
+        if let Err(error) = fs::rename(destination, staging) {
+            errors.push(format!(
+                "move {} back to staging: {error}",
+                destination.display()
+            ));
+            continue;
+        }
+        if let Some(backup) = backup
+            && let Err(error) = fs::rename(backup, destination)
+        {
+            errors.push(format!(
+                "restore {} from {}: {error}",
+                destination.display(),
+                backup.display()
+            ));
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(io::Error::other(errors.join("; ")))
+    }
+}
+
+fn commit_staged_directory(
+    staging: &Path,
+    output: &Path,
+    parent: &Path,
+    output_existed: bool,
+) -> io::Result<()> {
+    ensure_no_link_ancestors(output)?;
+    if !output_existed {
+        if fs::symlink_metadata(output).is_ok() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "Extraction destination appeared during extraction: {}",
+                    output.display()
+                ),
+            ));
+        }
+        fs::rename(staging, output)?;
+        if let Err(error) = sync_directory(parent) {
+            tracing::warn!(path = %parent.display(), %error, "failed to sync extraction output directory");
+        }
+        return Ok(());
+    }
+
+    validate_extraction_merge(staging, output)?;
+    let backup = temporary_sibling(parent, output, "backup")?;
+    fs::create_dir(&backup)?;
+    let mut actions = Vec::new();
+    if let Err(commit_error) =
+        merge_extracted_directory(staging, output, output, &backup, &mut actions)
+    {
+        return match rollback_extraction_merge(&actions) {
+            Ok(()) => {
+                remove_staging_directory(&backup);
+                Err(commit_error)
+            }
+            Err(rollback_error) => Err(io::Error::other(format!(
+                "Failed to merge extracted archive ({commit_error}); rollback also failed ({rollback_error}); recovery data remains at {}",
+                backup.display()
+            ))),
+        };
+    }
+    remove_staging_directory(staging);
+    if let Err(error) = sync_directory(parent) {
+        tracing::warn!(path = %parent.display(), %error, "failed to sync extraction output directory");
+    }
+    remove_staging_directory(&backup);
+    Ok(())
+}
+
+fn with_staged_extraction<T>(
+    output_dir: &Path,
+    extract: impl FnOnce(&Path) -> io::Result<T>,
+) -> io::Result<T> {
+    let (output, parent) = resolve_sibling_target(output_dir, true)?;
+    ensure_no_link_ancestors(&output)?;
+    let output_existed = match fs::symlink_metadata(&output) {
+        Ok(metadata) => {
+            if metadata_is_link_or_reparse(&metadata) {
+                return Err(link_or_reparse_error(&output));
+            }
+            if !metadata.is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "Extraction destination is not a directory: {}",
+                        output.display()
+                    ),
+                ));
+            }
+            true
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error),
+    };
+
+    let staging = temporary_sibling(&parent, &output, "extract")?;
+    fs::create_dir(&staging)?;
+    let result = (|| {
+        let value = extract(&staging)?;
+        validate_tree_without_links(&staging)?;
+        commit_staged_directory(&staging, &output, &parent, output_existed)?;
+        Ok(value)
+    })();
+    if result.is_err() {
+        remove_staging_directory(&staging);
+    }
+    result
 }
 
 impl ArchiveFormat {
@@ -182,21 +763,21 @@ impl Default for CompressOptions {
 fn estimate_sources_total_bytes(sources: &[PathBuf]) -> io::Result<u64> {
     let mut total: u64 = 0;
     for source in sources {
-        if source.is_file() {
-            if let Ok(metadata) = fs::metadata(source) {
-                total = total.saturating_add(metadata.len());
+        match classify_source(source)? {
+            ArchiveSourceKind::File => {
+                total = total
+                    .saturating_add(open_regular_file_without_links(source)?.metadata()?.len());
             }
-            continue;
-        }
-        if source.is_dir() {
-            for entry in WalkDir::new(source).into_iter().filter_map(|e| e.ok()) {
-                if entry.file_type().is_symlink() {
-                    continue;
-                }
-                if entry.file_type().is_file()
-                    && let Ok(metadata) = entry.metadata()
-                {
-                    total = total.saturating_add(metadata.len());
+            ArchiveSourceKind::Directory => {
+                for entry in WalkDir::new(source).follow_links(false) {
+                    let entry = entry.map_err(io::Error::other)?;
+                    if classify_walk_entry(&entry)? == ArchiveSourceKind::File {
+                        total = total.saturating_add(
+                            open_regular_file_without_links(entry.path())?
+                                .metadata()?
+                                .len(),
+                        );
+                    }
                 }
             }
         }
@@ -210,36 +791,35 @@ pub fn create_zip_archive(
     output_path: &Path,
     compression_level: CompressionLevel,
 ) -> io::Result<u64> {
-    let file = File::create(output_path)?;
-    let writer = BufWriter::new(file);
-    let mut zip = ZipWriter::new(writer);
+    ensure_output_outside_sources(sources, output_path)?;
+    with_atomic_archive_output(output_path, |file| {
+        let writer = BufWriter::new(file);
+        let mut zip = ZipWriter::new(writer);
+        let method = match compression_level {
+            CompressionLevel::None => CompressionMethod::Stored,
+            _ => CompressionMethod::Deflated,
+        };
+        let options: SimpleFileOptions = SimpleFileOptions::default()
+            .compression_method(method)
+            .unix_permissions(0o755);
+        let mut total_bytes: u64 = 0;
 
-    let method = match compression_level {
-        CompressionLevel::None => CompressionMethod::Stored,
-        _ => CompressionMethod::Deflated,
-    };
-
-    let options: SimpleFileOptions = SimpleFileOptions::default()
-        .compression_method(method)
-        .unix_permissions(0o755);
-
-    let mut total_bytes: u64 = 0;
-
-    for source in sources {
-        if source.is_dir() {
-            total_bytes += add_directory_to_zip(&mut zip, source, source, options)?;
-        } else if source.is_file() {
-            total_bytes += add_file_to_zip(
-                &mut zip,
-                source,
-                source.file_name().unwrap().to_str().unwrap(),
-                options,
-            )?;
+        for source in sources {
+            match classify_source(source)? {
+                ArchiveSourceKind::Directory => {
+                    total_bytes += add_directory_to_zip(&mut zip, source, source, options)?;
+                }
+                ArchiveSourceKind::File => {
+                    total_bytes +=
+                        add_file_to_zip(&mut zip, source, &archive_source_name(source)?, options)?;
+                }
+            }
         }
-    }
 
-    zip.finish()?;
-    Ok(total_bytes)
+        let mut writer = zip.finish()?;
+        writer.flush()?;
+        Ok(total_bytes)
+    })
 }
 
 pub fn create_zip_archive_with_progress(
@@ -248,38 +828,42 @@ pub fn create_zip_archive_with_progress(
     compression_level: CompressionLevel,
     progress: &mut impl FnMut(&Path, u64),
 ) -> io::Result<u64> {
-    let file = File::create(output_path)?;
-    let writer = BufWriter::new(file);
-    let mut zip = ZipWriter::new(writer);
+    ensure_output_outside_sources(sources, output_path)?;
+    with_atomic_archive_output(output_path, |file| {
+        let writer = BufWriter::new(file);
+        let mut zip = ZipWriter::new(writer);
+        let method = match compression_level {
+            CompressionLevel::None => CompressionMethod::Stored,
+            _ => CompressionMethod::Deflated,
+        };
+        let options = SimpleFileOptions::default()
+            .compression_method(method)
+            .unix_permissions(0o755);
+        let mut total_bytes: u64 = 0;
 
-    let method = match compression_level {
-        CompressionLevel::None => CompressionMethod::Stored,
-        _ => CompressionMethod::Deflated,
-    };
-
-    let options = SimpleFileOptions::default()
-        .compression_method(method)
-        .unix_permissions(0o755);
-
-    let mut total_bytes: u64 = 0;
-
-    for source in sources {
-        if source.is_dir() {
-            total_bytes +=
-                add_directory_to_zip_with_progress(&mut zip, source, source, options, progress)?;
-        } else if source.is_file() {
-            total_bytes += add_file_to_zip_with_progress(
-                &mut zip,
-                source,
-                source.file_name().unwrap().to_str().unwrap(),
-                options,
-                progress,
-            )?;
+        for source in sources {
+            match classify_source(source)? {
+                ArchiveSourceKind::Directory => {
+                    total_bytes += add_directory_to_zip_with_progress(
+                        &mut zip, source, source, options, progress,
+                    )?;
+                }
+                ArchiveSourceKind::File => {
+                    total_bytes += add_file_to_zip_with_progress(
+                        &mut zip,
+                        source,
+                        &archive_source_name(source)?,
+                        options,
+                        progress,
+                    )?;
+                }
+            }
         }
-    }
 
-    zip.finish()?;
-    Ok(total_bytes)
+        let mut writer = zip.finish()?;
+        writer.flush()?;
+        Ok(total_bytes)
+    })
 }
 
 fn add_directory_to_zip_with_progress<'a, W: Write + io::Seek>(
@@ -296,7 +880,9 @@ fn add_directory_to_zip_with_progress<'a, W: Write + io::Seek>(
         .to_str()
         .unwrap_or("");
 
-    for entry in WalkDir::new(dir_path).into_iter().filter_map(|e| e.ok()) {
+    for entry in WalkDir::new(dir_path).follow_links(false) {
+        let entry = entry.map_err(io::Error::other)?;
+        let kind = classify_walk_entry(&entry)?;
         let path = entry.path();
         let relative_path = path.strip_prefix(dir_path).unwrap_or(path);
 
@@ -311,11 +897,11 @@ fn add_directory_to_zip_with_progress<'a, W: Write + io::Seek>(
             )
         };
 
-        if path.is_dir() {
+        if kind == ArchiveSourceKind::Directory {
             // Add directory entry
             let dir_name = format!("{}/", archive_path);
             zip.add_directory(&dir_name, options)?;
-        } else if path.is_file() {
+        } else {
             total_bytes +=
                 add_file_to_zip_with_progress(zip, path, &archive_path, options, progress)?;
         }
@@ -349,7 +935,9 @@ fn add_directory_to_zip<'a, W: Write + io::Seek>(
         .to_str()
         .unwrap_or("");
 
-    for entry in WalkDir::new(dir_path).into_iter().filter_map(|e| e.ok()) {
+    for entry in WalkDir::new(dir_path).follow_links(false) {
+        let entry = entry.map_err(io::Error::other)?;
+        let kind = classify_walk_entry(&entry)?;
         let path = entry.path();
         let relative_path = path.strip_prefix(dir_path).unwrap_or(path);
 
@@ -364,11 +952,11 @@ fn add_directory_to_zip<'a, W: Write + io::Seek>(
             )
         };
 
-        if path.is_dir() {
+        if kind == ArchiveSourceKind::Directory {
             // Add directory entry
             let dir_name = format!("{}/", archive_path);
             zip.add_directory(&dir_name, options)?;
-        } else if path.is_file() {
+        } else {
             total_bytes += add_file_to_zip(zip, path, &archive_path, options)?;
         }
     }
@@ -391,7 +979,7 @@ fn write_file_to_zip<'a, W: Write + io::Seek>(
     archive_name: &str,
     options: zip::write::FileOptions<'a, ()>,
 ) -> io::Result<u64> {
-    let mut file = File::open(file_path)?;
+    let mut file = open_regular_file_without_links(file_path)?;
     let metadata = file.metadata()?;
     let size = metadata.len();
 
@@ -416,42 +1004,47 @@ pub fn create_tar_archive(
     gzip: bool,
     compression_level: CompressionLevel,
 ) -> io::Result<u64> {
-    let file = File::create(output_path)?;
-    let mut total_bytes: u64 = 0;
-
-    if gzip {
-        let encoder = flate2::write::GzEncoder::new(
-            BufWriter::new(file),
-            compression_level.to_flate2_level(),
-        );
-        let mut archive = tar::Builder::new(encoder);
-
-        for source in sources {
-            if source.is_dir() {
-                total_bytes += add_directory_to_tar(&mut archive, source)?;
-            } else if source.is_file() {
-                let name = source.file_name().unwrap().to_str().unwrap();
-                total_bytes += add_file_to_tar(&mut archive, source, name)?;
+    ensure_output_outside_sources(sources, output_path)?;
+    with_atomic_archive_output(output_path, |file| {
+        let mut total_bytes: u64 = 0;
+        if gzip {
+            let encoder = flate2::write::GzEncoder::new(
+                BufWriter::new(file),
+                compression_level.to_flate2_level(),
+            );
+            let mut archive = tar::Builder::new(encoder);
+            for source in sources {
+                match classify_source(source)? {
+                    ArchiveSourceKind::Directory => {
+                        total_bytes += add_directory_to_tar(&mut archive, source)?;
+                    }
+                    ArchiveSourceKind::File => {
+                        total_bytes +=
+                            add_file_to_tar(&mut archive, source, &archive_source_name(source)?)?;
+                    }
+                }
             }
-        }
-
-        archive.finish()?;
-    } else {
-        let mut archive = tar::Builder::new(BufWriter::new(file));
-
-        for source in sources {
-            if source.is_dir() {
-                total_bytes += add_directory_to_tar(&mut archive, source)?;
-            } else if source.is_file() {
-                let name = source.file_name().unwrap().to_str().unwrap();
-                total_bytes += add_file_to_tar(&mut archive, source, name)?;
+            let encoder = archive.into_inner()?;
+            let mut writer = encoder.finish()?;
+            writer.flush()?;
+        } else {
+            let mut archive = tar::Builder::new(BufWriter::new(file));
+            for source in sources {
+                match classify_source(source)? {
+                    ArchiveSourceKind::Directory => {
+                        total_bytes += add_directory_to_tar(&mut archive, source)?;
+                    }
+                    ArchiveSourceKind::File => {
+                        total_bytes +=
+                            add_file_to_tar(&mut archive, source, &archive_source_name(source)?)?;
+                    }
+                }
             }
+            let mut writer = archive.into_inner()?;
+            writer.flush()?;
         }
-
-        archive.finish()?;
-    }
-
-    Ok(total_bytes)
+        Ok(total_bytes)
+    })
 }
 
 pub fn create_tar_archive_with_progress(
@@ -461,42 +1054,57 @@ pub fn create_tar_archive_with_progress(
     compression_level: CompressionLevel,
     progress: &mut impl FnMut(&Path, u64),
 ) -> io::Result<u64> {
-    let file = File::create(output_path)?;
-    let mut total_bytes: u64 = 0;
-
-    if gzip {
-        let encoder = flate2::write::GzEncoder::new(
-            BufWriter::new(file),
-            compression_level.to_flate2_level(),
-        );
-        let mut archive = tar::Builder::new(encoder);
-
-        for source in sources {
-            if source.is_dir() {
-                total_bytes += add_directory_to_tar_with_progress(&mut archive, source, progress)?;
-            } else if source.is_file() {
-                let name = source.file_name().unwrap().to_str().unwrap();
-                total_bytes += add_file_to_tar_with_progress(&mut archive, source, name, progress)?;
+    ensure_output_outside_sources(sources, output_path)?;
+    with_atomic_archive_output(output_path, |file| {
+        let mut total_bytes: u64 = 0;
+        if gzip {
+            let encoder = flate2::write::GzEncoder::new(
+                BufWriter::new(file),
+                compression_level.to_flate2_level(),
+            );
+            let mut archive = tar::Builder::new(encoder);
+            for source in sources {
+                match classify_source(source)? {
+                    ArchiveSourceKind::Directory => {
+                        total_bytes +=
+                            add_directory_to_tar_with_progress(&mut archive, source, progress)?;
+                    }
+                    ArchiveSourceKind::File => {
+                        total_bytes += add_file_to_tar_with_progress(
+                            &mut archive,
+                            source,
+                            &archive_source_name(source)?,
+                            progress,
+                        )?;
+                    }
+                }
             }
-        }
-
-        archive.finish()?;
-    } else {
-        let mut archive = tar::Builder::new(BufWriter::new(file));
-
-        for source in sources {
-            if source.is_dir() {
-                total_bytes += add_directory_to_tar_with_progress(&mut archive, source, progress)?;
-            } else if source.is_file() {
-                let name = source.file_name().unwrap().to_str().unwrap();
-                total_bytes += add_file_to_tar_with_progress(&mut archive, source, name, progress)?;
+            let encoder = archive.into_inner()?;
+            let mut writer = encoder.finish()?;
+            writer.flush()?;
+        } else {
+            let mut archive = tar::Builder::new(BufWriter::new(file));
+            for source in sources {
+                match classify_source(source)? {
+                    ArchiveSourceKind::Directory => {
+                        total_bytes +=
+                            add_directory_to_tar_with_progress(&mut archive, source, progress)?;
+                    }
+                    ArchiveSourceKind::File => {
+                        total_bytes += add_file_to_tar_with_progress(
+                            &mut archive,
+                            source,
+                            &archive_source_name(source)?,
+                            progress,
+                        )?;
+                    }
+                }
             }
+            let mut writer = archive.into_inner()?;
+            writer.flush()?;
         }
-
-        archive.finish()?;
-    }
-
-    Ok(total_bytes)
+        Ok(total_bytes)
+    })
 }
 
 fn add_directory_to_tar_with_progress<W: Write>(
@@ -507,9 +1115,11 @@ fn add_directory_to_tar_with_progress<W: Write>(
     let mut total_bytes: u64 = 0;
     let _base_name = dir_path.file_name().unwrap_or_default();
 
-    for entry in WalkDir::new(dir_path).into_iter().filter_map(|e| e.ok()) {
+    for entry in WalkDir::new(dir_path).follow_links(false) {
+        let entry = entry.map_err(io::Error::other)?;
+        let kind = classify_walk_entry(&entry)?;
         let path = entry.path();
-        if path.is_file() {
+        if kind == ArchiveSourceKind::File {
             let relative_path = path
                 .strip_prefix(dir_path.parent().unwrap_or(dir_path))
                 .unwrap_or(path);
@@ -539,9 +1149,11 @@ fn add_directory_to_tar<W: Write>(
     let mut total_bytes: u64 = 0;
     let _base_name = dir_path.file_name().unwrap_or_default();
 
-    for entry in WalkDir::new(dir_path).into_iter().filter_map(|e| e.ok()) {
+    for entry in WalkDir::new(dir_path).follow_links(false) {
+        let entry = entry.map_err(io::Error::other)?;
+        let kind = classify_walk_entry(&entry)?;
         let path = entry.path();
-        if path.is_file() {
+        if kind == ArchiveSourceKind::File {
             let relative_path = path
                 .strip_prefix(dir_path.parent().unwrap_or(dir_path))
                 .unwrap_or(path);
@@ -558,7 +1170,7 @@ fn add_file_to_tar<W: Write>(
     file_path: &Path,
     archive_name: &str,
 ) -> io::Result<u64> {
-    let mut file = File::open(file_path)?;
+    let mut file = open_regular_file_without_links(file_path)?;
     let metadata = file.metadata()?;
     let size = metadata.len();
 
@@ -582,46 +1194,54 @@ fn add_file_to_tar<W: Write>(
 
 /// Extract a ZIP archive to a directory
 pub fn extract_zip_archive(archive_path: &Path, output_dir: &Path) -> io::Result<u64> {
+    with_staged_extraction(output_dir, |staging| {
+        extract_zip_archive_into(archive_path, staging, None)
+    })
+}
+
+fn extract_zip_archive_into(
+    archive_path: &Path,
+    output_dir: &Path,
+    password: Option<&str>,
+) -> io::Result<u64> {
     let file = File::open(archive_path)?;
     let reader = BufReader::new(file);
     let mut archive = ZipArchive::new(reader)?;
     let mut total_bytes: u64 = 0;
 
-    // Create output directory if it doesn't exist
-    fs::create_dir_all(output_dir)?;
-
     for i in 0..archive.len() {
-        let mut file = archive.by_index(i)?;
+        let mut file = if let Some(password) = password {
+            archive.by_index_decrypt(i, password.as_bytes())?
+        } else {
+            archive.by_index(i)?
+        };
         let name = file.name().to_string();
-        validate_archive_entry_path(Path::new(&name))?;
-
-        // Security: prevent path traversal attacks
-        let out_path = output_dir.join(&name);
-        if !out_path.starts_with(output_dir) {
+        let entry_path = Path::new(&name);
+        let out_path = ensure_safe_extraction_path(output_dir, entry_path)?;
+        if file
+            .unix_mode()
+            .is_some_and(|mode| mode & 0o170000 == 0o120000)
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "Invalid archive: path traversal attempt detected",
+                format!("Invalid archive: symbolic link entry {name}"),
             ));
         }
 
         if file.is_dir() {
             fs::create_dir_all(&out_path)?;
         } else {
-            // Create parent directories if needed
             if let Some(parent) = out_path.parent() {
                 fs::create_dir_all(parent)?;
+                ensure_no_link_ancestors(parent)?;
             }
-
-            let mut out_file = File::create(&out_path)?;
-            let mut buffer = vec![0u8; 65536];
-            loop {
-                let bytes_read = file.read(&mut buffer)?;
-                if bytes_read == 0 {
-                    break;
-                }
-                out_file.write_all(&buffer[..bytes_read])?;
-                total_bytes += bytes_read as u64;
-            }
+            let mut out_file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&out_path)?;
+            total_bytes = total_bytes.saturating_add(io::copy(&mut file, &mut out_file)?);
+            out_file.flush()?;
         }
     }
 
@@ -630,11 +1250,13 @@ pub fn extract_zip_archive(archive_path: &Path, output_dir: &Path) -> io::Result
 
 /// Extract a TAR archive (optionally gzipped) to a directory
 pub fn extract_tar_archive(archive_path: &Path, output_dir: &Path, gzip: bool) -> io::Result<u64> {
+    with_staged_extraction(output_dir, |staging| {
+        extract_tar_archive_into(archive_path, staging, gzip)
+    })
+}
+
+fn extract_tar_archive_into(archive_path: &Path, output_dir: &Path, gzip: bool) -> io::Result<u64> {
     let file = File::open(archive_path)?;
-
-    // Create output directory if it doesn't exist
-    fs::create_dir_all(output_dir)?;
-
     let total_bytes = if gzip {
         let decoder = flate2::read::GzDecoder::new(BufReader::new(file));
         let mut archive = tar::Archive::new(decoder);
@@ -655,24 +1277,25 @@ fn extract_tar_entries<R: Read>(
 
     for entry in archive.entries()? {
         let mut entry = entry?;
-        let path = entry.path()?;
+        let path = entry.path()?.into_owned();
         validate_archive_entry_path(&path)?;
-        let out_path = output_dir.join(&path);
-
-        // Security: prevent path traversal attacks
-        if !out_path.starts_with(output_dir) {
+        let entry_type = entry.header().entry_type();
+        if !entry_type.is_file() && !entry_type.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Invalid archive: unsupported TAR entry type for {}",
+                    path.display()
+                ),
+            ));
+        }
+        ensure_safe_extraction_path(output_dir, &path)?;
+        if !entry.unpack_in(output_dir)? {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Invalid archive: path traversal attempt detected",
             ));
         }
-
-        // Create parent directories if needed
-        if let Some(parent) = out_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        entry.unpack(&out_path)?;
         total_bytes += entry.size();
     }
 
@@ -778,9 +1401,16 @@ pub fn extract_rar_archive(
     output_dir: &Path,
     password: Option<&str>,
 ) -> io::Result<u64> {
-    // Create output directory if it doesn't exist
-    fs::create_dir_all(output_dir)?;
+    with_staged_extraction(output_dir, |staging| {
+        extract_rar_archive_into(archive_path, staging, password)
+    })
+}
 
+fn extract_rar_archive_into(
+    archive_path: &Path,
+    output_dir: &Path,
+    password: Option<&str>,
+) -> io::Result<u64> {
     let archive = if let Some(pwd) = password {
         unrar::Archive::with_password(archive_path, pwd)
     } else {
@@ -802,28 +1432,53 @@ pub fn extract_rar_archive(
             format!("Failed to read RAR header: {:?}", e),
         )
     })? {
-        validate_archive_entry_path(&header.entry().filename)?;
-        let entry_path = output_dir.join(&header.entry().filename);
-
-        // Security: prevent path traversal attacks
-        if !entry_path.starts_with(output_dir) {
+        let filename = header.entry().filename.clone();
+        let size = header.entry().unpacked_size;
+        let is_directory = header.entry().is_directory();
+        let attributes = header.entry().file_attr;
+        let unix_kind = attributes & 0o170000;
+        const WINDOWS_REPARSE_ATTRIBUTE: u32 = 0x400;
+        let is_link = unix_kind == 0o120000 || attributes & WINDOWS_REPARSE_ATTRIBUTE != 0;
+        if is_link {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "Invalid archive: path traversal attempt detected",
+                format!(
+                    "Invalid archive: RAR link or reparse entry {}",
+                    filename.display()
+                ),
             ));
         }
+        let entry_path = ensure_safe_extraction_path(output_dir, &filename)?;
 
-        // Create parent directories if needed
-        if let Some(parent) = entry_path.parent() {
-            fs::create_dir_all(parent)?;
+        if is_directory {
+            fs::create_dir_all(&entry_path)?;
+            archive = header.skip().map_err(|error| {
+                io::Error::other(format!("Failed to process RAR directory: {error:?}"))
+            })?;
+        } else {
+            if let Some(parent) = entry_path.parent() {
+                fs::create_dir_all(parent)?;
+                ensure_no_link_ancestors(parent)?;
+            }
+            archive = header.extract_to(&entry_path).map_err(|error| {
+                io::Error::other(format!("Failed to extract RAR entry: {error:?}"))
+            })?;
+            let metadata = fs::symlink_metadata(&entry_path)?;
+            if metadata_is_link_or_reparse(&metadata)
+                || !metadata.is_file()
+                || file_has_multiple_hard_links(&entry_path)?
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Invalid archive: unsafe RAR output {}",
+                        entry_path.display()
+                    ),
+                ));
+            }
         }
 
-        let size = header.entry().unpacked_size;
-        archive = header
-            .extract_to(&entry_path)
-            .map_err(|e| io::Error::other(format!("Failed to extract RAR entry: {:?}", e)))?;
-
-        total_bytes += size;
+        total_bytes = total_bytes.saturating_add(size);
     }
 
     Ok(total_bytes)
@@ -888,30 +1543,30 @@ pub fn create_7z_archive(
     output_path: &Path,
     _password: Option<&str>,
 ) -> io::Result<u64> {
-    let mut total_bytes: u64 = 0;
-    let output_file = File::create(output_path)?;
-    let mut sz = sevenz_rust::SevenZWriter::new(output_file)
-        .map_err(|e| io::Error::other(format!("Failed to create 7z: {:?}", e)))?;
+    ensure_output_outside_sources(sources, output_path)?;
+    with_atomic_archive_output(output_path, |output_file| {
+        let mut total_bytes: u64 = 0;
+        let mut sz = sevenz_rust::SevenZWriter::new(output_file)
+            .map_err(|error| io::Error::other(format!("Failed to create 7z: {error:?}")))?;
+        sz.set_content_methods(vec![sevenz_rust::SevenZMethodConfiguration::new(
+            sevenz_rust::SevenZMethod::LZMA2,
+        )]);
 
-    // Use LZMA2 compression method
-    sz.set_content_methods(vec![sevenz_rust::SevenZMethodConfiguration::new(
-        sevenz_rust::SevenZMethod::LZMA2,
-    )]);
-    // Note: Password-protected 7z creation is not fully supported by sevenz-rust
-
-    for source in sources {
-        if source.is_dir() {
-            total_bytes += add_directory_to_7z(&mut sz, source)?;
-        } else if source.is_file() {
-            let name = source.file_name().unwrap().to_str().unwrap();
-            total_bytes += add_file_to_7z(&mut sz, source, name)?;
+        for source in sources {
+            match classify_source(source)? {
+                ArchiveSourceKind::Directory => {
+                    total_bytes += add_directory_to_7z(&mut sz, source)?;
+                }
+                ArchiveSourceKind::File => {
+                    total_bytes += add_file_to_7z(&mut sz, source, &archive_source_name(source)?)?;
+                }
+            }
         }
-    }
 
-    sz.finish()
-        .map_err(|e| io::Error::other(format!("Failed to finish 7z: {:?}", e)))?;
-
-    Ok(total_bytes)
+        sz.finish()
+            .map_err(|error| io::Error::other(format!("Failed to finish 7z: {error:?}")))?;
+        Ok(total_bytes)
+    })
 }
 
 pub fn create_7z_archive_with_progress(
@@ -920,30 +1575,35 @@ pub fn create_7z_archive_with_progress(
     _password: Option<&str>,
     progress: &mut impl FnMut(&Path, u64),
 ) -> io::Result<u64> {
-    let mut total_bytes: u64 = 0;
-    let output_file = File::create(output_path)?;
-    let mut sz = sevenz_rust::SevenZWriter::new(output_file)
-        .map_err(|e| io::Error::other(format!("Failed to create 7z: {:?}", e)))?;
+    ensure_output_outside_sources(sources, output_path)?;
+    with_atomic_archive_output(output_path, |output_file| {
+        let mut total_bytes: u64 = 0;
+        let mut sz = sevenz_rust::SevenZWriter::new(output_file)
+            .map_err(|error| io::Error::other(format!("Failed to create 7z: {error:?}")))?;
+        sz.set_content_methods(vec![sevenz_rust::SevenZMethodConfiguration::new(
+            sevenz_rust::SevenZMethod::LZMA2,
+        )]);
 
-    // Use LZMA2 compression method
-    sz.set_content_methods(vec![sevenz_rust::SevenZMethodConfiguration::new(
-        sevenz_rust::SevenZMethod::LZMA2,
-    )]);
-    // Note: Password-protected 7z creation is not fully supported by sevenz-rust
-
-    for source in sources {
-        if source.is_dir() {
-            total_bytes += add_directory_to_7z_with_progress(&mut sz, source, progress)?;
-        } else if source.is_file() {
-            let name = source.file_name().unwrap().to_str().unwrap();
-            total_bytes += add_file_to_7z_with_progress(&mut sz, source, name, progress)?;
+        for source in sources {
+            match classify_source(source)? {
+                ArchiveSourceKind::Directory => {
+                    total_bytes += add_directory_to_7z_with_progress(&mut sz, source, progress)?;
+                }
+                ArchiveSourceKind::File => {
+                    total_bytes += add_file_to_7z_with_progress(
+                        &mut sz,
+                        source,
+                        &archive_source_name(source)?,
+                        progress,
+                    )?;
+                }
+            }
         }
-    }
 
-    sz.finish()
-        .map_err(|e| io::Error::other(format!("Failed to finish 7z: {:?}", e)))?;
-
-    Ok(total_bytes)
+        sz.finish()
+            .map_err(|error| io::Error::other(format!("Failed to finish 7z: {error:?}")))?;
+        Ok(total_bytes)
+    })
 }
 
 fn add_directory_to_7z_with_progress<W: Write + io::Seek>(
@@ -954,9 +1614,11 @@ fn add_directory_to_7z_with_progress<W: Write + io::Seek>(
     let mut total_bytes: u64 = 0;
     let _base_name = dir_path.file_name().unwrap_or_default();
 
-    for entry in WalkDir::new(dir_path).into_iter().filter_map(|e| e.ok()) {
+    for entry in WalkDir::new(dir_path).follow_links(false) {
+        let entry = entry.map_err(io::Error::other)?;
+        let kind = classify_walk_entry(&entry)?;
         let path = entry.path();
-        if path.is_file() {
+        if kind == ArchiveSourceKind::File {
             let relative_path = path
                 .strip_prefix(dir_path.parent().unwrap_or(dir_path))
                 .unwrap_or(path);
@@ -986,9 +1648,11 @@ fn add_directory_to_7z<W: Write + io::Seek>(
     let mut total_bytes: u64 = 0;
     let _base_name = dir_path.file_name().unwrap_or_default();
 
-    for entry in WalkDir::new(dir_path).into_iter().filter_map(|e| e.ok()) {
+    for entry in WalkDir::new(dir_path).follow_links(false) {
+        let entry = entry.map_err(io::Error::other)?;
+        let kind = classify_walk_entry(&entry)?;
         let path = entry.path();
-        if path.is_file() {
+        if kind == ArchiveSourceKind::File {
             let relative_path = path
                 .strip_prefix(dir_path.parent().unwrap_or(dir_path))
                 .unwrap_or(path);
@@ -1005,11 +1669,14 @@ fn add_file_to_7z<W: Write + io::Seek>(
     file_path: &Path,
     archive_name: &str,
 ) -> io::Result<u64> {
-    let mut file = File::open(file_path)?;
+    let mut file = open_regular_file_without_links(file_path)?;
     let metadata = file.metadata()?;
     let size = metadata.len();
 
-    let entry = sevenz_rust::SevenZArchiveEntry::from_path(file_path, archive_name.to_string());
+    let mut entry = sevenz_rust::SevenZArchiveEntry::new();
+    entry.name = archive_name.to_string();
+    entry.has_stream = true;
+    entry.size = size;
     sz.push_archive_entry(entry, Some(&mut file))
         .map_err(|e| io::Error::other(format!("Failed to add file to 7z: {:?}", e)))?;
 
@@ -1022,38 +1689,66 @@ pub fn extract_7z_archive(
     output_dir: &Path,
     password: Option<&str>,
 ) -> io::Result<u64> {
-    // Create output directory if it doesn't exist
-    fs::create_dir_all(output_dir)?;
+    with_staged_extraction(output_dir, |staging| {
+        extract_7z_archive_into(archive_path, staging, password)
+    })
+}
 
+fn extract_7z_archive_into(
+    archive_path: &Path,
+    output_dir: &Path,
+    password: Option<&str>,
+) -> io::Result<u64> {
+    let file = File::open(archive_path)?;
+    let len = file.metadata()?.len();
+    let reader = BufReader::new(file);
+    let password = password
+        .map(SevenZPassword::from)
+        .unwrap_or_else(SevenZPassword::empty);
+    let mut archive = sevenz_rust::SevenZReader::new(reader, len, password).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Failed to open 7z: {error:?}"),
+        )
+    })?;
     let mut total_bytes: u64 = 0;
-    validate_7z_entries(archive_path, password)?;
 
-    if let Some(pwd) = password {
-        sevenz_rust::decompress_file_with_password(archive_path, output_dir, pwd.into()).map_err(
-            |e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("Failed to extract 7z: {:?}", e),
-                )
-            },
-        )?;
-    } else {
-        sevenz_rust::decompress_file(archive_path, output_dir).map_err(|e| {
+    archive
+        .for_each_entries(|entry, reader| {
+            if entry.is_anti_item() {
+                return Err(sevenz_rust::Error::other(format!(
+                    "Unsupported 7z anti-item: {}",
+                    entry.name()
+                )));
+            }
+            let entry_path = Path::new(entry.name());
+            let output_path = ensure_safe_extraction_path(output_dir, entry_path)
+                .map_err(sevenz_rust::Error::io)?;
+            if entry.is_directory() {
+                fs::create_dir_all(&output_path).map_err(sevenz_rust::Error::io)?;
+            } else {
+                if let Some(parent) = output_path.parent() {
+                    fs::create_dir_all(parent).map_err(sevenz_rust::Error::io)?;
+                    ensure_no_link_ancestors(parent).map_err(sevenz_rust::Error::io)?;
+                }
+                let mut output = OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&output_path)
+                    .map_err(sevenz_rust::Error::io)?;
+                let written = io::copy(reader, &mut output).map_err(sevenz_rust::Error::io)?;
+                output.flush().map_err(sevenz_rust::Error::io)?;
+                total_bytes = total_bytes.saturating_add(written);
+            }
+            Ok(true)
+        })
+        .map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("Failed to extract 7z: {:?}", e),
+                format!("Failed to extract 7z: {error:?}"),
             )
         })?;
-    }
-
-    // Calculate total bytes extracted by walking the output directory
-    for entry in WalkDir::new(output_dir).into_iter().filter_map(|e| e.ok()) {
-        if entry.path().is_file()
-            && let Ok(meta) = entry.metadata()
-        {
-            total_bytes += meta.len();
-        }
-    }
 
     Ok(total_bytes)
 }
@@ -1103,27 +1798,6 @@ pub fn list_7z_contents(archive_path: &Path) -> io::Result<ArchiveInfo> {
         entry_count: entries.len(),
         entries,
     })
-}
-
-fn validate_7z_entries(archive_path: &Path, password: Option<&str>) -> io::Result<()> {
-    let file = File::open(archive_path)?;
-    let len = file.metadata()?.len();
-    let reader = BufReader::new(file);
-    let pwd = password
-        .map(SevenZPassword::from)
-        .unwrap_or_else(SevenZPassword::empty);
-    let archive = sevenz_rust::SevenZReader::new(reader, len, pwd).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Failed to open 7z: {:?}", e),
-        )
-    })?;
-
-    for entry in archive.archive().files.iter() {
-        validate_archive_entry_path(Path::new(entry.name()))?;
-    }
-
-    Ok(())
 }
 
 /// Detect archive format and list its contents
@@ -1177,55 +1851,9 @@ pub fn extract_zip_archive_with_password(
     output_dir: &Path,
     password: Option<&str>,
 ) -> io::Result<u64> {
-    let file = File::open(archive_path)?;
-    let reader = BufReader::new(file);
-    let mut archive = ZipArchive::new(reader)?;
-    let mut total_bytes: u64 = 0;
-
-    // Create output directory if it doesn't exist
-    fs::create_dir_all(output_dir)?;
-
-    for i in 0..archive.len() {
-        let mut file = if let Some(pwd) = password {
-            archive.by_index_decrypt(i, pwd.as_bytes())?
-        } else {
-            archive.by_index(i)?
-        };
-
-        let name = file.name().to_string();
-        validate_archive_entry_path(Path::new(&name))?;
-
-        // Security: prevent path traversal attacks
-        let out_path = output_dir.join(&name);
-        if !out_path.starts_with(output_dir) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Invalid archive: path traversal attempt detected",
-            ));
-        }
-
-        if file.is_dir() {
-            fs::create_dir_all(&out_path)?;
-        } else {
-            // Create parent directories if needed
-            if let Some(parent) = out_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-
-            let mut out_file = File::create(&out_path)?;
-            let mut buffer = vec![0u8; 65536];
-            loop {
-                let bytes_read = file.read(&mut buffer)?;
-                if bytes_read == 0 {
-                    break;
-                }
-                out_file.write_all(&buffer[..bytes_read])?;
-                total_bytes += bytes_read as u64;
-            }
-        }
-    }
-
-    Ok(total_bytes)
+    with_staged_extraction(output_dir, |staging| {
+        extract_zip_archive_into(archive_path, staging, password)
+    })
 }
 
 /// Create an archive from sources with the specified format
@@ -1334,41 +1962,44 @@ pub fn create_zip_archive_with_password(
     compression_level: CompressionLevel,
     password: Option<&str>,
 ) -> io::Result<u64> {
-    let file = File::create(output_path)?;
-    let writer = BufWriter::new(file);
-    let mut zip = ZipWriter::new(writer);
+    ensure_output_outside_sources(sources, output_path)?;
+    with_atomic_archive_output(output_path, |file| {
+        let writer = BufWriter::new(file);
+        let mut zip = ZipWriter::new(writer);
+        let method = match compression_level {
+            CompressionLevel::None => CompressionMethod::Stored,
+            _ => CompressionMethod::Deflated,
+        };
+        let password_owned = password.map(str::to_owned);
+        let mut total_bytes: u64 = 0;
 
-    let method = match compression_level {
-        CompressionLevel::None => CompressionMethod::Stored,
-        _ => CompressionMethod::Deflated,
-    };
-
-    // Store password as owned String to avoid lifetime issues
-    let password_owned = password.map(|p| p.to_string());
-    let mut total_bytes: u64 = 0;
-
-    for source in sources {
-        if source.is_dir() {
-            total_bytes += add_directory_to_zip_with_password(
-                &mut zip,
-                source,
-                source,
-                method,
-                password_owned.as_deref(),
-            )?;
-        } else if source.is_file() {
-            total_bytes += add_file_to_zip_with_password(
-                &mut zip,
-                source,
-                source.file_name().unwrap().to_str().unwrap(),
-                method,
-                password_owned.as_deref(),
-            )?;
+        for source in sources {
+            match classify_source(source)? {
+                ArchiveSourceKind::Directory => {
+                    total_bytes += add_directory_to_zip_with_password(
+                        &mut zip,
+                        source,
+                        source,
+                        method,
+                        password_owned.as_deref(),
+                    )?;
+                }
+                ArchiveSourceKind::File => {
+                    total_bytes += add_file_to_zip_with_password(
+                        &mut zip,
+                        source,
+                        &archive_source_name(source)?,
+                        method,
+                        password_owned.as_deref(),
+                    )?;
+                }
+            }
         }
-    }
 
-    zip.finish()?;
-    Ok(total_bytes)
+        let mut writer = zip.finish()?;
+        writer.flush()?;
+        Ok(total_bytes)
+    })
 }
 
 pub fn create_zip_archive_with_password_and_progress(
@@ -1378,43 +2009,46 @@ pub fn create_zip_archive_with_password_and_progress(
     password: Option<&str>,
     progress: &mut impl FnMut(&Path, u64),
 ) -> io::Result<u64> {
-    let file = File::create(output_path)?;
-    let writer = BufWriter::new(file);
-    let mut zip = ZipWriter::new(writer);
+    ensure_output_outside_sources(sources, output_path)?;
+    with_atomic_archive_output(output_path, |file| {
+        let writer = BufWriter::new(file);
+        let mut zip = ZipWriter::new(writer);
+        let method = match compression_level {
+            CompressionLevel::None => CompressionMethod::Stored,
+            _ => CompressionMethod::Deflated,
+        };
+        let password_owned = password.map(str::to_owned);
+        let mut total_bytes: u64 = 0;
 
-    let method = match compression_level {
-        CompressionLevel::None => CompressionMethod::Stored,
-        _ => CompressionMethod::Deflated,
-    };
-
-    // Store password as owned String to avoid lifetime issues
-    let password_owned = password.map(|p| p.to_string());
-    let mut total_bytes: u64 = 0;
-
-    for source in sources {
-        if source.is_dir() {
-            total_bytes += add_directory_to_zip_with_password_and_progress(
-                &mut zip,
-                source,
-                source,
-                method,
-                password_owned.as_deref(),
-                progress,
-            )?;
-        } else if source.is_file() {
-            total_bytes += add_file_to_zip_with_password_and_progress(
-                &mut zip,
-                source,
-                source.file_name().unwrap().to_str().unwrap(),
-                method,
-                password_owned.as_deref(),
-                progress,
-            )?;
+        for source in sources {
+            match classify_source(source)? {
+                ArchiveSourceKind::Directory => {
+                    total_bytes += add_directory_to_zip_with_password_and_progress(
+                        &mut zip,
+                        source,
+                        source,
+                        method,
+                        password_owned.as_deref(),
+                        progress,
+                    )?;
+                }
+                ArchiveSourceKind::File => {
+                    total_bytes += add_file_to_zip_with_password_and_progress(
+                        &mut zip,
+                        source,
+                        &archive_source_name(source)?,
+                        method,
+                        password_owned.as_deref(),
+                        progress,
+                    )?;
+                }
+            }
         }
-    }
 
-    zip.finish()?;
-    Ok(total_bytes)
+        let mut writer = zip.finish()?;
+        writer.flush()?;
+        Ok(total_bytes)
+    })
 }
 
 fn add_directory_to_zip_with_password_and_progress<W: Write + io::Seek>(
@@ -1432,7 +2066,9 @@ fn add_directory_to_zip_with_password_and_progress<W: Write + io::Seek>(
         .to_str()
         .unwrap_or("");
 
-    for entry in WalkDir::new(dir_path).into_iter().filter_map(|e| e.ok()) {
+    for entry in WalkDir::new(dir_path).follow_links(false) {
+        let entry = entry.map_err(io::Error::other)?;
+        let kind = classify_walk_entry(&entry)?;
         let path = entry.path();
         let relative_path = path.strip_prefix(dir_path).unwrap_or(path);
 
@@ -1447,14 +2083,14 @@ fn add_directory_to_zip_with_password_and_progress<W: Write + io::Seek>(
             )
         };
 
-        if path.is_dir() {
+        if kind == ArchiveSourceKind::Directory {
             // Add directory entry
             let dir_name = format!("{}/", archive_path);
             let options = SimpleFileOptions::default()
                 .compression_method(method)
                 .unix_permissions(0o755);
             zip.add_directory(&dir_name, options)?;
-        } else if path.is_file() {
+        } else {
             total_bytes += add_file_to_zip_with_password_and_progress(
                 zip,
                 path,
@@ -1507,7 +2143,9 @@ fn add_directory_to_zip_with_password<W: Write + io::Seek>(
         .to_str()
         .unwrap_or("");
 
-    for entry in WalkDir::new(dir_path).into_iter().filter_map(|e| e.ok()) {
+    for entry in WalkDir::new(dir_path).follow_links(false) {
+        let entry = entry.map_err(io::Error::other)?;
+        let kind = classify_walk_entry(&entry)?;
         let path = entry.path();
         let relative_path = path.strip_prefix(dir_path).unwrap_or(path);
 
@@ -1522,14 +2160,14 @@ fn add_directory_to_zip_with_password<W: Write + io::Seek>(
             )
         };
 
-        if path.is_dir() {
+        if kind == ArchiveSourceKind::Directory {
             // Add directory entry
             let dir_name = format!("{}/", archive_path);
             let options = SimpleFileOptions::default()
                 .compression_method(method)
                 .unix_permissions(0o755);
             zip.add_directory(&dir_name, options)?;
-        } else if path.is_file() {
+        } else {
             total_bytes +=
                 add_file_to_zip_with_password(zip, path, &archive_path, method, password)?;
         }
@@ -1623,8 +2261,20 @@ pub fn archive_needs_password(archive_path: &Path) -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use std::io::{Cursor, Write};
     use tempfile::TempDir;
+
+    fn assert_no_staging_paths(parent: &Path) {
+        let staging_paths: Vec<_> = fs::read_dir(parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".explorie-") && name.ends_with(".tmp"))
+            .collect();
+        assert!(
+            staging_paths.is_empty(),
+            "leftover staging paths: {staging_paths:?}"
+        );
+    }
 
     #[test]
     fn test_archive_format_detection() {
@@ -1665,6 +2315,8 @@ mod tests {
 
         // Extract archive
         let extract_dir = temp_dir.path().join("extracted");
+        fs::create_dir(&extract_dir).unwrap();
+        fs::write(extract_dir.join("existing.txt"), b"preserved").unwrap();
         extract_zip_archive(&archive_path, &extract_dir).unwrap();
 
         // Verify extraction
@@ -1672,6 +2324,10 @@ mod tests {
         assert!(extracted_file.exists());
         let content = fs::read_to_string(&extracted_file).unwrap();
         assert_eq!(content, "Hello, World!");
+        assert_eq!(
+            fs::read(extract_dir.join("existing.txt")).unwrap(),
+            b"preserved"
+        );
     }
 
     #[test]
@@ -1777,14 +2433,141 @@ mod tests {
 
         let archive_path = temp_dir.path().join("symlink.zip");
         let sources = vec![source_dir.clone()];
-        create_zip_archive(&sources, &archive_path, CompressionLevel::Normal).unwrap();
+        fs::write(&archive_path, b"prior archive").unwrap();
+        assert!(create_zip_archive(&sources, &archive_path, CompressionLevel::Normal).is_err());
+        assert_eq!(fs::read(&archive_path).unwrap(), b"prior archive");
+    }
 
-        let extract_dir = temp_dir.path().join("extracted");
-        extract_zip_archive(&archive_path, &extract_dir).unwrap();
+    #[test]
+    fn failed_archive_creation_preserves_every_existing_output() {
+        let temp = TempDir::new().unwrap();
+        let first = temp.path().join("first.txt");
+        let second = temp.path().join("second.txt");
+        fs::write(&first, b"first").unwrap();
+        let sources = vec![first.clone(), second.clone()];
+        let cases = [
+            (ArchiveFormat::Zip, "zip", None),
+            (ArchiveFormat::Zip, "protected.zip", Some("secret")),
+            (ArchiveFormat::Tar, "tar", None),
+            (ArchiveFormat::TarGz, "tar.gz", None),
+            (ArchiveFormat::SevenZ, "7z", None),
+        ];
 
-        let extracted_file = extract_dir.join("source/link.txt");
-        let content = fs::read_to_string(&extracted_file).unwrap();
-        assert_eq!(content, "Symlink target");
+        for (index, (format, extension, password)) in cases.into_iter().enumerate() {
+            fs::write(&second, b"second").unwrap();
+            let output = temp.path().join(format!("existing-{index}.{extension}"));
+            fs::write(&output, b"prior archive").unwrap();
+            let options = CompressOptions {
+                format,
+                compression_level: CompressionLevel::Normal,
+                password: password.map(str::to_owned),
+            };
+            let mut removed_second = false;
+            let result = create_archive_with_progress(&sources, &output, &options, |_| {
+                if !removed_second {
+                    fs::remove_file(&second).unwrap();
+                    removed_second = true;
+                }
+            });
+
+            assert!(removed_second, "case {index} never began writing");
+            assert!(result.is_err(), "case {index} unexpectedly succeeded");
+            assert_eq!(fs::read(&output).unwrap(), b"prior archive");
+            assert_no_staging_paths(temp.path());
+        }
+    }
+
+    #[test]
+    fn archive_output_inside_source_is_rejected() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("input.txt"), b"input").unwrap();
+        let output = source.join("nested.zip");
+
+        let result = create_zip_archive(
+            std::slice::from_ref(&source),
+            &output,
+            CompressionLevel::Normal,
+        );
+        assert!(result.is_err());
+        assert!(!output.exists());
+        assert_no_staging_paths(&source);
+    }
+
+    #[test]
+    fn failed_zip_extraction_preserves_existing_destination() {
+        let temp = TempDir::new().unwrap();
+        let archive_path = temp.path().join("traversal.zip");
+        let output = temp.path().join("output");
+        fs::create_dir(&output).unwrap();
+        fs::write(output.join("sentinel.txt"), b"preserved").unwrap();
+
+        let file = File::create(&archive_path).unwrap();
+        let mut archive = ZipWriter::new(file);
+        let options = SimpleFileOptions::default();
+        archive.start_file("good.txt", options).unwrap();
+        archive.write_all(b"good").unwrap();
+        archive.start_file("../escape.txt", options).unwrap();
+        archive.write_all(b"escaped").unwrap();
+        archive.finish().unwrap();
+
+        assert!(extract_zip_archive(&archive_path, &output).is_err());
+        assert_eq!(fs::read(output.join("sentinel.txt")).unwrap(), b"preserved");
+        assert!(!output.join("good.txt").exists());
+        assert!(!temp.path().join("escape.txt").exists());
+        assert_no_staging_paths(temp.path());
+    }
+
+    #[test]
+    fn successful_zip_extraction_merges_after_full_staging() {
+        let temp = TempDir::new().unwrap();
+        let archive_path = temp.path().join("merge.zip");
+        let output = temp.path().join("output");
+        fs::create_dir(&output).unwrap();
+        fs::write(output.join("same.txt"), b"old").unwrap();
+        fs::write(output.join("unrelated.txt"), b"untouched").unwrap();
+
+        let file = File::create(&archive_path).unwrap();
+        let mut archive = ZipWriter::new(file);
+        archive
+            .start_file("same.txt", SimpleFileOptions::default())
+            .unwrap();
+        archive.write_all(b"new").unwrap();
+        archive.finish().unwrap();
+
+        extract_zip_archive(&archive_path, &output).unwrap();
+        assert_eq!(fs::read(output.join("same.txt")).unwrap(), b"new");
+        assert_eq!(
+            fs::read(output.join("unrelated.txt")).unwrap(),
+            b"untouched"
+        );
+        assert_no_staging_paths(temp.path());
+    }
+
+    #[test]
+    fn seven_z_traversal_preserves_existing_destination() {
+        let temp = TempDir::new().unwrap();
+        let archive_path = temp.path().join("traversal.7z");
+        let output = temp.path().join("output");
+        fs::create_dir(&output).unwrap();
+        fs::write(output.join("sentinel.txt"), b"preserved").unwrap();
+
+        let file = File::create(&archive_path).unwrap();
+        let mut archive = sevenz_rust::SevenZWriter::new(file).unwrap();
+        let mut entry = sevenz_rust::SevenZArchiveEntry::new();
+        entry.name = "../escape.txt".to_string();
+        entry.has_stream = true;
+        entry.size = 7;
+        archive
+            .push_archive_entry(entry, Some(Cursor::new(b"escaped")))
+            .unwrap();
+        archive.finish().unwrap();
+
+        assert!(extract_7z_archive(&archive_path, &output, None).is_err());
+        assert_eq!(fs::read(output.join("sentinel.txt")).unwrap(), b"preserved");
+        assert!(!temp.path().join("escape.txt").exists());
+        assert_no_staging_paths(temp.path());
     }
 
     #[test]
@@ -1797,5 +2580,78 @@ mod tests {
         let extract_dir = temp_dir.path().join("extracted");
         let result = extract_zip_archive(&archive_path, &extract_dir);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn tar_extraction_rejects_parent_path_entry() {
+        let temp = TempDir::new().unwrap();
+        let archive_path = temp.path().join("traversal.tar");
+        let output = temp.path().join("output");
+        let payload = b"escaped";
+        fs::create_dir(&output).unwrap();
+        fs::write(output.join("sentinel.txt"), b"preserved").unwrap();
+
+        let file = File::create(&archive_path).unwrap();
+        let mut builder = tar::Builder::new(file);
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(payload.len() as u64);
+        header.set_mode(0o644);
+        header.set_path("placeholder").unwrap();
+        header.as_mut_bytes()[..100].fill(0);
+        header.as_mut_bytes()[..13].copy_from_slice(b"../escape.txt");
+        header.set_cksum();
+        builder.append(&header, &payload[..]).unwrap();
+        builder.finish().unwrap();
+
+        assert!(extract_tar_archive(&archive_path, &output, false).is_err());
+        assert!(!temp.path().join("escape.txt").exists());
+        assert_eq!(fs::read(output.join("sentinel.txt")).unwrap(), b"preserved");
+        assert_no_staging_paths(temp.path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tar_extraction_rejects_archive_symlink_breakout() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let archive_path = temp.path().join("malicious.tar");
+        let outside = temp.path().join("outside");
+        let output = temp.path().join("output");
+        fs::create_dir(&outside).unwrap();
+
+        let file = File::create(&archive_path).unwrap();
+        let mut builder = tar::Builder::new(file);
+        let mut link_header = tar::Header::new_gnu();
+        link_header.set_entry_type(tar::EntryType::Symlink);
+        link_header.set_size(0);
+        link_header.set_mode(0o777);
+        link_header.set_path("link").unwrap();
+        link_header.set_link_name(&outside).unwrap();
+        link_header.set_cksum();
+        builder.append(&link_header, io::empty()).unwrap();
+
+        let payload = b"escaped";
+        let mut file_header = tar::Header::new_gnu();
+        file_header.set_entry_type(tar::EntryType::Regular);
+        file_header.set_size(payload.len() as u64);
+        file_header.set_mode(0o644);
+        file_header.set_path("link/escaped.txt").unwrap();
+        file_header.set_cksum();
+        builder.append(&file_header, &payload[..]).unwrap();
+        builder.finish().unwrap();
+
+        assert!(extract_tar_archive(&archive_path, &output, false).is_err());
+        assert!(!outside.join("escaped.txt").exists());
+
+        // The same guard must reject a symlink that existed before extraction.
+        if output.exists() {
+            fs::remove_dir_all(&output).unwrap();
+        }
+        fs::create_dir(&output).unwrap();
+        symlink(&outside, output.join("link")).unwrap();
+        assert!(extract_tar_archive(&archive_path, &output, false).is_err());
+        assert!(!outside.join("escaped.txt").exists());
     }
 }

@@ -1,21 +1,9 @@
 /**
  * File system utilities using Tauri's fs plugin
  */
-import {
-  readTextFile,
-  writeTextFile,
-  readDir,
-  exists,
-  rename,
-  mkdir,
-  remove,
-  readFile as readBinaryFile,
-  writeFile as writeBinaryFile,
-  stat,
-} from '@tauri-apps/plugin-fs';
+import { readTextFile, readDir, exists, stat } from '@tauri-apps/plugin-fs';
 import { clearDirSizeCache } from '../dirSizeCache';
 import { invoke } from '@tauri-apps/api/core';
-import { basename, getParentPath, joinPaths } from './path';
 import { validateFileName } from './fileName';
 import { formatErrorMessage } from './errorMessages';
 import type { CustomFields, CustomFieldValue } from './customFieldTypes';
@@ -23,12 +11,7 @@ import type { CustomFields, CustomFieldValue } from './customFieldTypes';
 export type { DirEntry } from '@tauri-apps/plugin-fs';
 
 // Re-export the functions directly
-export { readTextFile, writeTextFile, readDir, exists };
-
-type ReadDirEntry = Awaited<ReturnType<typeof readDir>>[number] & {
-  path?: string;
-  name?: string;
-};
+export { readTextFile, readDir, exists };
 
 // Re-export error formatting for convenience
 export {
@@ -59,25 +42,6 @@ async function assertReadable(path: string): Promise<void> {
   }
 }
 
-async function assertWritableDir(dirPath: string): Promise<void> {
-  try {
-    const info = await stat(dirPath);
-    if (!info.isDirectory) {
-      throw new Error('Not a directory');
-    }
-    if (info.readonly) {
-      throw new Error('Access denied');
-    }
-  } catch (error) {
-    throw toFsError(error);
-  }
-}
-
-async function assertWritableParent(path: string): Promise<void> {
-  const parent = getParentPath(path);
-  await assertWritableDir(parent);
-}
-
 /**
  * Read a text file and return its contents
  * @param path Path to the file
@@ -89,21 +53,6 @@ export async function readFile(path: string): Promise<string> {
     return await readTextFile(path);
   } catch (error) {
     console.error(`Failed to read file at ${path}:`, error);
-    throw toFsError(error);
-  }
-}
-
-/**
- * Write text to a file
- * @param path Path to the file
- * @param contents Contents to write
- */
-export async function writeFile(path: string, contents: string): Promise<void> {
-  try {
-    await assertWritableParent(path);
-    await writeTextFile(path, contents);
-  } catch (error) {
-    console.error(`Failed to write to file at ${path}:`, error);
     throw toFsError(error);
   }
 }
@@ -140,24 +89,14 @@ export async function fileExists(path: string): Promise<boolean> {
 // Re-export joinPaths from path.ts for backwards compatibility
 export { joinPaths } from './path';
 
-/**
- * Move a file or folder into a target directory (rename).
- * Preserves the original basename.
- */
-export async function moveToFolder(sourcePath: string, targetDirPath: string): Promise<void> {
-  await assertWritableParent(sourcePath);
-  await assertWritableDir(targetDirPath);
-  const name = basename(sourcePath);
-  const dest = joinPaths(targetDirPath, name);
+async function invokeMutation<T>(command: string, args: Record<string, unknown>): Promise<T> {
   try {
-    await rename(sourcePath, dest);
+    const result = await invoke<T>(command, args);
+    clearDirSizeCache();
+    return result;
   } catch (error) {
     throw toFsError(error);
   }
-  // Any filesystem change can invalidate folder sizes; clear cache.
-  try {
-    clearDirSizeCache();
-  } catch {}
 }
 
 /**
@@ -165,65 +104,17 @@ export async function moveToFolder(sourcePath: string, targetDirPath: string): P
  * Returns the destination path.
  */
 export async function renamePath(sourcePath: string, newBaseName: string): Promise<string> {
-  const parent = getParentPath(sourcePath);
-  const sanitized = ensureValidFileName(newBaseName);
-  const tryDest = joinPaths(parent, sanitized);
-  let dest = tryDest;
-  if (await fileExists(dest)) {
-    const extMatch = sanitized.match(/(.*)(\.[^.]*)$/);
-    const base = extMatch ? extMatch[1] : sanitized;
-    const ext = extMatch ? extMatch[2] : '';
-    let n = 2;
-    while (await fileExists(dest)) {
-      dest = joinPaths(parent, `${base} (${n})${ext}`);
-      n += 1;
-      if (n > 9999) throw new Error('Could not find unique name for rename');
-    }
-  }
-  await assertWritableDir(parent);
-  try {
-    await rename(sourcePath, dest);
-  } catch (error) {
-    throw toFsError(error);
-  }
-  try {
-    clearDirSizeCache();
-  } catch {}
-  return dest;
+  return invokeMutation('rename_path', {
+    sourcePath,
+    newBaseName: ensureValidFileName(newBaseName),
+  });
 }
 
 /**
  * Delete a file or directory. For directories, remove recursively by default.
  */
 export async function deletePath(targetPath: string, recursive: boolean = true): Promise<void> {
-  await assertWritableParent(targetPath);
-  try {
-    await remove(targetPath, { recursive });
-  } catch (error) {
-    throw toFsError(error);
-  } finally {
-    try {
-      clearDirSizeCache();
-    } catch {}
-  }
-}
-
-/**
- * Find a unique path by appending " (n)" if needed.
- */
-export async function uniquePath(baseDir: string, baseName: string): Promise<string> {
-  const checkedName = ensureValidFileName(baseName);
-  let n = 1;
-  // Try without suffix first
-  let p = joinPaths(baseDir, checkedName);
-  // If file exists, try incrementing suffix
-  while (await fileExists(p)) {
-    n += 1;
-    p = joinPaths(baseDir, `${checkedName} (${n})`);
-    // Safety bail-out
-    if (n > 9999) throw new Error('Could not find unique name');
-  }
-  return p;
+  await invokeMutation('delete_path_permanently', { path: targetPath, recursive });
 }
 
 /**
@@ -231,17 +122,10 @@ export async function uniquePath(baseDir: string, baseName: string): Promise<str
  * Returns created folder path.
  */
 export async function createFolderIn(dirPath: string, baseName = 'New Folder'): Promise<string> {
-  const target = await uniquePath(dirPath, baseName);
-  await assertWritableDir(dirPath);
-  try {
-    await mkdir(target);
-  } catch (error) {
-    throw toFsError(error);
-  }
-  try {
-    clearDirSizeCache();
-  } catch {}
-  return target;
+  return invokeMutation('create_folder', {
+    dirPath,
+    baseName: ensureValidFileName(baseName),
+  });
 }
 
 /**
@@ -249,26 +133,11 @@ export async function createFolderIn(dirPath: string, baseName = 'New Folder'): 
  * Returns created file path.
  */
 export async function createNoteIn(dirPath: string, baseName = 'New Note.md'): Promise<string> {
-  // If user passed a name without extension, add .md
   const ensureMd = (n: string) => (n.toLowerCase().endsWith('.md') ? n : `${n}.md`);
-  const nameOnly = ensureValidFileName(ensureMd(baseName));
-  let candidate = joinPaths(dirPath, nameOnly);
-  if (await fileExists(candidate)) {
-    // Strip extension and delegate to uniquePath on basename without ext
-    const base = nameOnly.replace(/\.md$/i, '');
-    const p = await uniquePath(dirPath, base);
-    candidate = `${p}.md`;
-  }
-  await assertWritableDir(dirPath);
-  try {
-    await writeTextFile(candidate, '# New Note\n');
-  } catch (error) {
-    throw toFsError(error);
-  }
-  try {
-    clearDirSizeCache();
-  } catch {}
-  return candidate;
+  return invokeMutation('create_note', {
+    dirPath,
+    baseName: ensureValidFileName(ensureMd(baseName)),
+  });
 }
 
 /**
@@ -281,87 +150,11 @@ export async function createWebsiteLinkIn(
   baseName = 'New Link.url'
 ): Promise<string> {
   const ensureUrlExt = (n: string) => (n.toLowerCase().endsWith('.url') ? n : `${n}.url`);
-  const nameOnly = ensureValidFileName(ensureUrlExt(baseName));
-  let candidate = joinPaths(dirPath, nameOnly);
-  if (await fileExists(candidate)) {
-    const base = nameOnly.replace(/\.url$/i, '');
-    const p = await uniquePath(dirPath, base);
-    candidate = `${p}.url`;
-  }
-  const contents = `[InternetShortcut]\nURL=${url}\n`;
-  await assertWritableDir(dirPath);
-  try {
-    await writeTextFile(candidate, contents);
-  } catch (error) {
-    throw toFsError(error);
-  }
-  try {
-    clearDirSizeCache();
-  } catch {}
-  return candidate;
-}
-
-/**
- * Recursively copy a file or directory into a target directory.
- * Returns the created destination path.
- */
-export async function copyPathToDir(sourcePath: string, targetDirPath: string): Promise<string> {
-  await assertWritableDir(targetDirPath);
-  let sourceInfo: Awaited<ReturnType<typeof stat>>;
-  try {
-    sourceInfo = await stat(sourcePath);
-  } catch (error) {
-    throw toFsError(error);
-  }
-  // Determine destination path with unique naming
-  const srcName = basename(sourcePath);
-  const destBase = srcName;
-  let destPath = joinPaths(targetDirPath, destBase);
-  if (await fileExists(destPath)) {
-    // If file, preserve extension when uniquifying
-    const m = destBase.match(/^(.*?)(\.[^.]*)?$/);
-    const base = m ? m[1] || destBase : destBase;
-    const ext = m ? m[2] || '' : '';
-    let n = 2;
-    while (await fileExists(destPath)) {
-      destPath = joinPaths(targetDirPath, `${base} (${n})${ext}`);
-      n += 1;
-      if (n > 9999) throw new Error('Could not find unique name for copy');
-    }
-  }
-  if (!sourceInfo.isDirectory) {
-    try {
-      const data = await readBinaryFile(sourcePath);
-      await writeBinaryFile(destPath, data);
-    } catch (error) {
-      throw toFsError(error);
-    }
-    try {
-      clearDirSizeCache();
-    } catch {}
-    return destPath;
-  }
-  // Directory: create and recurse
-  try {
-    await mkdir(destPath);
-  } catch (error) {
-    throw toFsError(error);
-  }
-  let entries: Awaited<ReturnType<typeof readDir>>;
-  try {
-    entries = await readDir(sourcePath);
-  } catch (error) {
-    throw toFsError(error);
-  }
-  for (const entry of entries as ReadDirEntry[]) {
-    const childPath = entry.path || joinPaths(sourcePath, entry.name || '');
-    if (!childPath) continue;
-    await copyPathToDir(childPath, destPath);
-  }
-  try {
-    clearDirSizeCache();
-  } catch {}
-  return destPath;
+  return invokeMutation('create_website_link', {
+    dirPath,
+    baseName: ensureValidFileName(ensureUrlExt(baseName)),
+    url,
+  });
 }
 
 /**

@@ -9,7 +9,6 @@ export type {
   FileModified,
   FileEntry,
   ThemeSpec,
-  ImportedFont,
   FavoriteItem,
   WorkspaceTab,
   Workspace,

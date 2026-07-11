@@ -35,9 +35,6 @@ describe('GoToFolderDialog', () => {
         if (command === 'get_home_dir') {
           return '/home/test';
         }
-        if (command === 'get_env_var') {
-          return args?.name === 'HOME' ? '/home/test' : '';
-        }
         if (command === 'list_files') {
           if (args?.path?.includes('missing')) {
             throw new Error('No such file or directory');
@@ -66,13 +63,13 @@ describe('GoToFolderDialog', () => {
     expect(container).toBeEmptyDOMElement();
   });
 
-  it('expands environment variables, validates the folder, records it as recent, and navigates', async () => {
+  it('expands the home shorthand, validates the folder, records it as recent, and navigates', async () => {
     const user = userEvent.setup();
     const { props } = renderDialog();
     const input = screen.getByPlaceholderText('Enter folder path...');
 
     await user.clear(input);
-    await user.type(input, '$HOME/projects');
+    await user.type(input, '~/projects');
     await user.click(screen.getByRole('button', { name: 'Go' }));
 
     await waitFor(() => expect(props.onNavigate).toHaveBeenCalledWith('/home/test/projects'));
@@ -97,7 +94,7 @@ describe('GoToFolderDialog', () => {
     expect(input).toHaveValue('/root/Documents');
   });
 
-  it('supports recent and environment suggestions from the keyboard', async () => {
+  it('supports recent suggestions from the keyboard', async () => {
     window.localStorage.setItem(
       'explorie:goToFolderRecent',
       JSON.stringify(['/root/Recent Project'])
@@ -108,18 +105,18 @@ describe('GoToFolderDialog', () => {
     await userEvent.clear(input);
     fireEvent.focus(input);
     expect(await screen.findByText('/root/Recent Project')).toBeInTheDocument();
+    expect(input).toHaveAttribute('role', 'combobox');
+    expect(input).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.getByRole('listbox', { name: 'Folder suggestions' })).toBeInTheDocument();
 
     fireEvent.keyDown(input, { key: 'ArrowDown' });
+    expect(input).toHaveAttribute('aria-activedescendant', 'go-to-folder-suggestion-0');
+    expect(screen.getByRole('option', { name: /Recent Project/i })).toHaveAttribute(
+      'aria-selected',
+      'true'
+    );
     fireEvent.keyDown(input, { key: 'Enter' });
     expect(input).toHaveValue('/root/Recent Project');
-
-    await userEvent.clear(input);
-    await userEvent.type(input, '$');
-    expect(await screen.findByText('$HOME - User home (Unix)')).toBeInTheDocument();
-
-    fireEvent.keyDown(input, { key: 'ArrowDown' });
-    fireEvent.keyDown(input, { key: 'Enter' });
-    expect(input).toHaveValue('$HOME');
   });
 
   it('shows validation errors and closes from backdrop or Escape', async () => {

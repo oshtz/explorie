@@ -185,5 +185,10 @@ export async function getAppsForFile(path: string): Promise<AppInfo[]> {
  * Check if "Open With" functionality is available
  */
 export async function isOpenWithAvailable(): Promise<boolean> {
-  return isMacOS();
+  try {
+    const platform = await invoke<string>('get_platform');
+    return platform === 'macos' || platform === 'windows';
+  } catch {
+    return false;
+  }
 }

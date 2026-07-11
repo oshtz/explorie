@@ -9,7 +9,7 @@
 .tagList {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
+  gap: var(--padding-sm);
   align-items: center;
 }
 
