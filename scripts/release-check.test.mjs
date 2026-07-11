@@ -24,6 +24,7 @@ const {
 
 const expectedDisplays = [
   'pnpm install --frozen-lockfile --ignore-scripts',
+  'pnpm --filter explorie-desktop prepare:native',
   'pnpm --filter explorie-desktop exec tsc --noEmit',
   'pnpm lint:ts',
   'pnpm format:check',
@@ -94,15 +95,17 @@ test('DEFAULT_COMMANDS preserves exact display order and representative executio
   );
 
   assert.equal(DEFAULT_COMMANDS[1].command, 'pnpm');
-  assert.deepEqual(DEFAULT_COMMANDS[1].args, [
+  assert.deepEqual(DEFAULT_COMMANDS[1].args, ['--filter', 'explorie-desktop', 'prepare:native']);
+  assert.equal(DEFAULT_COMMANDS[2].command, 'pnpm');
+  assert.deepEqual(DEFAULT_COMMANDS[2].args, [
     '--filter',
     'explorie-desktop',
     'exec',
     'tsc',
     '--noEmit',
   ]);
-  assert.equal(DEFAULT_COMMANDS[7].command, 'cargo');
-  assert.deepEqual(DEFAULT_COMMANDS[7].args, [
+  assert.equal(DEFAULT_COMMANDS[8].command, 'cargo');
+  assert.deepEqual(DEFAULT_COMMANDS[8].args, [
     'clippy',
     '--workspace',
     '--all-targets',
@@ -111,8 +114,8 @@ test('DEFAULT_COMMANDS preserves exact display order and representative executio
     '-D',
     'warnings',
   ]);
-  assert.equal(DEFAULT_COMMANDS[12].command, 'pnpm');
-  assert.deepEqual(DEFAULT_COMMANDS[12].args, [
+  assert.equal(DEFAULT_COMMANDS[13].command, 'pnpm');
+  assert.deepEqual(DEFAULT_COMMANDS[13].args, [
     '--filter',
     'explorie-desktop',
     'exec',
@@ -123,8 +126,8 @@ test('DEFAULT_COMMANDS preserves exact display order and representative executio
     '--',
     '--locked',
   ]);
-  assert.equal(DEFAULT_COMMANDS[13].command, 'git');
-  assert.deepEqual(DEFAULT_COMMANDS[13].args, ['diff', '--check']);
+  assert.equal(DEFAULT_COMMANDS[14].command, 'git');
+  assert.deepEqual(DEFAULT_COMMANDS[14].args, ['diff', '--check']);
 });
 
 test('Playwright release command uses an isolated strict dev server port', () => {

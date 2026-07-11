@@ -15,6 +15,11 @@ export const DEFAULT_COMMANDS = [
     args: ['install', '--frozen-lockfile', '--ignore-scripts'],
   },
   {
+    display: 'pnpm --filter explorie-desktop prepare:native',
+    command: 'pnpm',
+    args: ['--filter', 'explorie-desktop', 'prepare:native'],
+  },
+  {
     display: 'pnpm --filter explorie-desktop exec tsc --noEmit',
     command: 'pnpm',
     args: ['--filter', 'explorie-desktop', 'exec', 'tsc', '--noEmit'],
