@@ -1,6 +1,5 @@
 #import "MountHelper.h"
 #import <Security/Security.h>
-#import <bsm/libbsm.h>
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
@@ -49,9 +48,8 @@ static NSString *ExplorieRealPath(NSString *path) {
 }
 
 static BOOL ExplorieValidatePeer(NSXPCConnection *connection) {
-    audit_token_t token = connection.auditToken;
-    NSData *audit = [NSData dataWithBytes:&token length:sizeof(token)];
-    NSDictionary *attributes = @{(__bridge id)kSecGuestAttributeAudit: audit};
+    NSNumber *processID = @(connection.processIdentifier);
+    NSDictionary *attributes = @{(__bridge id)kSecGuestAttributePid: processID};
     SecCodeRef code = NULL;
     if (SecCodeCopyGuestWithAttributes(NULL, (__bridge CFDictionaryRef)attributes, kSecCSDefaultFlags, &code) != errSecSuccess) return NO;
     if (SecCodeCheckValidity(code, kSecCSStrictValidate, NULL) != errSecSuccess) {
