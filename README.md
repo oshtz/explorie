@@ -204,9 +204,9 @@ macOS releases require these signing secrets:
 
 - macOS: base64-encoded P12 in `APPLE_CERTIFICATE`, plus `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID`.
 
-The v0.2.6 workflow publishes an explicitly named unsigned Windows x64 EVB portable executable, a signed/notarized macOS arm64 DMG, and platform SHA-256 manifests. Windows signing remains optional when `WINDOWS_CODESIGN_CERTIFICATE` and `WINDOWS_CODESIGN_PASSWORD` are later configured; until then, SmartScreen or antivirus warnings are expected. CI launch-smokes each package on its target runner; publication additionally requires explicit proof that both candidates passed disposable filesystem operations on real machines.
+The v0.2.7 workflow publishes an explicitly named unsigned Windows x64 EVB portable executable, a signed/notarized macOS arm64 DMG, and platform SHA-256 manifests. Windows signing remains optional when `WINDOWS_CODESIGN_CERTIFICATE` and `WINDOWS_CODESIGN_PASSWORD` are later configured; until then, SmartScreen or antivirus warnings are expected. CI launch-smokes each package on its target runner; publication additionally requires explicit proof that both candidates passed disposable filesystem operations on real machines.
 
-The v0.2.6 draft contains `explorie-0.2.6-windows-x64-portable-unsigned.exe`, `explorie-0.2.6-macos-arm64.dmg`, `SHA256SUMS-windows.txt`, and `SHA256SUMS-macos.txt`.
+The v0.2.7 draft contains `explorie-0.2.7-windows-x64-portable-unsigned.exe`, `explorie-0.2.7-macos-arm64.dmg`, `SHA256SUMS-windows.txt`, and `SHA256SUMS-macos.txt`.
 
 Before creating a new tag, manually verify:
 

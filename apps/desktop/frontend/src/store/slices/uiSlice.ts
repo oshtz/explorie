@@ -10,12 +10,24 @@ import type {
   BorderRadius,
 } from '../types';
 import type { ViewMode } from '../../components/ViewModeToggle';
+import { loadRemoteDrives } from '../../utils/remoteDrives';
 
 const THEME_MODES = ['dark', 'light', 'system'] as const;
 const ACCENT_COLORS = ['blue', 'green', 'purple', 'orange', 'pink', 'custom'] as const;
 const DENSITIES = ['comfortable', 'compact'] as const;
 const FONT_CHOICES = ['mono', 'system', 'serif', 'custom'] as const;
 const BORDER_RADII = [0, 4, 8] as const;
+
+export function loadRemoteDrivesEnabled(): boolean {
+  try {
+    if (typeof window !== 'undefined') {
+      const value = window.localStorage.getItem('explorie:remoteDrivesEnabled');
+      if (value === 'true') return true;
+      if (value === 'false') return false;
+    }
+  } catch {}
+  return loadRemoteDrives().length > 0;
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -252,6 +264,7 @@ export const createUISlice: StateCreator<StoreState, [], [], UISlice> = (set) =>
     } catch {}
     return true;
   })(),
+  remoteDrivesEnabled: loadRemoteDrivesEnabled(),
   themes: (() => {
     try {
       if (typeof window !== 'undefined') {
@@ -383,6 +396,14 @@ export const createUISlice: StateCreator<StoreState, [], [], UISlice> = (set) =>
       }
     } catch {}
     set({ showStatusBar: show });
+  },
+  setRemoteDrivesEnabled: (enabled) => {
+    try {
+      if (typeof window !== 'undefined') {
+        window.localStorage.setItem('explorie:remoteDrivesEnabled', String(enabled));
+      }
+    } catch {}
+    set({ remoteDrivesEnabled: enabled });
   },
   saveTheme: (name: string, spec?: ThemeSpec) => {
     set((state) => {

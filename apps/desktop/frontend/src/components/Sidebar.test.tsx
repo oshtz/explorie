@@ -29,6 +29,7 @@ const favoritesData = [
 ];
 
 const invokeMock = vi.fn();
+let remoteDrivesEnabled = false;
 
 vi.mock('../store', () => ({
   useFileStore: (selector?: (state: any) => any) => {
@@ -44,12 +45,17 @@ vi.mock('../store', () => ({
       setActiveSmartFolderId: mockSetActiveSmartFolderId,
       activeSmartFolderId: 'sf1',
       setViewMode: mockSetViewMode,
+      remoteDrivesEnabled,
     };
     if (selector) {
       return selector(state);
     }
     return state;
   },
+}));
+
+vi.mock('./RemoteDrivesSection', () => ({
+  RemoteDrivesSection: () => <div data-testid="remote-drives-section" />,
 }));
 
 vi.mock('@tauri-apps/api/core', () => ({
@@ -64,6 +70,7 @@ describe('Sidebar', () => {
   beforeEach(() => {
     // Clear all mock call history
     vi.clearAllMocks();
+    remoteDrivesEnabled = false;
 
     invokeMock.mockResolvedValue({
       desktop: '/root/Desktop',
@@ -78,6 +85,15 @@ describe('Sidebar', () => {
   });
 
   afterEach(cleanup);
+
+  it('mounts Remote Drives only when enabled', () => {
+    const { rerender } = render(<Sidebar recents={[]} />);
+    expect(screen.queryByTestId('remote-drives-section')).not.toBeInTheDocument();
+
+    remoteDrivesEnabled = true;
+    rerender(<Sidebar recents={[]} />);
+    expect(screen.getByTestId('remote-drives-section')).toBeInTheDocument();
+  });
 
   it('invokes navigation and settings callbacks', async () => {
     const user = userEvent.setup();

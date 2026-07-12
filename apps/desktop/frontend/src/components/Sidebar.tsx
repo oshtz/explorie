@@ -71,6 +71,7 @@ export function Sidebar({
   const setActiveSmartFolderId = useFileStore((s) => s.setActiveSmartFolderId);
   const activeSmartFolderId = useFileStore((s) => s.activeSmartFolderId);
   const setViewMode = useFileStore((s) => s.setViewMode);
+  const remoteDrivesEnabled = useFileStore((s) => s.remoteDrivesEnabled);
 
   // Drag and drop state for favorites reordering
   const [draggedFavIndex, setDraggedFavIndex] = useState<number | null>(null);
@@ -591,7 +592,7 @@ export function Sidebar({
           </div>
         </div>
 
-        <RemoteDrivesSection onSelectLocation={handleSelect} />
+        {remoteDrivesEnabled && <RemoteDrivesSection onSelectLocation={handleSelect} />}
 
         {/* Drives Section */}
         <div className={styles.section}>

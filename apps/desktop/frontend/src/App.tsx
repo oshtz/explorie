@@ -8,7 +8,7 @@ import { FilePreviewer } from './components/FilePreviewer';
 import { QuickLookModal } from './components/QuickLookModal';
 import { StatusBar } from './components/StatusBar';
 import { GoToFolderDialog } from './components/GoToFolderDialog';
-import { getCachedDirSize, setCachedDirSize } from './dirSizeCache';
+import { getCachedDirSize, mergeDirectorySizes, setCachedDirSize } from './dirSizeCache';
 import styles from './App.module.css'; // Import CSS Module
 import { useShallow } from 'zustand/shallow';
 import { useInitialPath } from './hooks/useInitialPath';
@@ -60,7 +60,7 @@ interface ExplorieWindow extends Window {
 
 async function fetchDirSizesConcurrent(
   entries: FileEntry[],
-  onSize: (entry: FileEntry, size: number) => void,
+  onSizes: (sizes: ReadonlyMap<string, number>) => void,
   shouldCancel: () => boolean
 ): Promise<void> {
   if (typeof window === 'undefined') return;
@@ -76,6 +76,23 @@ async function fetchDirSizesConcurrent(
     w.__explorieInflightSizes = new Map<string, Promise<number>>();
   }
   const inflight = w.__explorieInflightSizes;
+  const completed = new Map<string, number>();
+  let flushTimer: number | null = null;
+
+  const flush = () => {
+    flushTimer = null;
+    if (shouldCancel() || completed.size === 0) {
+      completed.clear();
+      return;
+    }
+    onSizes(new Map(completed));
+    completed.clear();
+  };
+
+  const queueSize = (entry: FileEntry, size: number) => {
+    completed.set(entry.id, size);
+    if (flushTimer === null) flushTimer = window.setTimeout(flush, 50);
+  };
 
   const runWorker = async () => {
     while (!shouldCancel() && queue.length > 0) {
@@ -89,7 +106,7 @@ async function fetchDirSizesConcurrent(
       const cached = getCachedDirSize(entry.path);
       if (cached !== undefined) {
         if (shouldCancel()) return;
-        onSize(entry, cached);
+        queueSize(entry, cached);
         continue;
       }
 
@@ -105,7 +122,7 @@ async function fetchDirSizesConcurrent(
         inflight.delete(key);
         setCachedDirSize(key, size);
         if (shouldCancel()) return;
-        onSize(entry, size);
+        queueSize(entry, size);
       } catch {
         inflight.delete(key);
         if (shouldCancel()) return;
@@ -114,6 +131,8 @@ async function fetchDirSizesConcurrent(
   };
 
   await Promise.all(Array.from({ length: workerCount }, runWorker));
+  if (flushTimer !== null) window.clearTimeout(flushTimer);
+  flush();
 }
 
 import { Sidebar } from './components/Sidebar';
@@ -676,9 +695,7 @@ function AppContent() {
           if (showFolderSizes) {
             void fetchDirSizesConcurrent(
               result,
-              (entry, size) => {
-                setFiles((prev) => prev.map((f) => (f.id === entry.id ? { ...f, size } : f)));
-              },
+              (sizes) => setFiles((prev) => mergeDirectorySizes(prev, sizes)),
               () => cancelled
             );
           }
@@ -760,12 +777,10 @@ function AppContent() {
               sizeTasks.push(() =>
                 fetchDirSizesConcurrent(
                   result,
-                  (entry, size) => {
+                  (sizes) => {
                     setColumnFiles((prev) => ({
                       ...prev,
-                      [columnPath]: (prev[columnPath] || []).map((f) =>
-                        f.id === entry.id ? { ...f, size } : f
-                      ),
+                      [columnPath]: mergeDirectorySizes(prev[columnPath] || [], sizes),
                     }));
                   },
                   () => cancelled
@@ -899,9 +914,7 @@ function AppContent() {
         if (showFolderSizes) {
           void fetchDirSizesConcurrent(
             refreshed,
-            (entry, size) => {
-              setFiles((prev) => prev.map((f) => (f.id === entry.id ? { ...f, size } : f)));
-            },
+            (sizes) => setFiles((prev) => mergeDirectorySizes(prev, sizes)),
             () => false
           );
         }
@@ -915,10 +928,10 @@ function AppContent() {
           if (showFolderSizes) {
             void fetchDirSizesConcurrent(
               res,
-              (entry, size) => {
+              (sizes) => {
                 setColumnFiles((prev) => ({
                   ...prev,
-                  [path]: (prev[path] || []).map((f) => (f.id === entry.id ? { ...f, size } : f)),
+                  [path]: mergeDirectorySizes(prev[path] || [], sizes),
                 }));
               },
               () => false

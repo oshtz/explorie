@@ -83,6 +83,8 @@ function createStoreState(overrides: MockState = {}): MockState {
     setShowPreviewPanel: storeSetter('showPreviewPanel'),
     showStatusBar: true,
     setShowStatusBar: storeSetter('showStatusBar'),
+    remoteDrivesEnabled: false,
+    setRemoteDrivesEnabled: storeSetter('remoteDrivesEnabled'),
     showFolderSizes: false,
     setShowFolderSizes: storeSetter('showFolderSizes'),
     previewExecutableScripts: false,
@@ -192,6 +194,7 @@ describe('SettingsPanel', () => {
     await user.click(screen.getByLabelText(/Show hidden files/i));
     await user.click(screen.getByLabelText(/Show status bar/i));
     await user.click(screen.getByLabelText(/Show folder sizes/i));
+    await user.click(screen.getByLabelText(/Enable Remote Drives/i));
     await user.click(screen.getByLabelText(/Confirm before delete/i));
     await user.click(screen.getByLabelText(/Error reporting/i));
     await user.click(screen.getByLabelText(/Preview executable scripts/i));
@@ -200,6 +203,7 @@ describe('SettingsPanel', () => {
     expect(mocks.state.setShowHidden).toHaveBeenCalledWith(true);
     expect(mocks.state.setShowStatusBar).toHaveBeenCalledWith(false);
     expect(mocks.state.setShowFolderSizes).toHaveBeenCalledWith(true);
+    expect(mocks.state.setRemoteDrivesEnabled).toHaveBeenCalledWith(true);
     expect(mocks.state.setConfirmBeforeDelete).toHaveBeenCalledWith(false);
     expect(mocks.state.setEnableErrorReporting).toHaveBeenCalledWith(true);
     expect(mocks.state.setPreviewExecutableScripts).toHaveBeenCalledWith(true);
@@ -322,6 +326,7 @@ describe('SettingsPanel', () => {
 
     expect(mocks.state.setFontCustom).toHaveBeenCalledWith('');
     expect(mocks.state.setShowStatusBar).toHaveBeenCalledWith(true);
+    expect(mocks.state.setRemoteDrivesEnabled).toHaveBeenCalledWith(false);
     expect(mocks.state.setConfirmBeforeDelete).toHaveBeenCalledWith(true);
     expect(mocks.state.setEnableErrorReporting).toHaveBeenCalledWith(false);
     expect(mocks.state.setListRowHeight).toHaveBeenCalledWith(34);
