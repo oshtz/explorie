@@ -281,6 +281,11 @@ jobs:
             --evbOptions.allowRunningOfVirtualExeFiles True `
             --evbOptions.mapExecutableWithTemporaryFile True
           if ($LASTEXITCODE -ne 0) { throw "Enigma Virtual Box project generation failed." }
+          $projectText = [IO.File]::ReadAllText($project, [Text.Encoding]::GetEncoding(1252))
+          $rcloneAction = [regex]::new('(?s)(<Name>rclone\.exe</Name>.*?<Action>)0(</Action>)')
+          $updatedProject = $rcloneAction.Replace($projectText, '${1}1${2}', 1)
+          if ($updatedProject -eq $projectText) { throw "Failed to set the rclone extraction action." }
+          [IO.File]::WriteAllText($project, $updatedProject, [Text.Encoding]::GetEncoding(1252))
           & $env:EVB_CONSOLE $project
           if ($LASTEXITCODE -ne 0) { throw "Enigma Virtual Box packaging failed." }
           if (-not (Test-Path -LiteralPath $output -PathType Leaf)) { throw "Portable executable was not created." }
@@ -326,6 +331,7 @@ jobs:
           $debugPort = 9331
           $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = "--remote-debugging-port=$debugPort"
           $app = Start-Process -FilePath $portable[0].FullName -WorkingDirectory $portable[0].DirectoryName -PassThru
+          $rclone = Join-Path $portable[0].DirectoryName "rclone.exe"
           try {
             $webviewReady = $false
             for ($attempt = 0; $attempt -lt 40; $attempt++) {
@@ -343,9 +349,13 @@ jobs:
               }
             }
             if (-not $webviewReady) { throw "Portable application did not load the Tauri page in WebView2." }
+            if (-not (Test-Path -LiteralPath $rclone -PathType Leaf)) { throw "Portable application did not extract rclone." }
+            & $rclone version | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "Extracted rclone failed its version check." }
           } finally {
             $app.Refresh()
             if (-not $app.HasExited) { Stop-Process -Id $app.Id -Force }
+            Remove-Item -LiteralPath $rclone -Force -ErrorAction SilentlyContinue
           }
 
       - name: Upload Windows package
