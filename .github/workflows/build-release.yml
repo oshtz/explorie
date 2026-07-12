@@ -277,7 +277,7 @@ jobs:
             --input $input `
             --output $output `
             --project-name $project `
-            --evbOptions.shareVirtualSystem True `
+            --evbOptions.shareVirtualSystem False `
             --evbOptions.allowRunningOfVirtualExeFiles True `
             --evbOptions.mapExecutableWithTemporaryFile True
           if ($LASTEXITCODE -ne 0) { throw "Enigma Virtual Box project generation failed." }
@@ -323,11 +323,30 @@ jobs:
         run: |
           $portable = @(Get-ChildItem release-artifacts/windows/*-windows-x64-portable*.exe)
           if ($portable.Count -ne 1) { throw "Expected exactly one portable executable." }
+          $debugPort = 9331
+          $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = "--remote-debugging-port=$debugPort"
           $app = Start-Process -FilePath $portable[0].FullName -WorkingDirectory $portable[0].DirectoryName -PassThru
-          Start-Sleep -Seconds 8
-          $app.Refresh()
-          if ($app.HasExited) { throw "Portable application exited during launch smoke test." }
-          Stop-Process -Id $app.Id -Force
+          try {
+            $webviewReady = $false
+            for ($attempt = 0; $attempt -lt 40; $attempt++) {
+              Start-Sleep -Milliseconds 500
+              $app.Refresh()
+              if ($app.HasExited) { throw "Portable application exited during launch smoke test." }
+              try {
+                $targets = @(Invoke-RestMethod -Uri "http://127.0.0.1:$debugPort/json/list" -TimeoutSec 1)
+              } catch {
+                continue
+              }
+              if ($targets | Where-Object { $_.type -eq "page" -and $_.url -eq "http://tauri.localhost/" }) {
+                $webviewReady = $true
+                break
+              }
+            }
+            if (-not $webviewReady) { throw "Portable application did not load the Tauri page in WebView2." }
+          } finally {
+            $app.Refresh()
+            if (-not $app.HasExited) { Stop-Process -Id $app.Id -Force }
+          }
 
       - name: Upload Windows package
         uses: actions/upload-artifact@v4
