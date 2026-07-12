@@ -388,6 +388,7 @@ test('workflows block audits and publish the exact attested draft assets', async
     /Copy-Item -LiteralPath \$rclone -Destination "\$staging\/rclone\.exe"[\s\S]*?\$staging\/installers\/winfsp-2\.1\.25156\.msi/
   );
   assert.match(release, /Smoke test Windows portable executable/);
+  assert.match(release, /--remote-debugging-port=\$debugPort[\s\S]*?http:\/\/tauri\.localhost\//);
   assert.doesNotMatch(release, /Build NSIS installer|--bundles nsis|Smoke test Windows installer/);
   assert.match(release, /Smoke test macOS DMG/);
   assert.match(
