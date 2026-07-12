@@ -261,16 +261,11 @@ jobs:
           $input = "target/release/explorie-desktop.exe"
           $rclone = "target/release/rclone.exe"
           $winfsp = "apps/desktop/frontend/src-tauri/resources/winfsp-2.1.25156.msi"
-          $webview = Get-ChildItem target -Recurse -Filter "WebView2Loader.dll" |
-            Where-Object { $_.FullName -match "\\release\\" } |
-            Select-Object -First 1
           if (-not (Test-Path -LiteralPath $input -PathType Leaf)) { throw "Application executable was not found." }
           if (-not (Test-Path -LiteralPath $rclone -PathType Leaf)) { throw "rclone executable was not found." }
-          if (-not $webview) { throw "WebView2Loader.dll was not found." }
 
           $staging = Join-Path $env:RUNNER_TEMP "explorie-evb"
           New-Item -ItemType Directory -Force -Path $staging, "$staging/installers", "$staging/licenses" | Out-Null
-          Copy-Item -LiteralPath $webview.FullName -Destination "$staging/WebView2Loader.dll"
           Copy-Item -LiteralPath $rclone -Destination "$staging/rclone.exe"
           Copy-Item -LiteralPath $winfsp -Destination "$staging/installers/winfsp-2.1.25156.msi"
           Copy-Item -LiteralPath "apps/desktop/frontend/src-tauri/resources/rclone-COPYING" -Destination "$staging/licenses/rclone-COPYING"
