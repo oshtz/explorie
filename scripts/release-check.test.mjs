@@ -57,7 +57,7 @@ test('rclone sidecars are pinned for every packaged desktop target', () => {
   }
 });
 
-test('WinFsp installer is pinned for one-click Windows setup', () => {
+test('WinFsp installer is pinned for on-demand Windows remote drives', () => {
   assert.equal(WINFSP_VERSION, '2.1.25156');
   assert.equal(WINFSP_INSTALLER, 'winfsp-2.1.25156.msi');
   assert.match(WINFSP_SHA256, /^[0-9a-f]{64}$/);
@@ -377,7 +377,17 @@ test('workflows block audits and publish the exact attested draft assets', async
     release,
     /name: Notarize and staple macOS DMG[\s\S]*?xcrun notarytool submit[\s\S]*?--wait[\s\S]*?xcrun stapler staple/
   );
-  assert.match(release, /Smoke test Windows installer/);
+  assert.match(release, /Restore Enigma Virtual Box installer cache/);
+  assert.match(release, /Install Enigma Virtual Box/);
+  assert.match(release, /@insco\/enigma-virtualbox@1\.3\.4/);
+  assert.match(release, /--evbOptions\.shareVirtualSystem True/);
+  assert.match(release, /--evbOptions\.allowRunningOfVirtualExeFiles True/);
+  assert.match(
+    release,
+    /Copy-Item -LiteralPath \$rclone -Destination "\$staging\/rclone\.exe"[\s\S]*?\$staging\/installers\/winfsp-2\.1\.25156\.msi/
+  );
+  assert.match(release, /Smoke test Windows portable executable/);
+  assert.doesNotMatch(release, /Build NSIS installer|--bundles nsis|Smoke test Windows installer/);
   assert.match(release, /Smoke test macOS DMG/);
   assert.match(
     release,
@@ -395,8 +405,9 @@ test('workflows block audits and publish the exact attested draft assets', async
   assert.match(release, /if: github\.ref_type == 'tag'/);
   assert.match(release, /Release .* already exists; refusing to replace it/);
   assert.match(release, /must exist as a draft before publication/);
-  assert.match(release, /explorie-\$version-windows-x64-setup\$suffix\.exe/);
-  assert.match(release, /The Windows package will be unsigned/);
+  assert.match(release, /explorie-\$version-windows-x64-portable\$suffix\.exe/);
+  assert.doesNotMatch(release, /windows-x64-setup/);
+  assert.match(release, /The Windows portable executable will be unsigned/);
   assert.match(release, /explorie-\$version-macos-arm64\.dmg/);
   assert.match(release, /SHA256SUMS-windows\.txt/);
   assert.match(release, /SHA256SUMS-macos\.txt/);
