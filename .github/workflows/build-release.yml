@@ -277,7 +277,7 @@ jobs:
             --input $input `
             --output $output `
             --project-name $project `
-            --evbOptions.shareVirtualSystem True `
+            --evbOptions.shareVirtualSystem False `
             --evbOptions.allowRunningOfVirtualExeFiles True `
             --evbOptions.mapExecutableWithTemporaryFile True
           if ($LASTEXITCODE -ne 0) { throw "Enigma Virtual Box project generation failed." }

@@ -381,7 +381,7 @@ test('workflows block audits and publish the exact attested draft assets', async
   assert.match(release, /Install Enigma Virtual Box/);
   assert.match(release, /@insco\/enigma-virtualbox@1\.3\.4/);
   assert.doesNotMatch(release, /WebView2Loader\.dll/);
-  assert.match(release, /--evbOptions\.shareVirtualSystem True/);
+  assert.match(release, /--evbOptions\.shareVirtualSystem False/);
   assert.match(release, /--evbOptions\.allowRunningOfVirtualExeFiles True/);
   assert.match(
     release,
