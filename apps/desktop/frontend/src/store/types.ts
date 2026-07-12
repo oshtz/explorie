@@ -168,6 +168,7 @@ export interface UISlice {
   enableErrorReporting: boolean;
   showPreviewPanel: boolean;
   showStatusBar: boolean;
+  remoteDrivesEnabled: boolean;
   themes: Record<string, ThemeSpec>;
   setViewMode: (mode: ViewMode) => void;
   setTheme: (theme: ThemeMode) => void;
@@ -186,6 +187,7 @@ export interface UISlice {
   setEnableErrorReporting: (v: boolean) => void;
   setShowPreviewPanel: (show: boolean) => void;
   setShowStatusBar: (show: boolean) => void;
+  setRemoteDrivesEnabled: (enabled: boolean) => void;
   saveTheme: (name: string, spec?: ThemeSpec) => void;
   deleteTheme: (name: string) => void;
   applyThemeSpec: (spec: ThemeSpec) => void;

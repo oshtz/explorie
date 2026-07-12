@@ -76,6 +76,21 @@ vi.mock('../hooks/useMarqueeSelection', () => ({
   }),
 }));
 
+vi.mock('../hooks/useVirtualRows', () => ({
+  useVirtualRows: ({ count }: { count: number }) => {
+    const rendered = Math.min(count, 20);
+    return {
+      totalSize: count * 34,
+      virtualRows: Array.from({ length: rendered }, (_, index) => ({
+        index,
+        start: index * 34,
+        size: 34,
+        key: index,
+      })),
+    };
+  },
+}));
+
 vi.mock('./ContextMenu', async () => {
   const ReactActual = await vi.importActual<typeof import('react')>('react');
   return {
@@ -316,6 +331,27 @@ describe('ColumnView', () => {
     expect(screen.getByText('render')).toBeInTheDocument();
     expect(screen.getAllByText('docs').length).toBeGreaterThan(0);
     expect(screen.getByText('readme.md')).toBeInTheDocument();
+  });
+
+  it('renders only the virtualized slice of a large column', () => {
+    storeState.pathStack = ['/large'];
+    const files = Array.from({ length: 1000 }, (_, index) =>
+      makeEntry(`/large/file-${String(index).padStart(4, '0')}.txt`)
+    );
+
+    render(
+      <ColumnView
+        pathStack={storeState.pathStack}
+        columnFiles={{ '/large': files } as any}
+        onFolderClick={vi.fn()}
+        onColumnBack={vi.fn()}
+      />
+    );
+
+    const options = screen.getAllByRole('option');
+    expect(options).toHaveLength(20);
+    expect(options[0]).toHaveAttribute('aria-setsize', '1000');
+    expect(screen.queryByText('file-0999.txt')).not.toBeInTheDocument();
   });
 
   it('filters hidden entries, folder mode, search results, and draft folders', () => {

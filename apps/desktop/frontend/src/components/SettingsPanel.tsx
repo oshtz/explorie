@@ -76,6 +76,8 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
     setShowPreviewPanel,
     showStatusBar,
     setShowStatusBar,
+    remoteDrivesEnabled,
+    setRemoteDrivesEnabled,
     showFolderSizes,
     setShowFolderSizes,
     previewExecutableScripts,
@@ -163,6 +165,7 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
     setShowFolderSizes(false);
     setShowPreviewPanel(false);
     setShowStatusBar(true);
+    setRemoteDrivesEnabled(false);
     setPreviewExecutableScripts(false);
     setConfirmBeforeDelete(true);
     setEnableErrorReporting(false);
@@ -254,6 +257,20 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
                   onChange={(e) => setShowFolderSizes(e.target.checked)}
                 />
                 <span className={styles.checkboxRowLabel}>Show folder sizes</span>
+              </label>
+              <label className={styles.checkboxRow}>
+                <input
+                  type="checkbox"
+                  checked={remoteDrivesEnabled}
+                  onChange={(e) => setRemoteDrivesEnabled(e.target.checked)}
+                />
+                <span className={styles.checkboxRowLabel}>
+                  Enable Remote Drives
+                  <span className={styles.rowHint}>
+                    Show and auto-connect configured rclone remotes; existing mounts remain until
+                    restart
+                  </span>
+                </span>
               </label>
               <label className={styles.checkboxRow}>
                 <input

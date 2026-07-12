@@ -1173,7 +1173,7 @@ dependencies = [
 
 [[package]]
 name = "explorie-desktop"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "cc",
  "dirs 5.0.1",

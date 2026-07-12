@@ -81,3 +81,17 @@ export function seedFromEntries(
     pruneCache(now);
   }
 }
+
+export function mergeDirectorySizes<T extends { id: string; size: number }>(
+  entries: T[],
+  sizes: ReadonlyMap<string, number>
+): T[] {
+  let changed = false;
+  const next = entries.map((entry) => {
+    const size = sizes.get(entry.id);
+    if (size === undefined || size === entry.size) return entry;
+    changed = true;
+    return { ...entry, size };
+  });
+  return changed ? next : entries;
+}

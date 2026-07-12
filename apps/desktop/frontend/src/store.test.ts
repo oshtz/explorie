@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { useFileStore, type FileEntry, type SmartFolderCriteria, type ThemeSpec } from './store';
 import type { StoreState } from './store/types';
-import { normalizeThemeSpec } from './store/slices/uiSlice';
+import { loadRemoteDrivesEnabled, normalizeThemeSpec } from './store/slices/uiSlice';
 
 const initialState = useFileStore.getState();
 
@@ -84,6 +84,7 @@ function resetStore(overrides: Partial<StoreState> = {}) {
       enableErrorReporting: false,
       showPreviewPanel: false,
       showStatusBar: true,
+      remoteDrivesEnabled: false,
       themes: {},
       favorites: [],
       workspaces: {},
@@ -103,6 +104,25 @@ describe('useFileStore', () => {
     vi.setSystemTime(new Date('2026-06-03T12:00:00Z'));
     localStorage.clear();
     resetStore();
+  });
+
+  it('enables existing remote-drive profiles unless explicitly disabled', () => {
+    localStorage.setItem(
+      'explorie:remoteDrives',
+      JSON.stringify([
+        {
+          id: '672ce77a-b72d-4e16-a9e8-55e0ac5bc580',
+          name: 'Archive',
+          remote: 'cloud',
+          remotePath: '',
+          mountTarget: 'R:',
+        },
+      ])
+    );
+    expect(loadRemoteDrivesEnabled()).toBe(true);
+
+    localStorage.setItem('explorie:remoteDrivesEnabled', 'false');
+    expect(loadRemoteDrivesEnabled()).toBe(false);
   });
 
   it('adds favorites and avoids duplicates', () => {
@@ -218,6 +238,7 @@ describe('useFileStore', () => {
     store.setEnableErrorReporting(true);
     store.setShowPreviewPanel(true);
     store.setShowStatusBar(false);
+    store.setRemoteDrivesEnabled(true);
 
     expect(useFileStore.getState()).toMatchObject({
       viewMode: 'grid',
@@ -237,6 +258,7 @@ describe('useFileStore', () => {
       enableErrorReporting: true,
       showPreviewPanel: true,
       showStatusBar: false,
+      remoteDrivesEnabled: true,
     });
     expect(localStorage.getItem('explorie:viewMode')).toBe('grid');
     expect(localStorage.getItem('explorie:accentCustom')).toBe('#ff00aa');
@@ -244,6 +266,7 @@ describe('useFileStore', () => {
     expect(localStorage.getItem('explorie:listRowHeight')).toBe('52');
     expect(localStorage.getItem('explorie:gridMinWidth')).toBe('120');
     expect(localStorage.getItem('explorie:iconSize')).toBe('10');
+    expect(localStorage.getItem('explorie:remoteDrivesEnabled')).toBe('true');
   });
 
   it('saves, deletes, and applies theme specs', () => {

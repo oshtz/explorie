@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   clearDirSizeCache,
   getCachedDirSize,
+  mergeDirectorySizes,
   seedFromEntries,
   setCachedDirSize,
 } from './dirSizeCache';
@@ -35,5 +36,18 @@ describe('dirSizeCache', () => {
     expect(getCachedDirSize('/a')).toBe(100);
     expect(getCachedDirSize('/b')).toBeUndefined();
     expect(getCachedDirSize('/c')).toBeUndefined();
+  });
+
+  it('merges a size batch without replacing unchanged entries or arrays', () => {
+    const entries = [
+      { id: 'a', size: 0 },
+      { id: 'b', size: 5 },
+    ];
+
+    const merged = mergeDirectorySizes(entries, new Map([['a', 10]]));
+    expect(merged).not.toBe(entries);
+    expect(merged[0]).toEqual({ id: 'a', size: 10 });
+    expect(merged[1]).toBe(entries[1]);
+    expect(mergeDirectorySizes(merged, new Map([['a', 10]]))).toBe(merged);
   });
 });

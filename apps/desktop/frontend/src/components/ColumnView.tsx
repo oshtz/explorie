@@ -16,6 +16,7 @@ import { useToast } from './Toast';
 import { deleteWithUndo } from '../utils/fileOperations';
 import { reportError } from '../utils/errorReporter';
 import type { GetSelectedFilesFunction } from '../hooks/useKeyboardClipboard';
+import { useVirtualRows } from '../hooks/useVirtualRows';
 
 // Column width constants
 const MIN_COLUMN_WIDTH = 180;
@@ -250,8 +251,7 @@ function formatBytes(bytes: number, decimals = 1): string {
   return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
 }
 
-// Row height for column view items
-const COLUMN_ROW_HEIGHT = 28;
+const columnRowHeight = (uiScale: number) => Math.round(32 * uiScale) + 2;
 
 type ColumnSelection = { ids: Set<string>; anchor: number | null };
 type ColumnSelectionByPath = Record<string, ColumnSelection>;
@@ -273,6 +273,7 @@ interface ColumnFileListProps {
   editingId: string | null;
   renderEditingItem: (entry: FileEntry, path: string) => React.ReactNode;
   listRef?: React.Ref<HTMLUListElement>;
+  rowHeight: number;
 }
 
 function ColumnFileList({
@@ -291,6 +292,7 @@ function ColumnFileList({
   editingId,
   renderEditingItem,
   listRef: externalRef,
+  rowHeight,
 }: ColumnFileListProps) {
   const internalRef = React.useRef<HTMLUListElement>(null);
   const listRef = (externalRef as React.RefObject<HTMLUListElement>) || internalRef;
@@ -298,15 +300,15 @@ function ColumnFileList({
   const getItemRect = React.useCallback(
     (index: number) => {
       if (index < 0 || index >= visible.length) return null;
-      const top = index * COLUMN_ROW_HEIGHT;
+      const top = index * rowHeight;
       return {
         left: 0,
         top,
         right: listRef.current?.clientWidth ?? 200,
-        bottom: top + COLUMN_ROW_HEIGHT,
+        bottom: top + rowHeight,
       };
     },
-    [visible.length, listRef]
+    [visible.length, listRef, rowHeight]
   );
 
   const getItemId = React.useCallback(
@@ -340,10 +342,27 @@ function ColumnFileList({
     getItemId,
     onSelectionChange: handleMarqueeSelectionChange,
     enabled: !draggingItemIds?.size,
-    itemSelector: 'li',
+    itemSelector: 'li[data-file-id]',
     onEmptyClick: handleEmptyClick,
   });
   const focusId = selectedIds.values().next().value;
+  const { totalSize, virtualRows } = useVirtualRows({
+    count: visible.length,
+    parentRef: listRef as React.RefObject<HTMLElement>,
+    estimateSize: rowHeight,
+    overscan: 4,
+    freeze: !!draggingItemIds?.size,
+  });
+  const topSpacer = virtualRows[0]?.start ?? 0;
+  const lastRow = virtualRows[virtualRows.length - 1];
+  const bottomSpacer = lastRow ? Math.max(0, totalSize - lastRow.start - lastRow.size) : 0;
+  const spacerStyle = (height: number): React.CSSProperties => ({
+    height,
+    minHeight: height,
+    margin: 0,
+    padding: 0,
+    pointerEvents: 'none',
+  });
 
   return (
     <ul
@@ -356,7 +375,7 @@ function ColumnFileList({
       onMouseDown={(e) => {
         if (e.button !== 0) return;
         const target = e.target as HTMLElement;
-        if (target.closest('li')) return;
+        if (target.closest('li[data-file-id]')) return;
         marquee.onMouseDown(e);
         onHoverFolder?.(null);
       }}
@@ -380,7 +399,11 @@ function ColumnFileList({
           This folder is empty
         </li>
       )}
-      {visible.map((entry, index) => {
+      {topSpacer > 0 && <li aria-hidden="true" style={spacerStyle(topSpacer)} />}
+      {virtualRows.map((row) => {
+        const index = row.index;
+        const entry = visible[index];
+        if (!entry) return null;
         const isFolder = isDirectory(entry);
         const fileName = entry.path.split(/[/\\]/).pop() || entry.path;
         const isSource = draggingItemIds?.has(entry.id) ?? false;
@@ -392,6 +415,8 @@ function ColumnFileList({
             className={`${styles.fileItem} ${isFolder ? styles.folder : styles.file} ${selectedIds.has(entry.id) ? styles.selected : ''} ${isSource ? styles.dragSource : ''} ${dragCombineTargetId === entry.id && isFolder ? styles.dropTarget : ''}`}
             role="option"
             aria-selected={selectedIds.has(entry.id)}
+            aria-setsize={visible.length}
+            aria-posinset={index + 1}
             tabIndex={focusId === entry.id ? 0 : -1}
             aria-label={isFolder ? `Open folder ${fileName}` : `Select file ${fileName}`}
             onClick={(e) => onItemClick(e, index, entry)}
@@ -419,7 +444,11 @@ function ColumnFileList({
               if (draggingItemIds?.size && isFolder && !isSource) onHoverFolder?.(entry);
               else if (draggingItemIds?.size) onHoverFolder?.(null);
             }}
-            style={isSource ? { pointerEvents: 'none' } : undefined}
+            style={{
+              height: rowHeight - 2,
+              minHeight: rowHeight - 2,
+              ...(isSource ? { pointerEvents: 'none' } : {}),
+            }}
           >
             <span className={styles.fileIcon}>
               <Icon name={getFileIconName(entry)} />
@@ -437,6 +466,7 @@ function ColumnFileList({
           </li>
         );
       })}
+      {bottomSpacer > 0 && <li aria-hidden="true" style={spacerStyle(bottomSpacer)} />}
     </ul>
   );
 }
@@ -507,7 +537,9 @@ function ColumnViewInner({
     editingId,
     pathStack: pathStackState,
     confirmBeforeDelete,
+    uiScale,
   } = useFileStore();
+  const rowHeight = columnRowHeight(uiScale ?? 1);
   const setEditingId = useFileStore((s) => s.setEditingId);
   const setDraftNew = useFileStore((s) => s.setDraftNew);
   const setPathStackStore = useFileStore((s) => s.setPathStack);
@@ -757,14 +789,19 @@ function ColumnViewInner({
   const lastColumnListRef = useRef<HTMLUListElement | null>(null);
 
   // Scroll selected item into view
-  const scrollItemIntoView = useCallback((index: number) => {
-    const list = lastColumnListRef.current;
-    if (!list) return;
-    const item = list.children[index] as HTMLElement | undefined;
-    if (item) {
-      item.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
-    }
-  }, []);
+  const scrollItemIntoView = useCallback(
+    (index: number) => {
+      const list = lastColumnListRef.current;
+      if (!list) return;
+      const top = index * rowHeight;
+      const bottom = top + rowHeight;
+      if (top < list.scrollTop) list.scrollTop = top;
+      else if (bottom > list.scrollTop + list.clientHeight) {
+        list.scrollTop = bottom - list.clientHeight;
+      }
+    },
+    [rowHeight]
+  );
 
   // Track the previous pathStack length to detect navigation direction
   const prevPathStackLengthRef = useRef(pathStack.length);
@@ -1124,6 +1161,7 @@ function ColumnViewInner({
                       draggingItemIds={draggingItemIds}
                       dragStart={dragStart}
                       editingId={editingId}
+                      rowHeight={rowHeight}
                       listRef={colIdx === pathStack.length - 1 ? lastColumnListRef : undefined}
                       renderEditingItem={(entry, containerPath) => (
                         <InlineRenameCol
