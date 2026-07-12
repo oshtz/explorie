@@ -12,7 +12,7 @@ on:
         required: true
         default: false
       windows_real_machine_verified:
-        description: Windows install, launch, unsigned warning, and disposable filesystem operations passed
+        description: Windows portable launch, unsigned warning, remote drives, and disposable filesystem operations passed
         type: boolean
         required: true
         default: false
@@ -163,7 +163,7 @@ jobs:
           CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_PASSWORD }}
         run: |
           $available = [bool]$env:CERTIFICATE -and [bool]$env:CERTIFICATE_PASSWORD
-          if (-not $available) { Write-Warning "The Windows package will be unsigned." }
+          if (-not $available) { Write-Warning "The Windows portable executable will be unsigned." }
           "available=$($available.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
 
       - name: Build application executable
@@ -214,10 +214,86 @@ jobs:
           }
           Remove-Item -LiteralPath $certificatePath -Force
 
-      - name: Build NSIS installer
-        run: pnpm --filter explorie-desktop exec -- tauri bundle --bundles nsis --ci
+      - name: Restore Enigma Virtual Box installer cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.tool_cache }}/enigma-virtual-box/enigmavb.exe
+          key: enigma-virtual-box-AB743F5E3DD927A288E126BBB053D367F270592E89378C9A06B7F3B15FA1EE35
 
-      - name: Sign and stage Windows installer
+      - name: Install Enigma Virtual Box
+        shell: pwsh
+        run: |
+          $cache = Join-Path $env:RUNNER_TOOL_CACHE "enigma-virtual-box"
+          $installer = Join-Path $cache "enigmavb.exe"
+          $expectedHash = "AB743F5E3DD927A288E126BBB053D367F270592E89378C9A06B7F3B15FA1EE35"
+          New-Item -ItemType Directory -Force -Path $cache | Out-Null
+
+          if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
+            for ($attempt = 1; $attempt -le 3; $attempt++) {
+              try {
+                Invoke-WebRequest -Uri "https://www.enigmaprotector.com/assets/files/enigmavb.exe" -OutFile $installer -UseBasicParsing -MaximumRedirection 5
+                break
+              } catch {
+                if ($attempt -eq 3) { throw }
+                Start-Sleep -Seconds 2
+              }
+            }
+          }
+          $hash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash
+          if ($hash -ne $expectedHash) { throw "Enigma Virtual Box installer hash mismatch." }
+          $signature = Get-AuthenticodeSignature -LiteralPath $installer
+          if ($signature.Status -ne "Valid" -or $signature.SignerCertificate.Subject -notmatch "enigmaprotector\.com") {
+            throw "Enigma Virtual Box installer signature is invalid."
+          }
+
+          $install = Start-Process -FilePath $installer -ArgumentList @("/VERYSILENT", "/NORESTART") -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "Enigma Virtual Box installation failed with exit code $($install.ExitCode)." }
+          $console = @(
+            "C:\Program Files (x86)\Enigma Virtual Box\enigmavbconsole.exe",
+            "C:\Program Files\Enigma Virtual Box\enigmavbconsole.exe"
+          ) | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+          if (-not $console) { throw "enigmavbconsole.exe was not found after installation." }
+          "EVB_CONSOLE=$console" >> $env:GITHUB_ENV
+
+      - name: Build Windows portable executable
+        shell: pwsh
+        run: |
+          $input = "target/release/explorie-desktop.exe"
+          $rclone = "target/release/rclone.exe"
+          $winfsp = "apps/desktop/frontend/src-tauri/resources/winfsp-2.1.25156.msi"
+          $webview = Get-ChildItem target -Recurse -Filter "WebView2Loader.dll" |
+            Where-Object { $_.FullName -match "\\release\\" } |
+            Select-Object -First 1
+          if (-not (Test-Path -LiteralPath $input -PathType Leaf)) { throw "Application executable was not found." }
+          if (-not (Test-Path -LiteralPath $rclone -PathType Leaf)) { throw "rclone executable was not found." }
+          if (-not $webview) { throw "WebView2Loader.dll was not found." }
+
+          $staging = Join-Path $env:RUNNER_TEMP "explorie-evb"
+          New-Item -ItemType Directory -Force -Path $staging, "$staging/installers", "$staging/licenses" | Out-Null
+          Copy-Item -LiteralPath $webview.FullName -Destination "$staging/WebView2Loader.dll"
+          Copy-Item -LiteralPath $rclone -Destination "$staging/rclone.exe"
+          Copy-Item -LiteralPath $winfsp -Destination "$staging/installers/winfsp-2.1.25156.msi"
+          Copy-Item -LiteralPath "apps/desktop/frontend/src-tauri/resources/rclone-COPYING" -Destination "$staging/licenses/rclone-COPYING"
+          Copy-Item -LiteralPath "apps/desktop/frontend/src-tauri/resources/winfsp-NOTICE.txt" -Destination "$staging/licenses/winfsp-NOTICE.txt"
+
+          $project = Join-Path $env:RUNNER_TEMP "explorie.evb"
+          $output = "target/release/explorie-portable.exe"
+          pnpm --package=@insco/enigma-virtualbox@1.3.4 dlx enigmavirtualbox generate $staging `
+            --input $input `
+            --output $output `
+            --project-name $project `
+            --evbOptions.shareVirtualSystem True `
+            --evbOptions.allowRunningOfVirtualExeFiles True `
+            --evbOptions.mapExecutableWithTemporaryFile True
+          if ($LASTEXITCODE -ne 0) { throw "Enigma Virtual Box project generation failed." }
+          & $env:EVB_CONSOLE $project
+          if ($LASTEXITCODE -ne 0) { throw "Enigma Virtual Box packaging failed." }
+          if (-not (Test-Path -LiteralPath $output -PathType Leaf)) { throw "Portable executable was not created." }
+          if ((Get-Item -LiteralPath $output).Length -le (Get-Item -LiteralPath $input).Length) {
+            throw "Portable executable does not contain the staged resources."
+          }
+
+      - name: Sign and stage Windows portable executable
         shell: pwsh
         env:
           CERTIFICATE: ${{ secrets.WINDOWS_CODESIGN_CERTIFICATE }}
@@ -225,64 +301,37 @@ jobs:
           SIGNTOOL: ${{ steps.signtool.outputs.path }}
           SIGNING_AVAILABLE: ${{ steps.signing.outputs.available }}
         run: |
-          $installers = @(Get-ChildItem target/release/bundle/nsis/*-setup.exe)
-          if ($installers.Count -ne 1) {
-            throw "Expected exactly one NSIS installer, found $($installers.Count)."
-          }
-
-          $installer = $installers[0].FullName
+          $portable = "target/release/explorie-portable.exe"
           if ($env:SIGNING_AVAILABLE -eq "true") {
             $certificatePath = Join-Path $env:RUNNER_TEMP "explorie-codesign.pfx"
             [IO.File]::WriteAllBytes($certificatePath, [Convert]::FromBase64String($env:CERTIFICATE))
-            & $env:SIGNTOOL sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $certificatePath /p $env:CERTIFICATE_PASSWORD $installer
-            if ($LASTEXITCODE -ne 0) { throw "Installer signing failed." }
-            & $env:SIGNTOOL verify /pa /v $installer
-            if ($LASTEXITCODE -ne 0) { throw "Installer signature verification failed." }
+            & $env:SIGNTOOL sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $certificatePath /p $env:CERTIFICATE_PASSWORD $portable
+            if ($LASTEXITCODE -ne 0) { throw "Portable executable signing failed." }
+            & $env:SIGNTOOL verify /pa /v $portable
+            if ($LASTEXITCODE -ne 0) { throw "Portable executable signature verification failed." }
             Remove-Item -LiteralPath $certificatePath -Force
+          } elseif ((Get-AuthenticodeSignature -LiteralPath $portable).Status -ne "NotSigned") {
+            throw "Unsigned portable executable has an unexpected Authenticode status."
           }
 
           $version = (Get-Content package.json | ConvertFrom-Json).version
           $staging = "release-artifacts/windows"
           New-Item -ItemType Directory -Force $staging | Out-Null
           $suffix = if ($env:SIGNING_AVAILABLE -eq "true") { "" } else { "-unsigned" }
-          $asset = Join-Path $staging "explorie-$version-windows-x64-setup$suffix.exe"
-          Copy-Item -LiteralPath $installer -Destination $asset
+          $asset = Join-Path $staging "explorie-$version-windows-x64-portable$suffix.exe"
+          Copy-Item -LiteralPath $portable -Destination $asset
           $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $asset).Hash.ToLowerInvariant()
           "$hash *$(Split-Path $asset -Leaf)" | Set-Content -Encoding ascii (Join-Path $staging "SHA256SUMS-windows.txt")
 
-      - name: Smoke test Windows installer
+      - name: Smoke test Windows portable executable
         shell: pwsh
         run: |
-          $installers = @(Get-ChildItem target/release/bundle/nsis/*-setup.exe)
-          if ($installers.Count -ne 1) { throw "Expected exactly one NSIS installer." }
-
-          $installDir = Join-Path $env:RUNNER_TEMP "explorie-smoke-$env:GITHUB_RUN_ID"
-          if (Test-Path -LiteralPath $installDir) { throw "Smoke-test directory already exists." }
-          $install = Start-Process -FilePath $installers[0].FullName -ArgumentList @("/S", "/D=$installDir") -Wait -PassThru
-          if ($install.ExitCode -ne 0) { throw "NSIS smoke install failed with exit code $($install.ExitCode)." }
-
-          $installedExe = Get-ChildItem -LiteralPath $installDir -Recurse -Filter "*.exe" |
-            Where-Object { $_.Name -notmatch "(?i)uninstall" } |
-            Sort-Object { if ($_.Name -match "(?i)^explorie(-desktop)?\.exe$") { 0 } else { 1 } } |
-            Select-Object -First 1
-          if (-not $installedExe) { throw "Installed application executable was not found." }
-          $installedRclone = Get-ChildItem -LiteralPath $installDir -Recurse -Filter "rclone.exe" | Select-Object -First 1
-          if (-not $installedRclone) { throw "Installed rclone sidecar was not found." }
-          $rcloneVersion = & $installedRclone.FullName version | Select-Object -First 1
-          if ($rcloneVersion -ne "rclone v1.74.4") { throw "Unexpected installed rclone version: $rcloneVersion" }
-          if (-not (Get-ChildItem -LiteralPath $installDir -Recurse -Filter "rclone-COPYING" | Select-Object -First 1)) {
-            throw "Installed rclone license was not found."
-          }
-          $winfspInstaller = Get-ChildItem -LiteralPath $installDir -Recurse -Filter "winfsp-2.1.25156.msi" | Select-Object -First 1
-          if (-not $winfspInstaller) { throw "Bundled WinFsp installer was not found." }
-          if (-not (Get-ChildItem -LiteralPath $installDir -Recurse -Filter "winfsp-NOTICE.txt" | Select-Object -First 1)) {
-            throw "Bundled WinFsp notice was not found."
-          }
-
-          $app = Start-Process -FilePath $installedExe.FullName -WorkingDirectory $installedExe.DirectoryName -PassThru
+          $portable = @(Get-ChildItem release-artifacts/windows/*-windows-x64-portable*.exe)
+          if ($portable.Count -ne 1) { throw "Expected exactly one portable executable." }
+          $app = Start-Process -FilePath $portable[0].FullName -WorkingDirectory $portable[0].DirectoryName -PassThru
           Start-Sleep -Seconds 8
           $app.Refresh()
-          if ($app.HasExited) { throw "Installed application exited during launch smoke test." }
+          if ($app.HasExited) { throw "Portable application exited during launch smoke test." }
           Stop-Process -Id $app.Id -Force
 
       - name: Upload Windows package
@@ -570,10 +619,10 @@ jobs:
           sha256sum --check SHA256SUMS-windows.txt
           sha256sum --check SHA256SUMS-macos.txt
           shopt -s nullglob
-          windows=(explorie-*-windows-x64-setup*.exe)
+          windows=(explorie-*-windows-x64-portable*.exe)
           macos=(explorie-*-macos-arm64.dmg)
           if [ "${#windows[@]}" -ne 1 ] || [ "${#macos[@]}" -ne 1 ]; then
-            echo "Draft release must contain exactly one Windows installer and one macOS DMG."
+            echo "Draft release must contain exactly one Windows portable executable and one macOS DMG."
             exit 1
           fi
 
