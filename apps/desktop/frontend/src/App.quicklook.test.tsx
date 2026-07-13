@@ -8,6 +8,21 @@ import type { StoreState } from './store/types';
 
 const initialFileStoreState = useFileStore.getState();
 
+const fsWatch = vi.hoisted(() => {
+  const callbacks: Array<(event: { type: unknown; paths: string[]; attrs: unknown }) => void> = [];
+  const unwatch = vi.fn();
+  const watch = vi.fn(
+    async (
+      _paths: string[],
+      callback: (event: { type: unknown; paths: string[]; attrs: unknown }) => void
+    ) => {
+      callbacks.push(callback);
+      return unwatch;
+    }
+  );
+  return { callbacks, unwatch, watch };
+});
+
 const sampleFiles: FileEntry[] = [
   {
     id: 'alpha',
@@ -55,6 +70,11 @@ vi.mock('@tauri-apps/api/core', () => ({
     if (command === 'get_dir_size') return 0;
     return null;
   }),
+}));
+
+vi.mock('@tauri-apps/plugin-fs', async () => ({
+  ...(await vi.importActual<typeof import('@tauri-apps/plugin-fs')>('@tauri-apps/plugin-fs')),
+  watch: fsWatch.watch,
 }));
 
 vi.mock('@tauri-apps/api/window', () => ({
@@ -373,6 +393,7 @@ function resetFileStore(overrides: Partial<StoreState> = {}) {
 }
 
 function installBrowserStubs() {
+  fsWatch.callbacks.length = 0;
   Object.defineProperty(window, 'matchMedia', {
     writable: true,
     value: vi.fn().mockImplementation((query: string) => ({
@@ -523,6 +544,64 @@ describe('App Quick Look shortcut', () => {
 
     expect(await screen.findByRole('button', { name: 'Select alpha.txt' })).toBeVisible();
     await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument());
+  });
+
+  it('refreshes visible files after filesystem changes without reacting to reads', async () => {
+    const invokeMock = vi.mocked(invoke);
+    render(<App />);
+
+    await screen.findByRole('button', { name: 'Select alpha.txt' });
+    await waitFor(() => expect(fsWatch.callbacks).toHaveLength(1));
+    invokeMock.mockClear();
+
+    act(() =>
+      fsWatch.callbacks[0]({
+        type: { access: { kind: 'open', mode: 'read' } },
+        paths: ['/root/alpha.txt'],
+        attrs: null,
+      })
+    );
+    expect(invokeMock).not.toHaveBeenCalled();
+
+    invokeMock.mockResolvedValueOnce([
+      ...sampleFiles,
+      {
+        id: 'gamma',
+        path: '/root/gamma.txt',
+        name: 'gamma.txt',
+        size: 300,
+        modified: 5,
+        is_dir: false,
+        custom: {},
+      },
+    ]);
+    act(() =>
+      fsWatch.callbacks[0]({
+        type: { create: { kind: 'file' } },
+        paths: ['/root/gamma.txt'],
+        attrs: null,
+      })
+    );
+
+    expect(await screen.findByRole('button', { name: 'Select gamma.txt' })).toBeVisible();
+  });
+
+  it('refetches cached columns when the path stack is used as a refresh signal', async () => {
+    const invokeMock = vi.mocked(invoke);
+    resetFileStore({ files: [], viewMode: 'column', pathStack: ['/root'] });
+    render(<App />);
+
+    await screen.findByRole('button', { name: 'Column select alpha.txt' });
+    invokeMock.mockClear();
+
+    act(() => useFileStore.getState().setPathStack(['/root']));
+
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith('list_files', {
+        path: '/root',
+        calc_dir_size: false,
+      })
+    );
   });
 
   it('provides keyboard-operable pane separators without application role', async () => {
