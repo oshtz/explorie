@@ -1,5 +1,6 @@
 import React, { useEffect, useState, useCallback, useMemo, useRef } from 'react';
 import { invoke, isTauri } from '@tauri-apps/api/core';
+import { watch } from '@tauri-apps/plugin-fs';
 import { useFileStore } from './store';
 import { ListView } from './components/ListView';
 import { ColumnView } from './components/ColumnView';
@@ -725,17 +726,23 @@ function AppContent() {
   // Track columnFiles in a ref to avoid dependency issues
   const columnFilesRef = useRef(columnFiles);
   columnFilesRef.current = columnFiles;
+  const previousColumnPathStackRef = useRef<string[]>([]);
 
-  // Fetch files for each path in pathStack (column view)
-  // Only fetch paths that aren't already loaded to avoid unnecessary reloads
+  // Fetch new columns, or refetch all when the same stack is emitted as a refresh signal.
   useEffect(() => {
     if (pathInitializing || !currentPath) return;
     if (viewMode === 'column') {
       let cancelled = false;
+      const previousPathStack = previousColumnPathStackRef.current;
+      const refreshRequested =
+        previousPathStack.length === pathStack.length &&
+        previousPathStack.every((path, index) => path === pathStack[index]);
+      previousColumnPathStackRef.current = pathStack;
       const fetchAll = async () => {
         const currentColumnFiles = columnFilesRef.current;
-        // Determine which paths need fetching (not already in columnFiles)
-        const pathsToFetch = pathStack.filter((p) => !currentColumnFiles[p]);
+        const pathsToFetch = refreshRequested
+          ? pathStack
+          : pathStack.filter((p) => !currentColumnFiles[p]);
 
         // If no new paths to fetch, just trim columnFiles to current pathStack
         if (pathsToFetch.length === 0) {
@@ -896,7 +903,6 @@ function AppContent() {
 
   // Refresh currently visible views (list/grid or column)
   const refreshVisibleViews = useCallback(async () => {
-    setLoading(true);
     setError(null);
     try {
       if (viewMode === 'list' || viewMode === 'grid') {
@@ -942,8 +948,6 @@ function AppContent() {
       }
     } catch (refreshError) {
       setError(formatErrorMessage(refreshError));
-    } finally {
-      setLoading(false);
     }
   }, [
     viewMode,
@@ -952,7 +956,6 @@ function AppContent() {
     showFolderSizes,
     setFiles,
     setError,
-    setLoading,
     activeSmartFolder,
     shouldUseDevMockEntries,
   ]);
@@ -1025,6 +1028,35 @@ function AppContent() {
   useEffect(() => {
     refreshVisibleViewsRef.current = refreshVisibleViews;
   }, [refreshVisibleViews]);
+
+  useEffect(() => {
+    if (!tauri || pathInitializing || activeSmartFolder || !currentPath) return;
+
+    const visiblePaths = viewMode === 'column' ? [...new Set(pathStack)] : [currentPath];
+    let disposed = false;
+    let stopWatching: (() => void) | undefined;
+
+    void watch(
+      visiblePaths,
+      (event) => {
+        if (typeof event.type === 'object' && 'access' in event.type) return;
+        void refreshVisibleViewsRef.current();
+      },
+      { recursive: false, delayMs: 200 }
+    )
+      .then((unwatch) => {
+        if (disposed) unwatch();
+        else stopWatching = unwatch;
+      })
+      .catch((watchError) => {
+        if (!disposed) console.warn('Directory watching unavailable:', watchError);
+      });
+
+    return () => {
+      disposed = true;
+      stopWatching?.();
+    };
+  }, [activeSmartFolder, currentPath, pathInitializing, pathStack, tauri, viewMode]);
 
   const handlePaletteGoUp = useCallback(() => {
     const path = normalizePath(currentPathRef.current);
