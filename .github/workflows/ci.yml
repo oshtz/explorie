@@ -280,4 +280,4 @@ jobs:
         run: |
           set -o pipefail
           echo "## Node.js Security Audit" >> $GITHUB_STEP_SUMMARY
-          pnpm audit --audit-level=moderate 2>&1 | tee -a $GITHUB_STEP_SUMMARY
+          corepack pnpm@11.13.0 audit --audit-level=moderate 2>&1 | tee -a $GITHUB_STEP_SUMMARY
