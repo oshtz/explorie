@@ -367,6 +367,7 @@ test('workflows block audits and publish the exact attested draft assets', async
   assert.match(ci, /--port 47173 --strictPort/);
   assert.doesNotMatch(ci, /audit[^\n]*\|\| true/);
   assert.match(ci, /corepack pnpm@11\.13\.0 audit --audit-level=moderate/);
+  assert.match(ci, /name: Security Audit[\s\S]*?node-version: '24'/);
   assert.match(ci, /name: Rust Tests & Coverage[\s\S]*?runs-on: windows-latest/);
   assert.match(ci, /name: macOS Core Tests & Tauri Build[\s\S]*?runs-on: macos-latest/);
   assert.match(ci, /Build macOS application[\s\S]*?tauri build --no-bundle --ci -- --locked/);
@@ -376,6 +377,7 @@ test('workflows block audits and publish the exact attested draft assets', async
   assert.match(release, /gh release create/);
   assert.match(release, /run: pnpm release:check/);
   assert.match(release, /name: Validate release source[\s\S]*?runs-on: windows-latest/);
+  assert.match(release, /name: Validate release source[\s\S]*?node-version: '24'/);
   assert.match(release, /exec -- tauri build --no-bundle --ci -- --locked/);
   assert.match(release, /exec -- tauri build --bundles dmg --ci -- --locked/);
   assert.match(
