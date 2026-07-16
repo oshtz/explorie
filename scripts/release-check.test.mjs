@@ -34,7 +34,7 @@ const expectedDisplays = [
   'cargo clippy --workspace --all-targets --all-features -- -D warnings',
   'cargo audit',
   'pnpm --filter explorie-desktop test',
-  'pnpm audit --audit-level=moderate',
+  'corepack pnpm@11.13.0 audit --audit-level=moderate',
   'pnpm exec playwright test',
   'pnpm --filter explorie-desktop exec -- tauri build --no-bundle -- --locked',
   'git diff --check',
@@ -193,6 +193,10 @@ test('createSpawnInvocation shells pnpm on Windows only', () => {
   assert.deepEqual(createSpawnInvocation('pnpm', ['--version'], 'win32'), {
     command: 'cmd.exe',
     args: ['/d', '/s', '/c', 'pnpm', '--version'],
+  });
+  assert.deepEqual(createSpawnInvocation('corepack', ['pnpm@11.13.0', '--version'], 'win32'), {
+    command: 'cmd.exe',
+    args: ['/d', '/s', '/c', 'corepack', 'pnpm@11.13.0', '--version'],
   });
   assert.deepEqual(createSpawnInvocation('pnpm', ['--version'], 'linux'), {
     command: 'pnpm',
@@ -362,6 +366,8 @@ test('workflows block audits and publish the exact attested draft assets', async
 
   assert.match(ci, /--port 47173 --strictPort/);
   assert.doesNotMatch(ci, /audit[^\n]*\|\| true/);
+  assert.match(ci, /corepack pnpm@11\.13\.0 audit --audit-level=moderate/);
+  assert.match(ci, /name: Security Audit[\s\S]*?node-version: '24'/);
   assert.match(ci, /name: Rust Tests & Coverage[\s\S]*?runs-on: windows-latest/);
   assert.match(ci, /name: macOS Core Tests & Tauri Build[\s\S]*?runs-on: macos-latest/);
   assert.match(ci, /Build macOS application[\s\S]*?tauri build --no-bundle --ci -- --locked/);
@@ -371,6 +377,7 @@ test('workflows block audits and publish the exact attested draft assets', async
   assert.match(release, /gh release create/);
   assert.match(release, /run: pnpm release:check/);
   assert.match(release, /name: Validate release source[\s\S]*?runs-on: windows-latest/);
+  assert.match(release, /name: Validate release source[\s\S]*?node-version: '24'/);
   assert.match(release, /exec -- tauri build --no-bundle --ci -- --locked/);
   assert.match(release, /exec -- tauri build --bundles dmg --ci -- --locked/);
   assert.match(

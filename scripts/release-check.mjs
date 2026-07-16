@@ -65,9 +65,9 @@ export const DEFAULT_COMMANDS = [
     args: ['--filter', 'explorie-desktop', 'test'],
   },
   {
-    display: 'pnpm audit --audit-level=moderate',
-    command: 'pnpm',
-    args: ['audit', '--audit-level=moderate'],
+    display: 'corepack pnpm@11.13.0 audit --audit-level=moderate',
+    command: 'corepack',
+    args: ['pnpm@11.13.0', 'audit', '--audit-level=moderate'],
   },
   {
     display: 'pnpm exec playwright test',
@@ -185,10 +185,10 @@ function createValidationResult(display, errors) {
 }
 
 export function createSpawnInvocation(command, args = [], platform = process.platform) {
-  if (platform === 'win32' && command === 'pnpm') {
+  if (platform === 'win32' && ['corepack', 'pnpm'].includes(command)) {
     return {
       command: 'cmd.exe',
-      args: ['/d', '/s', '/c', 'pnpm', ...args],
+      args: ['/d', '/s', '/c', command, ...args],
     };
   }
 

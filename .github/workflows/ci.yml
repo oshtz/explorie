@@ -255,7 +255,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '24'
           cache: 'pnpm'
           cache-dependency-path: pnpm-lock.yaml
 
@@ -280,4 +280,4 @@ jobs:
         run: |
           set -o pipefail
           echo "## Node.js Security Audit" >> $GITHUB_STEP_SUMMARY
-          pnpm audit --audit-level=moderate 2>&1 | tee -a $GITHUB_STEP_SUMMARY
+          corepack pnpm@11.13.0 audit --audit-level=moderate 2>&1 | tee -a $GITHUB_STEP_SUMMARY
