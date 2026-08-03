@@ -132,7 +132,7 @@ export function RemoteDrivesSection({
       const result = await disconnect(previous);
       if (result.blocked) {
         const confirmed = window.confirm(
-          `This drive still has ${result.pendingUploads} upload(s) or ${result.erroredFiles} error(s). Disconnect while preserving its cache?`
+          `${result.status.error ?? `This drive still has ${result.pendingUploads} upload(s) or ${result.erroredFiles} error(s).`} Disconnect while preserving its cache?`
         );
         if (!confirmed) return;
         await disconnect(previous, true);
@@ -148,7 +148,8 @@ export function RemoteDrivesSection({
       const result = await disconnect(profile);
       if (result.blocked) {
         window.alert(
-          `Wait for ${result.pendingUploads} upload(s) and resolve ${result.erroredFiles} error(s) before removing this drive.`
+          result.status.error ??
+            `Wait for ${result.pendingUploads} upload(s) and resolve ${result.erroredFiles} error(s) before removing this drive.`
         );
         return;
       }
@@ -168,7 +169,7 @@ export function RemoteDrivesSection({
       const result = await disconnect(profile);
       if (!result.blocked) return;
       const confirmed = window.confirm(
-        `This drive still has ${result.pendingUploads} upload(s) or ${result.erroredFiles} error(s). Disconnect while preserving its cache?`
+        `${result.status.error ?? `This drive still has ${result.pendingUploads} upload(s) or ${result.erroredFiles} error(s).`} Disconnect while preserving its cache?`
       );
       if (confirmed) await disconnect(profile, true);
     } catch (error) {

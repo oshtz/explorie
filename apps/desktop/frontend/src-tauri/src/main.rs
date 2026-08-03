@@ -32,6 +32,64 @@ struct FileOperationJobs {
     cancellations: Mutex<HashMap<String, Arc<AtomicBool>>>,
 }
 
+impl FileOperationJobs {
+    fn cancel_all(&self) {
+        for cancelled in self
+            .cancellations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+        {
+            cancelled.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+#[derive(Default)]
+struct ActiveMutations {
+    count: AtomicU64,
+    exit_requested: AtomicBool,
+}
+
+impl ActiveMutations {
+    fn begin(&self) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn finish(&self) -> bool {
+        self.count.fetch_sub(1, Ordering::AcqRel) == 1
+            && self.exit_requested.swap(false, Ordering::AcqRel)
+    }
+
+    fn request_exit(&self) -> bool {
+        let active = self.count.load(Ordering::Acquire) > 0;
+        self.exit_requested.store(active, Ordering::Release);
+        active
+    }
+}
+
+struct ActiveMutation(AppHandle);
+
+impl ActiveMutation {
+    fn begin(app: &AppHandle) -> Self {
+        app.state::<ActiveMutations>().begin();
+        Self(app.clone())
+    }
+}
+
+impl Drop for ActiveMutation {
+    fn drop(&mut self) {
+        if self.0.state::<ActiveMutations>().finish()
+            && self
+                .0
+                .state::<RemoteDriveManager>()
+                .disconnect_all_if_clean(&self.0)
+        {
+            self.0.exit(0);
+        }
+    }
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct FileOperationEvent {
@@ -505,6 +563,7 @@ fn start_file_operation(
     {
         return Err("Refusing to mutate a managed remote-drive root".to_string());
     }
+    let mutation = ActiveMutation::begin(&app);
     let job_id = format!(
         "{}-{}",
         std::process::id(),
@@ -577,6 +636,7 @@ fn start_file_operation(
             },
         };
         emit_file_operation(&task_app, event);
+        drop(mutation);
     });
 
     Ok(job_id)
@@ -1938,8 +1998,10 @@ async fn compress_files(
     compression_level: String,
     operation_id: String,
 ) -> Result<CompressResult, String> {
+    let mutation = ActiveMutation::begin(window.app_handle());
     let window = window.clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let _mutation = mutation;
         let sources: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
         let output = PathBuf::from(&output_path);
 
@@ -1993,10 +2055,13 @@ async fn compress_files(
 
 #[tauri::command]
 async fn extract_archive_cmd(
+    app: AppHandle,
     archive_path: String,
     output_dir: String,
 ) -> Result<ExtractResult, String> {
+    let mutation = ActiveMutation::begin(&app);
     tauri::async_runtime::spawn_blocking(move || {
+        let _mutation = mutation;
         let archive = PathBuf::from(&archive_path);
         let output = PathBuf::from(&output_dir);
 
@@ -2054,6 +2119,7 @@ fn main() {
             }
         }))
         .manage(FileOperationJobs::default())
+        .manage(ActiveMutations::default())
         .manage(RemoteDriveManager::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
@@ -2112,12 +2178,16 @@ fn main() {
         .expect("error while building tauri application");
 
     app.run(|app_handle, event| {
-        if let tauri::RunEvent::ExitRequested { api, .. } = event
-            && !app_handle
+        if let tauri::RunEvent::ExitRequested { api, .. } = event {
+            if app_handle.state::<ActiveMutations>().request_exit() {
+                app_handle.state::<FileOperationJobs>().cancel_all();
+                api.prevent_exit();
+            } else if !app_handle
                 .state::<RemoteDriveManager>()
                 .disconnect_all_if_clean(app_handle)
-        {
-            api.prevent_exit();
+            {
+                api.prevent_exit();
+            }
         }
     });
 }
@@ -2335,6 +2405,18 @@ mod tests {
         let root = Path::new("/");
 
         assert!(ensure_not_mount_root(root).is_err());
+    }
+
+    #[test]
+    fn exit_waits_for_the_last_active_mutation() {
+        let mutations = ActiveMutations::default();
+        mutations.begin();
+        mutations.begin();
+
+        assert!(mutations.request_exit());
+        assert!(!mutations.finish());
+        assert!(mutations.finish());
+        assert!(!mutations.request_exit());
     }
 
     #[cfg(windows)]

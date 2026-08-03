@@ -246,14 +246,14 @@ fn write_custom_fields_atomic(
 
 /// Check if a file has extended attributes (macOS xattrs, Windows ADS).
 /// This is a best-effort check that returns false if unable to determine.
-fn has_extended_attributes(path: &Path) -> bool {
+fn has_extended_attributes(_path: &Path, _metadata: &fs::Metadata) -> bool {
     #[cfg(target_os = "macos")]
     {
         use std::ffi::CString;
         use std::os::unix::ffi::OsStrExt;
 
         // Use listxattr to check if there are any xattrs
-        let c_path = match CString::new(path.as_os_str().as_bytes()) {
+        let c_path = match CString::new(_path.as_os_str().as_bytes()) {
             Ok(p) => p,
             Err(_) => return false,
         };
@@ -283,12 +283,9 @@ fn has_extended_attributes(path: &Path) -> bool {
         use std::os::windows::fs::MetadataExt;
 
         // Check for sparse file attribute as a proxy (often used with ADS)
-        if let Ok(meta) = path.symlink_metadata() {
-            const FILE_ATTRIBUTE_SPARSE_FILE: u32 = 0x200;
-            // This is a simplified check - true ADS detection requires Win32 API
-            return (meta.file_attributes() & FILE_ATTRIBUTE_SPARSE_FILE) != 0;
-        }
-        false
+        const FILE_ATTRIBUTE_SPARSE_FILE: u32 = 0x200;
+        // This is a simplified check - true ADS detection requires Win32 API
+        (_metadata.file_attributes() & FILE_ATTRIBUTE_SPARSE_FILE) != 0
     }
 
     #[cfg(not(any(target_os = "macos", windows)))]
@@ -297,7 +294,7 @@ fn has_extended_attributes(path: &Path) -> bool {
         use std::ffi::CString;
         use std::os::unix::ffi::OsStrExt;
 
-        let c_path = match CString::new(path.as_os_str().as_bytes()) {
+        let c_path = match CString::new(_path.as_os_str().as_bytes()) {
             Ok(p) => p,
             Err(_) => return false,
         };
@@ -483,7 +480,7 @@ pub fn list_dir_with_sizes(path: &Path, calc_dir_size: bool) -> io::Result<Vec<F
             };
 
             // Check for extended attributes
-            let has_xattrs = has_extended_attributes(&entry.path());
+            let has_xattrs = has_extended_attributes(&entry.path(), &symlink_meta);
 
             // Use link metadata throughout so dangling links remain listable and
             // directory links are never traversed as real directories.
