@@ -15,6 +15,7 @@ use uuid::Uuid;
 use sha2::{Digest, Sha256};
 
 const READY_TIMEOUT: Duration = Duration::from_secs(15);
+const RC_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -389,7 +390,27 @@ impl RemoteDriveManager {
             mount
         };
 
-        let (pending, errors) = vfs_stats(&mount).unwrap_or((0, 0));
+        let (pending, errors) = match disconnect_stats(force, || vfs_stats(&mount)) {
+            Ok(stats) => stats,
+            Err(error) => {
+                let mount_path = mount.mount_path.to_string_lossy().into_owned();
+                self.mounts
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(id.to_string(), mount);
+                return Ok(DisconnectResult {
+                    status: status(
+                        id,
+                        "connected",
+                        Some(mount_path),
+                        Some(format!("Unable to verify pending remote writes: {error}")),
+                    ),
+                    pending_uploads: 0,
+                    errored_files: 0,
+                    blocked: true,
+                });
+            }
+        };
         if !force && (pending > 0 || errors > 0) {
             self.mounts
                 .lock()
@@ -470,6 +491,9 @@ impl RemoteDriveManager {
                 Ok(result) if result.blocked => {
                     blocker.pending_uploads += result.pending_uploads;
                     blocker.errored_files += result.errored_files;
+                    if result.status.error.is_some() {
+                        blocker.error = result.status.error;
+                    }
                 }
                 Ok(_) => {}
                 Err(error) => blocker.error = Some(error),
@@ -880,11 +904,31 @@ fn rc_call(
     pass: &str,
     endpoint: &str,
 ) -> Result<Value, String> {
-    let output = Command::new(rclone)
+    let mut child = Command::new(rclone)
         .args(["rc", "--url", url, endpoint])
         .env("RCLONE_RC_USER", user)
         .env("RCLONE_RC_PASS", pass)
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    let started = Instant::now();
+    while child
+        .try_wait()
+        .map_err(|error| error.to_string())?
+        .is_none()
+    {
+        if started.elapsed() >= RC_TIMEOUT {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "rclone remote-control call timed out after {RC_TIMEOUT:?}"
+            ));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    let output = child
+        .wait_with_output()
         .map_err(|error| error.to_string())?;
     if !output.status.success() {
         return Err(command_error(
@@ -893,6 +937,13 @@ fn rc_call(
         ));
     }
     serde_json::from_slice(&output.stdout).map_err(|error| error.to_string())
+}
+
+fn disconnect_stats(
+    force: bool,
+    get_stats: impl FnOnce() -> Result<(u64, u64), String>,
+) -> Result<(u64, u64), String> {
+    if force { Ok((0, 0)) } else { get_stats() }
 }
 
 fn vfs_stats(mount: &RunningMount) -> Result<(u64, u64), String> {
@@ -1168,6 +1219,18 @@ mod tests {
         assert!(ensure_mount_target_available(&target).is_err());
         fs::remove_dir(&target).unwrap();
         assert!(ensure_mount_target_available(&target).is_ok());
+    }
+
+    #[test]
+    fn forced_disconnect_skips_unavailable_remote_stats() {
+        assert_eq!(
+            disconnect_stats(true, || Err("offline".to_string())),
+            Ok((0, 0))
+        );
+        assert_eq!(
+            disconnect_stats(false, || Err("offline".to_string())),
+            Err("offline".to_string())
+        );
     }
 
     #[cfg(windows)]
