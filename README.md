@@ -91,6 +91,17 @@ sample/                    # Demo data + .explorie.json examples
 
 ---
 
+## Install
+
+Download the latest build from [GitHub Releases](https://github.com/oshtz/explorie/releases/latest):
+
+- **Windows 10/11 x64:** Download `explorie-<version>-windows-x64-portable-unsigned.exe` and run it directly. No installation is required; Windows may show an unsigned-app warning.
+- **macOS 13+ on Apple silicon:** Download `explorie-<version>-macos-arm64.dmg`, open it, and move Explorie to Applications.
+
+Platform-specific `SHA256SUMS` files are published alongside each release.
+
+---
+
 ## Quickstart
 
 ```bash
