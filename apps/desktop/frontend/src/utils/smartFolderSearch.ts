@@ -1,10 +1,8 @@
 import { invoke } from '@tauri-apps/api/core';
-import { readFile } from './fs';
 import { parseToMs } from './date';
 import { basename, normalizePathForCompare } from './path';
 import type { FileEntry, SmartFolderCriteria } from '../store';
-
-const MAX_CONTENT_BYTES = 5 * 1024 * 1024;
+import { lookupIndexedText, registerContentIndexRoots } from './contentSearchIndex';
 
 type NameMatcher = (name: string) => boolean;
 
@@ -66,13 +64,9 @@ async function matchesContent(entry: FileEntry, query?: string): Promise<boolean
   const needle = query?.trim().toLowerCase();
   if (!needle) return true;
   if (entry.is_dir) return false;
-  if (entry.size > MAX_CONTENT_BYTES) return false;
-  try {
-    const text = await readFile(entry.path);
-    return text.toLowerCase().includes(needle);
-  } catch {
-    return false;
-  }
+  const text = await lookupIndexedText(entry);
+  if (text == null) return false;
+  return text.includes(needle);
 }
 
 async function listFiles(path: string): Promise<FileEntry[]> {
@@ -143,6 +137,8 @@ export async function runSmartFolderSearch(criteria: SmartFolderCriteria): Promi
     ? criteria.searchPaths.filter((p) => typeof p === 'string' && p.trim().length > 0)
     : [];
   if (searchPaths.length === 0) return [];
+
+  registerContentIndexRoots(searchPaths);
 
   const recursive = criteria.recursive !== false;
   const nameMatcher = buildNameMatcher(criteria.namePattern, criteria.nameRegex);

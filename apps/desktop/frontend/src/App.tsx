@@ -18,6 +18,13 @@ import { useUndoRedoStore, useCanUndo, useCanRedo } from './undoRedoStore';
 import { OperationProgress } from './components/OperationProgress';
 import { getParentPath as getParentPathUtil, normalizePath } from './utils/path';
 import { runSmartFolderSearch } from './utils/smartFolderSearch';
+import {
+  createTauriContentIndexStorage,
+  hydrateContentIndexFromStorage,
+  invalidateContentIndexForPaths,
+  registerContentIndexRoots,
+  setContentIndexStorage,
+} from './utils/contentSearchIndex';
 import { sortFiles, type SortDir, type SortKey } from './components/FileTable';
 import { useTabs } from './hooks/useTabs';
 import { useWorkspaceManager } from './hooks/useWorkspaceManager';
@@ -1030,6 +1037,17 @@ function AppContent() {
   }, [refreshVisibleViews]);
 
   useEffect(() => {
+    const opened = viewMode === 'column' ? pathStack : currentPath ? [currentPath] : [];
+    const smartRoots = Object.values(smartFolders).flatMap((folder) => folder.criteria.searchPaths);
+    registerContentIndexRoots([...opened, ...smartRoots]);
+  }, [currentPath, pathStack, smartFolders, viewMode]);
+
+  useEffect(() => {
+    setContentIndexStorage(createTauriContentIndexStorage());
+    void hydrateContentIndexFromStorage();
+  }, []);
+
+  useEffect(() => {
     if (!tauri || pathInitializing || activeSmartFolder || !currentPath) return;
 
     const visiblePaths = viewMode === 'column' ? [...new Set(pathStack)] : [currentPath];
@@ -1040,6 +1058,7 @@ function AppContent() {
       visiblePaths,
       (event) => {
         if (typeof event.type === 'object' && 'access' in event.type) return;
+        invalidateContentIndexForPaths(event.paths?.length ? event.paths : visiblePaths);
         void refreshVisibleViewsRef.current();
       },
       { recursive: false, delayMs: 200 }

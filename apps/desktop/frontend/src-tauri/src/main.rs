@@ -1966,6 +1966,43 @@ fn get_app_version(app: AppHandle) -> String {
     app.package_info().version.to_string()
 }
 
+fn content_search_index_file(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| error.to_string())?
+        .join("content-index");
+    fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    Ok(dir.join("index.json"))
+}
+
+#[tauri::command]
+fn load_content_search_index(app: AppHandle) -> Result<String, String> {
+    let path = content_search_index_file(&app)?;
+    if !path.exists() {
+        return Ok(String::new());
+    }
+    fs::read_to_string(path).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn save_content_search_index(app: AppHandle, json: String) -> Result<(), String> {
+    let path = content_search_index_file(&app)?;
+    fs::write(path, json).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn clear_content_search_index(app: AppHandle) -> Result<(), String> {
+    let path = content_search_index_file(&app)?;
+    if path.exists() {
+        fs::remove_file(&path).map_err(|error| error.to_string())?;
+    }
+    if let Some(dir) = path.parent() {
+        let _ = fs::remove_dir(dir);
+    }
+    Ok(())
+}
+
 // --- Archive operations ---
 
 #[derive(Debug, Serialize)]
@@ -2168,6 +2205,9 @@ fn main() {
             get_home_dir,
             get_platform,
             get_app_version,
+            load_content_search_index,
+            save_content_search_index,
+            clear_content_search_index,
             // Archive operations
             compress_files,
             extract_archive_cmd,

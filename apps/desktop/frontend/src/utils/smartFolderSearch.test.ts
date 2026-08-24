@@ -1,6 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { FileEntry, SmartFolderCriteria } from '../store';
 import { runSmartFolderSearch } from './smartFolderSearch';
+import {
+  invalidateContentIndexForPaths,
+  resetContentSearchIndex,
+  seedContentIndex,
+} from './contentSearchIndex';
 
 vi.mock('@tauri-apps/api/core', () => ({
   invoke: vi.fn(),
@@ -47,6 +52,7 @@ describe('runSmartFolderSearch', () => {
     readFileMock = fs.readFile as unknown as MockInvoke;
     invokeMock.mockReset();
     readFileMock.mockReset();
+    resetContentSearchIndex();
   });
 
   it('returns matching files from recursive search paths without revisiting duplicates', async () => {
@@ -165,6 +171,83 @@ describe('runSmartFolderSearch', () => {
     );
 
     expect(results.map((entry) => entry.path)).toEqual(['/workspace/small.txt']);
+    expect(readFileMock).toHaveBeenCalledTimes(2);
+
+    readFileMock.mockClear();
+    const again = await runSmartFolderSearch(
+      criteria({
+        contentSearch: 'SECRET phrase',
+        typeFilter: 'files',
+        recursive: false,
+      })
+    );
+    expect(again.map((entry) => entry.path)).toEqual(['/workspace/small.txt']);
+    expect(readFileMock).not.toHaveBeenCalled();
+  });
+
+  it('queries a 10k-file fixture from the index without opening every file', async () => {
+    const entries = Array.from({ length: 10_000 }, (_, index) =>
+      file(`/workspace/doc-${index}.txt`, { size: 24 })
+    );
+    invokeMock.mockResolvedValue(entries);
+    for (const entry of entries) {
+      const hit = entry.path.endsWith('doc-12.txt') || entry.path.endsWith('doc-9001.txt');
+      seedContentIndex(entry.path, {
+        size: entry.size,
+        modifiedMs: Date.parse('2026-01-15T12:00:00Z'),
+        status: 'ready',
+        textLower: hit ? 'unique token lives here' : 'filler',
+      });
+    }
+
+    const results = await runSmartFolderSearch(
+      criteria({
+        contentSearch: 'UNIQUE token',
+        typeFilter: 'files',
+        recursive: false,
+      })
+    );
+
+    expect(results.map((entry) => entry.path)).toEqual([
+      '/workspace/doc-12.txt',
+      '/workspace/doc-9001.txt',
+    ]);
+    expect(readFileMock).not.toHaveBeenCalled();
+  });
+
+  it('invalidates indexed content after an external edit', async () => {
+    invokeMock.mockResolvedValue([file('/workspace/notes.txt', { size: 100 })]);
+    readFileMock.mockResolvedValue('alpha draft');
+
+    const first = await runSmartFolderSearch(
+      criteria({
+        contentSearch: 'alpha',
+        typeFilter: 'files',
+        recursive: false,
+      })
+    );
+    expect(first.map((entry) => entry.path)).toEqual(['/workspace/notes.txt']);
+
+    invalidateContentIndexForPaths(['/workspace/notes.txt']);
+    readFileMock.mockResolvedValue('beta draft');
+
+    const stale = await runSmartFolderSearch(
+      criteria({
+        contentSearch: 'alpha',
+        typeFilter: 'files',
+        recursive: false,
+      })
+    );
+    const next = await runSmartFolderSearch(
+      criteria({
+        contentSearch: 'beta',
+        typeFilter: 'files',
+        recursive: false,
+      })
+    );
+
+    expect(stale).toEqual([]);
+    expect(next.map((entry) => entry.path)).toEqual(['/workspace/notes.txt']);
     expect(readFileMock).toHaveBeenCalledTimes(2);
   });
 
