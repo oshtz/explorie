@@ -9,7 +9,7 @@ license = "MIT"
 repository = "https://github.com/oshtz/explorie"
 
 [dependencies]
-tauri = { version = "2.11.1", features = ["protocol-asset"] }
+tauri = { version = "2.11.1", features = ["protocol-asset", "test"] }
 tauri-plugin-fs = { version = "2.2.1", features = ["watch"] }
 tauri-plugin-dialog = "2.7.1"
 tauri-plugin-single-instance = "2.4.2"

@@ -456,8 +456,10 @@ pub fn list_dir_with_sizes(path: &Path, calc_dir_size: bool) -> io::Result<Vec<F
                 return Ok(None);
             }
 
+            let path_buf = entry.path();
+
             // Get symlink metadata (doesn't follow links)
-            let symlink_meta = entry.path().symlink_metadata()?;
+            let symlink_meta = path_buf.symlink_metadata()?;
             let is_symlink = symlink_meta.file_type().is_symlink();
 
             // Check for Windows junction points / reparse points
@@ -472,7 +474,7 @@ pub fn list_dir_with_sizes(path: &Path, calc_dir_size: bool) -> io::Result<Vec<F
 
             // Get link target for symlinks and junctions
             let link_target = if is_symlink || is_junction {
-                fs::read_link(entry.path())
+                fs::read_link(&path_buf)
                     .ok()
                     .map(|p| p.to_string_lossy().into_owned())
             } else {
@@ -480,7 +482,7 @@ pub fn list_dir_with_sizes(path: &Path, calc_dir_size: bool) -> io::Result<Vec<F
             };
 
             // Check for extended attributes
-            let has_xattrs = has_extended_attributes(&entry.path(), &symlink_meta);
+            let has_xattrs = has_extended_attributes(&path_buf, &symlink_meta);
 
             // Use link metadata throughout so dangling links remain listable and
             // directory links are never traversed as real directories.
@@ -495,7 +497,7 @@ pub fn list_dir_with_sizes(path: &Path, calc_dir_size: bool) -> io::Result<Vec<F
             } else if file_type.is_file() {
                 metadata.len()
             } else if is_dir && calc_dir_size {
-                dir_size(&entry.path())?
+                dir_size(&path_buf)?
             } else {
                 0
             };
@@ -515,13 +517,14 @@ pub fn list_dir_with_sizes(path: &Path, calc_dir_size: bool) -> io::Result<Vec<F
                 file_name_str.starts_with('.') && file_name_str != "." && file_name_str != "..";
 
             // Get custom fields for this entry if they exist
-            let custom = if let Some(fields) = custom_fields.get(file_name_str.as_ref()) {
+            let custom = if custom_fields.is_empty() {
+                HashMap::new()
+            } else if let Some(fields) = custom_fields.get(file_name_str.as_ref()) {
                 fields.clone()
             } else {
                 HashMap::new()
             };
 
-            let path_buf = entry.path();
             let path_key = path_buf.to_string_lossy().replace('\\', "/");
             let entry_id = Uuid::new_v5(&Uuid::NAMESPACE_URL, path_key.as_bytes());
 

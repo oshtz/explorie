@@ -2312,6 +2312,60 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "creates 100,000 files; run explicitly for listing IPC benchmarks"]
+    fn list_files_ipc_100k_benchmark() {
+        use std::time::Instant;
+
+        for count in [10_000, 100_000] {
+            let directory = TestDir::new();
+            for index in 0..count {
+                fs::File::create(directory.0.join(format!("file-{index:06}.txt"))).unwrap();
+            }
+
+            let app = tauri::test::mock_builder()
+                .invoke_handler(tauri::generate_handler![list_files])
+                .build(tauri::test::mock_context(tauri::test::noop_assets()))
+                .unwrap();
+            let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+                .build()
+                .unwrap();
+            let request = tauri::webview::InvokeRequest {
+                cmd: "list_files".into(),
+                callback: tauri::ipc::CallbackFn(0),
+                error: tauri::ipc::CallbackFn(1),
+                url: if cfg!(any(windows, target_os = "android")) {
+                    "http://tauri.localhost"
+                } else {
+                    "tauri://localhost"
+                }
+                .parse()
+                .unwrap(),
+                body: serde_json::json!({
+                    "path": directory.0.to_string_lossy(),
+                    "calc_dir_size": false,
+                })
+                .into(),
+                headers: Default::default(),
+                invoke_key: tauri::test::INVOKE_KEY.to_string(),
+            };
+
+            let started = Instant::now();
+            let response = tauri::test::get_ipc_response(&webview, request).unwrap();
+            let command_and_serialize_elapsed = started.elapsed();
+
+            let started = Instant::now();
+            let entries: Vec<explorie_core::FileEntry> = response.deserialize().unwrap();
+            let response_parse_elapsed = started.elapsed();
+            let payload_bytes = serde_json::to_vec(&entries).unwrap().len();
+
+            assert_eq!(entries.len(), count);
+            eprintln!(
+                "{count:>6} files: list_files IPC command+serialize={command_and_serialize_elapsed:.2?}, response_parse={response_parse_elapsed:.2?} ({payload_bytes} bytes)"
+            );
+        }
+    }
+
+    #[test]
     fn native_thumbnail_cache_keys_include_source_metadata_and_bounds() {
         let temp = TestDir::new();
         let image = temp.0.join("photo.jpg");
