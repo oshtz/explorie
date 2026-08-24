@@ -4,10 +4,10 @@ import { readFile as readBinaryFile } from '@tauri-apps/plugin-fs';
 import type { FileEntry } from '../store';
 import { useFileStore } from '../store';
 import { Preview } from './Preview';
-import { getCachedPreview, setCachedPreview } from '../utils/previewCache';
+import { getCachedPreview, previewCacheKey, setCachedPreview } from '../utils/previewCache';
 import { formatErrorMessage } from '../utils/errorMessages';
 import { normalizePath } from '../utils/path';
-import { getPreviewProviderKind } from '../utils/previewProviders';
+import { describeExternalPreviewFailure, getPreviewProviderKind } from '../utils/previewProviders';
 
 // Helper: convert Uint8Array to base64
 function uint8ToBase64(u8: Uint8Array) {
@@ -87,6 +87,8 @@ export function FilePreviewer({ file, onClose, variant = 'panel' }: FilePreviewe
   const [isLoading, setIsLoading] = React.useState<boolean>(true);
   const [archiveInfo, setArchiveInfo] = React.useState<ArchivePreviewInfo | undefined>(undefined);
   const [externalTool, setExternalTool] = React.useState<string | undefined>(undefined);
+  const [retryNonce, setRetryNonce] = React.useState(0);
+  const [canRetryPreview, setCanRetryPreview] = React.useState(false);
   const fallbackHandlerRef = React.useRef<(() => Promise<void>) | null>(null);
   const fallbackInFlightRef = React.useRef(false);
 
@@ -165,6 +167,9 @@ export function FilePreviewer({ file, onClose, variant = 'panel' }: FilePreviewe
     setIsTruncated(false);
     setArchiveInfo(undefined);
     setExternalTool(undefined);
+    setCanRetryPreview(false);
+
+    const cacheKey = previewCacheKey(file.path, file.size, file.modified);
 
     const finishLoading = () => {
       if (!cancelled) {
@@ -185,7 +190,7 @@ export function FilePreviewer({ file, onClose, variant = 'panel' }: FilePreviewe
             binary instanceof Uint8Array ? binary : new Uint8Array(binary as ArrayBufferLike);
           const mime = guessType(ext) || 'image/*';
           const dataUrl = `data:${mime};base64,${uint8ToBase64(bytes)}`;
-          setCachedPreview(file.path, dataUrl);
+          setCachedPreview(cacheKey, dataUrl);
           setDataUrl(dataUrl);
           setError(undefined);
         } catch (err) {
@@ -202,7 +207,7 @@ export function FilePreviewer({ file, onClose, variant = 'panel' }: FilePreviewe
 
       fallbackHandlerRef.current = fallbackToEmbedded;
 
-      const cached = getCachedPreview(file.path);
+      const cached = getCachedPreview(cacheKey);
       if (cached) {
         setDataUrl(cached);
         setError(undefined);
@@ -314,7 +319,8 @@ export function FilePreviewer({ file, onClose, variant = 'panel' }: FilePreviewe
         })
         .catch((e: unknown) => {
           if (!cancelled) {
-            setError('Failed to generate preview: ' + formatErrorMessage(e));
+            setError(describeExternalPreviewFailure(providerKind, formatErrorMessage(e)));
+            setCanRetryPreview(true);
             finishLoading();
           }
         });
@@ -328,7 +334,16 @@ export function FilePreviewer({ file, onClose, variant = 'panel' }: FilePreviewe
     return () => {
       cancelled = true;
     };
-  }, [file, file.path, file.id, toPreviewSrc, previewExecutableScripts]);
+  }, [
+    file,
+    file.path,
+    file.id,
+    file.size,
+    file.modified,
+    toPreviewSrc,
+    previewExecutableScripts,
+    retryNonce,
+  ]);
 
   // Handle file updates from the custom fields editor
   const handleFileUpdate = (updatedFile: FileEntry) => {
@@ -340,19 +355,34 @@ export function FilePreviewer({ file, onClose, variant = 'panel' }: FilePreviewe
     setFiles(updatedFiles);
   };
 
+  const handleRetryPreview = () => {
+    setError(undefined);
+    setCanRetryPreview(false);
+    setRetryNonce((n) => n + 1);
+  };
+
   // If there was an error loading the file, show it in the preview
   if (error) {
     return (
-      <Preview
-        file={{
-          name: file.name || file.path.split('/').pop() || file.path,
-          path: file.path,
-          type: 'error',
-          url: undefined,
-          content: error,
-        }}
-        onClose={onClose}
-      />
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 8, flex: 1, minHeight: 0 }}>
+        <Preview
+          file={{
+            name: file.name || file.path.split('/').pop() || file.path,
+            path: file.path,
+            type: 'error',
+            url: undefined,
+            content: error,
+          }}
+          onClose={onClose}
+        />
+        {canRetryPreview ? (
+          <div style={{ textAlign: 'center' }}>
+            <button type="button" onClick={handleRetryPreview}>
+              Retry
+            </button>
+          </div>
+        ) : null}
+      </div>
     );
   }
 

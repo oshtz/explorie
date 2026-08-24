@@ -5,6 +5,8 @@ import { useFileStore } from '../store';
 import type { ThemeSpec } from '../store';
 import { normalizeThemeSpec } from '../store/slices/uiSlice';
 import { createFocusTrap } from '../utils/accessibility';
+import { formatErrorMessage } from '../utils/errorMessages';
+import { clearPreviewCache } from '../utils/previewCache';
 import { Icon } from './Icon';
 
 interface SettingsPanelProps {
@@ -18,6 +20,18 @@ type AccentPreset = Exclude<ThemeSpec['accent'], 'custom'>;
 type SystemIntegrationStatus = {
   supported: boolean;
   enabled: boolean;
+};
+
+type HelperStatus = {
+  available: boolean;
+  version?: string;
+  extensions: string[];
+};
+
+type PreviewHelpersStatus = {
+  ffmpeg: HelperStatus;
+  libreoffice: HelperStatus;
+  imagemagick: HelperStatus;
 };
 
 const SETTINGS_TABS: { key: SettingsTab; label: string }[] = [
@@ -40,6 +54,28 @@ const FONT_CHOICES = ['system', 'mono', 'serif', 'custom'] as const;
 
 function isFontChoice(value: string): value is ThemeSpec['font'] {
   return (FONT_CHOICES as readonly string[]).includes(value);
+}
+
+function renderPreviewHelperRow(
+  label: string,
+  helper: HelperStatus,
+  missingHint: string
+): React.ReactNode {
+  return (
+    <div className={`${styles.row} ${styles.rowAlignStart}`}>
+      <div className={styles.rowLabel}>{label}</div>
+      <div className={styles.controls}>
+        <div>
+          <div>{helper.available ? 'Available' : 'Missing'}</div>
+          {helper.available && helper.version ? (
+            <span className={styles.rowHint}>{helper.version}</span>
+          ) : null}
+          {!helper.available ? <span className={styles.rowHint}>{missingHint}</span> : null}
+          <span className={styles.rowHint}>Coverage: {helper.extensions.join(', ')}</span>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
@@ -98,6 +134,11 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
     null
   );
   const [systemIntegrationBusy, setSystemIntegrationBusy] = React.useState(false);
+  const [previewHelpers, setPreviewHelpers] = React.useState<PreviewHelpersStatus | null>(null);
+  const [previewHelpersError, setPreviewHelpersError] = React.useState<string | null>(null);
+  const [previewHelpersLoading, setPreviewHelpersLoading] = React.useState(false);
+  const [helpersRefresh, setHelpersRefresh] = React.useState(0);
+  const [clearCacheBusy, setClearCacheBusy] = React.useState(false);
   const themes = useFileStore((s) => s.themes);
 
   React.useEffect(() => {
@@ -109,6 +150,31 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
       .then(setSystemIntegration)
       .catch(() => setSystemIntegration({ supported: false, enabled: false }));
   }, [open]);
+
+  React.useEffect(() => {
+    if (!open) return;
+    setPreviewHelpers(null);
+    setPreviewHelpersError(null);
+    setPreviewHelpersLoading(true);
+    let cancelled = false;
+    void invoke<PreviewHelpersStatus>('get_preview_helpers_status')
+      .then((status) => {
+        if (cancelled) return;
+        setPreviewHelpers(status);
+        setPreviewHelpersError(null);
+      })
+      .catch((error: unknown) => {
+        if (cancelled) return;
+        setPreviewHelpers(null);
+        setPreviewHelpersError(formatErrorMessage(error));
+      })
+      .finally(() => {
+        if (!cancelled) setPreviewHelpersLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open, helpersRefresh]);
 
   React.useEffect(() => {
     if (!open) return;
@@ -152,6 +218,20 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
       setStatus(`Could not update Windows integration: ${String(error)}`);
     } finally {
       setSystemIntegrationBusy(false);
+    }
+  };
+
+  const handleClearPreviewCache = async () => {
+    setClearCacheBusy(true);
+    setStatus('');
+    try {
+      await invoke('clear_preview_cache');
+      clearPreviewCache();
+      setStatus('Preview cache cleared');
+    } catch (error) {
+      setStatus(`Could not clear preview cache: ${formatErrorMessage(error)}`);
+    } finally {
+      setClearCacheBusy(false);
     }
   };
 
@@ -309,6 +389,64 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
                   </span>
                 </span>
               </label>
+              <div className={`${styles.row} ${styles.rowAlignStart}`}>
+                <div className={styles.rowLabel}>Preview helpers</div>
+                <div className={styles.controls}>
+                  {previewHelpersLoading && previewHelpers === null && !previewHelpersError ? (
+                    <div>Checking preview helpers…</div>
+                  ) : previewHelpersError ? (
+                    <div>
+                      <div>{previewHelpersError}</div>
+                      <span className={styles.rowHint}>
+                        Detection stays on this machine. Recheck after installing a helper.
+                      </span>
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+              {previewHelpers
+                ? renderPreviewHelperRow(
+                    'FFmpeg',
+                    previewHelpers.ffmpeg,
+                    'Install FFmpeg to preview MOV, AVI, MKV and similar videos.'
+                  )
+                : null}
+              {previewHelpers
+                ? renderPreviewHelperRow(
+                    'LibreOffice',
+                    previewHelpers.libreoffice,
+                    'Install LibreOffice to preview Office and OpenDocument files.'
+                  )
+                : null}
+              {previewHelpers
+                ? renderPreviewHelperRow(
+                    'ImageMagick',
+                    previewHelpers.imagemagick,
+                    'Install ImageMagick to preview HEIC, TIFF and PSD files.'
+                  )
+                : null}
+              <div className={styles.row}>
+                <div className={styles.rowLabel}>Preview cache</div>
+                <div className={styles.controls}>
+                  <button
+                    type="button"
+                    onClick={() => setHelpersRefresh((n) => n + 1)}
+                    disabled={previewHelpersLoading}
+                  >
+                    Recheck
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void handleClearPreviewCache()}
+                    disabled={clearCacheBusy}
+                  >
+                    Clear preview cache
+                  </button>
+                  <span className={styles.rowHint}>
+                    Clears generated previews only. Source files and metadata are not touched.
+                  </span>
+                </div>
+              </div>
             </div>
           )}
 

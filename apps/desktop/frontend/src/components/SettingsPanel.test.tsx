@@ -125,6 +125,28 @@ describe('SettingsPanel', () => {
       if (command === 'set_system_integration') {
         return Promise.resolve({ supported: true, enabled: true });
       }
+      if (command === 'get_preview_helpers_status') {
+        return Promise.resolve({
+          ffmpeg: {
+            available: true,
+            version: 'ffmpeg version 6.1',
+            extensions: ['mov', 'avi', 'mkv'],
+          },
+          libreoffice: {
+            available: false,
+            version: null,
+            extensions: ['doc', 'docx', 'odt'],
+          },
+          imagemagick: {
+            available: true,
+            version: 'ImageMagick 7.1',
+            extensions: ['heic', 'tif', 'psd'],
+          },
+        });
+      }
+      if (command === 'clear_preview_cache') {
+        return Promise.resolve();
+      }
       return Promise.reject(new Error(`Unexpected command: ${command}`));
     });
   });
@@ -332,6 +354,81 @@ describe('SettingsPanel', () => {
     expect(mocks.state.setListRowHeight).toHaveBeenCalledWith(34);
     expect(mocks.state.setGridMinWidth).toHaveBeenCalledWith(140);
     expect(screen.getByRole('status')).toHaveTextContent('Settings restored to defaults');
+  });
+
+  it('renders preview helper availability, version, and coverage', async () => {
+    renderPanel();
+
+    expect(await screen.findByText('FFmpeg')).toBeVisible();
+    expect(screen.getByText('LibreOffice')).toBeVisible();
+    expect(screen.getByText('ImageMagick')).toBeVisible();
+    expect(screen.getByText('ffmpeg version 6.1')).toBeVisible();
+    expect(screen.getByText('ImageMagick 7.1')).toBeVisible();
+    expect(screen.getAllByText('Available')).toHaveLength(2);
+    expect(screen.getByText('Missing')).toBeVisible();
+    expect(
+      screen.getByText('Install LibreOffice to preview Office and OpenDocument files.')
+    ).toBeVisible();
+    expect(screen.getByText(/Coverage: mov, avi, mkv/)).toBeVisible();
+    expect(screen.getByText(/Coverage: heic, tif, psd/)).toBeVisible();
+  });
+
+  it('shows an empty checking state and a recoverable detection error', async () => {
+    mocks.invoke.mockImplementation((command: string) => {
+      if (command === 'get_system_integration_status') {
+        return Promise.resolve({ supported: true, enabled: false });
+      }
+      if (command === 'get_preview_helpers_status') {
+        return new Promise(() => undefined);
+      }
+      return Promise.reject(new Error(`Unexpected command: ${command}`));
+    });
+
+    const pending = renderPanel();
+    expect(screen.getByText('Checking preview helpers…')).toBeVisible();
+    pending.unmount();
+
+    mocks.invoke.mockImplementation((command: string) => {
+      if (command === 'get_system_integration_status') {
+        return Promise.resolve({ supported: true, enabled: false });
+      }
+      if (command === 'get_preview_helpers_status') {
+        return Promise.reject(new Error('helper probe failed'));
+      }
+      return Promise.reject(new Error(`Unexpected command: ${command}`));
+    });
+
+    const { user } = renderPanel();
+    expect(await screen.findByText('Helper probe failed')).toBeVisible();
+    expect(
+      screen.getByText('Detection stays on this machine. Recheck after installing a helper.')
+    ).toBeVisible();
+
+    mocks.invoke.mockImplementation((command: string) => {
+      if (command === 'get_system_integration_status') {
+        return Promise.resolve({ supported: true, enabled: false });
+      }
+      if (command === 'get_preview_helpers_status') {
+        return Promise.resolve({
+          ffmpeg: { available: false, version: null, extensions: ['mov'] },
+          libreoffice: { available: false, version: null, extensions: ['docx'] },
+          imagemagick: { available: false, version: null, extensions: ['heic'] },
+        });
+      }
+      return Promise.reject(new Error(`Unexpected command: ${command}`));
+    });
+
+    await user.click(screen.getByRole('button', { name: 'Recheck' }));
+    expect(await screen.findByText('Coverage: mov')).toBeVisible();
+  });
+
+  it('clears the preview cache from Settings without touching source files', async () => {
+    const { user } = renderPanel();
+
+    await user.click(await screen.findByRole('button', { name: 'Clear preview cache' }));
+
+    expect(mocks.invoke).toHaveBeenCalledWith('clear_preview_cache');
+    expect(screen.getByRole('status')).toHaveTextContent('Preview cache cleared');
   });
 });
 

@@ -38,10 +38,14 @@ vi.mock('@tauri-apps/plugin-fs', () => ({
   readFile: (path: string) => mocks.readBinaryFile(path),
 }));
 
-vi.mock('../utils/previewCache', () => ({
-  getCachedPreview: (path: string) => mocks.getCachedPreview(path),
-  setCachedPreview: (path: string, dataUrl: string) => mocks.setCachedPreview(path, dataUrl),
-}));
+vi.mock('../utils/previewCache', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../utils/previewCache')>();
+  return {
+    ...actual,
+    getCachedPreview: (path: string) => mocks.getCachedPreview(path),
+    setCachedPreview: (path: string, dataUrl: string) => mocks.setCachedPreview(path, dataUrl),
+  };
+});
 
 vi.mock('./Preview', () => ({
   Preview: ({
@@ -254,7 +258,7 @@ describe('FilePreviewer', () => {
 
     render(<FilePreviewer file={makeFile('/root/cat.png')} />);
 
-    expect(mocks.getCachedPreview).toHaveBeenCalledWith('/root/cat.png');
+    expect(mocks.getCachedPreview).toHaveBeenCalledWith('/root/cat.png:0:0');
     expect(mocks.convertFileSrc).not.toHaveBeenCalled();
     expect(screen.getByTestId('preview')).toHaveAttribute('data-type', 'image/png');
     expect(screen.getByTestId('preview')).toHaveAttribute(
@@ -319,7 +323,7 @@ describe('FilePreviewer', () => {
 
     await waitFor(() => expect(mocks.readBinaryFile).toHaveBeenCalledWith('/root/cat.png'));
     expect(mocks.setCachedPreview).toHaveBeenCalledWith(
-      '/root/cat.png',
+      '/root/cat.png:0:0',
       'data:image/png;base64,aGk='
     );
     expect(screen.getByTestId('preview')).toHaveAttribute('data-url', 'data:image/png;base64,aGk=');
@@ -434,6 +438,59 @@ describe('FilePreviewer', () => {
       expect(screen.getByTestId('preview')).toHaveAttribute('data-type', 'error')
     );
     expect(screen.getByTestId('preview-content-sample')).toHaveTextContent('Install LibreOffice');
+    expect(screen.getByRole('button', { name: 'Retry' })).toBeVisible();
+  });
+
+  it('retries a failed Office preview after naming LibreOffice', async () => {
+    const user = userEvent.setup();
+    mocks.invoke
+      .mockRejectedValueOnce(
+        new Error('Install LibreOffice to preview Office and OpenDocument files.')
+      )
+      .mockResolvedValueOnce({
+        kind: 'pdf',
+        path: 'C:/Temp/explorie-preview-cache/report.pdf',
+        mime_type: 'application/pdf',
+        tool: 'soffice',
+      });
+    mocks.convertFileSrc.mockReturnValue('asset://preview/report.pdf');
+
+    render(<FilePreviewer file={makeFile('C:/Docs/report.docx')} />);
+
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Retry' })).toBeVisible());
+    await user.click(screen.getByRole('button', { name: 'Retry' }));
+
+    await waitFor(() =>
+      expect(screen.getByTestId('preview')).toHaveAttribute('data-type', 'application/pdf')
+    );
+    expect(mocks.invoke).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole('button', { name: 'Retry' })).not.toBeInTheDocument();
+  });
+
+  it('names FFmpeg and ImageMagick on failed video and HEIC previews', async () => {
+    mocks.invoke.mockRejectedValue(new Error('Conversion failed.'));
+
+    const video = render(<FilePreviewer file={makeFile('C:/Media/clip.mov')} />);
+    await waitFor(() =>
+      expect(screen.getByTestId('preview-content-sample')).toHaveTextContent('FFmpeg')
+    );
+    expect(screen.getByRole('button', { name: 'Retry' })).toBeVisible();
+    video.unmount();
+
+    render(<FilePreviewer file={makeFile('C:/Photos/img.heic')} />);
+    await waitFor(() =>
+      expect(screen.getByTestId('preview-content-sample')).toHaveTextContent('ImageMagick')
+    );
+    expect(screen.getByRole('button', { name: 'Retry' })).toBeVisible();
+  });
+
+  it('looks up image previews with source identity rather than path alone', () => {
+    mocks.getCachedPreview.mockReturnValue(undefined);
+
+    render(<FilePreviewer file={makeFile('/root/cat.png', { size: 40, modified: 99 })} />);
+
+    expect(mocks.getCachedPreview).toHaveBeenCalledWith('/root/cat.png:40:99');
+    expect(mocks.getCachedPreview).not.toHaveBeenCalledWith('/root/cat.png');
   });
 });
 

@@ -3,6 +3,16 @@ type CacheEntry = {
   size: number;
 };
 
+type PreviewIdentity = string | number | { secs_since_epoch: number };
+
+export function previewCacheKey(path: string, size: number, modified: PreviewIdentity): string {
+  const identity =
+    typeof modified === 'object' && modified !== null && 'secs_since_epoch' in modified
+      ? modified.secs_since_epoch
+      : modified;
+  return `${path}:${size}:${String(identity)}`;
+}
+
 const MAX_CACHE_BYTES = 32 * 1024 * 1024;
 const MAX_CACHE_ENTRIES = 64;
 

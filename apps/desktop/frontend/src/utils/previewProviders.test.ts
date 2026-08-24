@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
+  describeExternalPreviewFailure,
+  getPreviewHelperName,
   getPreviewProviderKind,
   isArchivePreviewExtension,
   isExternalDocumentPreviewExtension,
@@ -68,5 +70,32 @@ describe('previewProviders', () => {
     expect(getPreviewProviderKind('/docs/manual.pdf')).toBe('pdf');
     expect(getPreviewProviderKind('/media/video.mp4')).toBe('browser-video');
     expect(getPreviewProviderKind('/media/audio.mp3')).toBe('browser-audio');
+  });
+
+  it('names the helper required for office, video, and HEIC previews', () => {
+    expect(getPreviewHelperName(getPreviewProviderKind('/docs/report.docx'))).toBe('LibreOffice');
+    expect(getPreviewHelperName(getPreviewProviderKind('/media/clip.mov'))).toBe('FFmpeg');
+    expect(getPreviewHelperName(getPreviewProviderKind('/images/photo.heic'))).toBe('ImageMagick');
+    expect(getPreviewHelperName(getPreviewProviderKind('/images/logo.png'))).toBeNull();
+  });
+
+  it('keeps helper-specific install errors and otherwise names the helper and retry', () => {
+    expect(
+      describeExternalPreviewFailure(
+        'external-document',
+        'Install LibreOffice to preview Office and OpenDocument files.'
+      )
+    ).toBe('Install LibreOffice to preview Office and OpenDocument files.');
+    expect(describeExternalPreviewFailure('external-video', 'Conversion failed.')).toBe(
+      'FFmpeg could not generate this preview. Conversion failed. Install FFmpeg, then retry.'
+    );
+    expect(
+      describeExternalPreviewFailure(
+        'external-image',
+        'ImageMagick could not convert this image for preview.'
+      )
+    ).toBe(
+      'ImageMagick could not convert this image for preview. Install ImageMagick, then retry.'
+    );
   });
 });

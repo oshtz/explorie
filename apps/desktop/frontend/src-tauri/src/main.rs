@@ -1503,7 +1503,29 @@ fn is_external_image_preview(path: &Path) -> bool {
 }
 
 fn preview_cache_dir() -> PathBuf {
-    std::env::temp_dir().join("explorie-preview-cache")
+    dirs::cache_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("explorie")
+        .join("preview")
+}
+
+fn is_managed_preview_cache_dir(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| name == "preview")
+        && path
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .is_some_and(|name| name == "explorie")
+}
+
+fn preview_helper_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut command = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
 }
 
 #[cfg(target_os = "windows")]
@@ -1713,7 +1735,7 @@ fn generate_video_thumbnail(input: &Path, output: &Path, max_size: u32) -> Resul
         .ok_or_else(|| "Install FFmpeg to generate video thumbnails.".to_string())?;
     let filter =
         format!("thumbnail,scale={max_size}:{max_size}:force_original_aspect_ratio=decrease");
-    let status = Command::new(tool)
+    let status = preview_helper_command(tool)
         .args(["-y", "-i"])
         .arg(input)
         .args(["-frames:v", "1", "-vf", &filter])
@@ -1794,13 +1816,106 @@ fn sanitize_preview_stem(path: &Path) -> String {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HelperStatus {
+    available: bool,
+    version: Option<String>,
+    extensions: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PreviewHelpersStatus {
+    ffmpeg: HelperStatus,
+    libreoffice: HelperStatus,
+    imagemagick: HelperStatus,
+}
+
+fn preview_source_identity(path: &Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.to_string_lossy()
+        .to_ascii_lowercase()
+        .hash(&mut hasher);
+    if let Ok(metadata) = path.metadata() {
+        metadata.len().hash(&mut hasher);
+        metadata.modified().ok().hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 fn preview_cache_output_path(path: &Path, output_ext: &str) -> PathBuf {
-    preview_cache_dir().join(format!("{}.{}", sanitize_preview_stem(path), output_ext))
+    preview_cache_dir().join(format!(
+        "{}-{:016x}.{}",
+        sanitize_preview_stem(path),
+        preview_source_identity(path),
+        output_ext
+    ))
+}
+
+fn get_tool_version(tool: &str, version_arg: &str) -> Option<String> {
+    let output = preview_helper_command(tool)
+        .arg(version_arg)
+        .output()
+        .ok()?;
+    if output.status.success() {
+        String::from_utf8(output.stdout)
+            .ok()
+            .map(|s| s.lines().next().unwrap_or_default().to_string())
+            .filter(|s| !s.is_empty())
+    } else {
+        None
+    }
+}
+
+fn detect_ffmpeg() -> HelperStatus {
+    let tool = first_available_tool(&["ffmpeg"], "-version");
+    let version = tool.as_ref().and_then(|t| get_tool_version(t, "-version"));
+    HelperStatus {
+        available: tool.is_some(),
+        version,
+        extensions: vec![
+            "mov", "avi", "mkv", "wmv", "flv", "m2ts", "mts", "mpeg", "mpg", "3gp",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect(),
+    }
+}
+
+fn detect_libreoffice() -> HelperStatus {
+    let tool = first_available_tool(&["soffice", "libreoffice"], "--version");
+    let version = tool.as_ref().and_then(|t| get_tool_version(t, "--version"));
+    HelperStatus {
+        available: tool.is_some(),
+        version,
+        extensions: vec![
+            "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "odp", "rtf",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect(),
+    }
+}
+
+fn detect_imagemagick() -> HelperStatus {
+    let tool = first_available_tool(&["magick"], "--version");
+    let version = tool.as_ref().and_then(|t| get_tool_version(t, "--version"));
+    HelperStatus {
+        available: tool.is_some(),
+        version,
+        extensions: vec!["heic", "heif", "tif", "tiff", "psd"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+    }
 }
 
 fn first_available_tool(candidates: &[&str], version_arg: &str) -> Option<String> {
     candidates.iter().find_map(|candidate| {
-        let status = Command::new(candidate)
+        let status = preview_helper_command(candidate)
             .arg(version_arg)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -1818,7 +1933,7 @@ fn convert_document_preview(path: &Path) -> Result<PreviewArtifact, String> {
     std::fs::create_dir_all(&out_dir)
         .map_err(|err| format!("Failed to create preview cache directory: {err}"))?;
 
-    let status = Command::new(&tool)
+    let status = preview_helper_command(&tool)
         .args(["--headless", "--convert-to", "pdf", "--outdir"])
         .arg(&out_dir)
         .arg(path)
@@ -1831,7 +1946,7 @@ fn convert_document_preview(path: &Path) -> Result<PreviewArtifact, String> {
         return Err("LibreOffice could not convert this document for preview.".to_string());
     }
 
-    let produced = out_dir.join(format!("{}.pdf", sanitize_preview_stem(path)));
+    let produced = preview_cache_output_path(path, "pdf");
     let office_default = out_dir.join(format!(
         "{}.pdf",
         path.file_stem()
@@ -1867,7 +1982,7 @@ fn convert_video_preview(path: &Path) -> Result<PreviewArtifact, String> {
             .map_err(|err| format!("Failed to create preview cache directory: {err}"))?;
     }
 
-    let status = Command::new(&tool)
+    let status = preview_helper_command(&tool)
         .args(["-y", "-i"])
         .arg(path)
         .args(["-frames:v", "1", "-vf", "thumbnail,scale=1280:-1"])
@@ -1903,7 +2018,7 @@ fn convert_image_preview(path: &Path) -> Result<PreviewArtifact, String> {
     } else {
         path.to_string_lossy().to_string()
     };
-    let status = Command::new(&tool)
+    let status = preview_helper_command(&tool)
         .arg(input)
         .arg(&output)
         .stdout(Stdio::null())
@@ -1964,6 +2079,60 @@ fn get_platform() -> String {
 #[tauri::command]
 fn get_app_version(app: AppHandle) -> String {
     app.package_info().version.to_string()
+}
+
+fn detect_preview_helpers() -> PreviewHelpersStatus {
+    PreviewHelpersStatus {
+        ffmpeg: detect_ffmpeg(),
+        libreoffice: detect_libreoffice(),
+        imagemagick: detect_imagemagick(),
+    }
+}
+
+fn unavailable_preview_helpers() -> PreviewHelpersStatus {
+    PreviewHelpersStatus {
+        ffmpeg: HelperStatus {
+            available: false,
+            version: None,
+            extensions: Vec::new(),
+        },
+        libreoffice: HelperStatus {
+            available: false,
+            version: None,
+            extensions: Vec::new(),
+        },
+        imagemagick: HelperStatus {
+            available: false,
+            version: None,
+            extensions: Vec::new(),
+        },
+    }
+}
+
+fn clear_preview_cache_impl() -> Result<(), String> {
+    let cache_dir = preview_cache_dir();
+    if !is_managed_preview_cache_dir(&cache_dir) {
+        return Err("Refusing to clear a directory that is not the preview cache.".to_string());
+    }
+    if cache_dir.exists() {
+        std::fs::remove_dir_all(&cache_dir)
+            .map_err(|err| format!("Failed to clear preview cache: {err}"))?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_preview_helpers_status() -> PreviewHelpersStatus {
+    tauri::async_runtime::spawn_blocking(detect_preview_helpers)
+        .await
+        .unwrap_or_else(|_| unavailable_preview_helpers())
+}
+
+#[tauri::command]
+async fn clear_preview_cache() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(clear_preview_cache_impl)
+        .await
+        .map_err(|err| format!("Failed to clear preview cache: {err}"))?
 }
 
 // --- Archive operations ---
@@ -2165,6 +2334,8 @@ fn main() {
             get_file_icon,
             get_file_thumbnail,
             generate_preview_artifact,
+            get_preview_helpers_status,
+            clear_preview_cache,
             get_home_dir,
             get_platform,
             get_app_version,
@@ -2298,12 +2469,49 @@ mod tests {
 
     #[test]
     fn preview_artifact_cache_paths_are_stable_and_safe() {
-        let path = preview_cache_output_path(Path::new("C:/docs/Quarterly Report.docx"), "pdf");
-        let path_string = path.to_string_lossy();
+        let temp = TestDir::new();
+        let source = temp.0.join("Quarterly Report.docx");
+        fs::write(&source, b"doc").unwrap();
+        let path = preview_cache_output_path(&source, "pdf");
+        let name = path.file_name().unwrap().to_string_lossy();
 
-        assert!(path_string.contains("explorie-preview-cache"));
-        assert!(path_string.ends_with("Quarterly_Report.pdf"));
-        assert!(!path_string.contains("Quarterly Report.docx.pdf"));
+        assert!(
+            path.parent()
+                .and_then(|parent| parent.file_name())
+                .is_some_and(|name| name == "preview")
+        );
+        assert!(name.starts_with("Quarterly_Report-"));
+        assert!(name.ends_with(".pdf"));
+        assert!(!name.contains(' '));
+        assert!(!name.contains("Quarterly Report.docx.pdf"));
+
+        fs::write(&source, b"changed document").unwrap();
+        assert_ne!(path, preview_cache_output_path(&source, "pdf"));
+    }
+
+    #[test]
+    fn preview_cache_clear_refuses_unmanaged_directories() {
+        assert!(is_managed_preview_cache_dir(&preview_cache_dir()));
+        assert!(!is_managed_preview_cache_dir(Path::new(
+            "C:/Users/me/Documents"
+        )));
+        assert!(!is_managed_preview_cache_dir(Path::new(
+            "/tmp/explorie-preview-cache"
+        )));
+    }
+
+    #[test]
+    fn preview_helper_status_reports_extension_coverage() {
+        let ffmpeg = detect_ffmpeg();
+        let libreoffice = detect_libreoffice();
+        let imagemagick = detect_imagemagick();
+        assert!(ffmpeg.extensions.iter().any(|ext| ext == "mov"));
+        assert!(libreoffice.extensions.iter().any(|ext| ext == "docx"));
+        assert!(imagemagick.extensions.iter().any(|ext| ext == "heic"));
+        let unavailable = unavailable_preview_helpers();
+        assert!(!unavailable.ffmpeg.available);
+        assert!(!unavailable.libreoffice.available);
+        assert!(!unavailable.imagemagick.available);
     }
 
     #[test]

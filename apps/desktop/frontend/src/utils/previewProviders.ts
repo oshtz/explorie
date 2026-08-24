@@ -120,6 +120,29 @@ export function isExternalImagePreviewExtension(path: string): boolean {
   return EXTERNAL_IMAGE_EXTENSIONS.has(getPreviewExtension(path));
 }
 
+export function getPreviewHelperName(kind: PreviewProviderKind): string | null {
+  switch (kind) {
+    case 'external-document':
+      return 'LibreOffice';
+    case 'external-video':
+      return 'FFmpeg';
+    case 'external-image':
+      return 'ImageMagick';
+    default:
+      return null;
+  }
+}
+
+export function describeExternalPreviewFailure(kind: PreviewProviderKind, detail: string): string {
+  const helper = getPreviewHelperName(kind);
+  if (!helper) return detail;
+  const named = detail.toLowerCase().includes(helper.toLowerCase())
+    ? detail
+    : `${helper} could not generate this preview. ${detail}`;
+  if (/install |retry/i.test(named)) return named;
+  return `${named} Install ${helper}, then retry.`;
+}
+
 export function getPreviewProviderKind(path: string): PreviewProviderKind {
   const ext = getPreviewExtension(path);
 

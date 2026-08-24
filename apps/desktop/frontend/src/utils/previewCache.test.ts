@@ -1,5 +1,10 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { clearPreviewCache, getCachedPreview, setCachedPreview } from './previewCache';
+import {
+  clearPreviewCache,
+  getCachedPreview,
+  previewCacheKey,
+  setCachedPreview,
+} from './previewCache';
 
 describe('previewCache', () => {
   beforeEach(() => {
@@ -43,5 +48,26 @@ describe('previewCache', () => {
     setCachedPreview('/images/a.png', 'small');
     clearPreviewCache();
     expect(getCachedPreview('/images/a.png')).toBeUndefined();
+  });
+
+  it('changes identity when size or modified time changes', () => {
+    const path = '/images/photo.png';
+    const original = previewCacheKey(path, 12, 100);
+    const resized = previewCacheKey(path, 24, 100);
+    const rewritten = previewCacheKey(path, 12, 200);
+    const objectModified = previewCacheKey(path, 12, { secs_since_epoch: 100 });
+
+    expect(original).toBe('/images/photo.png:12:100');
+    expect(resized).not.toBe(original);
+    expect(rewritten).not.toBe(original);
+    expect(objectModified).toBe(original);
+
+    setCachedPreview(original, 'first');
+    expect(getCachedPreview(resized)).toBeUndefined();
+    expect(getCachedPreview(rewritten)).toBeUndefined();
+    expect(getCachedPreview(original)).toBe('first');
+
+    clearPreviewCache();
+    expect(getCachedPreview(original)).toBeUndefined();
   });
 });
