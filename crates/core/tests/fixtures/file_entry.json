@@ -1,0 +1,19 @@
+{
+  "id": "4f8f2c3a-36c8-4f3f-9db9-0d59db2aa001",
+  "path": "/fixtures/report.txt",
+  "size": 4096,
+  "modified": {
+    "secs_since_epoch": 1700000000,
+    "nanos_since_epoch": 123456700
+  },
+  "hidden": false,
+  "is_dir": false,
+  "custom": {
+    "rating": 5,
+    "tag": "fixture"
+  },
+  "is_symlink": true,
+  "is_junction": false,
+  "link_target": "/fixtures/source.txt",
+  "has_xattrs": true
+}
