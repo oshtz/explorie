@@ -146,6 +146,19 @@
   border: 1px solid var(--border-primary);
 }
 
+.watcherStatus {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--padding-sm);
+  margin: 0;
+  padding: var(--padding-sm) var(--padding-md);
+  color: var(--fg-secondary);
+  background: var(--bg-sunken);
+  border-bottom: 1px solid var(--border-primary);
+}
+
 /* File list container - needs to fill available space */
 :global(#file-list) {
   display: flex;

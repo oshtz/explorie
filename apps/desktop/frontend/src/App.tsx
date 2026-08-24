@@ -1,6 +1,5 @@
 import React, { useEffect, useState, useCallback, useMemo, useRef } from 'react';
 import { invoke, isTauri } from '@tauri-apps/api/core';
-import { watch } from '@tauri-apps/plugin-fs';
 import { useFileStore } from './store';
 import { ListView } from './components/ListView';
 import { ColumnView } from './components/ColumnView';
@@ -27,6 +26,10 @@ import { useAppCommands } from './hooks/useAppCommands';
 import { useAppKeyboardShortcuts } from './hooks/useAppKeyboardShortcuts';
 import { calculatePaneLayout, useAppLayoutPersistence } from './hooks/useAppLayoutPersistence';
 import { useQuickLookController } from './hooks/useQuickLookController';
+import {
+  FILESYSTEM_WATCH_UNAVAILABLE_MESSAGE,
+  useFilesystemWatcher,
+} from './hooks/useFilesystemWatcher';
 import { formatErrorMessage } from './utils/errorMessages';
 import { DragOverlay } from './components/DragOverlay';
 import { deleteWithUndo } from './utils/fileOperations';
@@ -1029,34 +1032,26 @@ function AppContent() {
     refreshVisibleViewsRef.current = refreshVisibleViews;
   }, [refreshVisibleViews]);
 
-  useEffect(() => {
-    if (!tauri || pathInitializing || activeSmartFolder || !currentPath) return;
+  const visibleWatchPaths = useMemo(
+    () => (viewMode === 'column' ? pathStack : currentPath ? [currentPath] : []),
+    [viewMode, pathStack, currentPath]
+  );
 
-    const visiblePaths = viewMode === 'column' ? [...new Set(pathStack)] : [currentPath];
-    let disposed = false;
-    let stopWatching: (() => void) | undefined;
+  const {
+    status: filesystemWatcherStatus,
+    error: filesystemWatcherError,
+    retry: retryFilesystemWatcher,
+  } = useFilesystemWatcher({
+    enabled: tauri && !pathInitializing && !activeSmartFolder && Boolean(currentPath),
+    paths: visibleWatchPaths,
+    scopeKey: `${activeTabId}:${viewMode}`,
+    onChange: () => refreshVisibleViewsRef.current(),
+  });
 
-    void watch(
-      visiblePaths,
-      (event) => {
-        if (typeof event.type === 'object' && 'access' in event.type) return;
-        void refreshVisibleViewsRef.current();
-      },
-      { recursive: false, delayMs: 200 }
-    )
-      .then((unwatch) => {
-        if (disposed) unwatch();
-        else stopWatching = unwatch;
-      })
-      .catch((watchError) => {
-        if (!disposed) console.warn('Directory watching unavailable:', watchError);
-      });
-
-    return () => {
-      disposed = true;
-      stopWatching?.();
-    };
-  }, [activeSmartFolder, currentPath, pathInitializing, pathStack, tauri, viewMode]);
+  const handleRetryFilesystemWatcher = useCallback(() => {
+    retryFilesystemWatcher();
+    void refreshVisibleViewsRef.current();
+  }, [retryFilesystemWatcher]);
 
   const handlePaletteGoUp = useCallback(() => {
     const path = normalizePath(currentPathRef.current);
@@ -1466,6 +1461,22 @@ function AppContent() {
                       onDismiss={dismissRecovery}
                     />
                   </InlineErrorBoundary>
+                )}
+                {filesystemWatcherStatus === 'unavailable' && (
+                  <div
+                    className={styles.watcherStatus}
+                    role="status"
+                    aria-live="polite"
+                    data-testid="filesystem-watcher-status"
+                  >
+                    <span>{filesystemWatcherError ?? FILESYSTEM_WATCH_UNAVAILABLE_MESSAGE}</span>
+                    <button type="button" onClick={handleRetryFilesystemWatcher}>
+                      Retry live updates
+                    </button>
+                    <button type="button" onClick={handleRefreshFromPalette}>
+                      Refresh now
+                    </button>
+                  </div>
                 )}
                 {waitingForInitialPath && (
                   <div className={styles.loadingMessage} role="status" aria-live="polite">

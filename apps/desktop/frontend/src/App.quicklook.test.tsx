@@ -5,6 +5,10 @@ import { invoke } from '@tauri-apps/api/core';
 import App from './App';
 import { useFileStore, type FileEntry } from './store';
 import type { StoreState } from './store/types';
+import {
+  FILESYSTEM_WATCH_DEBOUNCE_MS,
+  FILESYSTEM_WATCH_UNAVAILABLE_MESSAGE,
+} from './hooks/useFilesystemWatcher';
 
 const initialFileStoreState = useFileStore.getState();
 
@@ -21,6 +25,18 @@ const fsWatch = vi.hoisted(() => {
     }
   );
   return { callbacks, unwatch, watch };
+});
+
+const remoteEvents = vi.hoisted(() => {
+  const callbacks: Array<
+    (event: { payload: { state: string; mountPath?: string | null } }) => void
+  > = [];
+  const unlisten = vi.fn();
+  const listen = vi.fn(async (_event: string, callback: (event: { payload: unknown }) => void) => {
+    callbacks.push(callback);
+    return unlisten;
+  });
+  return { callbacks, listen, unlisten };
 });
 
 const sampleFiles: FileEntry[] = [
@@ -75,6 +91,10 @@ vi.mock('@tauri-apps/api/core', () => ({
 vi.mock('@tauri-apps/plugin-fs', async () => ({
   ...(await vi.importActual<typeof import('@tauri-apps/plugin-fs')>('@tauri-apps/plugin-fs')),
   watch: fsWatch.watch,
+}));
+
+vi.mock('@tauri-apps/api/event', () => ({
+  listen: remoteEvents.listen,
 }));
 
 vi.mock('@tauri-apps/api/window', () => ({
@@ -392,8 +412,29 @@ function resetFileStore(overrides: Partial<StoreState> = {}) {
   });
 }
 
+async function emitWatchEventAndFlush(event: { type: unknown; paths: string[]; attrs: unknown }) {
+  vi.useFakeTimers();
+  try {
+    act(() => fsWatch.callbacks[0](event));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(FILESYSTEM_WATCH_DEBOUNCE_MS);
+    });
+  } finally {
+    vi.useRealTimers();
+  }
+}
+
 function installBrowserStubs() {
   fsWatch.callbacks.length = 0;
+  remoteEvents.callbacks.length = 0;
+  remoteEvents.unlisten.mockClear();
+  remoteEvents.listen.mockClear();
+  remoteEvents.listen.mockImplementation(
+    async (_event: string, callback: (event: { payload: unknown }) => void) => {
+      remoteEvents.callbacks.push(callback);
+      return remoteEvents.unlisten;
+    }
+  );
   Object.defineProperty(window, 'matchMedia', {
     writable: true,
     value: vi.fn().mockImplementation((query: string) => ({
@@ -575,15 +616,63 @@ describe('App Quick Look shortcut', () => {
         custom: {},
       },
     ]);
+    await emitWatchEventAndFlush({
+      type: { create: { kind: 'file' } },
+      paths: ['/root/gamma.txt'],
+      attrs: null,
+    });
+
+    expect(await screen.findByRole('button', { name: 'Select gamma.txt' })).toBeVisible();
+  });
+
+  it('surfaces unavailable live updates with retry and manual refresh', async () => {
+    const invokeMock = vi.mocked(invoke);
+    fsWatch.watch.mockRejectedValueOnce(new Error('mount unavailable'));
+    render(<App />);
+
+    const status = await screen.findByTestId('filesystem-watcher-status');
+    expect(status).toHaveTextContent(FILESYSTEM_WATCH_UNAVAILABLE_MESSAGE);
+    expect(screen.getByRole('button', { name: 'Retry live updates' })).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Refresh now' })).toBeVisible();
+
+    fsWatch.watch.mockImplementationOnce(
+      async (
+        _paths: string[],
+        callback: (event: { type: unknown; paths: string[]; attrs: unknown }) => void
+      ) => {
+        fsWatch.callbacks.push(callback);
+        return fsWatch.unwatch;
+      }
+    );
+    invokeMock.mockClear();
+    fireEvent.click(screen.getByRole('button', { name: 'Retry live updates' }));
+
+    await waitFor(() => expect(fsWatch.watch).toHaveBeenCalledTimes(2));
+    await waitFor(() =>
+      expect(screen.queryByTestId('filesystem-watcher-status')).not.toBeInTheDocument()
+    );
+    expect(invokeMock).toHaveBeenCalledWith('list_files', {
+      path: '/root',
+      calc_dir_size: false,
+    });
+  });
+
+  it('degrades to retry when a covering remote mount disconnects', async () => {
+    render(<App />);
+
+    await screen.findByRole('button', { name: 'Select alpha.txt' });
+    await waitFor(() => expect(remoteEvents.callbacks).toHaveLength(1));
+
     act(() =>
-      fsWatch.callbacks[0]({
-        type: { create: { kind: 'file' } },
-        paths: ['/root/gamma.txt'],
-        attrs: null,
+      remoteEvents.callbacks[0]({
+        payload: { state: 'disconnected', mountPath: '/root' },
       })
     );
 
-    expect(await screen.findByRole('button', { name: 'Select gamma.txt' })).toBeVisible();
+    const status = await screen.findByTestId('filesystem-watcher-status');
+    expect(status).toHaveTextContent(FILESYSTEM_WATCH_UNAVAILABLE_MESSAGE);
+    expect(screen.getByRole('button', { name: 'Retry live updates' })).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Refresh now' })).toBeVisible();
   });
 
   it('refetches cached columns when the path stack is used as a refresh signal', async () => {
