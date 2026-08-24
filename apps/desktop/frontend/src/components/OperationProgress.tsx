@@ -3,6 +3,8 @@ import { Icon } from './Icon';
 import type { FileOperation } from '../operationQueueStore';
 import { useOperationQueueStore, formatBytes } from '../operationQueueStore';
 import { useFileStore } from '../store';
+import { useToast } from './Toast';
+import { retryFailedOrCancelledItems } from '../utils/fileOperations';
 import styles from './OperationProgress.module.css';
 
 // Helper to get icon for operation type
@@ -39,6 +41,10 @@ function getStatusClass(status: FileOperation['status']): string {
 function OperationItem({ operation }: { operation: FileOperation }) {
   const cancelOperation = useOperationQueueStore((s) => s.cancelOperation);
   const removeOperation = useOperationQueueStore((s) => s.removeOperation);
+  const getRetryableItems = useOperationQueueStore((s) => s.getRetryableItems);
+  const { show: showToast } = useToast();
+  const [showDetails, setShowDetails] = useState(false);
+  const [isRetrying, setIsRetrying] = useState(false);
 
   const rawProgress =
     operation.totalBytes > 0
@@ -57,6 +63,19 @@ function OperationItem({ operation }: { operation: FileOperation }) {
     operation.status === 'completed' ||
     operation.status === 'cancelled' ||
     operation.status === 'failed';
+  const canRetry =
+    canRemove &&
+    (operation.type === 'copy' || operation.type === 'move') &&
+    getRetryableItems(operation.id).length > 0;
+
+  const handleRetry = useCallback(async () => {
+    setIsRetrying(true);
+    try {
+      await retryFailedOrCancelledItems(operation.id, showToast, () => undefined);
+    } finally {
+      setIsRetrying(false);
+    }
+  }, [operation.id, showToast]);
 
   return (
     <div className={`${styles.operation} ${getStatusClass(operation.status)}`}>
@@ -84,6 +103,17 @@ function OperationItem({ operation }: { operation: FileOperation }) {
                 : 'Failed'}
         </span>
         <div className={styles.operationActions}>
+          {canRetry && (
+            <button
+              className={styles.actionButton}
+              onClick={() => void handleRetry()}
+              disabled={isRetrying}
+              title="Retry failed items"
+              aria-label={`Retry ${operation.type} operation`}
+            >
+              <Icon name="redo" size={12} />
+            </button>
+          )}
           {canCancel && (
             <button
               className={styles.actionButton}
@@ -102,6 +132,21 @@ function OperationItem({ operation }: { operation: FileOperation }) {
               aria-label={`Remove ${operation.type} operation`}
             >
               <Icon name="x" size={12} />
+            </button>
+          )}
+          {(operation.outcomes ||
+            (operation.status !== 'running' && operation.items.some((item) => item.outcome))) && (
+            <button
+              className={styles.actionButton}
+              onClick={() => setShowDetails((current) => !current)}
+              title={showDetails ? 'Hide details' : 'Show details'}
+              aria-label={
+                showDetails
+                  ? `Hide ${operation.type} operation details`
+                  : `Show ${operation.type} operation details`
+              }
+            >
+              <Icon name={showDetails ? 'chevron-up' : 'chevron-down'} size={12} />
             </button>
           )}
         </div>
@@ -177,6 +222,54 @@ function OperationItem({ operation }: { operation: FileOperation }) {
         <div className={styles.errorMessage}>
           <Icon name="warning-box" size={12} />
           {operation.error}
+        </div>
+      )}
+
+      {operation.outcomes && (
+        <div className={styles.outcomeSummary}>
+          {operation.outcomes.completed > 0 && (
+            <span className={styles.outcomeItem}>
+              <Icon name="check" size={12} />
+              {operation.outcomes.completed} completed
+            </span>
+          )}
+          {operation.outcomes.skipped > 0 && (
+            <span className={styles.outcomeItem}>
+              <Icon name="skip" size={12} />
+              {operation.outcomes.skipped} skipped
+            </span>
+          )}
+          {operation.outcomes.failed > 0 && (
+            <span className={styles.outcomeItem}>
+              <Icon name="x-circle" size={12} />
+              {operation.outcomes.failed} failed
+            </span>
+          )}
+          {operation.outcomes.cancelled > 0 && (
+            <span className={styles.outcomeItem}>
+              <Icon name="pause-circle" size={12} />
+              {operation.outcomes.cancelled} cancelled
+            </span>
+          )}
+        </div>
+      )}
+
+      {showDetails && (
+        <div className={styles.detailsSection}>
+          {operation.items.map((item) => (
+            <div key={item.sourcePath} className={styles.detailRow}>
+              <div className={styles.detailIcon}>
+                {item.outcome === 'completed' && <Icon name="check" size={12} />}
+                {item.outcome === 'skipped' && <Icon name="skip" size={12} />}
+                {item.outcome === 'failed' && <Icon name="x-circle" size={12} />}
+                {item.outcome === 'cancelled' && <Icon name="pause-circle" size={12} />}
+                {!item.outcome && <Icon name="file" size={12} />}
+              </div>
+              <div className={styles.detailName}>{item.name}</div>
+              {item.outcome && <div className={styles.detailStatus}>{item.outcome}</div>}
+              {item.error && <div className={styles.detailError}>{item.error}</div>}
+            </div>
+          ))}
         </div>
       )}
     </div>

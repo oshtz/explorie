@@ -6,6 +6,7 @@ import { isValidDropTarget, useFileDragAndDrop } from './useFileDragAndDrop';
 const mocks = vi.hoisted(() => ({
   moveWithUndoAndConflictResolution: vi.fn(),
   copyWithUndoAndConflictResolution: vi.fn(),
+  trackQueuedTransfer: vi.fn(() => 'queued-op'),
 }));
 
 const originalVisibilityState = document.visibilityState;
@@ -13,6 +14,7 @@ const originalVisibilityState = document.visibilityState;
 vi.mock('../utils/fileOperations', () => ({
   moveWithUndoAndConflictResolution: mocks.moveWithUndoAndConflictResolution,
   copyWithUndoAndConflictResolution: mocks.copyWithUndoAndConflictResolution,
+  trackQueuedTransfer: mocks.trackQueuedTransfer,
 }));
 
 function file(name: string, overrides: Partial<FileEntry> = {}): FileEntry {
@@ -59,6 +61,8 @@ describe('useFileDragAndDrop', () => {
     mocks.moveWithUndoAndConflictResolution.mockResolvedValue(true);
     mocks.copyWithUndoAndConflictResolution.mockReset();
     mocks.copyWithUndoAndConflictResolution.mockResolvedValue(true);
+    mocks.trackQueuedTransfer.mockReset();
+    mocks.trackQueuedTransfer.mockReturnValue('queued-op');
     vi.spyOn(window, 'requestAnimationFrame').mockReturnValue(1);
     vi.spyOn(window, 'cancelAnimationFrame').mockImplementation(() => {});
   });
@@ -110,7 +114,8 @@ describe('useFileDragAndDrop', () => {
         '/target/docs',
         expect.any(Function),
         props.refreshVisibleViews,
-        { conflictResolution: 'ask' }
+        { conflictResolution: 'ask' },
+        'queued-op'
       )
     );
   });
@@ -169,7 +174,8 @@ describe('useFileDragAndDrop', () => {
         '/target/docs',
         expect.any(Function),
         props.refreshVisibleViews,
-        { conflictResolution: 'ask' }
+        { conflictResolution: 'ask' },
+        'queued-op'
       )
     );
     expect(result.current.dragOverlay?.phase).toBe('dropping');
@@ -224,7 +230,8 @@ describe('useFileDragAndDrop', () => {
         '/videos',
         expect.any(Function),
         refreshVisibleViews,
-        { conflictResolution: 'ask' }
+        { conflictResolution: 'ask' },
+        'queued-op'
       )
     );
     await waitFor(() => expect(refreshVisibleViews).toHaveBeenCalledTimes(1));

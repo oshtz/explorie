@@ -4,7 +4,14 @@ import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const invoke = vi.hoisted(() => vi.fn());
+const retryFailedOrCancelledItems = vi.hoisted(() => vi.fn());
 vi.mock('@tauri-apps/api/core', () => ({ invoke }));
+vi.mock('../utils/fileOperations', () => ({
+  retryFailedOrCancelledItems,
+}));
+vi.mock('./Toast', () => ({
+  useToast: () => ({ show: vi.fn() }),
+}));
 
 import { OperationProgress } from './OperationProgress';
 import type { FileOperation } from '../operationQueueStore';
@@ -40,6 +47,7 @@ describe('OperationProgress', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     invoke.mockResolvedValue(true);
+    retryFailedOrCancelledItems.mockResolvedValue(true);
     useOperationQueueStore.setState({ operations: [], showProgressPanel: false });
   });
 
@@ -123,5 +131,72 @@ describe('OperationProgress', () => {
 
     expect(screen.getByRole('progressbar')).toHaveAttribute('aria-valuenow', '100');
     expect(screen.getByText('100%')).toBeInTheDocument();
+  });
+
+  it('shows Retry after a partial copy and hides it for delete', async () => {
+    const user = userEvent.setup();
+    retryFailedOrCancelledItems.mockResolvedValue(true);
+    useOperationQueueStore.setState({
+      showProgressPanel: true,
+      operations: [
+        operation({
+          status: 'completed',
+          items: [
+            {
+              sourcePath: '/root/one.txt',
+              size: 100,
+              name: 'one.txt',
+              isDir: false,
+              outcome: 'completed',
+            },
+            {
+              sourcePath: '/root/two.txt',
+              size: 100,
+              name: 'two.txt',
+              isDir: false,
+              outcome: 'failed',
+              error: 'disk full',
+            },
+          ],
+          outcomes: { completed: 1, skipped: 0, failed: 1, cancelled: 0 },
+        }),
+      ],
+    });
+    render(<OperationProgress />);
+
+    expect(screen.getByText('1 completed')).toBeInTheDocument();
+    expect(screen.getByText('1 failed')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Retry copy operation' }));
+    expect(retryFailedOrCancelledItems).toHaveBeenCalledWith(
+      'job-1',
+      expect.any(Function),
+      expect.any(Function)
+    );
+
+    cleanup();
+    useOperationQueueStore.setState({
+      showProgressPanel: true,
+      operations: [
+        operation({
+          id: 'delete-1',
+          type: 'delete',
+          status: 'failed',
+          error: 'Denied',
+          items: [
+            {
+              sourcePath: '/root/report.txt',
+              size: 200,
+              name: 'report.txt',
+              isDir: false,
+              outcome: 'failed',
+            },
+          ],
+        }),
+      ],
+    });
+    render(<OperationProgress />);
+    expect(
+      screen.queryByRole('button', { name: 'Retry delete operation' })
+    ).not.toBeInTheDocument();
   });
 });

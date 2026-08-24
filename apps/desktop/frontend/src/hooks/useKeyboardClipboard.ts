@@ -4,6 +4,7 @@ import type { ShowToastFn } from '../utils/fileOperations';
 import {
   moveWithUndoAndConflictResolution,
   copyWithUndoAndConflictResolution,
+  trackQueuedTransfer,
 } from '../utils/fileOperations';
 import { useOperationQueueStore } from '../operationQueueStore';
 import { reportError } from '../utils/errorReporter';
@@ -104,22 +105,27 @@ export function useKeyboardClipboardManager({
     const conflictResolution = storeResolution === 'rename' ? 'keepBoth' : storeResolution;
 
     try {
+      const resolution = conflictResolution as 'skip' | 'replace' | 'keepBoth' | 'ask';
       if (clipboard.mode === 'cut') {
+        const operationId = trackQueuedTransfer('move', clipboard.items, currentPath, resolution);
         await moveWithUndoAndConflictResolution(
           clipboard.items,
           currentPath,
           showToast,
           onRefresh,
-          { conflictResolution: conflictResolution as 'skip' | 'replace' | 'keepBoth' | 'ask' }
+          { conflictResolution: resolution },
+          operationId
         );
         setClipboard(null);
       } else if (clipboard.mode === 'copy') {
+        const operationId = trackQueuedTransfer('copy', clipboard.items, currentPath, resolution);
         await copyWithUndoAndConflictResolution(
           clipboard.items,
           currentPath,
           showToast,
           onRefresh,
-          { conflictResolution: conflictResolution as 'skip' | 'replace' | 'keepBoth' | 'ask' }
+          { conflictResolution: resolution },
+          operationId
         );
       }
     } catch (e) {

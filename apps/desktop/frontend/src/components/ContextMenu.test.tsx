@@ -31,6 +31,7 @@ const mocks = vi.hoisted(() => ({
   deleteWithUndo: vi.fn(),
   moveWithUndoAndConflictResolution: vi.fn(),
   copyWithUndoAndConflictResolution: vi.fn(),
+  trackQueuedTransfer: vi.fn(() => 'queued-op'),
   deletePath: vi.fn(),
   copyPathToDir: vi.fn(),
   moveToFolder: vi.fn(),
@@ -69,6 +70,7 @@ vi.mock('../utils/fileOperations', () => ({
   deleteWithUndo: mocks.deleteWithUndo,
   moveWithUndoAndConflictResolution: mocks.moveWithUndoAndConflictResolution,
   copyWithUndoAndConflictResolution: mocks.copyWithUndoAndConflictResolution,
+  trackQueuedTransfer: mocks.trackQueuedTransfer,
 }));
 
 vi.mock('../utils/fs', () => ({
@@ -130,6 +132,8 @@ describe('ContextMenu', () => {
     mocks.moveWithUndoAndConflictResolution.mockResolvedValue(undefined);
     mocks.copyWithUndoAndConflictResolution.mockReset();
     mocks.copyWithUndoAndConflictResolution.mockResolvedValue(undefined);
+    mocks.trackQueuedTransfer.mockReset();
+    mocks.trackQueuedTransfer.mockReturnValue('queued-op');
     mocks.deletePath.mockReset();
     mocks.copyPathToDir.mockReset();
     mocks.moveToFolder.mockReset();
@@ -224,12 +228,19 @@ describe('ContextMenu', () => {
 
     await user.click(screen.getByRole('menuitem', { name: /^Paste/ }));
 
+    expect(mocks.trackQueuedTransfer).toHaveBeenCalledWith(
+      'move',
+      [copied],
+      '/destination',
+      'keepBoth'
+    );
     expect(mocks.moveWithUndoAndConflictResolution).toHaveBeenCalledWith(
       [copied],
       '/destination',
       mocks.showToast,
       onRefresh,
-      { conflictResolution: 'keepBoth' }
+      { conflictResolution: 'keepBoth' },
+      'queued-op'
     );
     expect(mocks.storeState.setClipboard).toHaveBeenCalledWith(null);
     expect(onClose).toHaveBeenCalledTimes(1);

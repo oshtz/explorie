@@ -7,12 +7,14 @@ import { useKeyboardClipboardManager } from './useKeyboardClipboard';
 const mocks = vi.hoisted(() => ({
   copyWithUndoAndConflictResolution: vi.fn(),
   moveWithUndoAndConflictResolution: vi.fn(),
+  trackQueuedTransfer: vi.fn(() => 'queued-op'),
   reportError: vi.fn(),
 }));
 
 vi.mock('../utils/fileOperations', () => ({
   copyWithUndoAndConflictResolution: mocks.copyWithUndoAndConflictResolution,
   moveWithUndoAndConflictResolution: mocks.moveWithUndoAndConflictResolution,
+  trackQueuedTransfer: mocks.trackQueuedTransfer,
 }));
 
 vi.mock('../utils/errorReporter', () => ({
@@ -57,6 +59,8 @@ describe('useKeyboardClipboardManager', () => {
     mocks.reportError.mockReset();
     mocks.copyWithUndoAndConflictResolution.mockResolvedValue(undefined);
     mocks.moveWithUndoAndConflictResolution.mockResolvedValue(undefined);
+    mocks.trackQueuedTransfer.mockReset();
+    mocks.trackQueuedTransfer.mockReturnValue('queued-op');
     useOperationQueueStore.setState({ defaultConflictResolution: 'ask' });
   });
 
@@ -119,7 +123,8 @@ describe('useKeyboardClipboardManager', () => {
       '/target',
       copyRender.props.showToast,
       copyRender.props.onRefresh,
-      { conflictResolution: 'keepBoth' }
+      { conflictResolution: 'keepBoth' },
+      'queued-op'
     );
     expect(copyRender.props.setClipboard).not.toHaveBeenCalledWith(null);
 
@@ -141,7 +146,8 @@ describe('useKeyboardClipboardManager', () => {
       '/target',
       cutRender.props.showToast,
       cutRender.props.onRefresh,
-      { conflictResolution: 'keepBoth' }
+      { conflictResolution: 'keepBoth' },
+      'queued-op'
     );
     expect(cutRender.props.setClipboard).toHaveBeenCalledWith(null);
   });

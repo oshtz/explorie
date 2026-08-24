@@ -7,6 +7,7 @@ import {
   deleteWithUndo,
   moveWithUndoAndConflictResolution,
   copyWithUndoAndConflictResolution,
+  trackQueuedTransfer,
 } from '../utils/fileOperations';
 import { useOperationQueueStore } from '../operationQueueStore';
 import { useToast } from './Toast';
@@ -375,22 +376,37 @@ export function ContextMenu({
     try {
       const notify = showToast ?? (() => {});
       const refresh = onRefresh ?? (() => {});
+      const resolution = conflictResolution as 'skip' | 'replace' | 'keepBoth' | 'ask';
       if (clipboard.mode === 'cut') {
+        const operationId = trackQueuedTransfer(
+          'move',
+          clipboard.items,
+          state.containerPath,
+          resolution
+        );
         await moveWithUndoAndConflictResolution(
           clipboard.items,
           state.containerPath,
           notify,
           refresh,
-          { conflictResolution: conflictResolution as 'skip' | 'replace' | 'keepBoth' | 'ask' }
+          { conflictResolution: resolution },
+          operationId
         );
         setClipboard(null);
       } else if (clipboard.mode === 'copy') {
+        const operationId = trackQueuedTransfer(
+          'copy',
+          clipboard.items,
+          state.containerPath,
+          resolution
+        );
         await copyWithUndoAndConflictResolution(
           clipboard.items,
           state.containerPath,
           notify,
           refresh,
-          { conflictResolution: conflictResolution as 'skip' | 'replace' | 'keepBoth' | 'ask' }
+          { conflictResolution: resolution },
+          operationId
         );
       }
     } catch (e) {

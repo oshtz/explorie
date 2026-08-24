@@ -79,4 +79,65 @@ describe('operation queue store', () => {
     expect(formatBytes(0)).toBe('0 B');
     expect(formatBytes(1536, 2)).toBe('1.5 KB');
   });
+
+  it('records item outcomes and only retries failed or cancelled copy/move items', () => {
+    const store = useOperationQueueStore.getState();
+    store.trackOperation({
+      ...trackedOperation,
+      items: [
+        { sourcePath: '/a.txt', size: 10, name: 'a.txt', isDir: false },
+        { sourcePath: '/b.txt', size: 20, name: 'b.txt', isDir: false },
+        { sourcePath: '/c.txt', size: 30, name: 'c.txt', isDir: false },
+      ],
+      totalBytes: 60,
+      totalItems: 3,
+    });
+    store.updateItemOutcome('job-1', 0, 'completed');
+    store.updateItemOutcome('job-1', 1, 'failed', 'disk full');
+    store.updateItemOutcome('job-1', 2, 'cancelled', 'Operation cancelled');
+    store.setOperationOutcomeCounts('job-1', {
+      completed: 1,
+      skipped: 0,
+      failed: 1,
+      cancelled: 1,
+    });
+    store.finishOperation('job-1', 'cancelled');
+
+    expect(store.getRetryableItems('job-1').map((item) => item.sourcePath)).toEqual([
+      '/b.txt',
+      '/c.txt',
+    ]);
+
+    store.beginRetryOperation('job-1');
+    expect(useOperationQueueStore.getState().operations[0]).toMatchObject({
+      status: 'running',
+      processedItems: 1,
+      processedBytes: 10,
+      error: undefined,
+    });
+  });
+
+  it('does not expose retryable items for delete operations', () => {
+    const store = useOperationQueueStore.getState();
+    store.trackOperation({
+      ...trackedOperation,
+      id: 'delete-1',
+      type: 'delete',
+      destinationPath: undefined,
+    });
+    store.updateItemOutcome('delete-1', 0, 'failed', 'denied');
+
+    expect(store.getRetryableItems('delete-1')).toEqual([]);
+  });
+
+  it('cancels the in-flight native job when a parent operation has one', async () => {
+    invoke.mockResolvedValue(true);
+    const store = useOperationQueueStore.getState();
+    store.trackOperation(trackedOperation);
+    store.setNativeJobId('job-1', 'native-9');
+
+    await store.cancelOperation('job-1');
+
+    expect(invoke).toHaveBeenCalledWith('cancel_file_operation', { jobId: 'native-9' });
+  });
 });

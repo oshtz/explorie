@@ -6,6 +6,7 @@ import { basename, normalizePath } from '../utils/path';
 import {
   copyWithUndoAndConflictResolution,
   moveWithUndoAndConflictResolution,
+  trackQueuedTransfer,
   type ShowToastFn,
 } from '../utils/fileOperations';
 import { reportError } from '../utils/errorReporter';
@@ -316,11 +317,21 @@ export function useFileDragAndDrop({
       current ? { ...current, phase: 'dropping', releasePoint, destination } : current
     );
 
+    if (entries.length === 0) return;
+
     const mutate =
       operation === 'copy' ? copyWithUndoAndConflictResolution : moveWithUndoAndConflictResolution;
-    void mutate(entries, targetPath, showToast, refreshVisibleViews, {
-      conflictResolution: 'ask',
-    }).catch(async (error) => {
+    const operationId = trackQueuedTransfer(operation, entries, targetPath, 'ask');
+    void mutate(
+      entries,
+      targetPath,
+      showToast,
+      refreshVisibleViews,
+      {
+        conflictResolution: 'ask',
+      },
+      operationId
+    ).catch(async (error) => {
       reportError(`${operation === 'copy' ? 'Copy' : 'Move'} failed`, error, {
         toast: showToast,
       });

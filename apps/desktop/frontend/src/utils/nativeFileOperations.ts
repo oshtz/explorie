@@ -39,6 +39,7 @@ interface OperationPresentation {
   items: OperationItem[];
   destinationPath?: string;
   conflictResolution: ConflictResolution;
+  queueOperationId?: string;
 }
 
 export async function runNativeFileOperation(
@@ -54,6 +55,8 @@ export async function runNativeFileOperation(
     rejectCompletion = reject;
   });
 
+  const parentId = presentation.queueOperationId;
+
   const handleEvent = (payload: NativeFileOperationEvent) => {
     if (!jobId) {
       earlyEvents.push(payload);
@@ -62,31 +65,38 @@ export async function runNativeFileOperation(
     if (payload.jobId !== jobId) return;
 
     const store = useOperationQueueStore.getState();
-    if (payload.progress) {
-      store.updateProgress(jobId, {
+    const storeId = parentId ?? jobId;
+    if (payload.progress && !parentId) {
+      store.updateProgress(storeId, {
         processedBytes: payload.progress.processedBytes,
         processedItems: payload.progress.processedEntries,
         totalBytes: payload.progress.totalBytes,
         totalItems: payload.progress.totalEntries,
         currentItem: payload.progress.currentPath ?? undefined,
       });
+    } else if (payload.progress && parentId) {
+      store.updateProgress(parentId, {
+        currentItem: payload.progress.currentPath ?? undefined,
+      });
     }
     if (payload.state === 'completed') {
       const result = payload.result ?? { processedEntries: 0, processedBytes: 0, targets: [] };
-      store.updateProgress(jobId, {
-        processedBytes: result.processedBytes,
-        processedItems: result.processedEntries,
-      });
-      store.finishOperation(jobId, 'completed');
+      if (!parentId) {
+        store.updateProgress(jobId, {
+          processedBytes: result.processedBytes,
+          processedItems: result.processedEntries,
+        });
+        store.finishOperation(jobId, 'completed');
+      }
       resolveCompletion(result);
     } else if (payload.state === 'failed') {
       const error = new Error(payload.error || 'File operation failed');
-      store.finishOperation(jobId, 'failed', error.message);
+      if (!parentId) store.finishOperation(jobId, 'failed', error.message);
       rejectCompletion(error);
     } else if (payload.state === 'cancelled') {
       const error = new Error('File operation cancelled');
       error.name = 'AbortError';
-      store.finishOperation(jobId, 'cancelled');
+      if (!parentId) store.finishOperation(jobId, 'cancelled');
       rejectCompletion(error);
     }
   };
@@ -97,12 +107,16 @@ export async function runNativeFileOperation(
 
   try {
     jobId = await invoke<string>('start_file_operation', { request });
-    useOperationQueueStore.getState().trackOperation({
-      id: jobId,
-      ...presentation,
-      totalBytes: presentation.items.reduce((sum, item) => sum + item.size, 0),
-      totalItems: presentation.items.length,
-    });
+    if (parentId) {
+      useOperationQueueStore.getState().setNativeJobId(parentId, jobId);
+    } else {
+      useOperationQueueStore.getState().trackOperation({
+        id: jobId,
+        ...presentation,
+        totalBytes: presentation.items.reduce((sum, item) => sum + item.size, 0),
+        totalItems: presentation.items.length,
+      });
+    }
     for (const event of earlyEvents) handleEvent(event);
     return await completion;
   } finally {

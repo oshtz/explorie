@@ -4,6 +4,13 @@ import { create } from 'zustand';
 export type OperationType = 'copy' | 'move' | 'delete';
 export type OperationStatus = 'running' | 'completed' | 'failed' | 'cancelled';
 export type ConflictResolution = 'skip' | 'replace' | 'rename' | 'ask';
+export type ItemOutcome = 'pending' | 'completed' | 'skipped' | 'failed' | 'cancelled';
+
+export interface DestinationIdentity {
+  path: string;
+  isDir: boolean;
+  birthtimeMs: number | null;
+}
 
 export interface OperationItem {
   sourcePath: string;
@@ -11,6 +18,8 @@ export interface OperationItem {
   size: number;
   name: string;
   isDir: boolean;
+  outcome?: ItemOutcome;
+  error?: string;
 }
 
 export interface FileOperation {
@@ -19,6 +28,8 @@ export interface FileOperation {
   status: OperationStatus;
   items: OperationItem[];
   destinationPath?: string;
+  destinationIdentity?: DestinationIdentity;
+  nativeJobId?: string;
   totalBytes: number;
   processedBytes: number;
   totalItems: number;
@@ -28,6 +39,12 @@ export interface FileOperation {
   completedAt?: number;
   error?: string;
   conflictResolution: ConflictResolution;
+  outcomes?: {
+    completed: number;
+    skipped: number;
+    failed: number;
+    cancelled: number;
+  };
 }
 
 type ProgressUpdate = Partial<
@@ -57,6 +74,31 @@ interface OperationQueueState {
   setShowProgressPanel: (show: boolean) => void;
   getRunningOperations: () => FileOperation[];
   hasActiveOperations: () => boolean;
+  updateItemOutcome: (
+    operationId: string,
+    itemIndex: number,
+    outcome: ItemOutcome,
+    error?: string
+  ) => void;
+  setOperationOutcomeCounts: (
+    operationId: string,
+    outcomes: {
+      completed: number;
+      skipped: number;
+      failed: number;
+      cancelled: number;
+    }
+  ) => void;
+  getRetryableItems: (operationId: string) => OperationItem[];
+  setDestinationIdentity: (operationId: string, identity: DestinationIdentity) => void;
+  setNativeJobId: (operationId: string, nativeJobId: string) => void;
+  beginRetryOperation: (operationId: string) => void;
+}
+
+let queueOperationIdCounter = 0;
+
+export function generateQueueOperationId(): string {
+  return `queue-${Date.now()}-${++queueOperationIdCounter}`;
 }
 
 export const useOperationQueueStore = create<OperationQueueState>((set, get) => ({
@@ -89,18 +131,17 @@ export const useOperationQueueStore = create<OperationQueueState>((set, get) => 
   },
 
   finishOperation: (id, status, error) => {
-    let completed: FileOperation | undefined;
     set((state) => ({
       operations: state.operations.map((operation) => {
         if (operation.id !== id) return operation;
-        completed = { ...operation, status, error, completedAt: Date.now() };
-        return completed;
+        return { ...operation, status, error, completedAt: Date.now(), nativeJobId: undefined };
       }),
     }));
   },
 
   cancelOperation: async (id) => {
-    await invoke('cancel_file_operation', { jobId: id });
+    const operation = get().operations.find((item) => item.id === id);
+    await invoke('cancel_file_operation', { jobId: operation?.nativeJobId ?? id });
   },
 
   removeOperation: (id) => {
@@ -118,6 +159,73 @@ export const useOperationQueueStore = create<OperationQueueState>((set, get) => 
   getRunningOperations: () =>
     get().operations.filter((operation) => operation.status === 'running'),
   hasActiveOperations: () => get().operations.some((operation) => operation.status === 'running'),
+
+  updateItemOutcome: (operationId, itemIndex, outcome, error) => {
+    set((state) => ({
+      operations: state.operations.map((operation) => {
+        if (operation.id !== operationId) return operation;
+        const items = [...operation.items];
+        if (itemIndex >= 0 && itemIndex < items.length) {
+          items[itemIndex] = { ...items[itemIndex], outcome, error };
+        }
+        return { ...operation, items };
+      }),
+    }));
+  },
+
+  setOperationOutcomeCounts: (operationId, outcomes) => {
+    set((state) => ({
+      operations: state.operations.map((operation) =>
+        operation.id === operationId ? { ...operation, outcomes } : operation
+      ),
+    }));
+  },
+
+  getRetryableItems: (operationId) => {
+    const operation = get().operations.find((item) => item.id === operationId);
+    if (!operation || (operation.type !== 'copy' && operation.type !== 'move')) {
+      return [];
+    }
+    return operation.items.filter(
+      (item) => item.outcome === 'failed' || item.outcome === 'cancelled'
+    );
+  },
+
+  setDestinationIdentity: (operationId, identity) => {
+    set((state) => ({
+      operations: state.operations.map((operation) =>
+        operation.id === operationId ? { ...operation, destinationIdentity: identity } : operation
+      ),
+    }));
+  },
+
+  setNativeJobId: (operationId, nativeJobId) => {
+    set((state) => ({
+      operations: state.operations.map((operation) =>
+        operation.id === operationId ? { ...operation, nativeJobId } : operation
+      ),
+    }));
+  },
+
+  beginRetryOperation: (operationId) => {
+    set((state) => ({
+      operations: state.operations.map((operation) => {
+        if (operation.id !== operationId) return operation;
+        const baseline = operation.items.filter(
+          (item) => item.outcome === 'completed' || item.outcome === 'skipped'
+        );
+        return {
+          ...operation,
+          status: 'running' as const,
+          error: undefined,
+          completedAt: undefined,
+          currentItem: undefined,
+          processedItems: baseline.length,
+          processedBytes: baseline.reduce((sum, item) => sum + item.size, 0),
+        };
+      }),
+    }));
+  },
 }));
 
 export const useHasActiveOperations = () =>
