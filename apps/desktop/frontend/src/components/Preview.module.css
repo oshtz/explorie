@@ -178,6 +178,23 @@
   font-weight: 600;
 }
 
+.retryButton {
+  margin-top: var(--padding-sm);
+  min-height: calc(32px * var(--ui-scale));
+  padding: 0 var(--padding-md);
+  border: 1px solid var(--border-primary);
+  background: var(--bg-secondary);
+  color: var(--fg-primary);
+  cursor: pointer;
+  font: inherit;
+  font-size: calc(12px * var(--font-scale));
+}
+
+.retryButton:hover {
+  background: var(--bg-hover);
+  border-color: var(--border-secondary);
+}
+
 .previewToolNote {
   position: absolute;
   right: 10px;

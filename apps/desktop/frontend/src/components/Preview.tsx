@@ -15,6 +15,7 @@ type PreviewFile = {
   url?: string; // local file url or blob
   content?: string; // file content if available (text, markdown, etc)
   externalTool?: string;
+  retry?: number;
   archiveInfo?: {
     format: string;
     entry_count: number;
@@ -36,6 +37,7 @@ type PreviewProps = {
   loading?: boolean;
   onReady?: () => void;
   onContentError?: () => void;
+  onRetry?: () => void;
   variant?: 'panel' | 'quicklook';
 };
 
@@ -125,6 +127,7 @@ export function Preview({
   loading = false,
   onReady,
   onContentError,
+  onRetry,
   variant = 'panel',
 }: PreviewProps) {
   // State for the active tab
@@ -189,6 +192,22 @@ export function Preview({
       ))}
     </div>
   );
+
+  if (previewFile?.type === 'error' && !loading) {
+    return (
+      <div className={styles.previewUnsupported}>
+        <div className={styles.unsupportedTitle}>Preview unavailable</div>
+        <div className={styles.fileInfo}>
+          {previewFile.content || 'The preview could not be generated.'}
+        </div>
+        {onRetry && (
+          <button type="button" className={styles.retryButton} onClick={onRetry}>
+            Retry preview
+          </button>
+        )}
+      </div>
+    );
+  }
 
   // Get file content for preview
   const renderFilePreview = (

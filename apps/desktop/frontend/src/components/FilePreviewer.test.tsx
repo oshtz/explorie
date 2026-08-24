@@ -39,8 +39,9 @@ vi.mock('@tauri-apps/plugin-fs', () => ({
 }));
 
 vi.mock('../utils/previewCache', () => ({
-  getCachedPreview: (path: string) => mocks.getCachedPreview(path),
-  setCachedPreview: (path: string, dataUrl: string) => mocks.setCachedPreview(path, dataUrl),
+  getCachedPreview: (path: string, identity?: string) => mocks.getCachedPreview(path, identity),
+  setCachedPreview: (path: string, dataUrl: string, identity?: string) =>
+    mocks.setCachedPreview(path, dataUrl, identity),
 }));
 
 vi.mock('./Preview', () => ({
@@ -50,6 +51,7 @@ vi.mock('./Preview', () => ({
     onClose,
     onContentError,
     onReady,
+    onRetry,
     onUpdate,
   }: {
     file: {
@@ -69,6 +71,7 @@ vi.mock('./Preview', () => ({
     onClose?: () => void;
     onContentError?: () => void;
     onReady?: () => void;
+    onRetry?: () => void;
     onUpdate?: (file: any) => void;
   }) => (
     <section
@@ -85,6 +88,11 @@ vi.mock('./Preview', () => ({
       <button onClick={onClose}>close preview</button>
       <button onClick={onContentError}>content error</button>
       <button onClick={onReady}>preview ready</button>
+      {onRetry && (
+        <button type="button" onClick={onRetry}>
+          retry preview
+        </button>
+      )}
       <button
         onClick={() =>
           onUpdate?.({
@@ -254,12 +262,34 @@ describe('FilePreviewer', () => {
 
     render(<FilePreviewer file={makeFile('/root/cat.png')} />);
 
-    expect(mocks.getCachedPreview).toHaveBeenCalledWith('/root/cat.png');
+    expect(mocks.getCachedPreview).toHaveBeenCalledWith('/root/cat.png', '0:0');
     expect(mocks.convertFileSrc).not.toHaveBeenCalled();
     expect(screen.getByTestId('preview')).toHaveAttribute('data-type', 'image/png');
     expect(screen.getByTestId('preview')).toHaveAttribute(
       'data-url',
       'data:image/png;base64,cached'
+    );
+  });
+
+  it('does not reuse an image preview after the source identity changes', () => {
+    mocks.getCachedPreview.mockImplementation((_path: string, identity?: string) =>
+      identity === '10:1' ? 'data:image/png;base64,old' : undefined
+    );
+    mocks.convertFileSrc.mockReturnValue('http://asset.localhost/root/cat.png');
+
+    const { rerender } = render(
+      <FilePreviewer file={makeFile('/root/cat.png', { size: 10, modified: 1 })} />
+    );
+
+    expect(mocks.getCachedPreview).toHaveBeenCalledWith('/root/cat.png', '10:1');
+    expect(screen.getByTestId('preview')).toHaveAttribute('data-url', 'data:image/png;base64,old');
+
+    rerender(<FilePreviewer file={makeFile('/root/cat.png', { size: 11, modified: 1 })} />);
+
+    expect(mocks.getCachedPreview).toHaveBeenCalledWith('/root/cat.png', '11:1');
+    expect(screen.getByTestId('preview')).toHaveAttribute(
+      'data-url',
+      'http://asset.localhost/root/cat.png'
     );
   });
 
@@ -320,7 +350,8 @@ describe('FilePreviewer', () => {
     await waitFor(() => expect(mocks.readBinaryFile).toHaveBeenCalledWith('/root/cat.png'));
     expect(mocks.setCachedPreview).toHaveBeenCalledWith(
       '/root/cat.png',
-      'data:image/png;base64,aGk='
+      'data:image/png;base64,aGk=',
+      '0:0'
     );
     expect(screen.getByTestId('preview')).toHaveAttribute('data-url', 'data:image/png;base64,aGk=');
   });
@@ -434,6 +465,60 @@ describe('FilePreviewer', () => {
       expect(screen.getByTestId('preview')).toHaveAttribute('data-type', 'error')
     );
     expect(screen.getByTestId('preview-content-sample')).toHaveTextContent('Install LibreOffice');
+    expect(screen.getByRole('button', { name: 'retry preview' })).toBeInTheDocument();
+  });
+
+  it('shows helper guidance and retry for a missing video preview helper', async () => {
+    mocks.invoke.mockRejectedValue(new Error('ffmpeg exited with status 1: os error 2'));
+
+    render(<FilePreviewer file={makeFile('C:/Media/clip.mkv')} />);
+
+    await waitFor(() =>
+      expect(screen.getByTestId('preview')).toHaveAttribute('data-type', 'error')
+    );
+    expect(screen.getByTestId('preview-content-sample')).toHaveTextContent('Install FFmpeg');
+    expect(screen.getByTestId('preview-content-sample')).not.toHaveTextContent('os error');
+    expect(screen.getByRole('button', { name: 'retry preview' })).toBeInTheDocument();
+  });
+
+  it('shows helper guidance and retry for a missing HEIC preview helper', async () => {
+    mocks.invoke.mockRejectedValue(new Error('magick stderr dump'));
+
+    render(<FilePreviewer file={makeFile('C:/Photos/scan.heic')} />);
+
+    await waitFor(() =>
+      expect(screen.getByTestId('preview')).toHaveAttribute('data-type', 'error')
+    );
+    expect(screen.getByTestId('preview-content-sample')).toHaveTextContent('Install ImageMagick');
+    expect(screen.getByTestId('preview-content-sample')).not.toHaveTextContent('stderr');
+    expect(screen.getByRole('button', { name: 'retry preview' })).toBeInTheDocument();
+  });
+
+  it('retries a failed Office preview without exposing subprocess output', async () => {
+    const user = userEvent.setup();
+    mocks.invoke
+      .mockRejectedValueOnce(new Error('soffice exited with status 1: os error 2'))
+      .mockResolvedValueOnce({
+        kind: 'pdf',
+        path: 'C:/Temp/explorie-preview-cache/report.pdf',
+        mime_type: 'application/pdf',
+        tool: 'soffice',
+      });
+
+    render(<FilePreviewer file={makeFile('C:/Docs/report.docx')} />);
+
+    await waitFor(() =>
+      expect(screen.getByTestId('preview')).toHaveAttribute('data-type', 'error')
+    );
+    expect(screen.getByTestId('preview-content-sample')).toHaveTextContent('Install LibreOffice');
+    expect(screen.getByTestId('preview-content-sample')).not.toHaveTextContent('os error');
+
+    await user.click(screen.getByRole('button', { name: 'retry preview' }));
+
+    await waitFor(() =>
+      expect(screen.getByTestId('preview')).toHaveAttribute('data-type', 'application/pdf')
+    );
+    expect(mocks.invoke).toHaveBeenCalledTimes(2);
   });
 });
 

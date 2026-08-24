@@ -1,6 +1,7 @@
 // Prevents a terminal window from appearing on Windows
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod preview;
 mod remote_drives;
 
 use explorie_core::archive::{
@@ -438,14 +439,6 @@ struct DiskInfo {
     total_space: u64,
     available_space: u64,
     name: String,
-}
-
-#[derive(Serialize)]
-struct PreviewArtifact {
-    kind: String,
-    path: String,
-    mime_type: String,
-    tool: String,
 }
 
 #[tauri::command]
@@ -1481,27 +1474,6 @@ fn path_extension_lower(path: &Path) -> String {
         .to_ascii_lowercase()
 }
 
-fn is_external_document_preview(path: &Path) -> bool {
-    matches!(
-        path_extension_lower(path).as_str(),
-        "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "odt" | "ods" | "odp" | "rtf"
-    )
-}
-
-fn is_external_video_preview(path: &Path) -> bool {
-    matches!(
-        path_extension_lower(path).as_str(),
-        "mov" | "avi" | "mkv" | "wmv" | "flv" | "m2ts" | "mts" | "mpeg" | "mpg" | "3gp"
-    )
-}
-
-fn is_external_image_preview(path: &Path) -> bool {
-    matches!(
-        path_extension_lower(path).as_str(),
-        "heic" | "heif" | "tif" | "tiff" | "psd"
-    )
-}
-
 fn preview_cache_dir() -> PathBuf {
     std::env::temp_dir().join("explorie-preview-cache")
 }
@@ -1710,7 +1682,7 @@ fn is_video_thumbnail(path: &Path) -> bool {
 
 fn generate_video_thumbnail(input: &Path, output: &Path, max_size: u32) -> Result<(), String> {
     let tool = first_available_tool(&["ffmpeg"], "-version")
-        .ok_or_else(|| "Install FFmpeg to generate video thumbnails.".to_string())?;
+        .ok_or_else(|| preview::missing_helper_message("ffmpeg"))?;
     let filter =
         format!("thumbnail,scale={max_size}:{max_size}:force_original_aspect_ratio=decrease");
     let status = Command::new(tool)
@@ -1721,11 +1693,11 @@ fn generate_video_thumbnail(input: &Path, output: &Path, max_size: u32) -> Resul
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .map_err(|err| format!("Failed to run FFmpeg thumbnail generation: {err}"))?;
+        .map_err(|_| preview::failed_helper_message("ffmpeg"))?;
     status
         .success()
         .then_some(())
-        .ok_or_else(|| "FFmpeg could not generate a video thumbnail".to_string())
+        .ok_or_else(|| preview::failed_helper_message("ffmpeg"))
 }
 
 fn get_file_thumbnail_impl(path: String, max_size: u32) -> Result<Option<String>, String> {
@@ -1771,33 +1743,6 @@ async fn get_file_thumbnail(path: String, max_size: u32) -> Result<Option<String
         .map_err(|err| err.to_string())?
 }
 
-fn sanitize_preview_stem(path: &Path) -> String {
-    let raw = path
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or("preview");
-    let safe: String = raw
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let trimmed = safe.trim_matches('_');
-    if trimmed.is_empty() {
-        "preview".to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
-
-fn preview_cache_output_path(path: &Path, output_ext: &str) -> PathBuf {
-    preview_cache_dir().join(format!("{}.{}", sanitize_preview_stem(path), output_ext))
-}
-
 fn first_available_tool(candidates: &[&str], version_arg: &str) -> Option<String> {
     candidates.iter().find_map(|candidate| {
         let status = Command::new(candidate)
@@ -1810,143 +1755,32 @@ fn first_available_tool(candidates: &[&str], version_arg: &str) -> Option<String
     })
 }
 
-fn convert_document_preview(path: &Path) -> Result<PreviewArtifact, String> {
-    let tool = first_available_tool(&["soffice", "libreoffice"], "--version").ok_or_else(|| {
-        "Install LibreOffice to preview Office and OpenDocument files.".to_string()
-    })?;
-    let out_dir = preview_cache_dir();
-    std::fs::create_dir_all(&out_dir)
-        .map_err(|err| format!("Failed to create preview cache directory: {err}"))?;
-
-    let status = Command::new(&tool)
-        .args(["--headless", "--convert-to", "pdf", "--outdir"])
-        .arg(&out_dir)
-        .arg(path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|err| format!("Failed to run LibreOffice preview conversion: {err}"))?;
-
-    if !status.success() {
-        return Err("LibreOffice could not convert this document for preview.".to_string());
-    }
-
-    let produced = out_dir.join(format!("{}.pdf", sanitize_preview_stem(path)));
-    let office_default = out_dir.join(format!(
-        "{}.pdf",
-        path.file_stem()
-            .and_then(|stem| stem.to_str())
-            .unwrap_or("preview")
-    ));
-
-    let final_path = if office_default.exists() && office_default != produced {
-        let _ = std::fs::remove_file(&produced);
-        std::fs::rename(&office_default, &produced)
-            .map_err(|err| format!("Failed to normalize generated document preview: {err}"))?;
-        produced
-    } else if produced.exists() {
-        produced
-    } else {
-        return Err("LibreOffice finished without producing a PDF preview.".to_string());
-    };
-
-    Ok(PreviewArtifact {
-        kind: "pdf".to_string(),
-        path: final_path.to_string_lossy().to_string(),
-        mime_type: "application/pdf".to_string(),
-        tool,
-    })
-}
-
-fn convert_video_preview(path: &Path) -> Result<PreviewArtifact, String> {
-    let tool = first_available_tool(&["ffmpeg"], "-version")
-        .ok_or_else(|| "Install FFmpeg to preview this video format.".to_string())?;
-    let output = preview_cache_output_path(path, "png");
-    if let Some(parent) = output.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|err| format!("Failed to create preview cache directory: {err}"))?;
-    }
-
-    let status = Command::new(&tool)
-        .args(["-y", "-i"])
-        .arg(path)
-        .args(["-frames:v", "1", "-vf", "thumbnail,scale=1280:-1"])
-        .arg(&output)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|err| format!("Failed to run FFmpeg preview generation: {err}"))?;
-
-    if !status.success() || !output.exists() {
-        return Err("FFmpeg could not generate a thumbnail for this video.".to_string());
-    }
-
-    Ok(PreviewArtifact {
-        kind: "image".to_string(),
-        path: output.to_string_lossy().to_string(),
-        mime_type: "image/png".to_string(),
-        tool,
-    })
-}
-
-fn convert_image_preview(path: &Path) -> Result<PreviewArtifact, String> {
-    let tool = first_available_tool(&["magick"], "--version")
-        .ok_or_else(|| "Install ImageMagick to preview this image format.".to_string())?;
-    let output = preview_cache_output_path(path, "png");
-    if let Some(parent) = output.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|err| format!("Failed to create preview cache directory: {err}"))?;
-    }
-
-    let input = if path_extension_lower(path) == "psd" {
-        format!("{}[0]", path.to_string_lossy())
-    } else {
-        path.to_string_lossy().to_string()
-    };
-    let status = Command::new(&tool)
-        .arg(input)
-        .arg(&output)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|err| format!("Failed to run ImageMagick preview conversion: {err}"))?;
-
-    if !status.success() || !output.exists() {
-        return Err("ImageMagick could not convert this image for preview.".to_string());
-    }
-
-    Ok(PreviewArtifact {
-        kind: "image".to_string(),
-        path: output.to_string_lossy().to_string(),
-        mime_type: "image/png".to_string(),
-        tool,
-    })
-}
-
-fn generate_preview_artifact_impl(path: String) -> Result<PreviewArtifact, String> {
-    let path = PathBuf::from(path);
-    if !path.exists() {
-        return Err("File not found.".to_string());
-    }
-
-    if is_external_document_preview(&path) {
-        return convert_document_preview(&path);
-    }
-    if is_external_video_preview(&path) {
-        return convert_video_preview(&path);
-    }
-    if is_external_image_preview(&path) {
-        return convert_image_preview(&path);
-    }
-
-    Err("No external preview provider is available for this file type.".to_string())
+#[tauri::command]
+async fn get_preview_helper_status() -> Result<Vec<preview::PreviewHelperStatus>, String> {
+    tauri::async_runtime::spawn_blocking(preview::preview_helper_status)
+        .await
+        .map_err(|_| "Could not check preview helpers.".to_string())
 }
 
 #[tauri::command]
-async fn generate_preview_artifact(path: String) -> Result<PreviewArtifact, String> {
-    tauri::async_runtime::spawn_blocking(move || generate_preview_artifact_impl(path))
+async fn clear_preview_cache(app: AppHandle) -> Result<(), String> {
+    let cache_dir = preview::resolve_app_preview_cache(&app)?;
+    tauri::async_runtime::spawn_blocking(move || preview::clear_preview_cache(&cache_dir))
         .await
-        .map_err(|err| err.to_string())?
+        .map_err(|_| "Could not clear the preview cache.".to_string())?
+}
+
+#[tauri::command]
+async fn generate_preview_artifact(
+    app: AppHandle,
+    path: String,
+) -> Result<preview::PreviewArtifact, String> {
+    let cache_dir = preview::resolve_app_preview_cache(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        preview::generate_preview_artifact(Path::new(&path), &cache_dir)
+    })
+    .await
+    .map_err(|_| "Could not generate a preview.".to_string())?
 }
 
 #[tauri::command]
@@ -2165,6 +1999,8 @@ fn main() {
             get_file_icon,
             get_file_thumbnail,
             generate_preview_artifact,
+            get_preview_helper_status,
+            clear_preview_cache,
             get_home_dir,
             get_platform,
             get_app_version,
@@ -2268,7 +2104,7 @@ mod tests {
             "document.odt",
             "notes.rtf",
         ] {
-            assert!(is_external_document_preview(Path::new(path)));
+            assert!(preview::is_external_document_preview(Path::new(path)));
         }
     }
 
@@ -2282,7 +2118,7 @@ mod tests {
             "capture.flv",
             "camera.m2ts",
         ] {
-            assert!(is_external_video_preview(Path::new(path)));
+            assert!(preview::is_external_video_preview(Path::new(path)));
         }
 
         for path in [
@@ -2292,18 +2128,24 @@ mod tests {
             "scan.tiff",
             "design.psd",
         ] {
-            assert!(is_external_image_preview(Path::new(path)));
+            assert!(preview::is_external_image_preview(Path::new(path)));
         }
     }
 
     #[test]
     fn preview_artifact_cache_paths_are_stable_and_safe() {
-        let path = preview_cache_output_path(Path::new("C:/docs/Quarterly Report.docx"), "pdf");
+        let cache = PathBuf::from("C:/Users/USER/AppData/Local/com.omershatz.explorie/cache");
+        let path = preview::preview_cache_output_path(
+            &preview::preview_cache_dir(&cache),
+            Path::new("C:/docs/Quarterly Report.docx"),
+            "pdf",
+        );
         let path_string = path.to_string_lossy();
 
-        assert!(path_string.contains("explorie-preview-cache"));
-        assert!(path_string.ends_with("Quarterly_Report.pdf"));
-        assert!(!path_string.contains("Quarterly Report.docx.pdf"));
+        assert!(path_string.contains("preview"));
+        assert!(path_string.contains("Quarterly_Report-"));
+        assert!(path_string.ends_with(".pdf"));
+        assert!(!path_string.contains("Quarterly Report"));
     }
 
     #[test]

@@ -7,7 +7,7 @@ import { Preview } from './Preview';
 import { getCachedPreview, setCachedPreview } from '../utils/previewCache';
 import { formatErrorMessage } from '../utils/errorMessages';
 import { normalizePath } from '../utils/path';
-import { getPreviewProviderKind } from '../utils/previewProviders';
+import { formatExternalPreviewError, getPreviewProviderKind } from '../utils/previewProviders';
 
 // Helper: convert Uint8Array to base64
 function uint8ToBase64(u8: Uint8Array) {
@@ -87,6 +87,7 @@ export function FilePreviewer({ file, onClose, variant = 'panel' }: FilePreviewe
   const [isLoading, setIsLoading] = React.useState<boolean>(true);
   const [archiveInfo, setArchiveInfo] = React.useState<ArchivePreviewInfo | undefined>(undefined);
   const [externalTool, setExternalTool] = React.useState<string | undefined>(undefined);
+  const [retryToken, setRetryToken] = React.useState(0);
   const fallbackHandlerRef = React.useRef<(() => Promise<void>) | null>(null);
   const fallbackInFlightRef = React.useRef(false);
 
@@ -130,6 +131,7 @@ export function FilePreviewer({ file, onClose, variant = 'panel' }: FilePreviewe
     setCurrentFile(file);
 
     const ext = file.path.split('.').pop()?.toLowerCase() || '';
+    const cacheIdentity = `${file.size}:${JSON.stringify(file.modified)}`;
     const providerKind = getPreviewProviderKind(file.path);
     let cancelled = false;
     setIsLoading(true);
@@ -185,7 +187,7 @@ export function FilePreviewer({ file, onClose, variant = 'panel' }: FilePreviewe
             binary instanceof Uint8Array ? binary : new Uint8Array(binary as ArrayBufferLike);
           const mime = guessType(ext) || 'image/*';
           const dataUrl = `data:${mime};base64,${uint8ToBase64(bytes)}`;
-          setCachedPreview(file.path, dataUrl);
+          setCachedPreview(file.path, dataUrl, cacheIdentity);
           setDataUrl(dataUrl);
           setError(undefined);
         } catch (err) {
@@ -202,7 +204,7 @@ export function FilePreviewer({ file, onClose, variant = 'panel' }: FilePreviewe
 
       fallbackHandlerRef.current = fallbackToEmbedded;
 
-      const cached = getCachedPreview(file.path);
+      const cached = getCachedPreview(file.path, cacheIdentity);
       if (cached) {
         setDataUrl(cached);
         setError(undefined);
@@ -314,7 +316,7 @@ export function FilePreviewer({ file, onClose, variant = 'panel' }: FilePreviewe
         })
         .catch((e: unknown) => {
           if (!cancelled) {
-            setError('Failed to generate preview: ' + formatErrorMessage(e));
+            setError(formatExternalPreviewError(e, providerKind));
             finishLoading();
           }
         });
@@ -328,7 +330,16 @@ export function FilePreviewer({ file, onClose, variant = 'panel' }: FilePreviewe
     return () => {
       cancelled = true;
     };
-  }, [file, file.path, file.id, toPreviewSrc, previewExecutableScripts]);
+  }, [
+    file,
+    file.path,
+    file.id,
+    file.size,
+    file.modified,
+    retryToken,
+    toPreviewSrc,
+    previewExecutableScripts,
+  ]);
 
   // Handle file updates from the custom fields editor
   const handleFileUpdate = (updatedFile: FileEntry) => {
@@ -350,8 +361,14 @@ export function FilePreviewer({ file, onClose, variant = 'panel' }: FilePreviewe
           type: 'error',
           url: undefined,
           content: error,
+          retry: retryToken,
         }}
         onClose={onClose}
+        onRetry={
+          getPreviewProviderKind(file.path).startsWith('external-')
+            ? () => setRetryToken((value) => value + 1)
+            : undefined
+        }
       />
     );
   }
@@ -362,6 +379,7 @@ export function FilePreviewer({ file, onClose, variant = 'panel' }: FilePreviewe
     content?: string;
     archiveInfo?: ArchivePreviewInfo;
     externalTool?: string;
+    retry?: number;
   };
 
   // Create preview payload that carries both metadata (FileEntry) and preview url/content.

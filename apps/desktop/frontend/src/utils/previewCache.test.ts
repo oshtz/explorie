@@ -20,6 +20,12 @@ describe('previewCache', () => {
     expect(getCachedPreview('/images/a.png')).toBe('new');
   });
 
+  it('invalidates a preview when the source identity changes', () => {
+    setCachedPreview('/images/a.png', 'old', '10:1');
+    expect(getCachedPreview('/images/a.png', '10:2')).toBeUndefined();
+    expect(getCachedPreview('/images/a.png', '10:1')).toBe('old');
+  });
+
   it('evicts least-recently-used entries when the entry limit is exceeded', () => {
     for (let i = 0; i < 64; i += 1) {
       setCachedPreview(`/images/${i}.png`, `preview-${i}`);

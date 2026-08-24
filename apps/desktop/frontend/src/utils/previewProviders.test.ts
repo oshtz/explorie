@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  formatExternalPreviewError,
   getPreviewProviderKind,
   isArchivePreviewExtension,
   isExternalDocumentPreviewExtension,
@@ -68,5 +69,26 @@ describe('previewProviders', () => {
     expect(getPreviewProviderKind('/docs/manual.pdf')).toBe('pdf');
     expect(getPreviewProviderKind('/media/video.mp4')).toBe('browser-video');
     expect(getPreviewProviderKind('/media/audio.mp3')).toBe('browser-audio');
+  });
+
+  it('keeps helper-specific preview guidance and hides subprocess errors', () => {
+    expect(
+      formatExternalPreviewError(
+        'Install LibreOffice to preview Office and OpenDocument files. Then retry this preview.',
+        'external-document'
+      )
+    ).toMatch(/LibreOffice/i);
+    expect(
+      formatExternalPreviewError('ffmpeg exited with status 1: os error 2', 'external-video')
+    ).toBe('Install FFmpeg to preview this video format, then retry');
+    expect(formatExternalPreviewError(new Error('magick stderr dump'), 'external-image')).toBe(
+      'Install ImageMagick to preview HEIC, TIFF, or PSD files, then retry'
+    );
+    expect(
+      formatExternalPreviewError(
+        { message: 'FFmpeg could not generate a preview for this video. Retry.' },
+        'external-video'
+      )
+    ).toMatch(/FFmpeg/i);
   });
 });

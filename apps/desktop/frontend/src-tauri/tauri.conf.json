@@ -59,6 +59,7 @@
           "$HOME/**",
           "$PUBLIC/**",
           "$TEMP/explorie-preview-cache/**",
+          "$APPCACHE/preview/**",
           "/Volumes/**",
           "C:/**",
           "D:/**",

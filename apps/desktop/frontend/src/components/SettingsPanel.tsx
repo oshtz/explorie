@@ -6,6 +6,7 @@ import type { ThemeSpec } from '../store';
 import { normalizeThemeSpec } from '../store/slices/uiSlice';
 import { createFocusTrap } from '../utils/accessibility';
 import { Icon } from './Icon';
+import { clearPreviewCache as clearMemoryPreviewCache } from '../utils/previewCache';
 
 interface SettingsPanelProps {
   open: boolean;
@@ -18,6 +19,15 @@ type AccentPreset = Exclude<ThemeSpec['accent'], 'custom'>;
 type SystemIntegrationStatus = {
   supported: boolean;
   enabled: boolean;
+};
+
+type PreviewHelperStatus = {
+  id: string;
+  name: string;
+  available: boolean;
+  version?: string;
+  extensions: string[];
+  install_hint: string;
 };
 
 const SETTINGS_TABS: { key: SettingsTab; label: string }[] = [
@@ -98,7 +108,22 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
     null
   );
   const [systemIntegrationBusy, setSystemIntegrationBusy] = React.useState(false);
+  const [previewHelpers, setPreviewHelpers] = React.useState<PreviewHelperStatus[]>([]);
+  const [previewHelpersBusy, setPreviewHelpersBusy] = React.useState(false);
+  const [previewHelpersError, setPreviewHelpersError] = React.useState('');
   const themes = useFileStore((s) => s.themes);
+
+  const loadPreviewHelpers = React.useCallback(() => {
+    setPreviewHelpersBusy(true);
+    setPreviewHelpersError('');
+    void invoke<PreviewHelperStatus[]>('get_preview_helper_status')
+      .then(setPreviewHelpers)
+      .catch(() => {
+        setPreviewHelpers([]);
+        setPreviewHelpersError('Could not check preview helpers. Recheck after installing them.');
+      })
+      .finally(() => setPreviewHelpersBusy(false));
+  }, []);
 
   React.useEffect(() => {
     if (!open) return;
@@ -108,7 +133,8 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
     void invoke<SystemIntegrationStatus>('get_system_integration_status')
       .then(setSystemIntegration)
       .catch(() => setSystemIntegration({ supported: false, enabled: false }));
-  }, [open]);
+    loadPreviewHelpers();
+  }, [open, loadPreviewHelpers]);
 
   React.useEffect(() => {
     if (!open) return;
@@ -180,6 +206,16 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
     setStatus('Settings restored to defaults');
   };
 
+  const clearPreviewCache = async () => {
+    try {
+      await invoke('clear_preview_cache');
+      clearMemoryPreviewCache();
+      setStatus('Preview cache cleared');
+    } catch {
+      setStatus('Could not clear the preview cache');
+    }
+  };
+
   if (!open) return null;
 
   return (
@@ -226,6 +262,81 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
           {activeTab === 'general' && (
             <div className={styles.section}>
               <h2 className={styles.sectionTitle}>General</h2>
+              <h3 className={styles.sectionTitle}>Optional preview support</h3>
+              <p className={styles.textMuted}>
+                These helpers are optional and are never downloaded by Explorie.
+              </p>
+              <div aria-label="Preview helper diagnostics">
+                {previewHelpersBusy && (
+                  <div className={styles.row}>
+                    <div className={styles.rowLabel}>Helpers</div>
+                    <div className={styles.controls}>Checking preview helpers...</div>
+                  </div>
+                )}
+                {previewHelpersError && !previewHelpersBusy && (
+                  <div className={styles.row}>
+                    <div className={styles.rowLabel}>Helpers</div>
+                    <div className={styles.controls}>
+                      <span>{previewHelpersError}</span>
+                      <button type="button" onClick={loadPreviewHelpers}>
+                        Recheck helpers
+                      </button>
+                    </div>
+                  </div>
+                )}
+                {previewHelpers.map((helper) => (
+                  <div key={helper.id} className={styles.row}>
+                    <div className={styles.rowLabel}>{helper.name}</div>
+                    <div className={styles.controls}>
+                      <div>
+                        <span>
+                          {helper.available
+                            ? `Available${helper.version ? `: ${helper.version}` : ''}`
+                            : 'Not installed'}
+                        </span>
+                        {!helper.available && helper.install_hint && (
+                          <span className={styles.rowHint}>{helper.install_hint}</span>
+                        )}
+                        <span className={styles.rowHint}>
+                          Covers {helper.extensions.join(', ')}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+                {!previewHelpersBusy && !previewHelpersError && previewHelpers.length === 0 && (
+                  <div className={styles.row}>
+                    <div className={styles.rowLabel}>Helpers</div>
+                    <div className={styles.controls}>
+                      <span>No preview helpers were reported for this machine.</span>
+                      <button type="button" onClick={loadPreviewHelpers}>
+                        Recheck helpers
+                      </button>
+                    </div>
+                  </div>
+                )}
+                {!previewHelpersBusy && !previewHelpersError && previewHelpers.length > 0 && (
+                  <div className={styles.row}>
+                    <div className={styles.rowLabel}>Recheck</div>
+                    <div className={styles.controls}>
+                      <button type="button" onClick={loadPreviewHelpers}>
+                        Recheck helpers
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+              <div className={styles.row}>
+                <div className={styles.rowLabel}>Preview cache</div>
+                <div className={styles.controls}>
+                  <button type="button" onClick={() => void clearPreviewCache()}>
+                    Clear preview cache
+                  </button>
+                  <span className={styles.rowHint}>
+                    Removes generated previews only. Source files and metadata stay untouched.
+                  </span>
+                </div>
+              </div>
               <label className={styles.checkboxRow}>
                 <input
                   type="checkbox"

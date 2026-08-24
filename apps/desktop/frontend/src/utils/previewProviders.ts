@@ -135,3 +135,35 @@ export function getPreviewProviderKind(path: string): PreviewProviderKind {
 
   return 'unsupported';
 }
+
+function extractPreviewErrorText(error: unknown): string {
+  if (typeof error === 'string') return error;
+  if (error instanceof Error) return error.message;
+  if (error && typeof error === 'object') {
+    const record = error as Record<string, unknown>;
+    if (typeof record.message === 'string') return record.message;
+  }
+  return '';
+}
+
+export function formatExternalPreviewError(error: unknown, kind: PreviewProviderKind): string {
+  const technical = extractPreviewErrorText(error);
+  const looksLikeSubprocess = /os error|stderr|spawn|command line|exited with/i.test(technical);
+  const looksLikeHelperGuidance =
+    /ffmpeg|libreoffice|imagemagick|soffice|magick/i.test(technical) && !looksLikeSubprocess;
+
+  if (looksLikeHelperGuidance) {
+    return technical.replace(/[.!?]+$/, '');
+  }
+
+  switch (kind) {
+    case 'external-document':
+      return 'Install LibreOffice to preview Office and OpenDocument files, then retry';
+    case 'external-video':
+      return 'Install FFmpeg to preview this video format, then retry';
+    case 'external-image':
+      return 'Install ImageMagick to preview HEIC, TIFF, or PSD files, then retry';
+    default:
+      return technical || 'The preview could not be generated';
+  }
+}

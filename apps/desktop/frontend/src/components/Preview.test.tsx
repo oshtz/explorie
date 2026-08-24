@@ -184,6 +184,45 @@ describe('Preview', () => {
     expect(screen.getByText('Cannot preview this image (no preview available).')).toBeVisible();
   });
 
+  it('shows an empty state for unsupported file types', () => {
+    render(
+      <Preview
+        file={previewFile({
+          name: 'data.bin',
+          path: '/workspace/data.bin',
+          type: 'application/octet-stream',
+          content: undefined,
+        })}
+      />
+    );
+
+    expect(screen.getByText('No preview available for this file type.')).toBeVisible();
+    expect(screen.getByText('data.bin (application/octet-stream)')).toBeVisible();
+    expect(screen.queryByRole('button', { name: 'Retry preview' })).not.toBeInTheDocument();
+  });
+
+  it('shows helper guidance and a retry action for failed external previews', async () => {
+    const user = userEvent.setup();
+    const onRetry = vi.fn();
+
+    render(
+      <Preview
+        file={previewFile({
+          name: 'report.docx',
+          path: '/workspace/report.docx',
+          type: 'error',
+          content: 'Install LibreOffice to preview Office and OpenDocument files, then retry',
+        })}
+        onRetry={onRetry}
+      />
+    );
+
+    expect(screen.getByText('Preview unavailable')).toBeVisible();
+    expect(screen.getByText(/Install LibreOffice/i)).toBeVisible();
+    await user.click(screen.getByRole('button', { name: 'Retry preview' }));
+    expect(onRetry).toHaveBeenCalledTimes(1);
+  });
+
   it('renders untrusted markdown as plain text', () => {
     const markdown =
       '# Title\n\n**bold** <script>alert(1)</script> [click](javascript:alert(2)) [x](" onmouseover="alert(3))';

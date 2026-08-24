@@ -21,25 +21,27 @@ function evictIfNeeded() {
   }
 }
 
-export function getCachedPreview(path: string): string | undefined {
-  const entry = cache.get(path);
+export function getCachedPreview(path: string, identity = ''): string | undefined {
+  const key = `${path}\0${identity}`;
+  const entry = cache.get(key);
   if (!entry) return undefined;
-  cache.delete(path);
-  cache.set(path, entry);
+  cache.delete(key);
+  cache.set(key, entry);
   return entry.dataUrl;
 }
 
-export function setCachedPreview(path: string, dataUrl: string): void {
+export function setCachedPreview(path: string, dataUrl: string, identity = ''): void {
+  const key = `${path}\0${identity}`;
   const size = dataUrl.length;
   if (size > MAX_CACHE_BYTES) return;
 
-  const existing = cache.get(path);
+  const existing = cache.get(key);
   if (existing) {
     totalBytes = Math.max(0, totalBytes - existing.size);
-    cache.delete(path);
+    cache.delete(key);
   }
 
-  cache.set(path, { dataUrl, size });
+  cache.set(key, { dataUrl, size });
   totalBytes += size;
   evictIfNeeded();
 }

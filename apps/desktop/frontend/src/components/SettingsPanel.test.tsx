@@ -3,6 +3,7 @@ import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { SettingsPanel } from './SettingsPanel';
+import { getCachedPreview, setCachedPreview } from '../utils/previewCache';
 
 type MockState = Record<string, unknown>;
 
@@ -125,6 +126,36 @@ describe('SettingsPanel', () => {
       if (command === 'set_system_integration') {
         return Promise.resolve({ supported: true, enabled: true });
       }
+      if (command === 'get_preview_helper_status') {
+        return Promise.resolve([
+          {
+            id: 'ffmpeg',
+            name: 'FFmpeg',
+            available: true,
+            version: 'ffmpeg version 7',
+            extensions: ['MOV'],
+            install_hint: 'Install it with winget: winget install ffmpeg',
+          },
+          {
+            id: 'libreoffice',
+            name: 'LibreOffice',
+            available: false,
+            extensions: ['DOCX'],
+            install_hint: 'Install it from libreoffice.org',
+          },
+          {
+            id: 'imagemagick',
+            name: 'ImageMagick',
+            available: true,
+            version: 'ImageMagick 7',
+            extensions: ['HEIC'],
+            install_hint: 'Install it with winget: winget install ImageMagick.ImageMagick',
+          },
+        ]);
+      }
+      if (command === 'clear_preview_cache') {
+        return Promise.resolve();
+      }
       return Promise.reject(new Error(`Unexpected command: ${command}`));
     });
   });
@@ -158,6 +189,126 @@ describe('SettingsPanel', () => {
 
     expect(sectionButtons).toHaveLength(5);
     expect(screen.getByRole('button', { name: 'General' })).toHaveAttribute('aria-current', 'page');
+  });
+
+  it('shows optional preview helper availability and coverage', async () => {
+    renderPanel();
+    expect(await screen.findByText(/ffmpeg version 7/i)).toBeInTheDocument();
+    expect(screen.getByText(/ImageMagick 7/i)).toBeInTheDocument();
+    expect(screen.getByText('Not installed')).toBeInTheDocument();
+    expect(screen.getByText(/Install it from libreoffice.org/i)).toBeInTheDocument();
+    expect(screen.getByText(/Covers DOCX/i)).toBeInTheDocument();
+    expect(screen.getByText(/Covers HEIC/i)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /clear preview cache/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /recheck helpers/i })).toBeInTheDocument();
+  });
+
+  it('recovers preview helper diagnostics after a failed check', async () => {
+    mocks.invoke.mockImplementation((command: string) => {
+      if (command === 'get_system_integration_status') {
+        return Promise.resolve({ supported: true, enabled: false });
+      }
+      if (command === 'get_preview_helper_status') {
+        return Promise.reject(new Error('probe failed'));
+      }
+      return Promise.reject(new Error(`Unexpected command: ${command}`));
+    });
+
+    const { user } = renderPanel();
+    expect(await screen.findByText(/Could not check preview helpers/i)).toBeInTheDocument();
+
+    mocks.invoke.mockImplementation((command: string) => {
+      if (command === 'get_system_integration_status') {
+        return Promise.resolve({ supported: true, enabled: false });
+      }
+      if (command === 'get_preview_helper_status') {
+        return Promise.resolve([
+          {
+            id: 'ffmpeg',
+            name: 'FFmpeg',
+            available: false,
+            extensions: ['MOV'],
+            install_hint: 'Install it with winget: winget install ffmpeg',
+          },
+        ]);
+      }
+      return Promise.reject(new Error(`Unexpected command: ${command}`));
+    });
+
+    await user.click(screen.getByRole('button', { name: /recheck helpers/i }));
+    expect(await screen.findByText(/Install it with winget: winget install ffmpeg/i)).toBeVisible();
+    expect(screen.queryByText(/Could not check preview helpers/i)).not.toBeInTheDocument();
+  });
+
+  it('shows an empty helper state that can be rechecked', async () => {
+    mocks.invoke.mockImplementation((command: string) => {
+      if (command === 'get_system_integration_status') {
+        return Promise.resolve({ supported: true, enabled: false });
+      }
+      if (command === 'get_preview_helper_status') {
+        return Promise.resolve([]);
+      }
+      return Promise.reject(new Error(`Unexpected command: ${command}`));
+    });
+
+    const { user } = renderPanel();
+    expect(
+      await screen.findByText(/No preview helpers were reported for this machine/i)
+    ).toBeInTheDocument();
+
+    mocks.invoke.mockImplementation((command: string) => {
+      if (command === 'get_system_integration_status') {
+        return Promise.resolve({ supported: true, enabled: false });
+      }
+      if (command === 'get_preview_helper_status') {
+        return Promise.resolve([
+          {
+            id: 'ffmpeg',
+            name: 'FFmpeg',
+            available: true,
+            version: 'ffmpeg version 7',
+            extensions: ['MOV'],
+            install_hint: 'Install it with winget: winget install ffmpeg',
+          },
+        ]);
+      }
+      return Promise.reject(new Error(`Unexpected command: ${command}`));
+    });
+
+    await user.click(screen.getByRole('button', { name: /recheck helpers/i }));
+    expect(await screen.findByText(/ffmpeg version 7/i)).toBeVisible();
+    expect(
+      screen.queryByText(/No preview helpers were reported for this machine/i)
+    ).not.toBeInTheDocument();
+  });
+
+  it('clears only the generated preview cache', async () => {
+    setCachedPreview('/images/a.png', 'cached');
+    const { user } = renderPanel();
+    await user.click(await screen.findByRole('button', { name: /clear preview cache/i }));
+    expect(mocks.invoke).toHaveBeenCalledWith('clear_preview_cache');
+    expect(getCachedPreview('/images/a.png')).toBeUndefined();
+    expect(screen.getByRole('status')).toHaveTextContent('Preview cache cleared');
+  });
+
+  it('keeps cached previews when clearing the preview cache fails', async () => {
+    mocks.invoke.mockImplementation((command: string) => {
+      if (command === 'get_system_integration_status') {
+        return Promise.resolve({ supported: true, enabled: false });
+      }
+      if (command === 'get_preview_helper_status') {
+        return Promise.resolve([]);
+      }
+      if (command === 'clear_preview_cache') {
+        return Promise.reject(new Error('disk busy'));
+      }
+      return Promise.reject(new Error(`Unexpected command: ${command}`));
+    });
+    setCachedPreview('/images/a.png', 'cached');
+    const { user } = renderPanel();
+    await user.click(await screen.findByRole('button', { name: /clear preview cache/i }));
+    expect(getCachedPreview('/images/a.png')).toBe('cached');
+    expect(screen.getByRole('status')).toHaveTextContent('Could not clear the preview cache');
   });
 
   it('does not expose prototype controls', async () => {
