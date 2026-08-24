@@ -47,7 +47,9 @@ describe('operation queue store', () => {
       processedBytes: 8,
       processedItems: 1,
       currentItem: '/a.txt',
+      outcomes: { completed: 1, skipped: 0, failed: 0, cancelled: 0 },
     });
+    expect(useOperationQueueStore.getState().operations[0].items[0].outcome).toBe('completed');
   });
 
   it('delegates cancellation to the native job', async () => {
@@ -78,5 +80,68 @@ describe('operation queue store', () => {
     expect(renderHook(() => useActiveOperationsCount()).result.current).toBe(1);
     expect(formatBytes(0)).toBe('0 B');
     expect(formatBytes(1536, 2)).toBe('1.5 KB');
+  });
+
+  it('retains item outcomes and cancels the active native child job', async () => {
+    invoke.mockResolvedValue(true);
+    useOperationQueueStore.getState().trackOperation({
+      ...trackedOperation,
+      items: [
+        { sourcePath: '/done.txt', size: 10, name: 'done.txt', isDir: false, outcome: 'completed' },
+        { sourcePath: '/retry.txt', size: 10, name: 'retry.txt', isDir: false, outcome: 'failed' },
+      ],
+      totalBytes: 20,
+      totalItems: 2,
+    });
+    useOperationQueueStore.getState().updateItemOutcome('job-1', '/done.txt', 'completed');
+    useOperationQueueStore
+      .getState()
+      .updateItemOutcome('job-1', '/retry.txt', 'failed', 'Remote unavailable');
+    useOperationQueueStore.getState().registerChildJob('job-1', 'native-child-1');
+
+    expect(useOperationQueueStore.getState().operations[0].outcomes).toEqual({
+      completed: 1,
+      skipped: 0,
+      failed: 1,
+      cancelled: 0,
+    });
+    expect(useOperationQueueStore.getState().getRetryableItems('job-1')).toEqual([
+      expect.objectContaining({ sourcePath: '/retry.txt', outcome: 'failed' }),
+    ]);
+
+    await useOperationQueueStore.getState().cancelOperation('job-1');
+    expect(invoke).toHaveBeenCalledWith('cancel_file_operation', { jobId: 'native-child-1' });
+  });
+
+  it('resets retry progress to the completed and skipped baseline', () => {
+    useOperationQueueStore.getState().trackOperation({
+      ...trackedOperation,
+      totalBytes: 100,
+      totalItems: 4,
+      items: [
+        { sourcePath: '/done.txt', size: 10, name: 'done.txt', isDir: false },
+        { sourcePath: '/skipped.txt', size: 20, name: 'skipped.txt', isDir: false },
+        { sourcePath: '/failed.txt', size: 30, name: 'failed.txt', isDir: false },
+        { sourcePath: '/cancelled.txt', size: 40, name: 'cancelled.txt', isDir: false },
+      ],
+    });
+    useOperationQueueStore.getState().updateItemOutcome('job-1', '/done.txt', 'completed');
+    useOperationQueueStore.getState().updateItemOutcome('job-1', '/skipped.txt', 'skipped');
+    useOperationQueueStore.getState().updateItemOutcome('job-1', '/failed.txt', 'failed');
+    useOperationQueueStore.getState().updateItemOutcome('job-1', '/cancelled.txt', 'cancelled');
+    useOperationQueueStore.getState().updateProgress('job-1', {
+      processedBytes: 100,
+      processedItems: 4,
+      currentItem: '/cancelled.txt',
+    });
+
+    useOperationQueueStore.getState().beginRetryOperation('job-1');
+
+    expect(useOperationQueueStore.getState().operations[0]).toMatchObject({
+      status: 'running',
+      processedBytes: 30,
+      processedItems: 2,
+      currentItem: undefined,
+    });
   });
 });

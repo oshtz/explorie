@@ -18,7 +18,7 @@ export interface NativeFileOperationResult {
   targets: string[];
 }
 
-interface NativeProgress {
+export interface NativeFileOperationProgress {
   processedEntries: number;
   totalEntries: number;
   processedBytes: number;
@@ -26,10 +26,12 @@ interface NativeProgress {
   currentPath?: string | null;
 }
 
+type NativeOperationProgressHandler = (progress: NativeFileOperationProgress) => void;
+
 interface NativeFileOperationEvent {
   jobId: string;
   state: 'running' | 'completed' | 'cancelled' | 'failed';
-  progress?: NativeProgress;
+  progress?: NativeFileOperationProgress;
   result?: NativeFileOperationResult;
   error?: string;
 }
@@ -39,12 +41,22 @@ interface OperationPresentation {
   items: OperationItem[];
   destinationPath?: string;
   conflictResolution: ConflictResolution;
+  /** Internal parent-session context; never copied into queue presentation state. */
+  operationId?: string;
+  trackOperation?: boolean;
+  onProgress?: NativeOperationProgressHandler;
 }
 
 export async function runNativeFileOperation(
   request: NativeFileOperationRequest,
   presentation: OperationPresentation
 ): Promise<NativeFileOperationResult> {
+  const {
+    operationId: parentOperationId,
+    trackOperation = true,
+    onProgress,
+    ...queuePresentation
+  } = presentation;
   let jobId: string | undefined;
   const earlyEvents: NativeFileOperationEvent[] = [];
   let resolveCompletion!: (result: NativeFileOperationResult) => void;
@@ -61,32 +73,37 @@ export async function runNativeFileOperation(
     }
     if (payload.jobId !== jobId) return;
 
-    const store = useOperationQueueStore.getState();
     if (payload.progress) {
-      store.updateProgress(jobId, {
-        processedBytes: payload.progress.processedBytes,
-        processedItems: payload.progress.processedEntries,
-        totalBytes: payload.progress.totalBytes,
-        totalItems: payload.progress.totalEntries,
-        currentItem: payload.progress.currentPath ?? undefined,
-      });
+      if (trackOperation) {
+        useOperationQueueStore.getState().updateProgress(jobId, {
+          processedBytes: payload.progress.processedBytes,
+          processedItems: payload.progress.processedEntries,
+          totalBytes: payload.progress.totalBytes,
+          totalItems: payload.progress.totalEntries,
+          currentItem: payload.progress.currentPath ?? undefined,
+        });
+      }
+      onProgress?.(payload.progress);
     }
     if (payload.state === 'completed') {
       const result = payload.result ?? { processedEntries: 0, processedBytes: 0, targets: [] };
-      store.updateProgress(jobId, {
-        processedBytes: result.processedBytes,
-        processedItems: result.processedEntries,
-      });
-      store.finishOperation(jobId, 'completed');
+      if (trackOperation) {
+        useOperationQueueStore.getState().updateProgress(jobId, {
+          processedBytes: result.processedBytes,
+          processedItems: result.processedEntries,
+        });
+        useOperationQueueStore.getState().finishOperation(jobId, 'completed');
+      }
       resolveCompletion(result);
     } else if (payload.state === 'failed') {
       const error = new Error(payload.error || 'File operation failed');
-      store.finishOperation(jobId, 'failed', error.message);
+      if (trackOperation)
+        useOperationQueueStore.getState().finishOperation(jobId, 'failed', error.message);
       rejectCompletion(error);
     } else if (payload.state === 'cancelled') {
       const error = new Error('File operation cancelled');
       error.name = 'AbortError';
-      store.finishOperation(jobId, 'cancelled');
+      if (trackOperation) useOperationQueueStore.getState().finishOperation(jobId, 'cancelled');
       rejectCompletion(error);
     }
   };
@@ -97,15 +114,27 @@ export async function runNativeFileOperation(
 
   try {
     jobId = await invoke<string>('start_file_operation', { request });
-    useOperationQueueStore.getState().trackOperation({
-      id: jobId,
-      ...presentation,
-      totalBytes: presentation.items.reduce((sum, item) => sum + item.size, 0),
-      totalItems: presentation.items.length,
-    });
+    if (parentOperationId) {
+      const store = useOperationQueueStore.getState();
+      store.registerChildJob(parentOperationId, jobId);
+      if (store.isCancellationRequested(parentOperationId)) {
+        await invoke('cancel_file_operation', { jobId });
+      }
+    }
+    if (trackOperation) {
+      useOperationQueueStore.getState().trackOperation({
+        id: jobId,
+        ...queuePresentation,
+        totalBytes: queuePresentation.items.reduce((sum, item) => sum + item.size, 0),
+        totalItems: queuePresentation.items.length,
+      });
+    }
     for (const event of earlyEvents) handleEvent(event);
     return await completion;
   } finally {
+    if (parentOperationId && jobId) {
+      useOperationQueueStore.getState().unregisterChildJob(parentOperationId, jobId);
+    }
     unlisten();
   }
 }

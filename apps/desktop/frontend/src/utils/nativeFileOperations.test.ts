@@ -78,4 +78,55 @@ describe('runNativeFileOperation', () => {
     });
     expect(mocks.unlisten).toHaveBeenCalledTimes(1);
   });
+
+  it('attaches a child job to a parent transfer without tracking a second queue item', async () => {
+    useOperationQueueStore.getState().trackOperation({
+      id: 'parent',
+      type: 'copy',
+      items: [{ sourcePath: '/source/a.txt', size: 7, name: 'a.txt', isDir: false }],
+      destinationPath: '/target',
+      totalBytes: 7,
+      totalItems: 1,
+      conflictResolution: 'ask',
+    });
+    mocks.invoke.mockImplementation(async (command: string) => {
+      if (command === 'start_file_operation') {
+        mocks.handler?.({
+          payload: {
+            jobId: 'child-1',
+            state: 'completed',
+            result: { processedEntries: 1, processedBytes: 7, targets: ['/target/a.txt'] },
+          },
+        });
+        return 'child-1';
+      }
+      return true;
+    });
+
+    await expect(
+      runNativeFileOperation(
+        {
+          kind: 'copy',
+          sources: ['/source/a.txt'],
+          destination: '/target',
+          conflictPolicy: 'error',
+        },
+        {
+          type: 'copy',
+          items: [{ sourcePath: '/source/a.txt', size: 7, name: 'a.txt', isDir: false }],
+          destinationPath: '/target',
+          conflictResolution: 'ask',
+          operationId: 'parent',
+          trackOperation: false,
+        }
+      )
+    ).resolves.toEqual({
+      processedEntries: 1,
+      processedBytes: 7,
+      targets: ['/target/a.txt'],
+    });
+
+    expect(useOperationQueueStore.getState().operations.map((item) => item.id)).toEqual(['parent']);
+    expect(useOperationQueueStore.getState().operations[0].status).toBe('running');
+  });
 });

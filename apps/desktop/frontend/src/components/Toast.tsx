@@ -88,6 +88,11 @@ export function useToast() {
   return context;
 }
 
+/** Optional variant for panels that can also render in isolated previews/tests. */
+export function useOptionalToast() {
+  return useContext(ToastContext);
+}
+
 // Individual toast item component
 function ToastItem({ toast, onDismiss }: { toast: Toast; onDismiss: (id: string) => void }) {
   const [exiting, setExiting] = useState(false);

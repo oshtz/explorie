@@ -242,6 +242,61 @@
   gap: 4px;
 }
 
+.outcomeSummary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--padding-sm);
+  margin-top: var(--padding-md);
+  padding-top: var(--padding-md);
+  border-top: 1px solid var(--border-primary);
+  font-size: calc(11px * var(--font-scale, 1));
+  color: var(--fg-secondary);
+}
+
+.detailsSection {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 200px;
+  overflow-y: auto;
+  margin-top: var(--padding-md);
+  padding-top: var(--padding-sm);
+  border-top: 1px solid var(--border-primary);
+}
+
+.detailRow {
+  display: flex;
+  align-items: baseline;
+  gap: var(--padding-sm);
+  min-width: 0;
+  padding: var(--padding-xs) 0;
+  font-size: calc(11px * var(--font-scale, 1));
+}
+
+.detailName {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--fg-primary);
+}
+
+.detailStatus {
+  flex: 0 0 auto;
+  color: var(--fg-secondary);
+  text-transform: capitalize;
+}
+
+.detailError {
+  min-width: 0;
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--fg-error);
+}
+
 .errorSection {
   background: rgba(var(--accent-red-rgb), 0.1);
   border: 1px solid rgba(var(--accent-red-rgb), 0.3);

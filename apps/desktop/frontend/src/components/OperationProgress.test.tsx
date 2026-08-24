@@ -4,7 +4,9 @@ import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const invoke = vi.hoisted(() => vi.fn());
+const retryFailedOrCancelledItems = vi.hoisted(() => vi.fn());
 vi.mock('@tauri-apps/api/core', () => ({ invoke }));
+vi.mock('../utils/fileOperations', () => ({ retryFailedOrCancelledItems }));
 
 import { OperationProgress } from './OperationProgress';
 import type { FileOperation } from '../operationQueueStore';
@@ -40,6 +42,7 @@ describe('OperationProgress', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     invoke.mockResolvedValue(true);
+    retryFailedOrCancelledItems.mockResolvedValue(true);
     useOperationQueueStore.setState({ operations: [], showProgressPanel: false });
   });
 
@@ -123,5 +126,81 @@ describe('OperationProgress', () => {
 
     expect(screen.getByRole('progressbar')).toHaveAttribute('aria-valuenow', '100');
     expect(screen.getByText('100%')).toBeInTheDocument();
+  });
+
+  it('shows per-item outcomes and retries only unresolved transfer items', async () => {
+    const user = userEvent.setup();
+    useOperationQueueStore.setState({
+      showProgressPanel: true,
+      operations: [
+        operation({
+          status: 'failed',
+          items: [
+            {
+              sourcePath: '/root/done.txt',
+              size: 100,
+              name: 'done.txt',
+              isDir: false,
+              outcome: 'completed',
+            },
+            {
+              sourcePath: '/root/retry.txt',
+              size: 100,
+              name: 'retry.txt',
+              isDir: false,
+              outcome: 'failed',
+              error: 'Remote unavailable',
+            },
+          ],
+          outcomes: { completed: 1, skipped: 0, failed: 1, cancelled: 0 },
+          totalItems: 2,
+          totalBytes: 200,
+          error: '1 item(s) failed',
+        }),
+      ],
+    });
+    render(<OperationProgress />);
+
+    expect(screen.getByText('1 completed')).toBeInTheDocument();
+    expect(screen.getAllByText('1 failed').length).toBeGreaterThan(0);
+    await user.click(screen.getByRole('button', { name: 'Retry copy operation' }));
+    expect(retryFailedOrCancelledItems).toHaveBeenCalledWith('job-1', expect.any(Function));
+
+    await user.click(screen.getByRole('button', { name: 'Show copy operation details' }));
+    expect(screen.getByText('done.txt')).toBeInTheDocument();
+    expect(screen.getByText('retry.txt')).toBeInTheDocument();
+    expect(screen.getByText('Remote unavailable')).toBeInTheDocument();
+  });
+
+  it('does not offer retry for delete operations', () => {
+    useOperationQueueStore.setState({
+      showProgressPanel: true,
+      operations: [
+        operation({
+          id: 'delete-job',
+          type: 'delete',
+          status: 'failed',
+          error: 'Trash unavailable',
+          items: [
+            {
+              sourcePath: '/root/report.txt',
+              size: 200,
+              name: 'report.txt',
+              isDir: false,
+              outcome: 'failed',
+            },
+          ],
+          outcomes: { completed: 0, skipped: 0, failed: 1, cancelled: 0 },
+        }),
+      ],
+    });
+    render(<OperationProgress />);
+
+    expect(
+      screen.queryByRole('button', { name: 'Retry delete operation' })
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole('button', { name: 'Show delete operation details' })
+    ).toBeInTheDocument();
   });
 });

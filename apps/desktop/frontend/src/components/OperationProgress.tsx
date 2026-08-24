@@ -3,7 +3,11 @@ import { Icon } from './Icon';
 import type { FileOperation } from '../operationQueueStore';
 import { useOperationQueueStore, formatBytes } from '../operationQueueStore';
 import { useFileStore } from '../store';
+import { useOptionalToast } from './Toast';
+import { retryFailedOrCancelledItems } from '../utils/fileOperations';
 import styles from './OperationProgress.module.css';
+
+const noToast = () => '';
 
 // Helper to get icon for operation type
 function getOperationIcon(type: FileOperation['type']): string {
@@ -39,6 +43,11 @@ function getStatusClass(status: FileOperation['status']): string {
 function OperationItem({ operation }: { operation: FileOperation }) {
   const cancelOperation = useOperationQueueStore((s) => s.cancelOperation);
   const removeOperation = useOperationQueueStore((s) => s.removeOperation);
+  const getRetryableItems = useOperationQueueStore((s) => s.getRetryableItems);
+  const toast = useOptionalToast();
+  const showToast = toast?.show ?? noToast;
+  const [showDetails, setShowDetails] = useState(false);
+  const [isRetrying, setIsRetrying] = useState(false);
 
   const rawProgress =
     operation.totalBytes > 0
@@ -57,6 +66,20 @@ function OperationItem({ operation }: { operation: FileOperation }) {
     operation.status === 'completed' ||
     operation.status === 'cancelled' ||
     operation.status === 'failed';
+  const retryableItems = getRetryableItems(operation.id);
+  const canRetry =
+    operation.status !== 'running' &&
+    (operation.type === 'copy' || operation.type === 'move') &&
+    retryableItems.length > 0;
+
+  const handleRetry = useCallback(async () => {
+    setIsRetrying(true);
+    try {
+      await retryFailedOrCancelledItems(operation.id, showToast);
+    } finally {
+      setIsRetrying(false);
+    }
+  }, [operation.id, showToast]);
 
   return (
     <div className={`${styles.operation} ${getStatusClass(operation.status)}`}>
@@ -84,6 +107,17 @@ function OperationItem({ operation }: { operation: FileOperation }) {
                 : 'Failed'}
         </span>
         <div className={styles.operationActions}>
+          {canRetry && (
+            <button
+              className={styles.actionButton}
+              onClick={() => void handleRetry()}
+              disabled={isRetrying}
+              title="Retry failed and cancelled items"
+              aria-label={`Retry ${operation.type} operation`}
+            >
+              <Icon name="redo" size={12} />
+            </button>
+          )}
           {canCancel && (
             <button
               className={styles.actionButton}
@@ -102,6 +136,20 @@ function OperationItem({ operation }: { operation: FileOperation }) {
               aria-label={`Remove ${operation.type} operation`}
             >
               <Icon name="x" size={12} />
+            </button>
+          )}
+          {operation.status !== 'running' && (
+            <button
+              className={styles.actionButton}
+              onClick={() => setShowDetails((visible) => !visible)}
+              title={showDetails ? 'Hide operation details' : 'Show operation details'}
+              aria-label={
+                showDetails
+                  ? `Hide ${operation.type} operation details`
+                  : `Show ${operation.type} operation details`
+              }
+            >
+              <Icon name={showDetails ? 'chevron-up' : 'chevron-down'} size={12} />
             </button>
           )}
         </div>
@@ -177,6 +225,27 @@ function OperationItem({ operation }: { operation: FileOperation }) {
         <div className={styles.errorMessage}>
           <Icon name="warning-box" size={12} />
           {operation.error}
+        </div>
+      )}
+
+      {operation.outcomes && operation.status !== 'running' && (
+        <div className={styles.outcomeSummary} aria-label="Operation outcomes">
+          <span>{operation.outcomes.completed} completed</span>
+          <span>{operation.outcomes.skipped} skipped</span>
+          <span>{operation.outcomes.failed} failed</span>
+          <span>{operation.outcomes.cancelled} cancelled</span>
+        </div>
+      )}
+
+      {operation.status !== 'running' && showDetails && (
+        <div className={styles.detailsSection} aria-label="Operation item details">
+          {operation.items.map((item) => (
+            <div key={item.sourcePath} className={styles.detailRow}>
+              <span className={styles.detailName}>{item.name}</span>
+              <span className={styles.detailStatus}>{item.outcome ?? 'pending'}</span>
+              {item.error && <span className={styles.detailError}>{item.error}</span>}
+            </div>
+          ))}
         </div>
       )}
     </div>

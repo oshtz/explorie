@@ -10,14 +10,23 @@ import { generateOperationId, useUndoRedoStore } from '../undoRedoStore';
 import { clearDirSizeCache } from '../dirSizeCache';
 import type { ConflictAction } from '../conflictResolutionStore';
 import { checkForConflict, useConflictResolutionStore } from '../conflictResolutionStore';
-import { deletePath } from './fs';
+import { deletePath, fileExists } from './fs';
 import { formatErrorMessage } from './errorMessages';
 import { describeFileEntry, formatItemCount, summarizeFailedItems } from './fileOperationFormat';
 import { getParentPath } from './path';
+import { loadRemoteDrives } from './remoteDrives';
+import {
+  useOperationQueueStore,
+  type ConflictResolution,
+  type FileOperation,
+  type ItemOutcome,
+  type OperationItem,
+} from '../operationQueueStore';
 import {
   runNativeFileOperation,
   type NativeConflictPolicy,
   type NativeFileOperationResult,
+  type NativeFileOperationProgress,
 } from './nativeFileOperations';
 
 export type ShowToastFn = (
@@ -39,6 +48,8 @@ export interface DeleteOptions {
 export interface ConflictResolutionOptions {
   conflictResolution: 'skip' | 'replace' | 'keepBoth' | 'ask';
 }
+
+const transferRefreshHandlers = new Map<string, RefreshFn>();
 
 function presentationItem(file: FileEntry) {
   const descriptor = describeFileEntry(file);
@@ -77,22 +88,29 @@ async function runOne(
   kind: 'copy' | 'move',
   file: FileEntry,
   targetDir: string,
-  policy: NativeConflictPolicy
+  policy: NativeConflictPolicy,
+  operationId?: string,
+  onProgress?: (progress: NativeFileOperationProgress) => void
 ): Promise<NativeFileOperationResult> {
-  return runNativeFileOperation(
-    {
-      kind,
-      sources: [file.path],
-      destination: targetDir,
-      conflictPolicy: policy,
-    },
-    {
-      type: kind,
-      items: [presentationItem(file)],
-      destinationPath: targetDir,
-      conflictResolution: presentationPolicy(policy),
-    }
-  );
+  const request = {
+    kind,
+    sources: [file.path],
+    destination: targetDir,
+    conflictPolicy: policy,
+  };
+  const presentation = {
+    type: kind,
+    items: [presentationItem(file)],
+    destinationPath: targetDir,
+    conflictResolution: presentationPolicy(policy),
+  };
+  if (!operationId) return runNativeFileOperation(request, presentation);
+  return runNativeFileOperation(request, {
+    ...presentation,
+    operationId,
+    trackOperation: false,
+    onProgress,
+  });
 }
 
 async function refreshAfterMutation(onRefresh: RefreshFn): Promise<void> {
@@ -102,6 +120,159 @@ async function refreshAfterMutation(onRefresh: RefreshFn): Promise<void> {
 
 function isCancellation(error: unknown): boolean {
   return error instanceof Error && error.name === 'AbortError';
+}
+
+function queueConflictResolution(options: ConflictResolutionOptions): ConflictResolution {
+  return options.conflictResolution === 'keepBoth' ? 'rename' : options.conflictResolution;
+}
+
+function createTransferOperation(
+  id: string,
+  type: 'copy' | 'move',
+  files: FileEntry[],
+  destinationPath: string,
+  options: ConflictResolutionOptions,
+  onRefresh: RefreshFn
+): void {
+  transferRefreshHandlers.set(id, onRefresh);
+  useOperationQueueStore.getState().trackOperation({
+    id,
+    type,
+    items: files.map(presentationItem),
+    destinationPath,
+    destinationSnapshot: destinationPath,
+    totalBytes: files.reduce((sum, file) => sum + (file.size ?? 0), 0),
+    totalItems: files.length,
+    conflictResolution: queueConflictResolution(options),
+  });
+}
+
+function updateTransferItem(
+  operationId: string,
+  sourcePath: string,
+  outcome: ItemOutcome,
+  error?: string,
+  destPath?: string
+): void {
+  useOperationQueueStore
+    .getState()
+    .updateItemOutcome(operationId, sourcePath, outcome, error, destPath);
+}
+
+function markCancelledItems(operationId: string, files: FileEntry[], fromIndex: number): void {
+  for (const file of files.slice(fromIndex)) {
+    updateTransferItem(operationId, file.path, 'cancelled', 'Operation cancelled');
+  }
+}
+
+function currentTransferCounts(operationId: string) {
+  const operation = useOperationQueueStore
+    .getState()
+    .operations.find((item) => item.id === operationId);
+  return operation?.outcomes ?? { completed: 0, skipped: 0, failed: 0, cancelled: 0 };
+}
+
+function finishTransferOperation(operationId: string): void {
+  const counts = currentTransferCounts(operationId);
+  const status = counts.failed > 0 ? 'failed' : counts.cancelled > 0 ? 'cancelled' : 'completed';
+  const error = counts.failed > 0 ? `${counts.failed} item(s) failed` : undefined;
+  useOperationQueueStore.getState().finishOperation(operationId, status, error);
+}
+
+function retryOptions(operation: FileOperation): ConflictResolutionOptions {
+  switch (operation.conflictResolution) {
+    case 'replace':
+      return { conflictResolution: 'replace' };
+    case 'rename':
+      return { conflictResolution: 'keepBoth' };
+    case 'skip':
+      return { conflictResolution: 'skip' };
+    default:
+      return { conflictResolution: 'ask' };
+  }
+}
+
+function normalizePathForComparison(path: string): string {
+  const normalized = path
+    .replace(/[\\/]+/g, '/')
+    .replace(/\/+$/, '')
+    .toLowerCase();
+  return normalized || '/';
+}
+
+function configuredRemoteMountRoots(): string[] {
+  return loadRemoteDrives().flatMap(({ mountTarget }) => {
+    const target = normalizePathForComparison(mountTarget.trim());
+    if (!target) return [];
+    if (/^[a-z]:$/.test(target)) return [`${target}/`];
+    if (target.startsWith('/')) return [target];
+    return [`/volumes/${target}`];
+  });
+}
+
+function remoteMountRootForPath(path: string, roots: string[]): string | undefined {
+  const normalizedPath = normalizePathForComparison(path);
+  return roots.find((root) => {
+    const normalizedRoot = normalizePathForComparison(root);
+    return normalizedPath === normalizedRoot || normalizedPath.startsWith(`${normalizedRoot}/`);
+  });
+}
+
+function isTransientRemoteError(error?: string): boolean {
+  return /remote|network|offline|unavailable|disconnected|timed? ?out/i.test(error ?? '');
+}
+
+async function validateRetryPaths(
+  operation: FileOperation,
+  items: OperationItem[],
+  showToast: ShowToastFn
+): Promise<boolean> {
+  const destinationSnapshot = operation.destinationSnapshot ?? operation.destinationPath;
+  if (!operation.destinationPath || operation.destinationPath !== destinationSnapshot) {
+    showToast('Cannot retry: the original destination has changed.', { type: 'error' });
+    return false;
+  }
+  const remoteRoots = configuredRemoteMountRoots();
+  const mountAvailability = new Map<string, Promise<boolean>>();
+  const isRemoteMountUnavailable = async (path: string): Promise<boolean> => {
+    const root = remoteMountRootForPath(path, remoteRoots);
+    if (!root) return false;
+    let available = mountAvailability.get(root);
+    if (!available) {
+      available = fileExists(root);
+      mountAvailability.set(root, available);
+    }
+    return !(await available);
+  };
+
+  const destinationUnavailable = !(await fileExists(operation.destinationPath));
+  const destinationMayBeTransient =
+    items.some((item) => isTransientRemoteError(item.error)) ||
+    (destinationUnavailable && (await isRemoteMountUnavailable(operation.destinationPath)));
+  if (destinationUnavailable && !destinationMayBeTransient) {
+    showToast('Cannot retry: the original destination is no longer available.', {
+      type: 'error',
+    });
+    return false;
+  }
+  const missing = [] as string[];
+  for (const item of items) {
+    const sourceUnavailable = !(await fileExists(item.sourcePath));
+    const sourceMayBeTransient =
+      isTransientRemoteError(item.error) && sourceUnavailable
+        ? true
+        : sourceUnavailable && (await isRemoteMountUnavailable(item.sourcePath));
+    if (sourceUnavailable && !sourceMayBeTransient) {
+      missing.push(item.name);
+    }
+  }
+  if (missing.length > 0) {
+    showToast(`Cannot retry: source is no longer available (${missing.join(', ')}).`, {
+      type: 'error',
+    });
+    return false;
+  }
+  return true;
 }
 
 /**
@@ -173,10 +344,16 @@ export async function copyWithUndoAndConflictResolution(
   targetDir: string,
   showToast: ShowToastFn,
   onRefresh: RefreshFn,
-  options: ConflictResolutionOptions = { conflictResolution: 'ask' }
+  options: ConflictResolutionOptions = { conflictResolution: 'ask' },
+  operationId?: string
 ): Promise<boolean> {
   if (files.length === 0) return false;
   useConflictResolutionStore.getState().reset('copy');
+
+  const transferId = operationId ?? generateOperationId();
+  if (!operationId) {
+    createTransferOperation(transferId, 'copy', files, targetDir, options, onRefresh);
+  }
 
   const createdPaths: string[] = [];
   const sourceItems: CopyOperation['sourceItems'] = [];
@@ -186,29 +363,76 @@ export async function copyWithUndoAndConflictResolution(
   const skipped: string[] = [];
   let cancelled = false;
 
-  for (const file of files) {
+  for (let index = 0; index < files.length; index += 1) {
+    const file = files[index];
     const name = describeFileEntry(file).name;
+    if (useOperationQueueStore.getState().isCancellationRequested(transferId)) {
+      markCancelledItems(transferId, files, index);
+      cancelled = true;
+      break;
+    }
     try {
       const policy = await resolveConflictPolicy(file, targetDir, options);
       if (!policy) {
         skipped.push(name);
+        updateTransferItem(transferId, file.path, 'skipped');
+        const current = useOperationQueueStore
+          .getState()
+          .operations.find((item) => item.id === transferId);
+        useOperationQueueStore.getState().updateProgress(transferId, {
+          processedItems: (current?.processedItems ?? 0) + 1,
+        });
         continue;
       }
-      const result = await runOne('copy', file, targetDir, policy);
+      const before = useOperationQueueStore
+        .getState()
+        .operations.find((item) => item.id === transferId);
+      const result = await runOne('copy', file, targetDir, policy, transferId, (progress) => {
+        const base = useOperationQueueStore
+          .getState()
+          .operations.find((item) => item.id === transferId);
+        useOperationQueueStore.getState().updateProgress(transferId, {
+          processedBytes: (before?.processedBytes ?? 0) + progress.processedBytes,
+          processedItems: base?.processedItems ?? before?.processedItems ?? 0,
+          currentItem: progress.currentPath ?? file.path,
+        });
+      });
       const target = result.targets[0];
       if (!target) throw new Error('Native copy completed without a destination path');
       createdPaths.push(target);
       sourceItems.push({ path: file.path, name });
       completedFiles.push(file);
       completedPolicies.push(policy);
+      updateTransferItem(transferId, file.path, 'completed', undefined, target);
+      const current = useOperationQueueStore
+        .getState()
+        .operations.find((item) => item.id === transferId);
+      useOperationQueueStore.getState().updateProgress(transferId, {
+        processedBytes: (before?.processedBytes ?? 0) + result.processedBytes,
+        processedItems: (current?.processedItems ?? before?.processedItems ?? 0) + 1,
+        currentItem: undefined,
+      });
     } catch (error) {
       if (isCancellation(error)) {
         cancelled = true;
+        updateTransferItem(transferId, file.path, 'cancelled', 'Operation cancelled');
+        markCancelledItems(transferId, files, index + 1);
         break;
       }
-      failed.push({ name, error: formatErrorMessage(error) });
+      const errorMessage = formatErrorMessage(error);
+      failed.push({ name, error: errorMessage });
+      updateTransferItem(transferId, file.path, 'failed', errorMessage);
+      const current = useOperationQueueStore
+        .getState()
+        .operations.find((item) => item.id === transferId);
+      useOperationQueueStore.getState().updateProgress(transferId, {
+        processedItems: (current?.processedItems ?? 0) + 1,
+        currentItem: undefined,
+      });
     }
   }
+
+  finishTransferOperation(transferId);
 
   if (createdPaths.length === 0) {
     if (cancelled) {
@@ -318,10 +542,16 @@ export async function moveWithUndoAndConflictResolution(
   targetDir: string,
   showToast: ShowToastFn,
   onRefresh: RefreshFn,
-  options: ConflictResolutionOptions = { conflictResolution: 'ask' }
+  options: ConflictResolutionOptions = { conflictResolution: 'ask' },
+  operationId?: string
 ): Promise<boolean> {
   if (files.length === 0) return false;
   useConflictResolutionStore.getState().reset('move');
+
+  const transferId = operationId ?? generateOperationId();
+  if (!operationId) {
+    createTransferOperation(transferId, 'move', files, targetDir, options, onRefresh);
+  }
 
   const moveItems: MoveOperation['items'] = [];
   const movedFiles: FileEntry[] = [];
@@ -330,28 +560,75 @@ export async function moveWithUndoAndConflictResolution(
   const skipped: string[] = [];
   let cancelled = false;
 
-  for (const file of files) {
+  for (let index = 0; index < files.length; index += 1) {
+    const file = files[index];
     const name = describeFileEntry(file).name;
+    if (useOperationQueueStore.getState().isCancellationRequested(transferId)) {
+      markCancelledItems(transferId, files, index);
+      cancelled = true;
+      break;
+    }
     try {
       const policy = await resolveConflictPolicy(file, targetDir, options);
       if (!policy) {
         skipped.push(name);
+        updateTransferItem(transferId, file.path, 'skipped');
+        const current = useOperationQueueStore
+          .getState()
+          .operations.find((item) => item.id === transferId);
+        useOperationQueueStore.getState().updateProgress(transferId, {
+          processedItems: (current?.processedItems ?? 0) + 1,
+        });
         continue;
       }
-      const result = await runOne('move', file, targetDir, policy);
+      const before = useOperationQueueStore
+        .getState()
+        .operations.find((item) => item.id === transferId);
+      const result = await runOne('move', file, targetDir, policy, transferId, (progress) => {
+        const current = useOperationQueueStore
+          .getState()
+          .operations.find((item) => item.id === transferId);
+        useOperationQueueStore.getState().updateProgress(transferId, {
+          processedBytes: (before?.processedBytes ?? 0) + progress.processedBytes,
+          processedItems: current?.processedItems ?? before?.processedItems ?? 0,
+          currentItem: progress.currentPath ?? file.path,
+        });
+      });
       const target = result.targets[0];
       if (!target) throw new Error('Native move completed without a destination path');
       moveItems.push({ sourcePath: file.path, destPath: target, name });
       movedFiles.push(file);
       completedPolicies.push(policy);
+      updateTransferItem(transferId, file.path, 'completed', undefined, target);
+      const current = useOperationQueueStore
+        .getState()
+        .operations.find((item) => item.id === transferId);
+      useOperationQueueStore.getState().updateProgress(transferId, {
+        processedBytes: (before?.processedBytes ?? 0) + result.processedBytes,
+        processedItems: (current?.processedItems ?? before?.processedItems ?? 0) + 1,
+        currentItem: undefined,
+      });
     } catch (error) {
       if (isCancellation(error)) {
         cancelled = true;
+        updateTransferItem(transferId, file.path, 'cancelled', 'Operation cancelled');
+        markCancelledItems(transferId, files, index + 1);
         break;
       }
-      failed.push({ name, error: formatErrorMessage(error) });
+      const errorMessage = formatErrorMessage(error);
+      failed.push({ name, error: errorMessage });
+      updateTransferItem(transferId, file.path, 'failed', errorMessage);
+      const current = useOperationQueueStore
+        .getState()
+        .operations.find((item) => item.id === transferId);
+      useOperationQueueStore.getState().updateProgress(transferId, {
+        processedItems: (current?.processedItems ?? 0) + 1,
+        currentItem: undefined,
+      });
     }
   }
+
+  finishTransferOperation(transferId);
 
   if (moveItems.length === 0) {
     if (cancelled) {
@@ -449,4 +726,73 @@ export async function moveWithUndoAndConflictResolution(
   );
   await refreshAfterMutation(onRefresh);
   return !cancelled && failed.length === 0;
+}
+
+export async function retryFailedOrCancelledItems(
+  operationId: string,
+  showToast: ShowToastFn,
+  onRefresh?: RefreshFn
+): Promise<boolean> {
+  const operation = useOperationQueueStore
+    .getState()
+    .operations.find((item) => item.id === operationId);
+  if (!operation) {
+    showToast('Operation is no longer available.', { type: 'error' });
+    return false;
+  }
+  if (operation.type === 'delete') {
+    showToast('Delete operations cannot be retried.', { type: 'error' });
+    return false;
+  }
+  if (operation.status === 'running') {
+    showToast('This operation is still in progress.', { type: 'info' });
+    return false;
+  }
+
+  const retryableItems = useOperationQueueStore.getState().getRetryableItems(operationId);
+  if (retryableItems.length === 0) {
+    showToast('There are no failed or cancelled items to retry.', { type: 'info' });
+    return false;
+  }
+
+  const files: FileEntry[] = retryableItems.map((item) => ({
+    id: item.sourcePath,
+    path: item.sourcePath,
+    name: item.name,
+    size: item.size,
+    modified: new Date(0).toISOString(),
+    hidden: false,
+    is_dir: item.isDir,
+    custom: {},
+  }));
+
+  if (!(await validateRetryPaths(operation, retryableItems, showToast))) return false;
+
+  try {
+    useOperationQueueStore.getState().beginRetryOperation(operationId);
+    const options = retryOptions(operation);
+    const refresh = onRefresh ?? transferRefreshHandlers.get(operationId) ?? (() => undefined);
+    const result =
+      operation.type === 'copy'
+        ? await copyWithUndoAndConflictResolution(
+            files,
+            operation.destinationPath!,
+            showToast,
+            refresh,
+            options,
+            operationId
+          )
+        : await moveWithUndoAndConflictResolution(
+            files,
+            operation.destinationPath!,
+            showToast,
+            refresh,
+            options,
+            operationId
+          );
+    return result;
+  } catch (error) {
+    showToast(`Retry failed: ${formatErrorMessage(error)}`, { type: 'error' });
+    return false;
+  }
 }
