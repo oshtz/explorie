@@ -787,4 +787,77 @@ describe('FileTable', () => {
     fireEvent.click(screen.getByText('Mock extract action'));
     expect(await screen.findByText('Archive mode: extract')).toBeInTheDocument();
   });
+
+  it('distinguishes symlink, junction, dangling target, and ordinary files', () => {
+    render(
+      <FileTable
+        droppableId="list:/root"
+        files={[
+          makeFile({
+            id: 'ordinary',
+            path: '/root/notes.txt',
+            name: 'notes.txt',
+          }),
+          makeFile({
+            id: 'symlink',
+            path: '/root/alias.txt',
+            name: 'alias.txt',
+            is_symlink: true,
+            link_target: '/tmp/real.txt',
+            has_xattrs: true,
+          }),
+          makeFile({
+            id: 'junction',
+            path: '/root/docs-link',
+            name: 'docs-link',
+            is_junction: true,
+            link_target: 'D:\\share\\docs',
+          }),
+          makeFile({
+            id: 'dangling',
+            path: '/root/broken',
+            name: 'broken',
+            is_symlink: true,
+          }),
+        ]}
+        sortKey="name"
+        sortDir="asc"
+        onSort={vi.fn()}
+      />
+    );
+
+    const ordinary = screen.getByRole('row', { name: /file: notes\.txt/i });
+    expect(ordinary).not.toHaveAttribute('data-link-kind');
+    expect(within(ordinary).queryByTestId('link-kind')).not.toBeInTheDocument();
+    expect(within(ordinary).queryByTestId('xattr-mark')).not.toBeInTheDocument();
+    expect(within(ordinary).getByText('notes.txt')).toHaveAttribute('title', 'notes.txt');
+
+    const symlink = screen.getByRole('row', { name: /file: alias\.txt/i });
+    expect(symlink).toHaveAttribute('data-link-kind', 'symlink');
+    expect(within(symlink).getByTestId('link-kind')).toHaveAttribute('data-link-kind', 'symlink');
+    expect(within(symlink).getByTestId('link-kind')).toHaveAttribute('data-dangling', 'false');
+    expect(within(symlink).getByLabelText('Symbolic link to /tmp/real.txt')).toBeInTheDocument();
+    expect(within(symlink).getByTestId('xattr-mark')).toHaveAttribute(
+      'aria-label',
+      'Extended attributes on this item'
+    );
+    expect(within(symlink).getByText('alias.txt').getAttribute('title')).toContain('/tmp/real.txt');
+    expect(within(symlink).getByText('alias.txt').getAttribute('title')).toContain(
+      'Extended attributes on this item'
+    );
+
+    const junction = screen.getByRole('row', { name: /file: docs-link/i });
+    expect(junction).toHaveAttribute('data-link-kind', 'junction');
+    expect(within(junction).getByTestId('link-kind')).toHaveTextContent('junction');
+    expect(within(junction).getByLabelText('Junction to D:\\share\\docs')).toBeInTheDocument();
+    expect(within(junction).getByText('docs-link').getAttribute('title')).toContain(
+      'D:\\share\\docs'
+    );
+
+    const dangling = screen.getByRole('row', { name: /file: broken/i });
+    expect(dangling).toHaveAttribute('data-link-kind', 'symlink');
+    expect(within(dangling).getByTestId('link-kind')).toHaveAttribute('data-dangling', 'true');
+    expect(within(dangling).getByLabelText('Dangling symbolic link')).toBeInTheDocument();
+    expect(within(dangling).getByText('broken').getAttribute('title')).toContain('dangling target');
+  });
 });

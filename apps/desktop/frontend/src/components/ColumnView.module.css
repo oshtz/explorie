@@ -200,6 +200,11 @@
   font-size: calc(12px * var(--font-scale));
 }
 
+.symlink .fileName,
+.junction .fileName {
+  font-style: italic;
+}
+
 .fileSize {
   font-size: calc(10px * var(--font-scale));
   color: var(--fg-tertiary);

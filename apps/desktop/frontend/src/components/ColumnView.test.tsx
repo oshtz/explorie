@@ -709,4 +709,60 @@ describe('ColumnView', () => {
     expect(storeState.setPathStack).toHaveBeenCalledWith(['/draft']);
     expect(onFolderClick).not.toHaveBeenCalled();
   });
+
+  it('distinguishes symlink, junction, dangling target, and ordinary files', () => {
+    storeState.pathStack = ['/links'];
+    const columnFiles = {
+      '/links': [
+        makeEntry('/links/notes.txt', { id: 'ordinary' }),
+        makeEntry('/links/alias.txt', {
+          id: 'symlink',
+          is_symlink: true,
+          link_target: '/tmp/real.txt',
+          has_xattrs: true,
+        }),
+        makeEntry('/links/docs-link', {
+          id: 'junction',
+          is_junction: true,
+          link_target: 'D:\\share\\docs',
+        }),
+        makeEntry('/links/broken', { id: 'dangling', is_symlink: true }),
+      ],
+    };
+
+    render(
+      <ColumnView
+        pathStack={storeState.pathStack}
+        columnFiles={columnFiles as any}
+        onFolderClick={vi.fn()}
+        onColumnBack={vi.fn()}
+      />
+    );
+
+    const ordinary = screen.getByLabelText('Select file notes.txt');
+    expect(ordinary).not.toHaveAttribute('data-link-kind');
+    expect(ordinary.querySelector('[data-testid="link-kind"]')).toBeNull();
+    expect(ordinary.querySelector('[data-testid="xattr-mark"]')).toBeNull();
+
+    const symlink = screen.getByLabelText(
+      /Select file alias\.txt, symbolic link to \/tmp\/real\.txt/
+    );
+    expect(symlink).toHaveAttribute('data-link-kind', 'symlink');
+    expect(symlink.querySelector('[data-testid="xattr-mark"]')).toHaveAttribute(
+      'aria-label',
+      'Extended attributes on this item'
+    );
+    expect(screen.getByText('alias.txt').getAttribute('title')).toContain('/tmp/real.txt');
+
+    const junction = screen.getByLabelText(/Select file docs-link, junction to/);
+    expect(junction).toHaveAttribute('data-link-kind', 'junction');
+    expect(junction.querySelector('[data-testid="link-kind"]')).toHaveTextContent('junction');
+
+    const dangling = screen.getByLabelText('Select file broken, dangling symbolic link');
+    expect(dangling.querySelector('[data-testid="link-kind"]')).toHaveAttribute(
+      'data-dangling',
+      'true'
+    );
+    expect(screen.getByText('broken').getAttribute('title')).toContain('dangling target');
+  });
 });

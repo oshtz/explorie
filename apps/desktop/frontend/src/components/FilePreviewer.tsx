@@ -172,6 +172,16 @@ export function FilePreviewer({ file, onClose, variant = 'panel' }: FilePreviewe
       }
     };
 
+    if (file.is_symlink || file.is_junction) {
+      setFileType(file.is_junction ? 'inode/junction' : 'inode/symlink');
+      finishLoading();
+      return () => {
+        cancelled = true;
+        fallbackHandlerRef.current = null;
+        fallbackInFlightRef.current = false;
+      };
+    }
+
     // Image preview
     if (file.path && ['png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp'].includes(ext)) {
       const fallbackToEmbedded = async () => {

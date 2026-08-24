@@ -23,6 +23,13 @@ import { reportError } from '../utils/errorReporter';
 import type { GetSelectedFilesFunction } from '../hooks/useKeyboardClipboard';
 import { useCentralFileSelection } from '../hooks/useCentralFileSelection';
 import type { DragStartHandler } from '../hooks/useDragStart';
+import { LinkIdentityMarks } from './LinkIdentityMarks';
+import {
+  entryAriaSuffix,
+  entryDisplayTitle,
+  getLinkKind,
+  isLinkEntry,
+} from '../utils/linkIdentity';
 
 const LazyBatchRenameDialog = React.lazy(() =>
   import('./BatchRenameDialog').then((m) => ({ default: m.BatchRenameDialog }))
@@ -260,7 +267,8 @@ function GridFileVisual({
 }) {
   const [failed, setFailed] = useState(false);
   const extension = getFileExtension(file.path);
-  const hasThumbnail = !isDirectory(file) && GRID_THUMBNAIL_EXTENSIONS.has(extension);
+  const hasThumbnail =
+    !isDirectory(file) && !isLinkEntry(file) && GRID_THUMBNAIL_EXTENSIONS.has(extension);
   const src = hasThumbnail ? thumbnailSrc : nativeIconSrc;
 
   useEffect(() => setFailed(false), [src]);
@@ -541,6 +549,7 @@ function GridViewInner({
             (file): file is FileEntry =>
               Boolean(file) &&
               !isDirectory(file) &&
+              !isLinkEntry(file) &&
               ['exe', 'lnk'].includes(getFileExtension(file.path))
           )
           .map((file) => ({ path: file.path, modified: file.modified }))
@@ -585,6 +594,7 @@ function GridViewInner({
             (file): file is FileEntry =>
               Boolean(file) &&
               !isDirectory(file) &&
+              !isLinkEntry(file) &&
               GRID_THUMBNAIL_EXTENSIONS.has(getFileExtension(file.path))
           )
           .map((file) => ({ path: file.path, modified: file.modified }))
@@ -1132,6 +1142,7 @@ function GridViewInner({
                 const isFolder = isDirectory(file);
                 const fileName = file.path.split(/[/\\]/).pop() || file.path;
                 const isSource = draggingItemIds?.has(file.id) ?? false;
+                const linkKind = getLinkKind(file);
                 const itemStyle: React.CSSProperties = isFolder
                   ? {
                       backgroundImage:
@@ -1143,12 +1154,15 @@ function GridViewInner({
                   <div
                     key={file.id}
                     data-file-id={file.id}
+                    data-link-kind={linkKind ?? undefined}
                     className={`
                     ${styles.gridItem}
                     ${isFolder ? styles.folder : styles.file}
                     ${selectedIds.has(file.id) ? styles.selected : ''}
                     ${isSource ? styles.dragSource : ''}
                     ${dragCombineTargetId === file.id && isFolder ? styles.dropTarget : ''}
+                    ${linkKind === 'symlink' ? styles.symlink : ''}
+                    ${linkKind === 'junction' ? styles.junction : ''}
                   `}
                     style={{
                       ...(isSource ? { pointerEvents: 'none' } : {}),
@@ -1159,7 +1173,11 @@ function GridViewInner({
                     role="option"
                     aria-selected={selectedIds.has(file.id)}
                     tabIndex={cursorIndex === itemIndex ? 0 : -1}
-                    aria-label={isFolder ? `Open folder ${fileName}` : `Select file ${fileName}`}
+                    aria-label={
+                      isFolder
+                        ? `Open folder ${fileName}${entryAriaSuffix(file)}`
+                        : `Select file ${fileName}${entryAriaSuffix(file)}`
+                    }
                     onClick={(e) => handleItemClick(e, itemIndex, file)}
                     onDoubleClick={() => {
                       if (isFolder) onFolderOpen?.(file);
@@ -1223,10 +1241,11 @@ function GridViewInner({
                         onDone={(committed, newName) => handleRename(file, committed, newName)}
                       />
                     ) : (
-                      <span className={styles.fileName} title={fileName}>
+                      <span className={styles.fileName} title={entryDisplayTitle(fileName, file)}>
                         {fileName}
                       </span>
                     )}
+                    <LinkIdentityMarks file={file} />
                     <span className={styles.fileSize}>{formatBytes(file.size)}</span>
                   </div>
                 );

@@ -1,0 +1,26 @@
+.mark {
+  display: inline-flex;
+  align-items: center;
+  max-width: 9.5em;
+  min-height: 16px;
+  padding: 0 var(--padding-sm);
+  border: 1px solid var(--border-primary);
+  border-radius: 999px;
+  font-size: calc(9px * var(--font-scale));
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  line-height: 1.2;
+  text-transform: uppercase;
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+
+.link {
+  color: var(--fg-secondary);
+  background: var(--bg-sunken);
+}
+
+.xattr {
+  color: var(--fg-tertiary);
+  background: transparent;
+}

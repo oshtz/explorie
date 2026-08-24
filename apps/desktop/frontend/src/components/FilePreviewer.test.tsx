@@ -435,6 +435,24 @@ describe('FilePreviewer', () => {
     );
     expect(screen.getByTestId('preview-content-sample')).toHaveTextContent('Install LibreOffice');
   });
+
+  it('does not follow symlink or dangling targets when loading preview', async () => {
+    render(
+      <FilePreviewer
+        file={makeFile('/root/photo.png', {
+          is_symlink: true,
+          link_target: '/missing/nowhere.png',
+        })}
+      />
+    );
+
+    await waitFor(() =>
+      expect(screen.getByTestId('preview')).toHaveAttribute('data-type', 'inode/symlink')
+    );
+    expect(mocks.readBinaryFile).not.toHaveBeenCalled();
+    expect(mocks.convertFileSrc).not.toHaveBeenCalled();
+    expect(mocks.invoke).not.toHaveBeenCalled();
+  });
 });
 
 function makeFile(path: string, overrides: Partial<FileEntry> = {}): FileEntry {
@@ -446,5 +464,9 @@ function makeFile(path: string, overrides: Partial<FileEntry> = {}): FileEntry {
     modified: overrides.modified ?? 0,
     is_dir: overrides.is_dir ?? false,
     custom: overrides.custom ?? {},
+    is_symlink: overrides.is_symlink,
+    is_junction: overrides.is_junction,
+    link_target: overrides.link_target,
+    has_xattrs: overrides.has_xattrs,
   };
 }

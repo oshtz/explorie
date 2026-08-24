@@ -147,6 +147,11 @@
   font-weight: 500;
 }
 
+.symlink .fileName,
+.junction .fileName {
+  font-style: italic;
+}
+
 @keyframes thumbnailLoading {
   to {
     background-position: -220% 0;

@@ -21,6 +21,8 @@ import { getSortableColumnProps, announceSelection } from '../utils/accessibilit
 import type { GetSelectedFilesFunction } from '../hooks/useKeyboardClipboard';
 import { useCentralFileSelection } from '../hooks/useCentralFileSelection';
 import type { DragStartHandler } from '../hooks/useDragStart';
+import { LinkIdentityMarks } from './LinkIdentityMarks';
+import { entryAriaSuffix, entryDisplayTitle, getLinkKind } from '../utils/linkIdentity';
 
 const LazyBatchRenameDialog = React.lazy(() =>
   import('./BatchRenameDialog').then((m) => ({ default: m.BatchRenameDialog }))
@@ -1039,15 +1041,17 @@ function FileTableInner({
             const isSource = isDragging && draggingItemIds?.has(file.id);
             const isSelected = selectedIds.has(file.id);
             const fileName = file.name ?? (file.path.split(/[/\\]/).pop() || file.path);
+            const linkKind = getLinkKind(file);
             return (
               <tr
                 key={file.id}
                 data-file-id={file.id}
+                data-link-kind={linkKind ?? undefined}
                 role="row"
                 aria-rowindex={index + 2}
                 aria-selected={isSelected}
-                aria-label={`${isDirectory(file) ? 'Folder' : 'File'}: ${fileName}${isSelected ? ', selected' : ''}`}
-                className={`${styles.clickable} ${isSelected ? styles.selected : ''} ${isSource ? styles.dragSource : ''} ${combineTargetId === file.id && isDirectory(file) ? styles.dropTargetRow : ''}`}
+                aria-label={`${isDirectory(file) ? 'Folder' : 'File'}: ${fileName}${entryAriaSuffix(file)}${isSelected ? ', selected' : ''}`}
+                className={`${styles.clickable} ${isSelected ? styles.selected : ''} ${isSource ? styles.dragSource : ''} ${combineTargetId === file.id && isDirectory(file) ? styles.dropTargetRow : ''} ${linkKind === 'symlink' ? styles.symlink : ''} ${linkKind === 'junction' ? styles.junction : ''}`}
                 onClick={(e) => handleRowClick(e, index, file)}
                 onContextMenu={(e) => {
                   const clickedInSelection = selectedIds.has(file.id);
@@ -1150,10 +1154,11 @@ function FileTableInner({
                       }}
                     />
                   ) : (
-                    <span className={styles.fileName} title={fileName}>
+                    <span className={styles.fileName} title={entryDisplayTitle(fileName, file)}>
                       {fileName}
                     </span>
                   )}
+                  <LinkIdentityMarks file={file} />
                   {fileTags.map((tag) => (
                     <span
                       key={tag.key}

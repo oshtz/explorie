@@ -349,6 +349,10 @@ function makeFile(overrides: Partial<FileEntry> & Pick<FileEntry, 'id' | 'path'>
     is_dir: overrides.is_dir ?? false,
     custom: overrides.custom ?? {},
     is_draft: overrides.is_draft,
+    is_symlink: overrides.is_symlink,
+    is_junction: overrides.is_junction,
+    link_target: overrides.link_target,
+    has_xattrs: overrides.has_xattrs,
   };
 }
 
@@ -933,5 +937,62 @@ describe('GridView', () => {
     fireEvent.mouseDown(getGridContainer(container), { button: 0 });
     expect(mocks.marqueeMouseDown).toHaveBeenCalled();
     expect(onHoverFolder).toHaveBeenLastCalledWith(null);
+  });
+
+  it('distinguishes symlink, junction, dangling target, and ordinary files', () => {
+    const files = [
+      makeFile({ id: 'ordinary', path: '/root/notes.txt' }),
+      makeFile({
+        id: 'symlink',
+        path: '/root/alias.txt',
+        is_symlink: true,
+        link_target: '/tmp/real.txt',
+        has_xattrs: true,
+      }),
+      makeFile({
+        id: 'junction',
+        path: '/root/docs-link',
+        is_junction: true,
+        link_target: 'D:\\share\\docs',
+      }),
+      makeFile({
+        id: 'dangling',
+        path: '/root/broken',
+        is_symlink: true,
+      }),
+    ];
+
+    render(<GridView currentPath="/root" files={files} />);
+
+    const ordinary = screen.getByLabelText('Select file notes.txt');
+    expect(ordinary).not.toHaveAttribute('data-link-kind');
+    expect(ordinary.querySelector('[data-testid="link-kind"]')).toBeNull();
+    expect(ordinary.querySelector('[data-testid="xattr-mark"]')).toBeNull();
+
+    const symlink = screen.getByLabelText(
+      /Select file alias\.txt, symbolic link to \/tmp\/real\.txt/
+    );
+    expect(symlink).toHaveAttribute('data-link-kind', 'symlink');
+    expect(symlink.querySelector('[data-testid="link-kind"]')).toHaveAttribute(
+      'data-link-kind',
+      'symlink'
+    );
+    expect(symlink.querySelector('[data-testid="xattr-mark"]')).toHaveAttribute(
+      'aria-label',
+      'Extended attributes on this item'
+    );
+    expect(screen.getByText('alias.txt').getAttribute('title')).toContain('/tmp/real.txt');
+
+    const junction = screen.getByLabelText(/Select file docs-link, junction to/);
+    expect(junction).toHaveAttribute('data-link-kind', 'junction');
+    expect(junction.querySelector('[data-testid="link-kind"]')).toHaveTextContent('junction');
+
+    const dangling = screen.getByLabelText('Select file broken, dangling symbolic link');
+    expect(dangling).toHaveAttribute('data-link-kind', 'symlink');
+    expect(dangling.querySelector('[data-testid="link-kind"]')).toHaveAttribute(
+      'data-dangling',
+      'true'
+    );
+    expect(screen.getByText('broken').getAttribute('title')).toContain('dangling target');
   });
 });

@@ -6,6 +6,7 @@ import { FinderTags } from './FinderTags';
 import styles from './Preview.module.css';
 import { formatLocalDateTime } from '../utils/date';
 import { areFinderTagsAvailable } from '../services/finderIntegration';
+import { getLinkKind } from '../utils/linkIdentity';
 
 // Interface for the preview file type (from App.tsx FilePreviewer)
 type PreviewFile = {
@@ -368,6 +369,7 @@ export function Preview({
   // Render basic file metadata
   const renderFileMetadata = () => {
     if (!fileEntry) return null;
+    const kind = getLinkKind(fileEntry);
 
     return (
       <div className={styles.fileMetadata}>
@@ -385,6 +387,26 @@ export function Preview({
 
         <div className={styles.metadataLabel}>Type:</div>
         <div className={styles.metadataValue}>{fileType || ext || 'Unknown'}</div>
+
+        {kind ? (
+          <>
+            <div className={styles.metadataLabel}>Kind:</div>
+            <div className={styles.metadataValue}>
+              {kind === 'junction' ? 'Junction' : 'Symbolic link'}
+            </div>
+            <div className={styles.metadataLabel}>Link target:</div>
+            <div className={styles.metadataValue}>
+              {fileEntry.link_target ?? 'Dangling (target missing)'}
+            </div>
+          </>
+        ) : null}
+
+        {fileEntry.has_xattrs ? (
+          <>
+            <div className={styles.metadataLabel}>Extended attributes:</div>
+            <div className={styles.metadataValue}>Present on this item</div>
+          </>
+        ) : null}
 
         {/* Finder Tags (macOS only) */}
         {finderTagsAvailable && (

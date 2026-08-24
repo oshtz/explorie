@@ -303,4 +303,50 @@ describe('Preview', () => {
     expect(screen.queryByRole('tablist', { name: 'Preview tabs' })).not.toBeInTheDocument();
     expect(screen.getByText('Hello world')).toBeVisible();
   });
+
+  it('shows link target and xattr identity in the inspector without implying the link is the file', async () => {
+    const user = userEvent.setup();
+
+    render(
+      <Preview
+        file={fileEntry({
+          name: 'alias.txt',
+          path: '/workspace/alias.txt',
+          is_symlink: true,
+          link_target: '/tmp/real.txt',
+          has_xattrs: true,
+        })}
+      />
+    );
+
+    await user.click(screen.getByRole('tab', { name: 'Metadata' }));
+
+    expect(screen.getByText('Kind:')).toBeVisible();
+    expect(screen.getByText('Symbolic link')).toBeVisible();
+    expect(screen.getByText('Link target:')).toBeVisible();
+    expect(screen.getByText('/tmp/real.txt')).toBeVisible();
+    expect(screen.getByText('Extended attributes:')).toBeVisible();
+    expect(screen.getByText('Present on this item')).toBeVisible();
+  });
+
+  it('shows a dangling target in the inspector without crashing', async () => {
+    const user = userEvent.setup();
+
+    render(
+      <Preview
+        file={fileEntry({
+          name: 'broken',
+          path: '/workspace/broken',
+          is_symlink: true,
+        })}
+      />
+    );
+
+    await user.click(screen.getByRole('tab', { name: 'Metadata' }));
+
+    expect(screen.getByText('Kind:')).toBeVisible();
+    expect(screen.getByText('Symbolic link')).toBeVisible();
+    expect(screen.getByText('Dangling (target missing)')).toBeVisible();
+    expect(screen.queryByText('Extended attributes:')).not.toBeInTheDocument();
+  });
 });

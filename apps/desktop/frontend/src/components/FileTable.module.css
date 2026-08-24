@@ -269,6 +269,11 @@
   white-space: nowrap;
 }
 
+.symlink .fileName,
+.junction .fileName {
+  font-style: italic;
+}
+
 .fileSize,
 .fileModified {
   text-align: right;

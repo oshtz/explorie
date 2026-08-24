@@ -17,6 +17,8 @@ import { deleteWithUndo } from '../utils/fileOperations';
 import { reportError } from '../utils/errorReporter';
 import type { GetSelectedFilesFunction } from '../hooks/useKeyboardClipboard';
 import { useVirtualRows } from '../hooks/useVirtualRows';
+import { LinkIdentityMarks } from './LinkIdentityMarks';
+import { entryAriaSuffix, entryDisplayTitle, getLinkKind } from '../utils/linkIdentity';
 
 // Column width constants
 const MIN_COLUMN_WIDTH = 180;
@@ -407,18 +409,24 @@ function ColumnFileList({
         const isFolder = isDirectory(entry);
         const fileName = entry.path.split(/[/\\]/).pop() || entry.path;
         const isSource = draggingItemIds?.has(entry.id) ?? false;
+        const linkKind = getLinkKind(entry);
 
         return (
           <li
             key={entry.id}
             data-file-id={entry.id}
-            className={`${styles.fileItem} ${isFolder ? styles.folder : styles.file} ${selectedIds.has(entry.id) ? styles.selected : ''} ${isSource ? styles.dragSource : ''} ${dragCombineTargetId === entry.id && isFolder ? styles.dropTarget : ''}`}
+            className={`${styles.fileItem} ${isFolder ? styles.folder : styles.file} ${selectedIds.has(entry.id) ? styles.selected : ''} ${isSource ? styles.dragSource : ''} ${dragCombineTargetId === entry.id && isFolder ? styles.dropTarget : ''} ${linkKind === 'symlink' ? styles.symlink : ''} ${linkKind === 'junction' ? styles.junction : ''}`}
             role="option"
             aria-selected={selectedIds.has(entry.id)}
             aria-setsize={visible.length}
             aria-posinset={index + 1}
             tabIndex={focusId === entry.id ? 0 : -1}
-            aria-label={isFolder ? `Open folder ${fileName}` : `Select file ${fileName}`}
+            aria-label={
+              isFolder
+                ? `Open folder ${fileName}${entryAriaSuffix(entry)}`
+                : `Select file ${fileName}${entryAriaSuffix(entry)}`
+            }
+            data-link-kind={linkKind ?? undefined}
             onClick={(e) => onItemClick(e, index, entry)}
             onContextMenu={(e) => onContextMenu(e, entry)}
             onDoubleClick={() => {
@@ -456,10 +464,11 @@ function ColumnFileList({
             {editingId === entry.id ? (
               renderEditingItem(entry, path)
             ) : (
-              <span className={styles.fileName} title={fileName}>
+              <span className={styles.fileName} title={entryDisplayTitle(fileName, entry)}>
                 {fileName}
               </span>
             )}
+            <LinkIdentityMarks file={entry} />
             <span className={styles.fileSize}>
               {entry.is_dir && entry.size === 0 ? '-' : formatBytes(entry.size)}
             </span>
