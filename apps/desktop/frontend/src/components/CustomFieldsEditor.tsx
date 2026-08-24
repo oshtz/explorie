@@ -8,8 +8,78 @@ import {
   type CustomFields,
   type CustomFieldValue,
   FIELD_SUGGESTIONS,
+  getFieldEditorType,
   getValueSuggestions,
 } from '../utils/customFieldTypes';
+
+function fieldValueAsString(value: CustomFieldValue | undefined): string {
+  if (value == null) return '';
+  return String(value);
+}
+
+function FieldValueControl({
+  fieldName,
+  value,
+  onChange,
+  id,
+  className,
+  autoFocus,
+  onFocus,
+  onBlur,
+}: {
+  fieldName: string;
+  value: string;
+  onChange: (value: string) => void;
+  id?: string;
+  className?: string;
+  autoFocus?: boolean;
+  onFocus?: () => void;
+  onBlur?: () => void;
+}) {
+  const editorType = getFieldEditorType(fieldName);
+  const label = `${fieldName || 'field'} value`;
+
+  if (editorType === 'enum') {
+    const options = getValueSuggestions(fieldName);
+    const extra = value && !options.includes(value) ? value : null;
+    return (
+      <select
+        id={id}
+        aria-label={label}
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        onFocus={onFocus}
+        onBlur={onBlur}
+        className={className}
+        autoFocus={autoFocus}
+      >
+        <option value="">Select…</option>
+        {options.map((option) => (
+          <option key={option} value={option}>
+            {option}
+          </option>
+        ))}
+        {extra ? <option value={extra}>{extra}</option> : null}
+      </select>
+    );
+  }
+
+  const inputType = editorType === 'date' ? 'date' : editorType === 'url' ? 'url' : 'text';
+  return (
+    <input
+      id={id}
+      aria-label={label}
+      type={inputType}
+      placeholder={editorType === 'url' ? 'https://' : editorType === 'text' ? 'Value' : undefined}
+      value={value}
+      onChange={(event) => onChange(event.target.value)}
+      onFocus={onFocus}
+      onBlur={onBlur}
+      className={className}
+      autoFocus={autoFocus}
+    />
+  );
+}
 
 interface CustomFieldsEditorProps {
   file: FileEntry;
@@ -247,9 +317,10 @@ export function CustomFieldsEditor({ file, onUpdate }: CustomFieldsEditorProps) 
   // Edit an existing field
   const handleEditField = (field: string) => {
     setEditingField(field);
-    const fieldValue = fields[field];
-    setNewFieldValue(fieldValue != null ? String(fieldValue) : '');
-    setShowValueSuggestions(getValueSuggestions(field).length > 0);
+    setNewFieldValue(fieldValueAsString(fields[field]));
+    setShowValueSuggestions(
+      getFieldEditorType(field) === 'text' && getValueSuggestions(field).length > 0
+    );
   };
 
   // Save edited field
@@ -279,96 +350,121 @@ export function CustomFieldsEditor({ file, onUpdate }: CustomFieldsEditorProps) 
 
       {/* Existing fields */}
       <div className={styles.fieldsContainer}>
-        {Object.entries(fields).map(([field, value]) => (
-          <div key={field} className={styles.fieldRow}>
-            {editingField === field ? (
-              // Edit mode
-              <>
-                <label className={styles.fieldLabel}>{field}</label>
-                <div className={styles.editInputContainer}>
-                  <input
-                    type="text"
-                    value={newFieldValue}
-                    onChange={(e) => setNewFieldValue(e.target.value)}
-                    onFocus={() => setShowValueSuggestions(getValueSuggestions(field).length > 0)}
-                    onBlur={hideValueSuggestionsSoon}
-                    className={styles.fieldInput}
-                    autoFocus
-                  />
+        {Object.entries(fields).map(([field, value]) => {
+          const editorType = getFieldEditorType(field);
+          return (
+            <div key={field} className={styles.fieldRow}>
+              {editingField === field ? (
+                // Edit mode
+                <>
+                  <label className={styles.fieldLabel}>
+                    {field}
+                    {editorType !== 'text' && editorType !== 'tags' ? (
+                      <span className={styles.fieldType}>{editorType} type</span>
+                    ) : null}
+                  </label>
+                  <div className={styles.editInputContainer}>
+                    <FieldValueControl
+                      fieldName={field}
+                      value={newFieldValue}
+                      onChange={setNewFieldValue}
+                      className={styles.fieldInput}
+                      autoFocus
+                      onFocus={() =>
+                        setShowValueSuggestions(
+                          editorType === 'text' && getValueSuggestions(field).length > 0
+                        )
+                      }
+                      onBlur={hideValueSuggestionsSoon}
+                    />
 
-                  {/* Value suggestions */}
-                  {showValueSuggestions && filteredValueSuggestions(field).length > 0 && (
-                    <div className={styles.suggestions}>
-                      {filteredValueSuggestions(field).map((suggestion) => (
-                        <div
-                          key={suggestion}
-                          className={styles.suggestion}
-                          onMouseDown={() => handleValueSuggestion(suggestion)}
-                        >
-                          {suggestion}
+                    {/* Value suggestions */}
+                    {editorType === 'text' &&
+                      showValueSuggestions &&
+                      filteredValueSuggestions(field).length > 0 && (
+                        <div className={styles.suggestions}>
+                          {filteredValueSuggestions(field).map((suggestion) => (
+                            <div
+                              key={suggestion}
+                              className={styles.suggestion}
+                              onMouseDown={() => handleValueSuggestion(suggestion)}
+                            >
+                              {suggestion}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+
+                    <div className={styles.editButtons}>
+                      <button onClick={handleSaveEdit} className={styles.saveButton}>
+                        Save
+                      </button>
+                      <button onClick={handleCancelEdit} className={styles.cancelButton}>
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                </>
+              ) : (
+                // Display mode
+                <>
+                  <span className={styles.fieldLabel}>
+                    {field}
+                    {editorType !== 'text' && editorType !== 'tags' ? (
+                      <span className={styles.fieldType}>{editorType} type</span>
+                    ) : null}
+                  </span>
+
+                  {/* Tags require special rendering */}
+                  {field.toLowerCase() === 'tags' && Array.isArray(value) ? (
+                    <div className={styles.tagsContainer}>
+                      {value.map((tag: string) => (
+                        <div key={tag} className={styles.tag}>
+                          {tag}
+                          <button
+                            onClick={() => handleRemoveTag(tag)}
+                            className={styles.removeTagButton}
+                          >
+                            ×
+                          </button>
                         </div>
                       ))}
+
+                      {/* Add new tag button */}
+                      <button
+                        onClick={() => handleEditField(field)}
+                        className={styles.addTagButton}
+                      >
+                        + Add
+                      </button>
                     </div>
-                  )}
-
-                  <div className={styles.editButtons}>
-                    <button onClick={handleSaveEdit} className={styles.saveButton}>
-                      Save
-                    </button>
-                    <button onClick={handleCancelEdit} className={styles.cancelButton}>
-                      Cancel
-                    </button>
-                  </div>
-                </div>
-              </>
-            ) : (
-              // Display mode
-              <>
-                <span className={styles.fieldLabel}>{field}</span>
-
-                {/* Tags require special rendering */}
-                {field.toLowerCase() === 'tags' && Array.isArray(value) ? (
-                  <div className={styles.tagsContainer}>
-                    {value.map((tag: string) => (
-                      <div key={tag} className={styles.tag}>
-                        {tag}
+                  ) : (
+                    // Regular field value display
+                    <div className={styles.fieldValueContainer}>
+                      <span className={styles.fieldValue}>
+                        {typeof value === 'object' ? JSON.stringify(value) : String(value)}
+                      </span>
+                      <div className={styles.fieldActions}>
                         <button
-                          onClick={() => handleRemoveTag(tag)}
-                          className={styles.removeTagButton}
+                          onClick={() => handleEditField(field)}
+                          className={styles.editButton}
                         >
-                          ×
+                          Edit
+                        </button>
+                        <button
+                          onClick={() => handleRemoveField(field)}
+                          className={styles.removeButton}
+                        >
+                          Remove
                         </button>
                       </div>
-                    ))}
-
-                    {/* Add new tag button */}
-                    <button onClick={() => handleEditField(field)} className={styles.addTagButton}>
-                      + Add
-                    </button>
-                  </div>
-                ) : (
-                  // Regular field value display
-                  <div className={styles.fieldValueContainer}>
-                    <span className={styles.fieldValue}>
-                      {typeof value === 'object' ? JSON.stringify(value) : String(value)}
-                    </span>
-                    <div className={styles.fieldActions}>
-                      <button onClick={() => handleEditField(field)} className={styles.editButton}>
-                        Edit
-                      </button>
-                      <button
-                        onClick={() => handleRemoveField(field)}
-                        className={styles.removeButton}
-                      >
-                        Remove
-                      </button>
                     </div>
-                  </div>
-                )}
-              </>
-            )}
-          </div>
-        ))}
+                  )}
+                </>
+              )}
+            </div>
+          );
+        })}
       </div>
 
       {/* Add new field */}
@@ -402,23 +498,25 @@ export function CustomFieldsEditor({ file, onUpdate }: CustomFieldsEditorProps) 
           </div>
 
           <div className={styles.fieldValueContainer}>
-            <input
+            <FieldValueControl
               id="new-field-value"
-              type="text"
-              placeholder="Value"
+              fieldName={newFieldName}
               value={newFieldValue}
-              onChange={(e) => setNewFieldValue(e.target.value)}
+              onChange={setNewFieldValue}
+              className={styles.fieldValueInput}
               onFocus={() => {
-                if (getValueSuggestions(newFieldName).length > 0) {
+                if (
+                  getFieldEditorType(newFieldName) === 'text' &&
+                  getValueSuggestions(newFieldName).length > 0
+                ) {
                   setShowValueSuggestions(true);
                 }
               }}
               onBlur={hideValueSuggestionsSoon}
-              className={styles.fieldValueInput}
             />
 
-            {/* Value suggestions for new field */}
             {!editingField &&
+              getFieldEditorType(newFieldName) === 'text' &&
               showValueSuggestions &&
               filteredValueSuggestions(newFieldName).length > 0 && (
                 <div className={styles.suggestions}>
@@ -438,7 +536,13 @@ export function CustomFieldsEditor({ file, onUpdate }: CustomFieldsEditorProps) 
 
         <button
           onClick={handleAddField}
-          disabled={!newFieldName.trim()}
+          disabled={
+            !newFieldName.trim() ||
+            ((getFieldEditorType(newFieldName) === 'date' ||
+              getFieldEditorType(newFieldName) === 'url' ||
+              getFieldEditorType(newFieldName) === 'enum') &&
+              !newFieldValue.trim())
+          }
           className={styles.addButton}
         >
           Add Field

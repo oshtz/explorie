@@ -6,6 +6,9 @@ import {
   isPriorityValue,
   isTypeValue,
   isCategoryValue,
+  isIsoDateString,
+  isUrlValue,
+  getFieldEditorType,
   sanitizeCustomFields,
   validateKnownFieldValue,
   getValueSuggestions,
@@ -66,6 +69,7 @@ describe('customFieldTypes', () => {
       expect(isKnownFieldName('tags')).toBe(true);
       expect(isKnownFieldName('notes')).toBe(true);
       expect(isKnownFieldName('dueDate')).toBe(true);
+      expect(isKnownFieldName('url')).toBe(true);
     });
 
     it('should return false for unknown field names', () => {
@@ -131,6 +135,47 @@ describe('customFieldTypes', () => {
 
     it('should return false for invalid values', () => {
       expect(isCategoryValue('Other')).toBe(false);
+    });
+  });
+
+  describe('isIsoDateString', () => {
+    it('accepts real calendar dates', () => {
+      expect(isIsoDateString('2024-01-01')).toBe(true);
+      expect(isIsoDateString('2024-02-29')).toBe(true);
+    });
+
+    it('rejects non-dates and impossible calendar values', () => {
+      expect(isIsoDateString('not-a-date')).toBe(false);
+      expect(isIsoDateString('01/01/2024')).toBe(false);
+      expect(isIsoDateString('2024-13-01')).toBe(false);
+      expect(isIsoDateString('2023-02-29')).toBe(false);
+      expect(isIsoDateString(20240101)).toBe(false);
+    });
+  });
+
+  describe('isUrlValue', () => {
+    it('accepts http and https URLs', () => {
+      expect(isUrlValue('https://example.com/docs')).toBe(true);
+      expect(isUrlValue('http://localhost:3000/path')).toBe(true);
+    });
+
+    it('rejects non-URLs and non-http schemes', () => {
+      expect(isUrlValue('example.com')).toBe(false);
+      expect(isUrlValue('javascript:alert(1)')).toBe(false);
+      expect(isUrlValue('http://')).toBe(false);
+    });
+  });
+
+  describe('getFieldEditorType', () => {
+    it('exposes date, url, enum and tags types', () => {
+      expect(getFieldEditorType('dueDate')).toBe('date');
+      expect(getFieldEditorType('url')).toBe('url');
+      expect(getFieldEditorType('status')).toBe('enum');
+      expect(getFieldEditorType('priority')).toBe('enum');
+      expect(getFieldEditorType('type')).toBe('enum');
+      expect(getFieldEditorType('category')).toBe('enum');
+      expect(getFieldEditorType('tags')).toBe('tags');
+      expect(getFieldEditorType('notes')).toBe('text');
     });
   });
 
@@ -203,6 +248,9 @@ describe('customFieldTypes', () => {
       expect(validateKnownFieldValue('project', 'My Project')).toBe('My Project');
       expect(validateKnownFieldValue('notes', 'Some notes')).toBe('Some notes');
       expect(validateKnownFieldValue('dueDate', '2024-01-01')).toBe('2024-01-01');
+      expect(validateKnownFieldValue('dueDate', 'not-a-date')).toBeUndefined();
+      expect(validateKnownFieldValue('url', 'https://example.com')).toBe('https://example.com');
+      expect(validateKnownFieldValue('url', 'example.com')).toBeUndefined();
       expect(validateKnownFieldValue('project', 123)).toBeUndefined();
     });
   });

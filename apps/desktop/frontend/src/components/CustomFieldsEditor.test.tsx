@@ -85,14 +85,12 @@ describe('CustomFieldsEditor', () => {
     render(<CustomFieldsEditor file={createFile({ custom: {} })} onUpdate={onUpdate} />);
 
     const fieldName = screen.getByPlaceholderText('Field name');
-    const fieldValue = screen.getByPlaceholderText('Value');
 
     await user.click(fieldName);
     await user.type(fieldName, 'prio');
     await user.click(screen.getByText('priority'));
 
-    await user.click(fieldValue);
-    await user.click(screen.getByText('High'));
+    await user.selectOptions(screen.getByLabelText('priority value'), 'High');
     await user.click(screen.getByRole('button', { name: 'Add Field' }));
 
     await waitFor(() =>
@@ -139,11 +137,10 @@ describe('CustomFieldsEditor', () => {
     render(<CustomFieldsEditor file={createFile({ custom: { status: 'Todo' } })} />);
 
     await user.click(within(getFieldRow('status')).getByRole('button', { name: 'Edit' }));
-    const statusEditInput = within(getFieldRow('status')).getByDisplayValue('Todo');
-    expect(statusEditInput).toBeInTheDocument();
+    const statusEditInput = within(getFieldRow('status')).getByLabelText('status value');
+    expect(statusEditInput).toHaveValue('Todo');
 
-    await user.clear(statusEditInput);
-    await user.type(statusEditInput, 'Done');
+    await user.selectOptions(statusEditInput, 'Done');
     await user.click(screen.getByRole('button', { name: 'Save' }));
 
     await waitFor(() =>
@@ -153,13 +150,49 @@ describe('CustomFieldsEditor', () => {
     );
 
     await user.click(within(getFieldRow('status')).getByRole('button', { name: 'Edit' }));
-    const secondEditInput = within(getFieldRow('status')).getByDisplayValue('Done');
-    await user.clear(secondEditInput);
-    await user.type(secondEditInput, 'Blocked');
+    const secondEditInput = within(getFieldRow('status')).getByLabelText('status value');
+    await user.selectOptions(secondEditInput, 'Blocked');
     await user.click(screen.getByRole('button', { name: 'Cancel' }));
 
     expect(screen.queryByRole('button', { name: 'Cancel' })).not.toBeInTheDocument();
     expect(mocks.updateCustomFields).toHaveBeenCalledTimes(1);
+  });
+
+  it('exposes date, url and closed enum controls', async () => {
+    const user = userEvent.setup();
+    render(
+      <CustomFieldsEditor
+        file={createFile({
+          custom: {
+            dueDate: '2024-01-15',
+            url: 'https://example.com',
+            status: 'Todo',
+          },
+        })}
+      />
+    );
+
+    expect(within(getFieldRow('dueDate')).getByText('date type')).toBeInTheDocument();
+    expect(within(getFieldRow('url')).getByText('url type')).toBeInTheDocument();
+    expect(within(getFieldRow('status')).getByText('enum type')).toBeInTheDocument();
+
+    await user.click(within(getFieldRow('dueDate')).getByRole('button', { name: 'Edit' }));
+    expect(within(getFieldRow('dueDate')).getByLabelText('dueDate value')).toHaveAttribute(
+      'type',
+      'date'
+    );
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
+
+    await user.click(within(getFieldRow('url')).getByRole('button', { name: 'Edit' }));
+    expect(within(getFieldRow('url')).getByLabelText('url value')).toHaveAttribute('type', 'url');
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
+
+    await user.click(within(getFieldRow('status')).getByRole('button', { name: 'Edit' }));
+    const statusSelect = within(getFieldRow('status')).getByLabelText('status value');
+    expect(statusSelect.tagName).toBe('SELECT');
+    expect(
+      Array.from((statusSelect as HTMLSelectElement).options).map((option) => option.value)
+    ).toEqual(['', 'Todo', 'In Progress', 'Done', 'Blocked', 'Pending Review']);
   });
 
   it('reports failed saves and rolls optimistic changes back', async () => {

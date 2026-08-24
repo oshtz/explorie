@@ -48,6 +48,14 @@
   margin-bottom: 2px;
 }
 
+.fieldType {
+  margin-left: 6px;
+  font-weight: 400;
+  font-size: calc(10px * var(--font-scale));
+  color: var(--fg-tertiary);
+  text-transform: uppercase;
+}
+
 .fieldValueContainer {
   display: flex;
   align-items: center;
@@ -120,7 +128,9 @@
   position: relative;
 }
 
-.fieldInput {
+.fieldInput,
+select.fieldInput,
+select.fieldValueInput {
   font-size: calc(12px * var(--font-scale));
   padding: 4px 6px;
   border-radius: 0;

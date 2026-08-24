@@ -59,7 +59,8 @@ export type KnownFieldName =
   | 'project'
   | 'tags'
   | 'notes'
-  | 'dueDate';
+  | 'dueDate'
+  | 'url';
 
 /**
  * Map of known field names to their value types
@@ -72,7 +73,8 @@ export interface KnownFieldTypes {
   project: string;
   tags: string[];
   notes: string;
-  dueDate: string; // ISO date string
+  dueDate: string;
+  url: string;
 }
 
 // ============================================================================
@@ -126,6 +128,7 @@ export function isKnownFieldName(key: string): key is KnownFieldName {
     'tags',
     'notes',
     'dueDate',
+    'url',
   ];
   return knownFields.includes(key as KnownFieldName);
 }
@@ -160,6 +163,52 @@ export function isTypeValue(value: unknown): value is TypeValue {
 export function isCategoryValue(value: unknown): value is CategoryValue {
   const validCategories: CategoryValue[] = ['Work', 'Personal', 'Project', 'Reference', 'Template'];
   return typeof value === 'string' && validCategories.includes(value as CategoryValue);
+}
+
+const ISO_DATE = /^(\d{4})-(\d{2})-(\d{2})$/;
+
+export function isIsoDateString(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  const match = ISO_DATE.exec(value);
+  if (!match) return false;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  return (
+    date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day
+  );
+}
+
+export function isUrlValue(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  try {
+    const parsed = new URL(value);
+    return (
+      (parsed.protocol === 'http:' || parsed.protocol === 'https:') && parsed.hostname.length > 0
+    );
+  } catch {
+    return false;
+  }
+}
+
+export type FieldEditorType = 'text' | 'date' | 'url' | 'enum' | 'tags';
+
+export function getFieldEditorType(fieldName: string): FieldEditorType {
+  if (fieldName.toLowerCase() === 'tags') return 'tags';
+  switch (fieldName) {
+    case 'dueDate':
+      return 'date';
+    case 'url':
+      return 'url';
+    case 'status':
+    case 'priority':
+    case 'type':
+    case 'category':
+      return 'enum';
+    default:
+      return 'text';
+  }
 }
 
 // ============================================================================
@@ -218,8 +267,11 @@ export function validateKnownFieldValue<K extends KnownFieldName>(
       return undefined;
     case 'project':
     case 'notes':
-    case 'dueDate':
       return typeof value === 'string' ? (value as KnownFieldTypes[K]) : undefined;
+    case 'dueDate':
+      return isIsoDateString(value) ? (value as KnownFieldTypes[K]) : undefined;
+    case 'url':
+      return isUrlValue(value) ? (value as KnownFieldTypes[K]) : undefined;
     default:
       return undefined;
   }
@@ -241,6 +293,7 @@ export const FIELD_SUGGESTIONS: KnownFieldName[] = [
   'tags',
   'notes',
   'dueDate',
+  'url',
 ];
 
 /**

@@ -567,10 +567,171 @@ pub fn list_dir(path: &Path) -> io::Result<Vec<FileEntry>> {
     list_dir_with_sizes(path, false)
 }
 
+const EXPLORIE_SCHEMA_ENTRY: &str = "$schema";
+const STATUS_VALUES: &[&str] = &["Todo", "In Progress", "Done", "Blocked", "Pending Review"];
+const PRIORITY_VALUES: &[&str] = &["Low", "Medium", "High", "Urgent"];
+const TYPE_VALUES: &[&str] = &["Document", "Image", "Video", "Code", "Data", "Archive"];
+const CATEGORY_VALUES: &[&str] = &["Work", "Personal", "Project", "Reference", "Template"];
+
+fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+            if leap { 29 } else { 28 }
+        }
+        _ => 0,
+    }
+}
+
+fn is_iso_date(value: &str) -> bool {
+    if value.len() != 10 {
+        return false;
+    }
+    let bytes = value.as_bytes();
+    if bytes[4] != b'-' || bytes[7] != b'-' {
+        return false;
+    }
+    if !bytes.iter().enumerate().all(|(index, byte)| {
+        if index == 4 || index == 7 {
+            true
+        } else {
+            byte.is_ascii_digit()
+        }
+    }) {
+        return false;
+    }
+    let Ok(year) = value[0..4].parse::<i32>() else {
+        return false;
+    };
+    let Ok(month) = value[5..7].parse::<u32>() else {
+        return false;
+    };
+    let Ok(day) = value[8..10].parse::<u32>() else {
+        return false;
+    };
+    (1..=12).contains(&month) && day >= 1 && day <= days_in_month(year, month)
+}
+
+fn is_http_url(value: &str) -> bool {
+    let rest = match value.split_once("://") {
+        Some((scheme, rest))
+            if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") =>
+        {
+            rest
+        }
+        _ => return false,
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() {
+        return false;
+    }
+    let hostport = authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority);
+    if hostport.starts_with('[') {
+        return hostport.contains(']') && hostport.len() > 2;
+    }
+    let host = match hostport.rsplit_once(':') {
+        Some((host, port)) => {
+            if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) {
+                return false;
+            }
+            host
+        }
+        None => hostport,
+    };
+    !host.is_empty()
+        && !host.starts_with('.')
+        && !host.ends_with('.')
+        && !host.contains("..")
+        && host
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-'))
+}
+
+fn typed_field_error(field: &str, message: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("Invalid custom field \"{field}\": {message}"),
+    )
+}
+
+fn require_enum(name: &str, value: &serde_json::Value, allowed: &[&str]) -> io::Result<()> {
+    match value.as_str() {
+        Some(candidate) if allowed.contains(&candidate) => Ok(()),
+        _ => Err(typed_field_error(
+            name,
+            &format!("expected one of {}", allowed.join(", ")),
+        )),
+    }
+}
+
+fn validate_typed_field(name: &str, value: &serde_json::Value) -> io::Result<()> {
+    match name {
+        "dueDate" => match value.as_str() {
+            Some(candidate) if is_iso_date(candidate) => Ok(()),
+            _ => Err(typed_field_error(name, "expected ISO date (YYYY-MM-DD)")),
+        },
+        "url" => match value.as_str() {
+            Some(candidate) if is_http_url(candidate) => Ok(()),
+            _ => Err(typed_field_error(name, "expected http or https URL")),
+        },
+        "status" => require_enum(name, value, STATUS_VALUES),
+        "priority" => require_enum(name, value, PRIORITY_VALUES),
+        "type" => require_enum(name, value, TYPE_VALUES),
+        "category" => require_enum(name, value, CATEGORY_VALUES),
+        _ => Ok(()),
+    }
+}
+
+fn validate_explorie_fields(
+    file_name: &str,
+    fields: &HashMap<String, serde_json::Value>,
+) -> io::Result<()> {
+    if file_name == EXPLORIE_SCHEMA_ENTRY {
+        return Ok(());
+    }
+    for (name, value) in fields {
+        validate_typed_field(name, value)?;
+    }
+    Ok(())
+}
+
+fn validate_explorie_document(
+    document: &HashMap<String, HashMap<String, serde_json::Value>>,
+) -> io::Result<()> {
+    for (file_name, fields) in document {
+        validate_explorie_fields(file_name, fields)?;
+    }
+    Ok(())
+}
+
+fn read_explorie_document(
+    dir_path: &Path,
+) -> io::Result<HashMap<String, HashMap<String, serde_json::Value>>> {
+    let explorie_json_path = dir_path.join(".explorie.json");
+    if !explorie_json_path.exists() {
+        return Ok(HashMap::new());
+    }
+    let content = fs::read_to_string(&explorie_json_path)?;
+    serde_json::from_str(&content).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Invalid {}: {error}", explorie_json_path.display()),
+        )
+    })
+}
+
 /// Create or overwrite a `.explorie.json` file with custom field definitions.
 ///
 /// This replaces the entire contents of the `.explorie.json` file. To update
 /// individual file fields, use [`update_custom_fields`] instead.
+///
+/// A malformed existing file is reported and left untouched, including when
+/// `fields` is empty. Date, URL, and closed enum values are checked before write.
 ///
 /// # Arguments
 ///
@@ -599,6 +760,8 @@ pub fn create_explorie_schema(
     let _guard = custom_fields_write_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    read_explorie_document(dir_path)?;
+    validate_explorie_document(&fields)?;
     write_custom_fields_atomic(dir_path, &fields)
 }
 
@@ -638,26 +801,12 @@ pub fn update_custom_fields(
     file_name: &str,
     custom_fields: HashMap<String, serde_json::Value>,
 ) -> io::Result<()> {
-    let explorie_json_path = dir_path.join(".explorie.json");
     let _guard = custom_fields_write_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    // Load existing schema or create empty one
-    let mut schema: HashMap<String, HashMap<String, serde_json::Value>> =
-        if explorie_json_path.exists() {
-            let content = fs::read_to_string(&explorie_json_path)?;
-            serde_json::from_str(&content).map_err(|error| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("Invalid {}: {error}", explorie_json_path.display()),
-                )
-            })?
-        } else {
-            HashMap::new()
-        };
-
-    // Update the fields for this file
+    let mut schema = read_explorie_document(dir_path)?;
+    validate_explorie_fields(file_name, &custom_fields)?;
     schema.insert(file_name.to_string(), custom_fields);
 
     write_custom_fields_atomic(dir_path, &schema)
