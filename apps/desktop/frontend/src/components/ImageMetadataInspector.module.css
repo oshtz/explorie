@@ -1,0 +1,57 @@
+.photoSection {
+  margin-top: var(--padding-md);
+  padding-top: var(--padding-md);
+  border-top: 1px solid var(--border-primary);
+}
+
+.heading {
+  margin: 0 0 var(--padding-sm);
+  font-size: calc(12px * var(--font-scale));
+  font-weight: 600;
+  color: var(--fg-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.fields {
+  display: grid;
+  grid-template-columns: var(--metadata-label-width) minmax(0, 1fr);
+  gap: var(--padding-sm) var(--padding-md);
+}
+
+.label {
+  font-weight: 500;
+  color: var(--fg-secondary);
+}
+
+.value {
+  color: var(--fg-primary);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.empty {
+  color: var(--fg-tertiary);
+  font-size: calc(12px * var(--font-scale));
+}
+
+.gps {
+  margin-top: var(--padding-sm);
+}
+
+.gps summary {
+  cursor: pointer;
+  color: var(--fg-secondary);
+  font-size: calc(12px * var(--font-scale));
+}
+
+.gps summary:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 1px;
+}
+
+.gpsCoords {
+  margin-top: var(--padding-xs);
+  color: var(--fg-primary);
+  overflow-wrap: anywhere;
+}

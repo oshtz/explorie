@@ -35,6 +35,7 @@ const mocks = vi.hoisted(() => ({
     previewExecutableScripts: false,
   } as PreviewStoreState,
   areFinderTagsAvailable: vi.fn(),
+  readFile: vi.fn(),
 }));
 
 vi.mock('../store', () => ({
@@ -47,6 +48,10 @@ vi.mock('../services/finderIntegration', () => ({
 
 vi.mock('./FinderTags', () => ({
   FinderTags: ({ path }: { path: string }) => <div data-testid="finder-tags">{path}</div>,
+}));
+
+vi.mock('@tauri-apps/plugin-fs', () => ({
+  readFile: (path: string) => mocks.readFile(path),
 }));
 
 vi.mock('./CustomFieldsEditor', () => ({
@@ -105,6 +110,8 @@ describe('Preview', () => {
     mocks.storeState.previewExecutableScripts = false;
     mocks.areFinderTagsAvailable.mockReset();
     mocks.areFinderTagsAvailable.mockResolvedValue(false);
+    mocks.readFile.mockReset();
+    mocks.readFile.mockResolvedValue(new Uint8Array([0xff, 0xd8, 0xff, 0xd9]));
   });
 
   afterEach(() => {
@@ -295,6 +302,64 @@ describe('Preview', () => {
     expect(screen.getByText('2 entries')).toBeVisible();
     expect(screen.getByText('docs/readme.md')).toBeVisible();
     expect(screen.getByText('assets/')).toBeVisible();
+  });
+
+  it('shows photo metadata empty state for a JPEG without EXIF or IPTC', async () => {
+    const user = userEvent.setup();
+
+    render(
+      <Preview
+        file={fileEntry({
+          path: '/workspace/photo.jpg',
+          name: 'photo.jpg',
+        })}
+      />
+    );
+
+    await user.click(screen.getByRole('tab', { name: 'Metadata' }));
+
+    expect(await screen.findByRole('status')).toHaveTextContent('No camera or caption metadata');
+  });
+
+  it('shows photo metadata for a TIFF when visual preview fails', async () => {
+    const user = userEvent.setup();
+    const tiff = new Uint8Array(50);
+    const view = new DataView(tiff.buffer);
+    tiff[0] = 0x49;
+    tiff[1] = 0x49;
+    view.setUint16(2, 42, true);
+    view.setUint32(4, 8, true);
+    view.setUint16(8, 3, true);
+    const writeEntry = (index: number, tag: number, type: number, count: number, value: number) => {
+      const pos = 10 + index * 12;
+      view.setUint16(pos, tag, true);
+      view.setUint16(pos + 2, type, true);
+      view.setUint32(pos + 4, count, true);
+      view.setUint32(pos + 8, value, true);
+    };
+    writeEntry(0, 0x0100, 3, 1, 640);
+    writeEntry(1, 0x0101, 3, 1, 480);
+    writeEntry(2, 0x0110, 2, 3, 0x00375a);
+    mocks.readFile.mockResolvedValue(tiff);
+
+    render(
+      <Preview
+        file={previewFile({
+          name: 'scan.tif',
+          path: '/photos/scan.tif',
+          type: 'error',
+          content: 'Install ImageMagick to preview TIFF files.',
+        })}
+      />
+    );
+
+    expect(screen.getByText('Install ImageMagick to preview TIFF files.')).toBeVisible();
+    expect(screen.queryByRole('tab', { name: 'Custom Fields' })).not.toBeInTheDocument();
+    await user.click(screen.getByRole('tab', { name: 'Metadata' }));
+
+    expect(await screen.findByText('Z7')).toBeVisible();
+    expect(screen.getByText('640 × 480')).toBeVisible();
+    expect(mocks.readFile).toHaveBeenCalledWith('/photos/scan.tif');
   });
 
   it('renders Quick Look variant without side-panel tabs', () => {

@@ -6,6 +6,8 @@ import { FinderTags } from './FinderTags';
 import styles from './Preview.module.css';
 import { formatLocalDateTime } from '../utils/date';
 import { areFinderTagsAvailable } from '../services/finderIntegration';
+import { isImageMetadataPath } from '../utils/imageMetadata';
+import { ImageMetadataInspector } from './ImageMetadataInspector';
 
 // Interface for the preview file type (from App.tsx FilePreviewer)
 type PreviewFile = {
@@ -154,6 +156,8 @@ export function Preview({
   // Get file entry and preview file information (computed before hooks for consistent hook order)
   const fileEntry = file && isFileEntry(file) ? file : null;
   const previewFile = file && isPreviewFile(file) ? file : null;
+  const showPhotoMetadata = Boolean(file?.path && isImageMetadataPath(file.path));
+  const showMetadataTab = Boolean(fileEntry) || showPhotoMetadata;
 
   // Extract extension for file type detection
   const fileNameParts = file?.path?.split(/[/\\]/) ?? [];
@@ -433,33 +437,33 @@ export function Preview({
             Preview
           </button>
 
+          {showMetadataTab && (
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeTab === 'metadata'}
+              id={tabIds.metadata}
+              aria-controls={panelIds.metadata}
+              tabIndex={activeTab === 'metadata' ? 0 : -1}
+              className={`${styles.tab} ${activeTab === 'metadata' ? styles.tabActive : ''}`}
+              onClick={() => setActiveTab('metadata')}
+            >
+              Metadata
+            </button>
+          )}
           {fileEntry && (
-            <>
-              <button
-                type="button"
-                role="tab"
-                aria-selected={activeTab === 'metadata'}
-                id={tabIds.metadata}
-                aria-controls={panelIds.metadata}
-                tabIndex={activeTab === 'metadata' ? 0 : -1}
-                className={`${styles.tab} ${activeTab === 'metadata' ? styles.tabActive : ''}`}
-                onClick={() => setActiveTab('metadata')}
-              >
-                Metadata
-              </button>
-              <button
-                type="button"
-                role="tab"
-                aria-selected={activeTab === 'fields'}
-                id={tabIds.fields}
-                aria-controls={panelIds.fields}
-                tabIndex={activeTab === 'fields' ? 0 : -1}
-                className={`${styles.tab} ${activeTab === 'fields' ? styles.tabActive : ''}`}
-                onClick={() => setActiveTab('fields')}
-              >
-                Custom Fields
-              </button>
-            </>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeTab === 'fields'}
+              id={tabIds.fields}
+              aria-controls={panelIds.fields}
+              tabIndex={activeTab === 'fields' ? 0 : -1}
+              className={`${styles.tab} ${activeTab === 'fields' ? styles.tabActive : ''}`}
+              onClick={() => setActiveTab('fields')}
+            >
+              Custom Fields
+            </button>
           )}
         </div>
       )}
@@ -489,7 +493,7 @@ export function Preview({
         </div>
       )}
 
-      {activeTab === 'metadata' && fileEntry && (
+      {activeTab === 'metadata' && showMetadataTab && (
         <div
           className={styles.metadataSection}
           role="tabpanel"
@@ -497,6 +501,7 @@ export function Preview({
           aria-labelledby={tabIds.metadata}
         >
           {renderFileMetadata()}
+          {showPhotoMetadata ? <ImageMetadataInspector path={file.path} /> : null}
         </div>
       )}
 
