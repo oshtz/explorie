@@ -297,6 +297,36 @@ describe('Preview', () => {
     expect(screen.getByText('assets/')).toBeVisible();
   });
 
+  it('lets the user open a nested archive listing', async () => {
+    const onOpenNestedArchive = vi.fn();
+    const user = userEvent.setup();
+
+    render(
+      <Preview
+        file={previewFile({
+          name: 'bundle.zip',
+          path: '/workspace/bundle.zip',
+          type: 'application/x-explorie-archive',
+          archiveInfo: {
+            format: 'zip',
+            entry_count: 2,
+            total_size: 4096,
+            compressed_size: 1024,
+            entries: [
+              { path: 'inner.zip', size: 512, compressed_size: 128, is_dir: false },
+              { path: 'notes.txt', size: 32, compressed_size: 16, is_dir: false },
+            ],
+          },
+        })}
+        onOpenNestedArchive={onOpenNestedArchive}
+      />
+    );
+
+    expect(screen.getByRole('button', { name: 'Open' })).toBeVisible();
+    await user.click(screen.getByRole('button', { name: 'Open' }));
+    expect(onOpenNestedArchive).toHaveBeenCalledWith('inner.zip');
+  });
+
   it('renders Quick Look variant without side-panel tabs', () => {
     render(<Preview file={previewFile()} variant="quicklook" />);
 

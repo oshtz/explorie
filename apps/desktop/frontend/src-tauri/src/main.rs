@@ -5,7 +5,7 @@ mod remote_drives;
 
 use explorie_core::archive::{
     ArchiveFormat, ArchiveInfo, ArchiveProgress, CompressOptions, CompressionLevel,
-    create_archive_with_progress, extract_archive, is_archive, list_archive_contents,
+    create_archive_with_progress, extract_nested_archive, is_archive, list_nested_archive_contents,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -2058,14 +2058,20 @@ async fn extract_archive_cmd(
     app: AppHandle,
     archive_path: String,
     output_dir: String,
+    nested_entries: Option<Vec<String>>,
+    password: Option<String>,
 ) -> Result<ExtractResult, String> {
     let mutation = ActiveMutation::begin(&app);
     tauri::async_runtime::spawn_blocking(move || {
         let _mutation = mutation;
         let archive = PathBuf::from(&archive_path);
         let output = PathBuf::from(&output_dir);
+        let nested = nested_entries.unwrap_or_default();
+        let nested_refs: Vec<&str> = nested.iter().map(String::as_str).collect();
 
-        let total_bytes = extract_archive(&archive, &output).map_err(|e| e.to_string())?;
+        let total_bytes =
+            extract_nested_archive(&archive, &nested_refs, &output, password.as_deref())
+                .map_err(|e| e.to_string())?;
 
         Ok(ExtractResult {
             output_dir,
@@ -2077,10 +2083,17 @@ async fn extract_archive_cmd(
 }
 
 #[tauri::command]
-async fn list_archive(archive_path: String) -> Result<ArchiveInfo, String> {
+async fn list_archive(
+    archive_path: String,
+    nested_entries: Option<Vec<String>>,
+    password: Option<String>,
+) -> Result<ArchiveInfo, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let archive = PathBuf::from(&archive_path);
-        list_archive_contents(&archive).map_err(|e| e.to_string())
+        let nested = nested_entries.unwrap_or_default();
+        let nested_refs: Vec<&str> = nested.iter().map(String::as_str).collect();
+        list_nested_archive_contents(&archive, &nested_refs, password.as_deref())
+            .map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())?

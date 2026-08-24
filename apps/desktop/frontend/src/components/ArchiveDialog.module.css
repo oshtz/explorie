@@ -385,6 +385,32 @@
   color: var(--fg-tertiary);
 }
 
+.nestedOpen,
+.nestedBack {
+  border: 1px solid var(--border-primary);
+  background: var(--bg-elevated);
+  color: var(--fg-primary);
+  font-size: calc(11px * var(--font-scale, 1));
+  padding: 2px 8px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.nestedOpen:hover,
+.nestedBack:hover {
+  background: var(--bg-hover);
+}
+
+.nestedOpen:disabled,
+.nestedBack:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.nestedBack {
+  margin-top: 8px;
+}
+
 /* Footer */
 .footer {
   display: flex;

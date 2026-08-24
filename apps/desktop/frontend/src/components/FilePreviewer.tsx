@@ -69,6 +69,7 @@ type TextPreview = {
 };
 
 const TEXT_PREVIEW_LIMIT = 128 * 1024;
+const EMPTY_ARCHIVE_TRAIL: string[] = [];
 
 /**
  * FilePreviewer: handles loading and previewing files
@@ -86,6 +87,10 @@ export function FilePreviewer({ file, onClose, variant = 'panel' }: FilePreviewe
   const [currentFile, setCurrentFile] = React.useState<FileEntry>(file);
   const [isLoading, setIsLoading] = React.useState<boolean>(true);
   const [archiveInfo, setArchiveInfo] = React.useState<ArchivePreviewInfo | undefined>(undefined);
+  const [archiveNav, setArchiveNav] = React.useState<{ filePath: string; trail: string[] }>({
+    filePath: file.path,
+    trail: [],
+  });
   const [externalTool, setExternalTool] = React.useState<string | undefined>(undefined);
   const fallbackHandlerRef = React.useRef<(() => Promise<void>) | null>(null);
   const fallbackInFlightRef = React.useRef(false);
@@ -125,6 +130,11 @@ export function FilePreviewer({ file, onClose, variant = 'panel' }: FilePreviewe
     },
     []
   );
+
+  if (archiveNav.filePath !== file.path) {
+    setArchiveNav({ filePath: file.path, trail: [] });
+  }
+  const archiveTrail = archiveNav.filePath === file.path ? archiveNav.trail : EMPTY_ARCHIVE_TRAIL;
 
   React.useEffect(() => {
     setCurrentFile(file);
@@ -279,7 +289,11 @@ export function FilePreviewer({ file, onClose, variant = 'panel' }: FilePreviewe
 
     // Archive preview
     if (file.path && providerKind === 'archive') {
-      invoke<ArchivePreviewInfo>('list_archive', { archivePath: file.path })
+      const payload =
+        archiveTrail.length > 0
+          ? { archivePath: file.path, nestedEntries: archiveTrail }
+          : { archivePath: file.path };
+      invoke<ArchivePreviewInfo>('list_archive', payload)
         .then((info) => {
           if (cancelled) return;
           setArchiveInfo(info);
@@ -328,7 +342,7 @@ export function FilePreviewer({ file, onClose, variant = 'panel' }: FilePreviewe
     return () => {
       cancelled = true;
     };
-  }, [file, file.path, file.id, toPreviewSrc, previewExecutableScripts]);
+  }, [file, file.path, file.id, toPreviewSrc, previewExecutableScripts, archiveTrail]);
 
   // Handle file updates from the custom fields editor
   const handleFileUpdate = (updatedFile: FileEntry) => {
@@ -386,6 +400,13 @@ export function FilePreviewer({ file, onClose, variant = 'panel' }: FilePreviewe
         onReady={handlePreviewReady}
         onContentError={handlePreviewError}
         variant={variant}
+        archiveTrail={archiveTrail}
+        onOpenNestedArchive={(entryPath) =>
+          setArchiveNav({ filePath: file.path, trail: [...archiveTrail, entryPath] })
+        }
+        onNavigateArchiveParent={() =>
+          setArchiveNav({ filePath: file.path, trail: archiveTrail.slice(0, -1) })
+        }
       />
       {fileType.startsWith('text') && typeof textContent === 'string' && isTruncated && (
         <div role="status" style={{ textAlign: 'center' }}>

@@ -229,6 +229,78 @@ describe('ArchiveDialog', () => {
     await waitFor(() => expect(props.onSuccess).toHaveBeenCalledTimes(1));
   });
 
+  it('opens a nested archive listing and extracts through that nested entry', async () => {
+    const archive = file('bundle.zip');
+    mocks.invoke.mockImplementation(
+      async (command: string, args?: { nestedEntries?: string[] }) => {
+        if (command === 'list_archive') {
+          if (args?.nestedEntries?.includes('inner.zip')) {
+            return {
+              format: 'zip',
+              total_size: 12,
+              compressed_size: 12,
+              entry_count: 1,
+              entries: [
+                {
+                  name: 'hello.txt',
+                  path: 'hello.txt',
+                  size: 12,
+                  compressed_size: 12,
+                  is_dir: false,
+                },
+              ],
+            };
+          }
+          return {
+            format: 'zip',
+            total_size: 64,
+            compressed_size: 32,
+            entry_count: 1,
+            entries: [
+              {
+                name: 'inner.zip',
+                path: 'inner.zip',
+                size: 64,
+                compressed_size: 32,
+                is_dir: false,
+              },
+            ],
+          };
+        }
+        if (command === 'extract_archive_cmd') {
+          return {
+            output_dir: '/workspace/output',
+            total_bytes: 12,
+          };
+        }
+        throw new Error(`unexpected command ${command}`);
+      }
+    );
+
+    const { user } = renderDialog({
+      mode: 'extract',
+      files: [archive],
+      currentPath: '/workspace/output',
+    });
+
+    expect(await screen.findByText('inner.zip')).toBeVisible();
+    await user.click(screen.getByRole('button', { name: 'Open' }));
+    expect(await screen.findByText('hello.txt')).toBeVisible();
+    expect(mocks.invoke).toHaveBeenCalledWith('list_archive', {
+      archivePath: '/workspace/bundle.zip',
+      nestedEntries: ['inner.zip'],
+    });
+
+    await user.click(screen.getByRole('button', { name: /Extract/ }));
+    await waitFor(() =>
+      expect(mocks.invoke).toHaveBeenCalledWith('extract_archive_cmd', {
+        archivePath: '/workspace/bundle.zip',
+        outputDir: '/workspace/output',
+        nestedEntries: ['inner.zip'],
+      })
+    );
+  });
+
   it('reports archive listing and extraction errors', async () => {
     const archive = file('broken.zip');
     mocks.invoke.mockImplementation(async (command: string) => {

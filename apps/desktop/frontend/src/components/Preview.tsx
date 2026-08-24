@@ -37,7 +37,22 @@ type PreviewProps = {
   onReady?: () => void;
   onContentError?: () => void;
   variant?: 'panel' | 'quicklook';
+  archiveTrail?: string[];
+  onOpenNestedArchive?: (entryPath: string) => void;
+  onNavigateArchiveParent?: () => void;
 };
+
+function isArchiveEntryPath(path: string): boolean {
+  const name = (path.split(/[/\\]/).pop() || path).toLowerCase();
+  return (
+    name.endsWith('.zip') ||
+    name.endsWith('.tar.gz') ||
+    name.endsWith('.tgz') ||
+    name.endsWith('.tar') ||
+    name.endsWith('.7z') ||
+    name.endsWith('.rar')
+  );
+}
 
 // Type guard to check if file is a PreviewFile
 function isPreviewFile(file: PreviewFile | FileEntry): file is PreviewFile {
@@ -126,6 +141,9 @@ export function Preview({
   onReady,
   onContentError,
   variant = 'panel',
+  archiveTrail = [],
+  onOpenNestedArchive,
+  onNavigateArchiveParent,
 }: PreviewProps) {
   // State for the active tab
   const [activeTab, setActiveTab] = useState<TabTypes>('preview');
@@ -283,22 +301,45 @@ export function Preview({
             <div>
               <strong>{archive.format.toUpperCase()} archive</strong>
               <span>{archive.entry_count} entries</span>
+              {archiveTrail.length > 0 && <span>{archiveTrail[archiveTrail.length - 1]}</span>}
             </div>
             <div className={styles.archiveStats}>
               <span>{formatFileSize(archive.total_size)} unpacked</span>
               <span>{formatFileSize(archive.compressed_size)} compressed</span>
+              {archiveTrail.length > 0 && onNavigateArchiveParent && (
+                <button
+                  type="button"
+                  className={styles.archiveBack}
+                  onClick={onNavigateArchiveParent}
+                >
+                  Back to parent archive
+                </button>
+              )}
             </div>
           </div>
           <div className={styles.archiveEntries} role="list" aria-label="Archive contents">
-            {archive.entries.slice(0, 200).map((entry) => (
-              <div key={entry.path} className={styles.archiveEntry} role="listitem">
-                <span className={styles.archiveEntryKind}>{entry.is_dir ? 'DIR' : 'FILE'}</span>
-                <span className={styles.archiveEntryPath}>{entry.path}</span>
-                <span className={styles.archiveEntrySize}>
-                  {entry.is_dir ? '' : formatFileSize(entry.size)}
-                </span>
-              </div>
-            ))}
+            {archive.entries.slice(0, 200).map((entry) => {
+              const canOpenNested =
+                !entry.is_dir && Boolean(onOpenNestedArchive) && isArchiveEntryPath(entry.path);
+              return (
+                <div key={entry.path} className={styles.archiveEntry} role="listitem">
+                  <span className={styles.archiveEntryKind}>{entry.is_dir ? 'DIR' : 'FILE'}</span>
+                  <span className={styles.archiveEntryPath}>{entry.path}</span>
+                  <span className={styles.archiveEntrySize}>
+                    {entry.is_dir ? '' : formatFileSize(entry.size)}
+                  </span>
+                  {canOpenNested && (
+                    <button
+                      type="button"
+                      className={styles.archiveOpen}
+                      onClick={() => onOpenNestedArchive?.(entry.path)}
+                    >
+                      Open
+                    </button>
+                  )}
+                </div>
+              );
+            })}
           </div>
           {archive.entries.length > 200 && (
             <div className={styles.archiveMore}>

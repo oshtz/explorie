@@ -51,6 +51,7 @@ vi.mock('./Preview', () => ({
     onContentError,
     onReady,
     onUpdate,
+    onOpenNestedArchive,
   }: {
     file: {
       id?: string;
@@ -63,13 +64,17 @@ vi.mock('./Preview', () => ({
       modified?: number;
       is_dir?: boolean;
       custom?: Record<string, unknown>;
-      archiveInfo?: { entry_count: number };
+      archiveInfo?: {
+        entry_count: number;
+        entries?: Array<{ path: string; is_dir?: boolean }>;
+      };
     };
     loading?: boolean;
     onClose?: () => void;
     onContentError?: () => void;
     onReady?: () => void;
     onUpdate?: (file: any) => void;
+    onOpenNestedArchive?: (entryPath: string) => void;
   }) => (
     <section
       data-testid="preview"
@@ -82,6 +87,13 @@ vi.mock('./Preview', () => ({
     >
       <div data-testid="preview-content-length">{file.content ? file.content.length : 0}</div>
       <div data-testid="preview-content-sample">{file.content?.slice(0, 80) ?? ''}</div>
+      {(file.archiveInfo?.entries ?? [])
+        .filter((entry) => !entry.is_dir && entry.path.toLowerCase().endsWith('.zip'))
+        .map((entry) => (
+          <button key={entry.path} onClick={() => onOpenNestedArchive?.(entry.path)}>
+            open nested {entry.path}
+          </button>
+        ))}
       <button onClick={onClose}>close preview</button>
       <button onClick={onContentError}>content error</button>
       <button onClick={onReady}>preview ready</button>
@@ -381,6 +393,45 @@ describe('FilePreviewer', () => {
       'application/x-explorie-archive'
     );
     expect(screen.getByTestId('preview')).toHaveAttribute('data-archive-count', '2');
+  });
+
+  it('opens a nested archive listing without extracting', async () => {
+    mocks.invoke.mockImplementation(
+      async (_command: string, args?: { nestedEntries?: string[] }) => {
+        if (args?.nestedEntries?.includes('inner.zip')) {
+          return {
+            format: 'zip',
+            entry_count: 1,
+            total_size: 12,
+            compressed_size: 12,
+            entries: [{ path: 'hello.txt', size: 12, compressed_size: 12, is_dir: false }],
+          };
+        }
+        return {
+          format: 'zip',
+          entry_count: 1,
+          total_size: 64,
+          compressed_size: 32,
+          entries: [{ path: 'inner.zip', size: 64, compressed_size: 32, is_dir: false }],
+        };
+      }
+    );
+
+    const user = userEvent.setup();
+    render(<FilePreviewer file={makeFile('/root/bundle.zip')} />);
+
+    await waitFor(() =>
+      expect(screen.getByTestId('preview')).toHaveAttribute('data-loading', 'false')
+    );
+    await user.click(screen.getByRole('button', { name: 'open nested inner.zip' }));
+
+    await waitFor(() =>
+      expect(mocks.invoke).toHaveBeenCalledWith('list_archive', {
+        archivePath: '/root/bundle.zip',
+        nestedEntries: ['inner.zip'],
+      })
+    );
+    expect(screen.getByTestId('preview')).toHaveAttribute('data-archive-count', '1');
   });
 
   it('loads externally generated document previews as PDFs', async () => {

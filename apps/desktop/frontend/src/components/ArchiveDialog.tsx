@@ -78,7 +78,11 @@ function getDefaultArchiveName(files: FileEntry[]): string {
 
 // Helper to check if file is an archive
 function isArchiveFile(file: FileEntry): boolean {
-  const name = (file.name || file.path).toLowerCase();
+  return isArchiveEntryPath(file.name || file.path);
+}
+
+function isArchiveEntryPath(path: string): boolean {
+  const name = (path.split(/[/\\]/).pop() || path).toLowerCase();
   return (
     name.endsWith('.zip') ||
     name.endsWith('.tar.gz') ||
@@ -107,6 +111,7 @@ export function ArchiveDialog({
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
   const [archiveInfo, setArchiveInfo] = useState<ArchiveInfo | null>(null);
+  const [nestedEntries, setNestedEntries] = useState<string[]>([]);
   const [loadingInfo, setLoadingInfo] = useState(false);
   const [entrySearch, setEntrySearch] = useState('');
   const dialogRef = useRef<HTMLDivElement>(null);
@@ -124,11 +129,14 @@ export function ArchiveDialog({
   }, [open]);
 
   // Load archive info for extraction preview
-  const loadArchiveInfo = useCallback(async (path: string) => {
+  const loadArchiveInfo = useCallback(async (path: string, nested: string[] = []) => {
     setLoadingInfo(true);
     setError(null);
     try {
-      const info = await invoke<ArchiveInfo>('list_archive', { archivePath: path });
+      const info = await invoke<ArchiveInfo>(
+        'list_archive',
+        nested.length > 0 ? { archivePath: path, nestedEntries: nested } : { archivePath: path }
+      );
       setArchiveInfo(info);
     } catch (e) {
       setError(`Failed to read archive: ${formatErrorMessage(e)}`);
@@ -149,6 +157,7 @@ export function ArchiveDialog({
       setError(null);
       setSuccess(null);
       setArchiveInfo(null);
+      setNestedEntries([]);
       setEntrySearch('');
 
       // If extracting, load archive info
@@ -230,10 +239,12 @@ export function ArchiveDialog({
     setSuccess(null);
 
     try {
-      const result = await invoke<ExtractResult>('extract_archive_cmd', {
-        archivePath: files[0].path,
-        outputDir,
-      });
+      const result = await invoke<ExtractResult>(
+        'extract_archive_cmd',
+        nestedEntries.length > 0
+          ? { archivePath: files[0].path, outputDir, nestedEntries }
+          : { archivePath: files[0].path, outputDir }
+      );
 
       setProgress(100);
       setSuccess(`Extracted ${formatSize(result.total_bytes)} to ${result.output_dir}`);
@@ -247,7 +258,7 @@ export function ArchiveDialog({
     } finally {
       setProcessing(false);
     }
-  }, [processing, files, outputDir, onSuccess]);
+  }, [processing, files, outputDir, nestedEntries, onSuccess]);
 
   // Handle backdrop click
   const handleBackdropClick = useCallback(
@@ -362,8 +373,27 @@ export function ArchiveDialog({
                     />
                     <span className={styles.archiveSearchMeta}>
                       {filteredEntries.length} of {archiveInfo.entry_count} entries
+                      {nestedEntries.length > 0
+                        ? ` · ${nestedEntries[nestedEntries.length - 1]}`
+                        : ''}
                     </span>
                   </div>
+                  {nestedEntries.length > 0 && (
+                    <button
+                      type="button"
+                      className={styles.nestedBack}
+                      onClick={() => {
+                        const next = nestedEntries.slice(0, -1);
+                        setNestedEntries(next);
+                        if (files[0]) {
+                          void loadArchiveInfo(files[0].path, next);
+                        }
+                      }}
+                      disabled={loadingInfo || processing}
+                    >
+                      Back to parent archive
+                    </button>
+                  )}
                   {filteredEntries.length > 0 ? (
                     <div className={styles.archiveContents}>
                       {filteredEntries.slice(0, 10).map((entry) => (
@@ -373,6 +403,22 @@ export function ArchiveDialog({
                           </span>
                           <span className={styles.archiveEntryName}>{entry.path}</span>
                           <span className={styles.archiveEntrySize}>{formatSize(entry.size)}</span>
+                          {!entry.is_dir && isArchiveEntryPath(entry.path) && (
+                            <button
+                              type="button"
+                              className={styles.nestedOpen}
+                              onClick={() => {
+                                const next = [...nestedEntries, entry.path];
+                                setNestedEntries(next);
+                                if (files[0]) {
+                                  void loadArchiveInfo(files[0].path, next);
+                                }
+                              }}
+                              disabled={loadingInfo || processing}
+                            >
+                              Open
+                            </button>
+                          )}
                         </div>
                       ))}
                       {filteredEntries.length > 10 && (

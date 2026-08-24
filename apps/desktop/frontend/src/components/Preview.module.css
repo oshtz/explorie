@@ -249,7 +249,7 @@
 
 .archiveEntry {
   display: grid;
-  grid-template-columns: 44px minmax(0, 1fr) auto;
+  grid-template-columns: 44px minmax(0, 1fr) auto auto;
   gap: var(--padding-sm);
   align-items: center;
   padding: var(--padding-sm) var(--padding-md);
@@ -274,6 +274,27 @@
 .archiveEntrySize {
   color: var(--fg-tertiary);
   text-align: right;
+}
+
+.archiveOpen,
+.archiveBack {
+  border: 1px solid var(--border-primary);
+  background: var(--bg-elevated);
+  color: var(--fg-primary);
+  font-size: calc(11px * var(--font-scale));
+  padding: 2px 8px;
+  cursor: pointer;
+}
+
+.archiveOpen:hover,
+.archiveBack:hover {
+  background: var(--bg-hover);
+}
+
+.archiveBack {
+  display: block;
+  margin-top: 6px;
+  margin-left: auto;
 }
 
 .archiveMore {
