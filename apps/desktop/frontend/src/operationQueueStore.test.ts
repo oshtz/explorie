@@ -6,6 +6,7 @@ vi.mock('@tauri-apps/api/core', () => ({ invoke }));
 
 import {
   formatBytes,
+  getOperationProgress,
   useActiveOperationsCount,
   useHasActiveOperations,
   useOperationQueueStore,
@@ -58,6 +59,28 @@ describe('operation queue store', () => {
 
     expect(invoke).toHaveBeenCalledWith('cancel_file_operation', { jobId: 'job-1' });
     expect(useOperationQueueStore.getState().operations[0].status).toBe('running');
+  });
+
+  it('does not cancel an operation after its native job completed', async () => {
+    useOperationQueueStore.getState().trackOperation(trackedOperation);
+    useOperationQueueStore.getState().finishOperation('job-1', 'completed');
+
+    await useOperationQueueStore.getState().cancelOperation('job-1');
+
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it('calculates the shared aggregate progress used by both progress views', () => {
+    useOperationQueueStore.getState().trackOperation({
+      ...trackedOperation,
+      totalBytes: 40,
+      totalItems: 4,
+    });
+    useOperationQueueStore
+      .getState()
+      .updateProgress('job-1', { processedBytes: 10, processedItems: 1 });
+
+    expect(getOperationProgress(useOperationQueueStore.getState().operations[0])).toBe(25);
   });
 
   it('clears terminal operations while preserving active work', () => {

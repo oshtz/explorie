@@ -78,4 +78,70 @@ describe('runNativeFileOperation', () => {
     });
     expect(mocks.unlisten).toHaveBeenCalledTimes(1);
   });
+
+  it.each(['copy', 'move'] as const)(
+    'mirrors one aggregate %s event stream and preserves mid-job progress on cancel',
+    async (kind) => {
+      mocks.invoke.mockImplementation(async (command: string) => {
+        if (command === 'start_file_operation') return 'job-bulk';
+        if (command === 'cancel_file_operation') return true;
+        throw new Error(`Unexpected command: ${command}`);
+      });
+      const items = [0, 1, 2].map((index) => ({
+        sourcePath: `/source/item-${index}.txt`,
+        size: 10,
+        name: `item-${index}.txt`,
+        isDir: false,
+      }));
+
+      const operation = runNativeFileOperation(
+        {
+          kind,
+          sources: items.map((item) => item.sourcePath),
+          destination: '/target',
+          conflictPolicy: 'error',
+        },
+        {
+          type: kind,
+          items,
+          destinationPath: '/target',
+          conflictResolution: 'ask',
+        }
+      );
+      const cancelled = expect(operation).rejects.toMatchObject({ name: 'AbortError' });
+      await vi.waitFor(() => {
+        expect(useOperationQueueStore.getState().operations).toHaveLength(1);
+      });
+
+      mocks.handler?.({
+        payload: {
+          jobId: 'job-bulk',
+          state: 'running',
+          progress: {
+            processedEntries: 2,
+            totalEntries: 3,
+            processedBytes: 20,
+            totalBytes: 30,
+            currentPath: '/source/item-1.txt',
+          },
+        },
+      });
+      await useOperationQueueStore.getState().cancelOperation('job-bulk');
+      mocks.handler?.({ payload: { jobId: 'job-bulk', state: 'cancelled' } });
+      await cancelled;
+
+      expect(mocks.invoke).toHaveBeenCalledWith('cancel_file_operation', { jobId: 'job-bulk' });
+      expect(useOperationQueueStore.getState().operations).toHaveLength(1);
+      expect(useOperationQueueStore.getState().operations[0]).toMatchObject({
+        id: 'job-bulk',
+        status: 'cancelled',
+        processedItems: 2,
+        totalItems: 3,
+        processedBytes: 20,
+        totalBytes: 30,
+        currentItem: '/source/item-1.txt',
+      });
+      expect(mocks.unlisten).toHaveBeenCalledTimes(1);
+    }
+  );
 });

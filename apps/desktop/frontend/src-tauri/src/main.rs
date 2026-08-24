@@ -33,6 +33,34 @@ struct FileOperationJobs {
 }
 
 impl FileOperationJobs {
+    fn close_cancel_gate(&self, job_id: &str, cancelled: &AtomicBool) -> io::Result<()> {
+        let mut cancellations = self
+            .cancellations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "file operation cancelled",
+            ));
+        }
+        cancellations.remove(job_id);
+        Ok(())
+    }
+
+    fn cancel(&self, job_id: &str) -> bool {
+        let cancellations = self
+            .cancellations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(cancelled) = cancellations.get(job_id) {
+            cancelled.store(true, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
     fn cancel_all(&self) {
         for cancelled in self
             .cancellations
@@ -580,19 +608,31 @@ fn start_file_operation(
     tauri::async_runtime::spawn(async move {
         let progress_app = task_app.clone();
         let progress_job_id = task_job_id.clone();
+        let cancel_gate_app = task_app.clone();
+        let cancel_gate_job_id = task_job_id.clone();
         let operation = tauri::async_runtime::spawn_blocking(move || {
-            explorie_core::perform_file_operation(request, &cancelled, |progress| {
-                emit_file_operation(
-                    &progress_app,
-                    FileOperationEvent {
-                        job_id: progress_job_id.clone(),
-                        state: "running",
-                        progress: Some(progress),
-                        result: None,
-                        error: None,
-                    },
-                );
-            })
+            let gate_cancelled = Arc::clone(&cancelled);
+            explorie_core::perform_file_operation_with_cancel_gate(
+                request,
+                &cancelled,
+                |progress| {
+                    emit_file_operation(
+                        &progress_app,
+                        FileOperationEvent {
+                            job_id: progress_job_id.clone(),
+                            state: "running",
+                            progress: Some(progress),
+                            result: None,
+                            error: None,
+                        },
+                    );
+                },
+                || {
+                    cancel_gate_app
+                        .state::<FileOperationJobs>()
+                        .close_cancel_gate(&cancel_gate_job_id, &gate_cancelled)
+                },
+            )
         })
         .await;
 
@@ -644,16 +684,7 @@ fn start_file_operation(
 
 #[tauri::command]
 fn cancel_file_operation(jobs: tauri::State<'_, FileOperationJobs>, job_id: String) -> bool {
-    let jobs = jobs
-        .cancellations
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(cancelled) = jobs.get(&job_id) {
-        cancelled.store(true, Ordering::Relaxed);
-        true
-    } else {
-        false
-    }
+    jobs.cancel(&job_id)
 }
 
 fn read_text_preview_impl(path: &Path, max_bytes: u64) -> Result<TextPreview, String> {
@@ -2417,6 +2448,115 @@ mod tests {
         assert!(!mutations.finish());
         assert!(mutations.finish());
         assert!(!mutations.request_exit());
+    }
+
+    #[test]
+    fn replace_cleanup_closes_cancel_gate_before_deleting_backup() {
+        let temp = TestDir::new();
+        let source = temp.0.join("item.txt");
+        let destination = temp.0.join("destination");
+        let target = destination.join("item.txt");
+        fs::create_dir(&destination).unwrap();
+        fs::write(&source, b"new").unwrap();
+        fs::write(&target, b"old").unwrap();
+
+        let jobs = FileOperationJobs::default();
+        let job_id = "replace-job".to_string();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        jobs.cancellations
+            .lock()
+            .unwrap()
+            .insert(job_id.clone(), Arc::clone(&cancelled));
+        let gate_closed = AtomicBool::new(false);
+
+        explorie_core::perform_file_operation_with_cancel_gate(
+            explorie_core::FileOperationRequest {
+                kind: explorie_core::FileOperationKind::Copy,
+                sources: vec![source],
+                destination: Some(destination.clone()),
+                conflict_policy: explorie_core::ConflictPolicy::Replace,
+                conflict_policies: None,
+            },
+            &cancelled,
+            |_| {},
+            || {
+                assert!(fs::read_dir(&destination).unwrap().any(|entry| {
+                    entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".explorie-backup-")
+                }));
+                jobs.close_cancel_gate(&job_id, &cancelled)?;
+                gate_closed.store(true, Ordering::Relaxed);
+                assert!(!jobs.cancel(&job_id));
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(gate_closed.load(Ordering::Relaxed));
+        assert_eq!(fs::read(target).unwrap(), b"new");
+        assert!(fs::read_dir(destination).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".explorie-backup-")
+        }));
+    }
+
+    #[test]
+    fn replace_cancel_winning_cleanup_gate_restores_backup() {
+        let temp = TestDir::new();
+        let source = temp.0.join("item.txt");
+        let destination = temp.0.join("destination");
+        let target = destination.join("item.txt");
+        fs::create_dir(&destination).unwrap();
+        fs::write(&source, b"new").unwrap();
+        fs::write(&target, b"old").unwrap();
+
+        let jobs = FileOperationJobs::default();
+        let job_id = "cancelled-replace-job".to_string();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        jobs.cancellations
+            .lock()
+            .unwrap()
+            .insert(job_id.clone(), Arc::clone(&cancelled));
+
+        let result = explorie_core::perform_file_operation_with_cancel_gate(
+            explorie_core::FileOperationRequest {
+                kind: explorie_core::FileOperationKind::Copy,
+                sources: vec![source.clone()],
+                destination: Some(destination.clone()),
+                conflict_policy: explorie_core::ConflictPolicy::Replace,
+                conflict_policies: None,
+            },
+            &cancelled,
+            |_| {},
+            || {
+                assert!(fs::read_dir(&destination).unwrap().any(|entry| {
+                    entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".explorie-backup-")
+                }));
+                assert!(jobs.cancel(&job_id));
+                jobs.close_cancel_gate(&job_id, &cancelled)
+            },
+        );
+
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        assert_eq!(fs::read(source).unwrap(), b"new");
+        assert_eq!(fs::read(target).unwrap(), b"old");
+        assert!(fs::read_dir(destination).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".explorie-backup-")
+        }));
     }
 
     #[cfg(windows)]

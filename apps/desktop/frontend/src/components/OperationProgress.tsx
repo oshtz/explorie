@@ -1,7 +1,7 @@
 import React, { useCallback, useState } from 'react';
 import { Icon } from './Icon';
 import type { FileOperation } from '../operationQueueStore';
-import { useOperationQueueStore, formatBytes } from '../operationQueueStore';
+import { useOperationQueueStore, formatBytes, getOperationProgress } from '../operationQueueStore';
 import { useFileStore } from '../store';
 import styles from './OperationProgress.module.css';
 
@@ -40,16 +40,7 @@ function OperationItem({ operation }: { operation: FileOperation }) {
   const cancelOperation = useOperationQueueStore((s) => s.cancelOperation);
   const removeOperation = useOperationQueueStore((s) => s.removeOperation);
 
-  const rawProgress =
-    operation.totalBytes > 0
-      ? (operation.processedBytes / operation.totalBytes) * 100
-      : operation.totalItems > 0
-        ? (operation.processedItems / operation.totalItems) * 100
-        : 0;
-  const progress = Math.min(
-    100,
-    Math.max(0, Number.isFinite(rawProgress) ? Math.round(rawProgress) : 0)
-  );
+  const progress = getOperationProgress(operation);
 
   const isActive = operation.status === 'running';
   const canCancel = isActive;
@@ -122,6 +113,14 @@ function OperationItem({ operation }: { operation: FileOperation }) {
           </div>
           <div className={styles.progressStats}>
             <span className={styles.progressPercent}>{progress}%</span>
+            <span>
+              {operation.processedItems}/{operation.totalItems} items
+            </span>
+            {operation.totalBytes > 0 && (
+              <span>
+                {formatBytes(operation.processedBytes)} / {formatBytes(operation.totalBytes)}
+              </span>
+            )}
           </div>
         </div>
       )}

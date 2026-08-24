@@ -57,6 +57,8 @@ describe('OperationProgress', () => {
 
     expect(screen.getByText('1 active')).toBeInTheDocument();
     expect(screen.getByText('25%')).toBeInTheDocument();
+    expect(screen.getByText('1/2 items')).toBeInTheDocument();
+    expect(screen.getByText('50 B / 200 B')).toBeInTheDocument();
     expect(screen.getByText('report.txt')).toBeInTheDocument();
     expect(screen.getByRole('region', { name: 'File operations' })).toBeVisible();
     expect(screen.queryByRole('button', { name: 'Close operations' })).not.toBeInTheDocument();

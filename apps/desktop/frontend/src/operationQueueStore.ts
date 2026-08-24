@@ -100,6 +100,7 @@ export const useOperationQueueStore = create<OperationQueueState>((set, get) => 
   },
 
   cancelOperation: async (id) => {
+    if (get().operations.find((operation) => operation.id === id)?.status !== 'running') return;
     await invoke('cancel_file_operation', { jobId: id });
   },
 
@@ -140,4 +141,14 @@ export function formatBytes(bytes: number, decimals = 1): string {
   const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
   const i = Math.min(Math.floor(Math.log(bytes) / Math.log(k)), sizes.length - 1);
   return `${parseFloat((bytes / Math.pow(k, i)).toFixed(dm))} ${sizes[i]}`;
+}
+
+export function getOperationProgress(operation: FileOperation): number {
+  const rawProgress =
+    operation.totalBytes > 0
+      ? (operation.processedBytes / operation.totalBytes) * 100
+      : operation.totalItems > 0
+        ? (operation.processedItems / operation.totalItems) * 100
+        : 0;
+  return Math.min(100, Math.max(0, Number.isFinite(rawProgress) ? Math.round(rawProgress) : 0));
 }

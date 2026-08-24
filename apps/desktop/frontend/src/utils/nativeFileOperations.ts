@@ -10,6 +10,7 @@ export interface NativeFileOperationRequest {
   sources: string[];
   destination: string | null;
   conflictPolicy: NativeConflictPolicy;
+  conflictPolicies?: NativeConflictPolicy[];
 }
 
 export interface NativeFileOperationResult {

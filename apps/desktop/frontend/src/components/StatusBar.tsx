@@ -4,7 +4,7 @@ import type { FileEntry } from '../store';
 import { useFileStore } from '../store';
 import { useShallow } from 'zustand/shallow';
 import type { FileOperation } from '../operationQueueStore';
-import { useOperationQueueStore } from '../operationQueueStore';
+import { getOperationProgress, useOperationQueueStore } from '../operationQueueStore';
 import styles from './StatusBar.module.css';
 import { basename } from '../utils/path';
 
@@ -27,16 +27,6 @@ function formatFileSize(bytes: number): string {
   const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
   const i = Math.floor(Math.log(bytes) / Math.log(k));
   return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
-}
-
-function getOperationProgress(operation: FileOperation): number | null {
-  if (operation.totalBytes > 0) {
-    return Math.round((operation.processedBytes / operation.totalBytes) * 100);
-  }
-  if (operation.totalItems > 0) {
-    return Math.round((operation.processedItems / operation.totalItems) * 100);
-  }
-  return null;
 }
 
 export function StatusBar({ files, selectedFile, currentPath }: StatusBarProps) {
@@ -147,8 +137,7 @@ export function StatusBar({ files, selectedFile, currentPath }: StatusBarProps) 
     };
     if (active.length === 1) {
       const progress = getOperationProgress(primary);
-      const label =
-        progress !== null ? `${typeLabel[primary.type]} ${progress}%` : typeLabel[primary.type];
+      const label = `${typeLabel[primary.type]} ${progress}%`;
       const detail =
         primary.totalItems > 0
           ? `${primary.processedItems}/${primary.totalItems} items`

@@ -208,4 +208,104 @@ describe('native-backed file operations', () => {
     expect(mocks.runNativeFileOperation).toHaveBeenCalledTimes(1);
     expect(showToast).toHaveBeenCalledWith('Copy cancelled', { type: 'warning' });
   });
+
+  it('submits a multi-item copy as one aggregate native job', async () => {
+    const files = [file('/source/one.txt'), file('/source/two.txt')];
+    mocks.runNativeFileOperation.mockResolvedValueOnce({
+      processedEntries: 2,
+      processedBytes: 256,
+      targets: ['/destination/one.txt', '/destination/two.txt'],
+    });
+
+    await expect(
+      copyWithUndoAndConflictResolution(files, '/destination', showToast, refresh)
+    ).resolves.toBe(true);
+
+    expect(mocks.runNativeFileOperation).toHaveBeenCalledTimes(1);
+    expect(mocks.runNativeFileOperation).toHaveBeenCalledWith(
+      {
+        kind: 'copy',
+        sources: ['/source/one.txt', '/source/two.txt'],
+        destination: '/destination',
+        conflictPolicy: 'error',
+        conflictPolicies: ['error', 'error'],
+      },
+      expect.objectContaining({
+        type: 'copy',
+        items: [
+          expect.objectContaining({ sourcePath: '/source/one.txt' }),
+          expect.objectContaining({ sourcePath: '/source/two.txt' }),
+        ],
+      })
+    );
+  });
+
+  it('submits a multi-item move as one aggregate native job', async () => {
+    const files = [file('/source/one.txt'), file('/source/two.txt')];
+    mocks.runNativeFileOperation.mockResolvedValueOnce({
+      processedEntries: 2,
+      processedBytes: 256,
+      targets: ['/destination/one.txt', '/destination/two.txt'],
+    });
+
+    await expect(
+      moveWithUndoAndConflictResolution(files, '/destination', showToast, refresh)
+    ).resolves.toBe(true);
+
+    expect(mocks.runNativeFileOperation).toHaveBeenCalledTimes(1);
+    expect(mocks.runNativeFileOperation).toHaveBeenCalledWith(
+      {
+        kind: 'move',
+        sources: ['/source/one.txt', '/source/two.txt'],
+        destination: '/destination',
+        conflictPolicy: 'error',
+        conflictPolicies: ['error', 'error'],
+      },
+      expect.objectContaining({
+        type: 'move',
+        items: [
+          expect.objectContaining({ sourcePath: '/source/one.txt' }),
+          expect.objectContaining({ sourcePath: '/source/two.txt' }),
+        ],
+      })
+    );
+  });
+
+  it.each(['copy', 'move'] as const)(
+    'resolves same-basename %s collisions before submitting the aggregate job',
+    async (kind) => {
+      const files = [file('/first/report.txt'), file('/second/report.txt')];
+      mocks.queueConflict.mockResolvedValueOnce('keepBoth');
+      mocks.runNativeFileOperation.mockResolvedValueOnce({
+        processedEntries: 2,
+        processedBytes: 256,
+        targets: ['/destination/report.txt', '/destination/report (1).txt'],
+      });
+
+      const mutate =
+        kind === 'copy' ? copyWithUndoAndConflictResolution : moveWithUndoAndConflictResolution;
+      await expect(
+        mutate(files, '/destination', showToast, refresh, { conflictResolution: 'ask' })
+      ).resolves.toBe(true);
+
+      expect(mocks.queueConflict).toHaveBeenCalledWith(
+        expect.objectContaining({
+          sourcePath: '/second/report.txt',
+          destPath: '/destination/report.txt',
+          sourceName: 'report.txt',
+          destName: 'report.txt',
+        })
+      );
+      expect(mocks.runNativeFileOperation).toHaveBeenCalledWith(
+        {
+          kind,
+          sources: files.map((item) => item.path),
+          destination: '/destination',
+          conflictPolicy: 'error',
+          conflictPolicies: ['error', 'rename'],
+        },
+        expect.objectContaining({ type: kind })
+      );
+    }
+  );
 });
