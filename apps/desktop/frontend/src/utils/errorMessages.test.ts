@@ -2,6 +2,8 @@ import { describe, it, expect } from 'vitest';
 import {
   formatErrorMessage,
   formatError,
+  formatRemoteDriveError,
+  formatRemoteDriveFailureCopy,
   formatOperationError,
   formatBatchErrors,
   createOperationErrorMessage,
@@ -189,6 +191,54 @@ describe('errorMessages', () => {
       ];
       const result = formatBatchErrors(errors);
       expect(result).toContain('1 item');
+    });
+  });
+
+  describe('formatRemoteDriveError', () => {
+    it('maps rclone-exited failures to Retry connect without subprocess text', () => {
+      const formatted = formatRemoteDriveError('rclone exited with exit status: 1');
+      expect(formatted.kind).toBe('rclone-exited');
+      expect(formatted.message).toBe('The remote mount stopped unexpectedly');
+      expect(formatted.nextAction).toBe('Retry connect');
+      expect(formatted.retryable).toBe(true);
+      expect(
+        formatRemoteDriveFailureCopy('rclone exited before the mount was ready: exit code 1')
+      ).not.toMatch(/rclone exited with/i);
+    });
+
+    it('maps WinFsp-missing failures to Install WinFsp and does not mark them retryable', () => {
+      const formatted = formatRemoteDriveError(
+        'Install WinFsp before mounting remote drives on Windows.'
+      );
+      expect(formatted.kind).toBe('winfsp-missing');
+      expect(formatted.nextAction).toBe('Install WinFsp');
+      expect(formatted.retryable).toBe(false);
+    });
+
+    it('maps helper-approval failures to one System Settings action', () => {
+      const formatted = formatRemoteDriveError(
+        'Approve the Explorie Remote Drives helper in System Settings.'
+      );
+      expect(formatted.kind).toBe('helper-approval');
+      expect(formatted.nextAction).toBe('Approve the helper in System Settings');
+      expect(formatted.retryable).toBe(false);
+      expect(formatRemoteDriveError('approval-required').kind).toBe('helper-approval');
+    });
+
+    it('maps timeout failures through errorMessages to Retry connect', () => {
+      const formatted = formatRemoteDriveError('Timed out waiting for rclone to start.');
+      expect(formatted.kind).toBe('timeout');
+      expect(formatted.message).toBe('The operation timed out');
+      expect(formatted.nextAction).toBe('Retry connect');
+      expect(formatted.retryable).toBe(true);
+    });
+
+    it('maps network failures through errorMessages to a network retry', () => {
+      const formatted = formatRemoteDriveError('Connection refused');
+      expect(formatted.kind).toBe('network');
+      expect(formatted.message).toBe('Network connection failed');
+      expect(formatted.nextAction).toBe('Check the network, then retry');
+      expect(formatted.retryable).toBe(true);
     });
   });
 });

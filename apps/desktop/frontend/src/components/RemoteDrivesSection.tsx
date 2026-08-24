@@ -2,7 +2,9 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { Icon } from './Icon';
+import { formatRemoteDriveError, formatRemoteDriveFailureCopy } from '../utils/errorMessages';
 import {
+  connectRemoteDriveWithBackoff,
   loadRemoteDrives,
   saveRemoteDrives,
   type DisconnectResult,
@@ -18,6 +20,16 @@ const WINDOWS_LETTERS = Array.from({ length: 23 }, (_, index) =>
 );
 
 const disconnected = (id: string): RemoteDriveStatus => ({ id, state: 'disconnected' });
+
+function driveFailure(status: RemoteDriveStatus) {
+  if (status.state === 'approval-required') {
+    return formatRemoteDriveError(status.error ?? 'approval-required');
+  }
+  if (status.state === 'error' && status.error) {
+    return formatRemoteDriveError(status.error);
+  }
+  return null;
+}
 
 export function RemoteDrivesSection({
   onSelectLocation,
@@ -42,12 +54,12 @@ export function RemoteDrivesSection({
     try {
       const next = await invoke<RemoteDriveEnvironment>('get_remote_drive_environment');
       setEnvironment(next);
-      setSetupError(next.error ?? null);
+      setSetupError(next.error ? formatRemoteDriveFailureCopy(next.error) : null);
       if (next.rcloneAvailable) {
         setRemotes(await invoke<string[]>('list_rclone_remotes'));
       }
     } catch (error) {
-      setSetupError(String(error));
+      setSetupError(formatRemoteDriveFailureCopy(error));
     }
   }, []);
 
@@ -55,9 +67,17 @@ export function RemoteDrivesSection({
     async (profile: RemoteDriveProfile) => {
       updateStatus({ id: profile.id, state: 'connecting' });
       try {
-        updateStatus(await invoke<RemoteDriveStatus>('connect_remote_drive', { profile }));
+        updateStatus(
+          await connectRemoteDriveWithBackoff(profile.id, () =>
+            invoke<RemoteDriveStatus>('connect_remote_drive', { profile })
+          )
+        );
       } catch (error) {
-        updateStatus({ id: profile.id, state: 'error', error: String(error) });
+        updateStatus({
+          id: profile.id,
+          state: 'error',
+          error: formatRemoteDriveError(error).technical,
+        });
       }
     },
     [updateStatus]
@@ -160,7 +180,11 @@ export function RemoteDrivesSection({
         return next;
       });
     } catch (error) {
-      updateStatus({ id: profile.id, state: 'error', error: String(error) });
+      updateStatus({
+        id: profile.id,
+        state: 'error',
+        error: formatRemoteDriveError(error).technical,
+      });
     }
   };
 
@@ -173,7 +197,11 @@ export function RemoteDrivesSection({
       );
       if (confirmed) await disconnect(profile, true);
     } catch (error) {
-      updateStatus({ id: profile.id, state: 'error', error: String(error) });
+      updateStatus({
+        id: profile.id,
+        state: 'error',
+        error: formatRemoteDriveError(error).technical,
+      });
     }
   };
 
@@ -185,7 +213,7 @@ export function RemoteDrivesSection({
         await invoke('open_remote_drive_helper_settings');
       }
     } catch (error) {
-      setSetupError(String(error));
+      setSetupError(formatRemoteDriveFailureCopy(error));
     }
   };
 
@@ -196,7 +224,7 @@ export function RemoteDrivesSection({
       await invoke('install_winfsp');
       await refreshEnvironment();
     } catch (error) {
-      setSetupError(String(error));
+      setSetupError(formatRemoteDriveFailureCopy(error));
     } finally {
       setInstallingWinFsp(false);
     }
@@ -232,7 +260,7 @@ export function RemoteDrivesSection({
       if (next.length > 0) openEditor(undefined, next);
       else setSetupError('rclone finished without creating a remote.');
     } catch (error) {
-      setSetupError(String(error));
+      setSetupError(formatRemoteDriveFailureCopy(error));
     } finally {
       setConfiguringRemotes(false);
     }
@@ -308,12 +336,14 @@ export function RemoteDrivesSection({
         {profiles.map((profile) => {
           const driveStatus = statuses[profile.id] ?? disconnected(profile.id);
           const canOpen = driveStatus.state === 'connected' && driveStatus.mountPath;
+          const failure = driveFailure(driveStatus);
+          const failureCopy = failure ? `${failure.message} ${failure.nextAction}` : null;
           return (
             <div className={styles.item} key={profile.id}>
               <button
                 type="button"
                 className={styles.drive}
-                title={driveStatus.error ?? driveStatus.mountPath ?? profile.mountTarget}
+                title={failureCopy ?? driveStatus.mountPath ?? profile.mountTarget}
                 onClick={() =>
                   canOpen ? onSelectLocation(driveStatus.mountPath!) : void connect(profile)
                 }
@@ -347,6 +377,11 @@ export function RemoteDrivesSection({
                   <Icon name="x" size={12} />
                 </button>
               </div>
+              {failureCopy && (
+                <p className={styles.failure} role="status">
+                  {failureCopy}
+                </p>
+              )}
             </div>
           );
         })}

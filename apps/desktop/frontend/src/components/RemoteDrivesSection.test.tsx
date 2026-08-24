@@ -95,7 +95,9 @@ describe('RemoteDrivesSection', () => {
       if (command === 'list_rclone_remotes') return Promise.resolve(['cloud', 'backup']);
       if (command === 'get_remote_drive_statuses') return Promise.resolve([]);
       if (command === 'connect_remote_drive' && args?.profile?.id === profiles[0].id) {
-        return Promise.reject(new Error('offline'));
+        return Promise.reject(
+          new Error('Install WinFsp before mounting remote drives on Windows.')
+        );
       }
       if (command === 'connect_remote_drive') {
         return Promise.resolve({ id: profiles[1].id, state: 'connected', mountPath: 'F:\\' });
@@ -155,5 +157,111 @@ describe('RemoteDrivesSection', () => {
     await waitFor(() => expect(invokeMock).toHaveBeenCalledWith('configure_rclone', undefined));
     expect(await screen.findByRole('dialog', { name: 'Remote Drive' })).toBeInTheDocument();
     expect(screen.getByLabelText('rclone remote')).toHaveValue('cloud');
+  });
+
+  it('maps rclone-exited failures through errorMessages and gives up after the retry budget', async () => {
+    const profile = {
+      id: '672ce77a-b72d-4e16-a9e8-55e0ac5bc580',
+      name: 'Cloud',
+      remote: 'cloud',
+      remotePath: '',
+      mountTarget: 'E:',
+    };
+    window.localStorage.setItem('explorie:remoteDrives', JSON.stringify([profile]));
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'get_remote_drive_environment') return Promise.resolve(environment);
+      if (command === 'list_rclone_remotes') return Promise.resolve(['cloud']);
+      if (command === 'get_remote_drive_statuses') return Promise.resolve([]);
+      if (command === 'connect_remote_drive') {
+        return Promise.reject(new Error('rclone exited with exit status: 1'));
+      }
+      return Promise.resolve(undefined);
+    });
+
+    render(<RemoteDrivesSection onSelectLocation={vi.fn()} />);
+
+    expect(await screen.findByRole('status', undefined, { timeout: 4000 })).toHaveTextContent(
+      'The remote mount stopped unexpectedly Retry connect'
+    );
+    expect(screen.queryByText(/rclone exited with/i)).not.toBeInTheDocument();
+    const connects = invokeMock.mock.calls.filter(
+      ([command]) => command === 'connect_remote_drive'
+    );
+    expect(connects).toHaveLength(3);
+  });
+
+  it('does not auto-retry a missing WinFsp and names Install WinFsp', async () => {
+    const profile = {
+      id: '672ce77a-b72d-4e16-a9e8-55e0ac5bc580',
+      name: 'Cloud',
+      remote: 'cloud',
+      remotePath: '',
+      mountTarget: 'E:',
+    };
+    window.localStorage.setItem('explorie:remoteDrives', JSON.stringify([profile]));
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'get_remote_drive_environment') return Promise.resolve(environment);
+      if (command === 'list_rclone_remotes') return Promise.resolve(['cloud']);
+      if (command === 'get_remote_drive_statuses') return Promise.resolve([]);
+      if (command === 'connect_remote_drive') {
+        return Promise.reject(
+          new Error('Install WinFsp before mounting remote drives on Windows.')
+        );
+      }
+      return Promise.resolve(undefined);
+    });
+
+    render(<RemoteDrivesSection onSelectLocation={vi.fn()} />);
+
+    expect(await screen.findByRole('status')).toHaveTextContent(
+      'Windows needs WinFsp to mount remote drives Install WinFsp'
+    );
+    expect(
+      invokeMock.mock.calls.filter(([command]) => command === 'connect_remote_drive')
+    ).toHaveLength(1);
+  });
+
+  it('does not auto-retry an unapproved helper and names the System Settings action', async () => {
+    const profile = {
+      id: '672ce77a-b72d-4e16-a9e8-55e0ac5bc580',
+      name: 'Cloud',
+      remote: 'cloud',
+      remotePath: '',
+      mountTarget: 'Projects',
+    };
+    window.localStorage.setItem('explorie:remoteDrives', JSON.stringify([profile]));
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'get_remote_drive_environment') {
+        return Promise.resolve({
+          ...environment,
+          platform: 'macos',
+          winfspAvailable: null,
+          helperStatus: 'approval-required',
+        });
+      }
+      if (command === 'list_rclone_remotes') return Promise.resolve(['cloud']);
+      if (command === 'get_remote_drive_statuses') return Promise.resolve([]);
+      if (command === 'connect_remote_drive') {
+        return Promise.resolve({ id: profile.id, state: 'approval-required' });
+      }
+      return Promise.resolve(undefined);
+    });
+
+    const user = userEvent.setup();
+    render(<RemoteDrivesSection onSelectLocation={vi.fn()} />);
+
+    expect(await screen.findByText('Approve the privileged mount helper.')).toBeInTheDocument();
+    expect(
+      invokeMock.mock.calls.filter(([command]) => command === 'connect_remote_drive')
+    ).toHaveLength(0);
+
+    await user.click(await screen.findByText('Cloud'));
+
+    expect(await screen.findByRole('status')).toHaveTextContent(
+      'The privileged mount helper needs approval Approve the helper in System Settings'
+    );
+    expect(
+      invokeMock.mock.calls.filter(([command]) => command === 'connect_remote_drive')
+    ).toHaveLength(1);
   });
 });

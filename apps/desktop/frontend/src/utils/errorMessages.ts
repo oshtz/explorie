@@ -148,6 +148,45 @@ export type ErrorCategory =
   | 'system'
   | 'unknown';
 
+export type RemoteDriveFailureKind =
+  | 'rclone-exited'
+  | 'winfsp-missing'
+  | 'helper-approval'
+  | 'timeout'
+  | 'network'
+  | 'unknown';
+
+const REMOTE_DRIVE_KIND_PATTERNS: Array<{ kind: RemoteDriveFailureKind; pattern: RegExp }> = [
+  { kind: 'winfsp-missing', pattern: /winfsp/i },
+  {
+    kind: 'helper-approval',
+    pattern:
+      /approval-required|approve the explorie remote drives helper|approve the privileged mount helper/i,
+  },
+  { kind: 'rclone-exited', pattern: /rclone exited/i },
+  { kind: 'timeout', pattern: /timeout|timed out|etimedout/i },
+  {
+    kind: 'network',
+    pattern:
+      /network|connection refused|econnrefused|host unreachable|offline|econnreset|could not resolve|name or service not known/i,
+  },
+];
+
+const REMOTE_DRIVE_NEXT_ACTION: Record<RemoteDriveFailureKind, string> = {
+  'rclone-exited': 'Retry connect',
+  'winfsp-missing': 'Install WinFsp',
+  'helper-approval': 'Approve the helper in System Settings',
+  timeout: 'Retry connect',
+  network: 'Check the network, then retry',
+  unknown: 'Retry connect',
+};
+
+const REMOTE_DRIVE_MESSAGES: Partial<Record<RemoteDriveFailureKind, string>> = {
+  'rclone-exited': 'The remote mount stopped unexpectedly',
+  'winfsp-missing': 'Windows needs WinFsp to mount remote drives',
+  'helper-approval': 'The privileged mount helper needs approval',
+};
+
 export interface FormattedError {
   /** User-friendly message */
   message: string;
@@ -159,6 +198,12 @@ export interface FormattedError {
   recoverable: boolean;
   /** Suggested action for the user */
   suggestion?: string;
+}
+
+export interface RemoteDriveFormattedError extends FormattedError {
+  kind: RemoteDriveFailureKind;
+  nextAction: string;
+  retryable: boolean;
 }
 
 /**
@@ -203,6 +248,34 @@ export function formatError(error: unknown): FormattedError {
     technical,
     recoverable: false,
   };
+}
+
+export function classifyRemoteDriveFailure(error: unknown): RemoteDriveFailureKind {
+  const technical = extractErrorMessage(error);
+  for (const { kind, pattern } of REMOTE_DRIVE_KIND_PATTERNS) {
+    if (pattern.test(technical)) return kind;
+  }
+  return 'unknown';
+}
+
+export function formatRemoteDriveError(error: unknown): RemoteDriveFormattedError {
+  const kind = classifyRemoteDriveFailure(error);
+  const base = formatError(error);
+  const retryable = kind === 'rclone-exited' || kind === 'timeout' || kind === 'network';
+  return {
+    ...base,
+    message: REMOTE_DRIVE_MESSAGES[kind] ?? base.message,
+    kind,
+    nextAction: REMOTE_DRIVE_NEXT_ACTION[kind],
+    retryable,
+    recoverable: retryable,
+    suggestion: REMOTE_DRIVE_NEXT_ACTION[kind],
+  };
+}
+
+export function formatRemoteDriveFailureCopy(error: unknown): string {
+  const formatted = formatRemoteDriveError(error);
+  return `${formatted.message} ${formatted.nextAction}`;
 }
 
 /**
@@ -403,6 +476,9 @@ export function createOperationErrorMessage(
 export default {
   formatErrorMessage,
   formatError,
+  formatRemoteDriveError,
+  formatRemoteDriveFailureCopy,
+  classifyRemoteDriveFailure,
   formatOperationError,
   formatBatchErrors,
   createOperationErrorMessage,

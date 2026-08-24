@@ -1,3 +1,4 @@
+import { formatRemoteDriveError } from './errorMessages';
 import { getJsonWithDefault, setJson } from './localStorage';
 
 export interface RemoteDriveProfile {
@@ -86,4 +87,65 @@ export function saveRemoteDrives(profiles: RemoteDriveProfile[]): boolean {
       .map(sanitizeProfile)
       .filter((profile): profile is RemoteDriveProfile => profile !== null)
   );
+}
+
+export const REMOTE_DRIVE_CONNECT_ATTEMPTS = 3;
+export const REMOTE_DRIVE_CONNECT_BACKOFF_MS = [0, 250, 500] as const;
+
+export function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+export function isRemoteDriveConnectRetryable(error: unknown, state?: RemoteDriveState): boolean {
+  if (state === 'approval-required') return false;
+  return formatRemoteDriveError(error).retryable;
+}
+
+export async function connectRemoteDriveWithBackoff(
+  profileId: string,
+  attempt: () => Promise<RemoteDriveStatus>,
+  options?: {
+    sleep?: (ms: number) => Promise<void>;
+    attempts?: number;
+    backoffMs?: readonly number[];
+  }
+): Promise<RemoteDriveStatus> {
+  const attempts = options?.attempts ?? REMOTE_DRIVE_CONNECT_ATTEMPTS;
+  const backoffMs = options?.backoffMs ?? REMOTE_DRIVE_CONNECT_BACKOFF_MS;
+  const wait = options?.sleep ?? sleep;
+  let lastError: unknown;
+
+  for (let index = 0; index < attempts; index += 1) {
+    const delay = backoffMs[Math.min(index, Math.max(backoffMs.length - 1, 0))] ?? 0;
+    if (index > 0 && delay > 0) {
+      await wait(delay);
+    }
+    try {
+      const status = await attempt();
+      if (status.state !== 'error') {
+        return status;
+      }
+      lastError = status.error;
+      if (!isRemoteDriveConnectRetryable(status.error, status.state) || index === attempts - 1) {
+        return status;
+      }
+    } catch (error) {
+      lastError = error;
+      if (!isRemoteDriveConnectRetryable(error) || index === attempts - 1) {
+        return {
+          id: profileId,
+          state: 'error',
+          error: formatRemoteDriveError(error).technical || 'An unexpected error occurred',
+        };
+      }
+    }
+  }
+
+  return {
+    id: profileId,
+    state: 'error',
+    error: formatRemoteDriveError(lastError).technical || 'An unexpected error occurred',
+  };
 }

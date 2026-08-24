@@ -37,6 +37,7 @@
 
 .item {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   border-radius: var(--border-radius-sm, 4px);
 }
@@ -74,6 +75,15 @@
 .item:hover .actions,
 .item:focus-within .actions {
   display: flex;
+}
+
+.failure {
+  flex: 1 0 100%;
+  margin: 0;
+  padding: 0 var(--padding-sm) var(--padding-sm);
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.35;
 }
 
 .dot {
