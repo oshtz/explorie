@@ -4,7 +4,8 @@ members = [
     "crates/core",
     "crates/ffmpeg-wrapper",
     "apps/cli",
-    "apps/desktop/frontend/src-tauri"
+    "apps/desktop/frontend/src-tauri",
+    "apps/desktop/gpui"
 ]
 
 [profile.release]
