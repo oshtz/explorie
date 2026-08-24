@@ -1,8 +1,6 @@
 // Prevents a terminal window from appearing on Windows
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod remote_drives;
-
 use explorie_core::archive::{
     ArchiveFormat, ArchiveInfo, ArchiveProgress, CompressOptions, CompressionLevel,
     create_archive_with_progress, extract_archive, is_archive, list_archive_contents,
@@ -21,8 +19,8 @@ use tauri::{AppHandle, Emitter, Manager};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use remote_drives::{
-    DisconnectResult, RemoteDriveEnvironment, RemoteDriveManager, RemoteDriveProfile,
+use explorie_desktop::remote_drives::{
+    self, DisconnectResult, RemoteDriveEnvironment, RemoteDriveManager, RemoteDriveProfile,
     RemoteDriveStatus,
 };
 

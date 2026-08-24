@@ -145,6 +145,11 @@ jobs:
       - name: Test native file operations on macOS
         run: cargo test -p explorie-core
 
+      - name: Remote drive lifecycle harness
+        env:
+          TAURI_CONFIG: '{"bundle":{"externalBin":[],"resources":{}}}'
+        run: cargo test -p explorie-desktop --test lifecycle_harness -- --nocapture
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 

@@ -2,13 +2,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::net::TcpListener;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter, Manager, Runtime};
 use uuid::Uuid;
 
 #[cfg(windows)]
@@ -16,6 +17,8 @@ use sha2::{Digest, Sha256};
 
 const READY_TIMEOUT: Duration = Duration::from_secs(15);
 const RC_TIMEOUT: Duration = Duration::from_secs(5);
+const CONNECT_ATTEMPTS: usize = 3;
+const CONNECT_BACKOFF: [Duration; 2] = [Duration::from_millis(250), Duration::from_millis(500)];
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -81,8 +84,8 @@ pub struct RemoteDriveManager {
 }
 
 impl RemoteDriveManager {
-    pub fn environment(&self, app: &AppHandle) -> RemoteDriveEnvironment {
-        let rclone = find_rclone(app);
+    pub fn environment<R: Runtime>(&self, app: &AppHandle<R>) -> RemoteDriveEnvironment {
+        let rclone = find_rclone(Some(app));
         let version = rclone.as_ref().and_then(|path| rclone_version(path).ok());
         RemoteDriveEnvironment {
             platform: std::env::consts::OS,
@@ -95,23 +98,13 @@ impl RemoteDriveManager {
         }
     }
 
-    pub fn list_remotes(&self, app: &AppHandle) -> Result<Vec<String>, String> {
-        let rclone = find_rclone(app).ok_or_else(missing_rclone)?;
-        let output = Command::new(rclone)
-            .args(["listremotes", "--ask-password=false"])
-            .output()
-            .map_err(|error| format!("Failed to run rclone: {error}"))?;
-        if !output.status.success() {
-            return Err(command_error(
-                "rclone could not read its configuration",
-                &output.stderr,
-            ));
-        }
-        parse_remotes(&String::from_utf8_lossy(&output.stdout))
+    pub fn list_remotes<R: Runtime>(&self, app: &AppHandle<R>) -> Result<Vec<String>, String> {
+        let rclone = find_rclone(Some(app)).ok_or_else(missing_rclone)?;
+        list_remotes_from(&rclone)
     }
 
-    pub fn configure_remotes(&self, app: &AppHandle) -> Result<(), String> {
-        let rclone = find_rclone(app).ok_or_else(missing_rclone)?;
+    pub fn configure_remotes<R: Runtime>(&self, app: &AppHandle<R>) -> Result<(), String> {
+        let rclone = find_rclone(Some(app)).ok_or_else(missing_rclone)?;
 
         #[cfg(windows)]
         {
@@ -216,14 +209,34 @@ impl RemoteDriveManager {
             .any(|mount| normalize_compare_path(&mount.mount_path) == candidate)
     }
 
-    pub fn connect(
+    pub fn child_pid(&self, id: &str) -> Option<u32> {
+        self.mounts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(id)
+            .map(|mount| mount.child.id())
+    }
+
+    pub fn connect<R: Runtime>(
         &self,
-        app: &AppHandle,
+        app: &AppHandle<R>,
+        profile: RemoteDriveProfile,
+    ) -> Result<RemoteDriveStatus, String> {
+        self.connect_with(Some(app), profile)
+    }
+
+    pub fn test_connect(&self, profile: RemoteDriveProfile) -> Result<RemoteDriveStatus, String> {
+        self.connect_with::<tauri::Wry>(None, profile)
+    }
+
+    fn connect_with<R: Runtime>(
+        &self,
+        app: Option<&AppHandle<R>>,
         profile: RemoteDriveProfile,
     ) -> Result<RemoteDriveStatus, String> {
         validate_profile(&profile)?;
         #[cfg(target_os = "macos")]
-        if macos::status() != "enabled" {
+        if !using_test_runtime() && macos::status() != "enabled" {
             let approval = status(&profile.id, "approval-required", None, None);
             emit_status(app, approval.clone());
             return Ok(approval);
@@ -260,117 +273,67 @@ impl RemoteDriveManager {
         }
     }
 
-    fn connect_inner(
+    fn connect_inner<R: Runtime>(
         &self,
-        app: &AppHandle,
+        app: Option<&AppHandle<R>>,
         profile: &RemoteDriveProfile,
     ) -> Result<RemoteDriveStatus, String> {
         let rclone = find_rclone(app).ok_or_else(missing_rclone)?;
         ensure_rclone_capabilities(&rclone)?;
-        if !self
-            .list_remotes(app)?
+        if !list_remotes_from(&rclone)?
             .iter()
             .any(|remote| remote == &profile.remote)
         {
             return Err("The selected rclone remote is no longer configured.".to_string());
         }
         #[cfg(windows)]
-        if winfsp_available() != Some(true) {
+        if !using_test_runtime() && winfsp_available() != Some(true) {
             return Err("Install WinFsp before mounting remote drives on Windows.".to_string());
         }
 
         let mount_path = mount_path(profile)?;
         ensure_mount_target_available(&mount_path)?;
-        let cache_dir = profile_cache_dir(
-            &app.path()
-                .app_cache_dir()
-                .map_err(|error| error.to_string())?,
-            &profile.id,
-        );
+        let cache_dir = profile_cache_dir(&cache_root(app)?, &profile.id);
         fs::create_dir_all(&cache_dir).map_err(|error| error.to_string())?;
-        let log = File::create(cache_dir.join("rclone.log")).map_err(|error| error.to_string())?;
-        let log_err = log.try_clone().map_err(|error| error.to_string())?;
 
-        let rc_port = free_port()?;
-        let rc_url = format!("http://127.0.0.1:{rc_port}/");
-        let rc_user = "explorie".to_string();
-        let rc_pass = Uuid::new_v4().simple().to_string();
-        let remote = remote_spec(profile);
-        let mut command = Command::new(&rclone);
-
-        #[cfg(windows)]
-        command.args([
-            "mount",
-            &remote,
-            &profile.mount_target,
-            "--volname",
-            &profile.name,
-            "--vfs-cache-mode",
-            "writes",
-        ]);
-
-        #[cfg(target_os = "macos")]
-        let nfs_port = {
-            let port = free_port()?;
-            command.args([
-                "serve",
-                "nfs",
-                &remote,
-                "--addr",
-                &format!("127.0.0.1:{port}"),
-                "--vfs-cache-mode",
-                "full",
-            ]);
-            port
-        };
-
-        #[cfg(not(any(windows, target_os = "macos")))]
-        return Err("Remote Drives currently support Windows and macOS only.".to_string());
-
-        command
-            .args(["--cache-dir"])
-            .arg(&cache_dir)
-            .args(["--rc", "--rc-addr"])
-            .arg(format!("127.0.0.1:{rc_port}"))
-            .env("RCLONE_RC_USER", &rc_user)
-            .env("RCLONE_RC_PASS", &rc_pass)
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(log))
-            .stderr(Stdio::from(log_err));
-
-        let mut child = command
-            .spawn()
-            .map_err(|error| format!("Failed to start rclone: {error}"))?;
-        if let Err(error) = wait_for_rc(&mut child, &rclone, &rc_url, &rc_user, &rc_pass) {
-            let _ = child.kill();
-            return Err(error);
+        let mut last_error = None;
+        let mut backoff = CONNECT_BACKOFF.iter();
+        for _ in 0..CONNECT_ATTEMPTS {
+            match spawn_mount(profile, &rclone, &mount_path, &cache_dir) {
+                Ok(running) => {
+                    self.mounts
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(profile.id.clone(), running);
+                    return Ok(connected_status(&profile.id, &mount_path));
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                    if let Some(delay) = backoff.next() {
+                        thread::sleep(*delay);
+                    }
+                }
+            }
         }
-
-        #[cfg(target_os = "macos")]
-        if let Err(error) = macos_mount(&profile.id, &profile.mount_target, nfs_port) {
-            let _ = rc_call(&rclone, &rc_url, &rc_user, &rc_pass, "core/quit");
-            let _ = child.kill();
-            return Err(error);
-        }
-
-        let running = RunningMount {
-            child,
-            rclone,
-            rc_url,
-            rc_user,
-            rc_pass,
-            mount_path: mount_path.clone(),
-        };
-        self.mounts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(profile.id.clone(), running);
-        Ok(connected_status(&profile.id, &mount_path))
+        Err(last_error.unwrap_or_else(|| "Failed to start rclone.".to_string()))
     }
 
-    pub fn disconnect(
+    pub fn disconnect<R: Runtime>(
         &self,
-        app: &AppHandle,
+        app: &AppHandle<R>,
+        id: &str,
+        force: bool,
+    ) -> Result<DisconnectResult, String> {
+        self.disconnect_with(Some(app), id, force)
+    }
+
+    pub fn test_disconnect(&self, id: &str, force: bool) -> Result<DisconnectResult, String> {
+        self.disconnect_with::<tauri::Wry>(None, id, force)
+    }
+
+    fn disconnect_with<R: Runtime>(
+        &self,
+        app: Option<&AppHandle<R>>,
         id: &str,
         force: bool,
     ) -> Result<DisconnectResult, String> {
@@ -434,12 +397,16 @@ impl RemoteDriveManager {
             ),
         );
         #[cfg(target_os = "macos")]
-        if let Err(error) = macos_unmount(id, mount.mount_path.to_string_lossy().as_ref(), force) {
-            self.mounts
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(id.to_string(), mount);
-            return Err(error);
+        if !using_test_runtime() {
+            if let Err(error) =
+                macos_unmount(id, mount.mount_path.to_string_lossy().as_ref(), force)
+            {
+                self.mounts
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(id.to_string(), mount);
+                return Err(error);
+            }
         }
 
         let _ = rc_call(
@@ -460,20 +427,19 @@ impl RemoteDriveManager {
         })
     }
 
-    pub fn disconnect_all(&self, app: &AppHandle) {
-        let ids: Vec<String> = self
-            .mounts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .keys()
-            .cloned()
-            .collect();
-        for id in ids {
-            let _ = self.disconnect(app, &id, true);
-        }
+    pub fn disconnect_all<R: Runtime>(&self, app: &AppHandle<R>) {
+        self.disconnect_all_with(Some(app), true);
     }
 
-    pub fn disconnect_all_if_clean(&self, app: &AppHandle) -> bool {
+    pub fn disconnect_all_if_clean<R: Runtime>(&self, app: &AppHandle<R>) -> bool {
+        self.disconnect_all_with(Some(app), false)
+    }
+
+    pub fn test_disconnect_all_if_clean(&self) -> bool {
+        self.disconnect_all_with::<tauri::Wry>(None, false)
+    }
+
+    fn disconnect_all_with<R: Runtime>(&self, app: Option<&AppHandle<R>>, force: bool) -> bool {
         let ids: Vec<String> = self
             .mounts
             .lock()
@@ -481,13 +447,19 @@ impl RemoteDriveManager {
             .keys()
             .cloned()
             .collect();
+        if force {
+            for id in ids {
+                let _ = self.disconnect_with(app, &id, true);
+            }
+            return true;
+        }
         let mut blocker = RemoteDriveExitBlocker {
             pending_uploads: 0,
             errored_files: 0,
             error: None,
         };
         for id in ids {
-            match self.disconnect(app, &id, false) {
+            match self.disconnect_with(app, &id, false) {
                 Ok(result) if result.blocked => {
                     blocker.pending_uploads += result.pending_uploads;
                     blocker.errored_files += result.errored_files;
@@ -501,11 +473,113 @@ impl RemoteDriveManager {
         }
         let clean =
             blocker.pending_uploads == 0 && blocker.errored_files == 0 && blocker.error.is_none();
-        if !clean {
+        if !clean && let Some(app) = app {
             let _ = app.emit("remote-drive-exit-blocked", blocker);
         }
         clean
     }
+}
+
+fn using_test_runtime() -> bool {
+    std::env::var_os("EXPLORIE_FAKE_RCLONE").is_some()
+}
+
+fn cache_root<R: Runtime>(app: Option<&AppHandle<R>>) -> Result<PathBuf, String> {
+    if let Some(path) = std::env::var_os("EXPLORIE_REMOTE_DRIVE_TEST_CACHE") {
+        return Ok(PathBuf::from(path));
+    }
+    app.ok_or_else(|| "missing app cache directory".to_string())?
+        .path()
+        .app_cache_dir()
+        .map_err(|error| error.to_string())
+}
+
+fn spawn_mount(
+    profile: &RemoteDriveProfile,
+    rclone: &Path,
+    mount_path: &Path,
+    cache_dir: &Path,
+) -> Result<RunningMount, String> {
+    let log = File::create(cache_dir.join("rclone.log")).map_err(|error| error.to_string())?;
+    let log_err = log.try_clone().map_err(|error| error.to_string())?;
+
+    let rc_port = free_port()?;
+    let rc_url = format!("http://127.0.0.1:{rc_port}/");
+    let rc_user = "explorie".to_string();
+    let rc_pass = Uuid::new_v4().simple().to_string();
+    let remote = remote_spec(profile);
+    let mut command = Command::new(rclone);
+
+    #[cfg(windows)]
+    command.args([
+        "mount",
+        &remote,
+        &profile.mount_target,
+        "--volname",
+        &profile.name,
+        "--vfs-cache-mode",
+        "writes",
+    ]);
+
+    #[cfg(target_os = "macos")]
+    let nfs_port = {
+        let port = free_port()?;
+        command.args([
+            "serve",
+            "nfs",
+            &remote,
+            "--addr",
+            &format!("127.0.0.1:{port}"),
+            "--vfs-cache-mode",
+            "full",
+        ]);
+        port
+    };
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = (profile, mount_path, cache_dir, remote);
+        return Err("Remote Drives currently support Windows and macOS only.".to_string());
+    }
+
+    command
+        .args(["--cache-dir"])
+        .arg(cache_dir)
+        .args(["--rc", "--rc-addr"])
+        .arg(format!("127.0.0.1:{rc_port}"))
+        .env("RCLONE_RC_USER", &rc_user)
+        .env("RCLONE_RC_PASS", &rc_pass)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_err));
+
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("Failed to start rclone: {error}"))?;
+    if let Err(error) = wait_for_rc(&mut child, rclone, &rc_url, &rc_user, &rc_pass) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+
+    #[cfg(target_os = "macos")]
+    if !using_test_runtime() {
+        if let Err(error) = macos_mount(&profile.id, &profile.mount_target, nfs_port) {
+            let _ = rc_call(rclone, &rc_url, &rc_user, &rc_pass, "core/quit");
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    }
+
+    Ok(RunningMount {
+        child,
+        rclone: rclone.to_path_buf(),
+        rc_url,
+        rc_user,
+        rc_pass,
+        mount_path: mount_path.to_path_buf(),
+    })
 }
 
 fn validate_profile(profile: &RemoteDriveProfile) -> Result<(), String> {
@@ -626,6 +700,20 @@ fn occupied_mount_targets() -> Vec<String> {
     Vec::new()
 }
 
+fn list_remotes_from(rclone: &Path) -> Result<Vec<String>, String> {
+    let output = Command::new(rclone)
+        .args(["listremotes", "--ask-password=false"])
+        .output()
+        .map_err(|error| format!("Failed to run rclone: {error}"))?;
+    if !output.status.success() {
+        return Err(command_error(
+            "rclone could not read its configuration",
+            &output.stderr,
+        ));
+    }
+    parse_remotes(&String::from_utf8_lossy(&output.stdout))
+}
+
 fn parse_remotes(output: &str) -> Result<Vec<String>, String> {
     let mut remotes = Vec::new();
     for line in output
@@ -646,7 +734,14 @@ fn parse_remotes(output: &str) -> Result<Vec<String>, String> {
     Ok(remotes)
 }
 
-fn find_rclone(app: &AppHandle) -> Option<PathBuf> {
+fn find_rclone<R: Runtime>(app: Option<&AppHandle<R>>) -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("EXPLORIE_FAKE_RCLONE") {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    let app = app?;
     let binary_name = if cfg!(windows) {
         "rclone.exe"
     } else {
@@ -753,7 +848,7 @@ fn winfsp_available() -> Option<bool> {
     )
 }
 
-pub fn install_winfsp(app: &AppHandle) -> Result<(), String> {
+pub fn install_winfsp<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     #[cfg(windows)]
     {
         if winfsp_available() == Some(true) {
@@ -972,8 +1067,15 @@ fn wait_or_kill(child: &mut Child) {
     let _ = child.wait();
 }
 
-fn emit_status(app: &AppHandle, status: RemoteDriveStatus) {
-    let _ = app.emit("remote-drive-status", status);
+fn emit_status<R: Runtime>(app: Option<&AppHandle<R>>, status: RemoteDriveStatus) {
+    if let Ok(path) = std::env::var("EXPLORIE_REMOTE_DRIVE_TEST_EVENTS")
+        && let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path)
+    {
+        let _ = writeln!(file, "{}", status.state);
+    }
+    if let Some(app) = app {
+        let _ = app.emit("remote-drive-status", status);
+    }
 }
 
 fn status(
@@ -1157,6 +1259,157 @@ pub fn open_macos_helper_settings() -> Result<(), String> {
     }
     #[cfg(not(target_os = "macos"))]
     Err("Helper settings are only available on macOS.".to_string())
+}
+
+pub fn run_fake_rclone() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Err(error) = run_fake_rclone_args(&args) {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
+}
+
+fn run_fake_rclone_args(args: &[String]) -> Result<(), String> {
+    if args.iter().any(|arg| arg == "--help") {
+        return Ok(());
+    }
+    match args.first().map(String::as_str) {
+        Some("version") => {
+            println!("rclone v1.74.4");
+            Ok(())
+        }
+        Some("listremotes") => {
+            let remotes = std::env::var("EXPLORIE_FAKE_RCLONE_REMOTES").unwrap_or_default();
+            for remote in remotes
+                .split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+            {
+                println!("{remote}:");
+            }
+            Ok(())
+        }
+        Some("rc") => fake_rc_client(args),
+        Some("mount") | Some("serve") => fake_mount_server(args),
+        _ => Err("unsupported fake rclone command".to_string()),
+    }
+}
+
+fn fake_arg_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    let prefix = format!("{flag}=");
+    args.iter().enumerate().find_map(|(index, arg)| {
+        if arg == flag {
+            args.get(index + 1).map(String::as_str)
+        } else {
+            arg.strip_prefix(&prefix)
+        }
+    })
+}
+
+fn fake_state_dir() -> Option<PathBuf> {
+    std::env::var_os("EXPLORIE_FAKE_RCLONE_STATE").map(PathBuf::from)
+}
+
+fn bump_fake_counter(name: &str) -> u32 {
+    let Some(dir) = fake_state_dir() else {
+        return 1;
+    };
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join(name);
+    let next = fs::read_to_string(&path)
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .unwrap_or(0)
+        .saturating_add(1);
+    let _ = fs::write(path, next.to_string());
+    next
+}
+
+fn fake_mount_server(args: &[String]) -> Result<(), String> {
+    let spawn = bump_fake_counter("spawns");
+    let fail_spawns = std::env::var("EXPLORIE_FAKE_RCLONE_FAIL_SPAWNS")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(0);
+    if spawn <= fail_spawns {
+        return Err(format!("fake rclone spawn {spawn} failed"));
+    }
+
+    let rc_addr = fake_arg_value(args, "--rc-addr").unwrap_or("127.0.0.1:0");
+    let listener = TcpListener::bind(rc_addr).map_err(|error| error.to_string())?;
+    let vfs_stats = std::env::var("EXPLORIE_FAKE_RCLONE_VFS_STATS").unwrap_or_else(|_| {
+        r#"{"diskCache":{"uploadsQueued":0,"uploadsInProgress":0,"erroredFiles":0}}"#.to_string()
+    });
+
+    for incoming in listener.incoming() {
+        let mut stream = incoming.map_err(|error| error.to_string())?;
+        let mut buffer = [0_u8; 8192];
+        let read = stream
+            .read(&mut buffer)
+            .map_err(|error| error.to_string())?;
+        let request = String::from_utf8_lossy(&buffer[..read]);
+        let path = request
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or("/");
+        let body = if path.contains("vfs/stats") {
+            vfs_stats.as_str()
+        } else {
+            "{}"
+        };
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+        if path.contains("core/quit") {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn fake_rc_client(args: &[String]) -> Result<(), String> {
+    let url = fake_arg_value(args, "--url").ok_or_else(|| "missing --url".to_string())?;
+    let endpoint = args
+        .iter()
+        .skip(1)
+        .find(|arg| !arg.starts_with('-') && *arg != url)
+        .ok_or_else(|| "missing rc endpoint".to_string())?;
+    let path = if endpoint.starts_with('/') {
+        endpoint.clone()
+    } else {
+        format!("/{endpoint}")
+    };
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .ok_or_else(|| "unsupported rc url".to_string())?;
+    let rest = rest.trim_end_matches('/');
+    let hostport = rest.split('/').next().unwrap_or(rest);
+    let mut stream = TcpStream::connect(hostport).map_err(|error| error.to_string())?;
+    let body = "{}";
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {hostport}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|error| error.to_string())?;
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(|error| error.to_string())?;
+    let payload = response.split("\r\n\r\n").nth(1).unwrap_or("{}").trim();
+    println!("{payload}");
+    if !response.starts_with("HTTP/1.1 200") && !response.starts_with("HTTP/1.0 200") {
+        return Err("fake rclone rc call failed".to_string());
+    }
+    Ok(())
 }
 
 #[cfg(test)]

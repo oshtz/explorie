@@ -8,6 +8,14 @@ authors = ["explorie contributors"]
 license = "MIT"
 repository = "https://github.com/oshtz/explorie"
 
+[lib]
+name = "explorie_desktop"
+path = "src/lib.rs"
+
+[[test]]
+name = "lifecycle_harness"
+harness = false
+
 [dependencies]
 tauri = { version = "2.11.1", features = ["protocol-asset"] }
 tauri-plugin-fs = { version = "2.2.1", features = ["watch"] }
