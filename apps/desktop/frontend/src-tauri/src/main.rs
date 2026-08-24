@@ -7,7 +7,7 @@ use explorie_core::archive::{
     ArchiveFormat, ArchiveInfo, ArchiveProgress, CompressOptions, CompressionLevel,
     create_archive_with_progress, extract_archive, is_archive, list_archive_contents,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -33,6 +33,19 @@ struct FileOperationJobs {
 }
 
 impl FileOperationJobs {
+    fn cancel(&self, job_id: &str) -> bool {
+        let jobs = self
+            .cancellations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(cancelled) = jobs.get(job_id) {
+            cancelled.store(true, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
     fn cancel_all(&self) {
         for cancelled in self
             .cancellations
@@ -68,16 +81,16 @@ impl ActiveMutations {
     }
 }
 
-struct ActiveMutation(AppHandle);
+struct ActiveMutation<R: Runtime>(AppHandle<R>);
 
-impl ActiveMutation {
-    fn begin(app: &AppHandle) -> Self {
+impl<R: Runtime> ActiveMutation<R> {
+    fn begin(app: &AppHandle<R>) -> Self {
         app.state::<ActiveMutations>().begin();
         Self(app.clone())
     }
 }
 
-impl Drop for ActiveMutation {
+impl<R: Runtime> Drop for ActiveMutation<R> {
     fn drop(&mut self) {
         if self.0.state::<ActiveMutations>().finish()
             && self
@@ -271,19 +284,22 @@ fn set_system_integration(enabled: bool) -> Result<SystemIntegrationStatus, Stri
     }
 }
 
+fn list_files_body(
+    path: String,
+    calc_dir_size: Option<bool>,
+) -> Result<Vec<explorie_core::FileEntry>, String> {
+    let calc = calc_dir_size.unwrap_or(false);
+    explorie_core::list_dir_with_sizes(Path::new(&path), calc).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn list_files(
     path: String,
     calc_dir_size: Option<bool>,
 ) -> Result<Vec<explorie_core::FileEntry>, String> {
-    let calc = calc_dir_size.unwrap_or(false);
-    tauri::async_runtime::spawn_blocking(move || {
-        let p = std::path::Path::new(&path);
-        explorie_core::list_dir_with_sizes(p, calc)
-    })
-    .await
-    .map_err(|e| e.to_string())?
-    .map_err(|e| e.to_string())
+    tauri::async_runtime::spawn_blocking(move || list_files_body(path, calc_dir_size))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 fn find_syncthing_root(path: &Path) -> Option<PathBuf> {
@@ -303,31 +319,31 @@ async fn get_syncthing_root(path: String) -> Option<String> {
 }
 
 #[tauri::command]
-fn get_remote_drive_environment(
-    app: AppHandle,
+fn get_remote_drive_environment<R: Runtime>(
+    app: AppHandle<R>,
     manager: tauri::State<'_, RemoteDriveManager>,
 ) -> RemoteDriveEnvironment {
     manager.environment(&app)
 }
 
 #[tauri::command]
-fn list_rclone_remotes(
-    app: AppHandle,
+fn list_rclone_remotes<R: Runtime>(
+    app: AppHandle<R>,
     manager: tauri::State<'_, RemoteDriveManager>,
 ) -> Result<Vec<String>, String> {
     manager.list_remotes(&app)
 }
 
 #[tauri::command]
-async fn install_winfsp(app: AppHandle) -> Result<(), String> {
+async fn install_winfsp<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || remote_drives::install_winfsp(&app))
         .await
         .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-async fn configure_rclone(
-    app: AppHandle,
+async fn configure_rclone<R: Runtime>(
+    app: AppHandle<R>,
     manager: tauri::State<'_, RemoteDriveManager>,
 ) -> Result<(), String> {
     let manager = manager.inner().clone();
@@ -337,8 +353,8 @@ async fn configure_rclone(
 }
 
 #[tauri::command]
-async fn connect_remote_drive(
-    app: AppHandle,
+async fn connect_remote_drive<R: Runtime>(
+    app: AppHandle<R>,
     manager: tauri::State<'_, RemoteDriveManager>,
     profile: RemoteDriveProfile,
 ) -> Result<RemoteDriveStatus, String> {
@@ -349,8 +365,8 @@ async fn connect_remote_drive(
 }
 
 #[tauri::command]
-async fn disconnect_remote_drive(
-    app: AppHandle,
+async fn disconnect_remote_drive<R: Runtime>(
+    app: AppHandle<R>,
     manager: tauri::State<'_, RemoteDriveManager>,
     id: String,
     force: bool,
@@ -362,8 +378,8 @@ async fn disconnect_remote_drive(
 }
 
 #[tauri::command]
-async fn force_remote_drive_shutdown(
-    app: AppHandle,
+async fn force_remote_drive_shutdown<R: Runtime>(
+    app: AppHandle<R>,
     manager: tauri::State<'_, RemoteDriveManager>,
 ) -> Result<(), String> {
     let manager = manager.inner().clone();
@@ -388,8 +404,8 @@ fn register_remote_drive_helper() -> Result<String, String> {
 }
 
 #[tauri::command]
-fn unregister_remote_drive_helper(
-    app: AppHandle,
+fn unregister_remote_drive_helper<R: Runtime>(
+    app: AppHandle<R>,
     manager: tauri::State<'_, RemoteDriveManager>,
 ) -> Result<(), String> {
     manager.disconnect_all(&app);
@@ -545,17 +561,15 @@ async fn get_dir_info(path: String) -> Result<DirInfo, String> {
     .map_err(|e| e.to_string())?
 }
 
-fn emit_file_operation(app: &AppHandle, event: FileOperationEvent) {
+fn emit_file_operation<R: Runtime>(app: &AppHandle<R>, event: FileOperationEvent) {
     let _ = app.emit("file-operation", event);
 }
 
-#[tauri::command]
-fn start_file_operation(
-    app: AppHandle,
-    jobs: tauri::State<'_, FileOperationJobs>,
-    remote_drives: tauri::State<'_, RemoteDriveManager>,
-    request: explorie_core::FileOperationRequest,
-) -> Result<String, String> {
+fn start_file_operation_body(
+    jobs: &FileOperationJobs,
+    remote_drives: &RemoteDriveManager,
+    request: &explorie_core::FileOperationRequest,
+) -> Result<(String, Arc<AtomicBool>), String> {
     if request
         .sources
         .iter()
@@ -563,7 +577,6 @@ fn start_file_operation(
     {
         return Err("Refusing to mutate a managed remote-drive root".to_string());
     }
-    let mutation = ActiveMutation::begin(&app);
     let job_id = format!(
         "{}-{}",
         std::process::id(),
@@ -574,6 +587,18 @@ fn start_file_operation(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(job_id.clone(), Arc::clone(&cancelled));
+    Ok((job_id, cancelled))
+}
+
+#[tauri::command]
+fn start_file_operation<R: Runtime>(
+    app: AppHandle<R>,
+    jobs: tauri::State<'_, FileOperationJobs>,
+    remote_drives: tauri::State<'_, RemoteDriveManager>,
+    request: explorie_core::FileOperationRequest,
+) -> Result<String, String> {
+    let (job_id, cancelled) = start_file_operation_body(&jobs, &remote_drives, &request)?;
+    let mutation = ActiveMutation::begin(&app);
 
     let task_job_id = job_id.clone();
     let task_app = app.clone();
@@ -644,16 +669,7 @@ fn start_file_operation(
 
 #[tauri::command]
 fn cancel_file_operation(jobs: tauri::State<'_, FileOperationJobs>, job_id: String) -> bool {
-    let jobs = jobs
-        .cancellations
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(cancelled) = jobs.get(&job_id) {
-        cancelled.store(true, Ordering::Relaxed);
-        true
-    } else {
-        false
-    }
+    jobs.cancel(&job_id)
 }
 
 fn read_text_preview_impl(path: &Path, max_bytes: u64) -> Result<TextPreview, String> {
@@ -860,9 +876,8 @@ fn write_new_text_file(path: &Path, contents: &[u8]) -> io::Result<()> {
     result
 }
 
-#[tauri::command]
-fn rename_path(
-    remote_drives: tauri::State<'_, RemoteDriveManager>,
+fn rename_path_body(
+    remote_drives: &RemoteDriveManager,
     source_path: String,
     new_base_name: String,
 ) -> Result<String, String> {
@@ -870,6 +885,15 @@ fn rename_path(
         return Err("Refusing to rename a managed remote-drive root".to_string());
     }
     rename_path_impl(source_path, new_base_name)
+}
+
+#[tauri::command]
+fn rename_path(
+    remote_drives: tauri::State<'_, RemoteDriveManager>,
+    source_path: String,
+    new_base_name: String,
+) -> Result<String, String> {
+    rename_path_body(&remote_drives, source_path, new_base_name)
 }
 
 fn rename_path_impl(source_path: String, new_base_name: String) -> Result<String, String> {
@@ -1962,13 +1986,13 @@ fn get_platform() -> String {
 }
 
 #[tauri::command]
-fn get_app_version(app: AppHandle) -> String {
+fn get_app_version<R: Runtime>(app: AppHandle<R>) -> String {
     app.package_info().version.to_string()
 }
 
 // --- Archive operations ---
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct CompressResult {
     output_path: String,
     total_bytes: u64,
@@ -1983,15 +2007,64 @@ struct CompressProgressPayload {
     current_path: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct ExtractResult {
     output_dir: String,
     total_bytes: u64,
 }
 
+fn compress_files_body(
+    paths: Vec<String>,
+    output_path: String,
+    format: String,
+    compression_level: String,
+    mut on_progress: impl FnMut(CompressProgressPayload),
+) -> Result<CompressResult, String> {
+    let sources: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
+    let output = PathBuf::from(&output_path);
+
+    let archive_format = match format.to_lowercase().as_str() {
+        "zip" => ArchiveFormat::Zip,
+        "tar.gz" | "tgz" => ArchiveFormat::TarGz,
+        "tar" => ArchiveFormat::Tar,
+        "7z" => ArchiveFormat::SevenZ,
+        _ => return Err(format!("Unsupported format: {}", format)),
+    };
+
+    let level = match compression_level.to_lowercase().as_str() {
+        "none" => CompressionLevel::None,
+        "fast" => CompressionLevel::Fast,
+        "normal" | "default" => CompressionLevel::Normal,
+        "best" | "maximum" => CompressionLevel::Best,
+        _ => CompressionLevel::Normal,
+    };
+
+    let options = CompressOptions {
+        format: archive_format,
+        compression_level: level,
+        password: None,
+    };
+
+    let total_bytes =
+        create_archive_with_progress(&sources, &output, &options, |progress: ArchiveProgress| {
+            on_progress(CompressProgressPayload {
+                operation_id: String::new(),
+                processed_bytes: progress.processed_bytes,
+                total_bytes: progress.total_bytes,
+                current_path: progress.current_path,
+            });
+        })
+        .map_err(|e| e.to_string())?;
+
+    Ok(CompressResult {
+        output_path,
+        total_bytes,
+    })
+}
+
 #[tauri::command]
-async fn compress_files(
-    window: tauri::Window,
+async fn compress_files<R: Runtime>(
+    window: tauri::Window<R>,
     paths: Vec<String>,
     output_path: String,
     format: String,
@@ -2002,88 +2075,55 @@ async fn compress_files(
     let window = window.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let _mutation = mutation;
-        let sources: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
-        let output = PathBuf::from(&output_path);
-
-        let archive_format = match format.to_lowercase().as_str() {
-            "zip" => ArchiveFormat::Zip,
-            "tar.gz" | "tgz" => ArchiveFormat::TarGz,
-            "tar" => ArchiveFormat::Tar,
-            "7z" => ArchiveFormat::SevenZ,
-            _ => return Err(format!("Unsupported format: {}", format)),
-        };
-
-        let level = match compression_level.to_lowercase().as_str() {
-            "none" => CompressionLevel::None,
-            "fast" => CompressionLevel::Fast,
-            "normal" | "default" => CompressionLevel::Normal,
-            "best" | "maximum" => CompressionLevel::Best,
-            _ => CompressionLevel::Normal,
-        };
-
-        let options = CompressOptions {
-            format: archive_format,
-            compression_level: level,
-            password: None,
-        };
-
-        let op_id = operation_id.clone();
-        let total_bytes = create_archive_with_progress(
-            &sources,
-            &output,
-            &options,
-            |progress: ArchiveProgress| {
-                let payload = CompressProgressPayload {
-                    operation_id: op_id.clone(),
-                    processed_bytes: progress.processed_bytes,
-                    total_bytes: progress.total_bytes,
-                    current_path: progress.current_path,
-                };
+        compress_files_body(
+            paths,
+            output_path,
+            format,
+            compression_level,
+            |mut payload| {
+                payload.operation_id = operation_id.clone();
                 let _ = window.emit("archive:compress-progress", payload);
             },
         )
-        .map_err(|e| e.to_string())?;
-
-        Ok(CompressResult {
-            output_path,
-            total_bytes,
-        })
     })
     .await
     .map_err(|e| e.to_string())?
 }
 
+fn extract_archive_body(archive_path: String, output_dir: String) -> Result<ExtractResult, String> {
+    let archive = PathBuf::from(&archive_path);
+    let output = PathBuf::from(&output_dir);
+    let total_bytes = extract_archive(&archive, &output).map_err(|e| e.to_string())?;
+    Ok(ExtractResult {
+        output_dir,
+        total_bytes,
+    })
+}
+
 #[tauri::command]
-async fn extract_archive_cmd(
-    app: AppHandle,
+async fn extract_archive_cmd<R: Runtime>(
+    app: AppHandle<R>,
     archive_path: String,
     output_dir: String,
 ) -> Result<ExtractResult, String> {
     let mutation = ActiveMutation::begin(&app);
     tauri::async_runtime::spawn_blocking(move || {
         let _mutation = mutation;
-        let archive = PathBuf::from(&archive_path);
-        let output = PathBuf::from(&output_dir);
-
-        let total_bytes = extract_archive(&archive, &output).map_err(|e| e.to_string())?;
-
-        Ok(ExtractResult {
-            output_dir,
-            total_bytes,
-        })
+        extract_archive_body(archive_path, output_dir)
     })
     .await
     .map_err(|e| e.to_string())?
 }
 
+fn list_archive_body(archive_path: String) -> Result<ArchiveInfo, String> {
+    list_archive_contents(&PathBuf::from(archive_path)).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn list_archive(archive_path: String) -> Result<ArchiveInfo, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let archive = PathBuf::from(&archive_path);
-        list_archive_contents(&archive).map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(move || list_archive_body(archive_path))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -2091,39 +2131,9 @@ fn check_is_archive(path: String) -> bool {
     is_archive(Path::new(&path))
 }
 
-fn main() {
-    // Initialize structured logging
-    // Log level can be controlled via RUST_LOG env var (e.g., RUST_LOG=debug)
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,explorie_core=debug"));
-
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(true)
-        .with_thread_ids(false)
-        .with_file(true)
-        .with_line_number(true)
-        .init();
-
-    info!("Starting explorie desktop application");
-
-    let app = tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
-            if let Some(path) = launch_directory_from_args(args.into_iter().map(OsString::from)) {
-                let _ = app.emit("open-path", path);
-            }
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.unminimize();
-                let _ = window.show();
-                let _ = window.set_focus();
-            }
-        }))
-        .manage(FileOperationJobs::default())
-        .manage(ActiveMutations::default())
-        .manage(RemoteDriveManager::default())
-        .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_fs::init())
-        .invoke_handler(tauri::generate_handler![
+macro_rules! explorie_invoke_handler {
+    () => {
+        tauri::generate_handler![
             list_files,
             get_syncthing_root,
             list_system_locations,
@@ -2168,12 +2178,47 @@ fn main() {
             get_home_dir,
             get_platform,
             get_app_version,
-            // Archive operations
             compress_files,
             extract_archive_cmd,
             list_archive,
             check_is_archive,
-        ])
+        ]
+    };
+}
+
+fn main() {
+    // Initialize structured logging
+    // Log level can be controlled via RUST_LOG env var (e.g., RUST_LOG=debug)
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,explorie_core=debug"));
+
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .with_thread_ids(false)
+        .with_file(true)
+        .with_line_number(true)
+        .init();
+
+    info!("Starting explorie desktop application");
+
+    let app = tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            if let Some(path) = launch_directory_from_args(args.into_iter().map(OsString::from)) {
+                let _ = app.emit("open-path", path);
+            }
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
+        .manage(FileOperationJobs::default())
+        .manage(ActiveMutations::default())
+        .manage(RemoteDriveManager::default())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_fs::init())
+        .invoke_handler(explorie_invoke_handler!())
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
 
@@ -2195,6 +2240,9 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::de::DeserializeOwned;
+    use serde_json::{Value, json};
+    use std::time::{Duration, Instant};
 
     struct TestDir(PathBuf);
 
@@ -2214,6 +2262,59 @@ mod tests {
     impl Drop for TestDir {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn mock_desktop() -> (
+        tauri::App<tauri::test::MockRuntime>,
+        tauri::WebviewWindow<tauri::test::MockRuntime>,
+    ) {
+        let app = tauri::test::mock_builder()
+            .manage(FileOperationJobs::default())
+            .manage(ActiveMutations::default())
+            .manage(RemoteDriveManager::default())
+            .invoke_handler(explorie_invoke_handler!())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("mock desktop app");
+        let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .expect("mock webview");
+        (app, webview)
+    }
+
+    fn invoke_url() -> tauri::Url {
+        if cfg!(any(windows, target_os = "android")) {
+            "http://tauri.localhost".parse().unwrap()
+        } else {
+            "tauri://localhost".parse().unwrap()
+        }
+    }
+
+    fn invoke_cmd<T: DeserializeOwned>(
+        webview: &tauri::WebviewWindow<tauri::test::MockRuntime>,
+        cmd: &str,
+        body: Value,
+    ) -> Result<T, Value> {
+        tauri::test::get_ipc_response(
+            webview,
+            tauri::webview::InvokeRequest {
+                cmd: cmd.into(),
+                callback: tauri::ipc::CallbackFn(0),
+                error: tauri::ipc::CallbackFn(1),
+                url: invoke_url(),
+                body: tauri::ipc::InvokeBody::Json(body),
+                headers: Default::default(),
+                invoke_key: tauri::test::INVOKE_KEY.to_string(),
+            },
+        )
+        .map(|payload| payload.deserialize().expect("command success payload"))
+    }
+
+    fn wait_until(predicate: impl Fn() -> bool, message: &str) {
+        let started = Instant::now();
+        while !predicate() {
+            assert!(started.elapsed() < Duration::from_secs(10), "{message}");
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 
@@ -2451,5 +2552,224 @@ mod tests {
 
         assert!(!source.exists());
         assert_eq!(fs::read(outside.join("keep.txt")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn command_boundary_list_rename_copy_and_cancel_use_frontend_argument_names() {
+        let fixture = TestDir::new();
+        let source = fixture.0.join("notes.txt");
+        fs::write(&source, b"hello boundary").unwrap();
+        let dest_dir = fixture.0.join("copied");
+        fs::create_dir(&dest_dir).unwrap();
+        let (_app, webview) = mock_desktop();
+
+        let listed: Vec<explorie_core::FileEntry> = invoke_cmd(
+            &webview,
+            "list_files",
+            json!({
+                "path": fixture.0.to_string_lossy(),
+                "calcDirSize": false,
+            }),
+        )
+        .expect("list_files");
+        assert!(
+            listed
+                .iter()
+                .any(|entry| entry.path.file_name().and_then(|n| n.to_str()) == Some("notes.txt")),
+            "list_files should return the temp fixture file"
+        );
+        assert!(
+            invoke_cmd::<Value>(
+                &webview,
+                "list_files",
+                json!({ "directory": fixture.0.to_string_lossy(), "calcDirSize": false })
+            )
+            .is_err(),
+            "renaming list_files path argument must fail the Tauri decoder"
+        );
+        assert!(
+            invoke_cmd::<Value>(
+                &webview,
+                "listFiles",
+                json!({
+                    "path": fixture.0.to_string_lossy(),
+                    "calcDirSize": false,
+                }),
+            )
+            .is_err(),
+            "#[tauri::command(rename)] must not silently alias list_files"
+        );
+
+        let renamed: String = invoke_cmd(
+            &webview,
+            "rename_path",
+            json!({
+                "sourcePath": source.to_string_lossy(),
+                "newBaseName": "renamed.txt",
+            }),
+        )
+        .expect("rename_path");
+        let renamed_path = PathBuf::from(&renamed);
+        assert_eq!(renamed_path.file_name().unwrap(), "renamed.txt");
+        assert!(renamed_path.is_file());
+        assert!(!source.exists());
+        assert!(
+            invoke_cmd::<Value>(
+                &webview,
+                "rename_path",
+                json!({
+                    "from": source.to_string_lossy(),
+                    "newBaseName": "other.txt",
+                }),
+            )
+            .is_err(),
+            "renaming rename_path sourcePath argument must fail the Tauri decoder"
+        );
+
+        let job_id: String = invoke_cmd(
+            &webview,
+            "start_file_operation",
+            json!({
+                "request": {
+                    "kind": "copy",
+                    "sources": [renamed_path.to_string_lossy()],
+                    "destination": dest_dir.to_string_lossy(),
+                    "conflictPolicy": "error",
+                }
+            }),
+        )
+        .expect("start_file_operation");
+        assert!(
+            job_id.contains('-'),
+            "job id is {{pid}}-{{counter}}, got {job_id}"
+        );
+        let copied = dest_dir.join("renamed.txt");
+        wait_until(
+            || copied.is_file(),
+            "copy did not finish through start_file_operation",
+        );
+        assert_eq!(fs::read(&copied).unwrap(), b"hello boundary");
+
+        let missing: bool = invoke_cmd(
+            &webview,
+            "cancel_file_operation",
+            json!({ "jobId": "missing-job" }),
+        )
+        .expect("cancel_file_operation missing job");
+        assert!(!missing);
+        assert!(
+            invoke_cmd::<Value>(
+                &webview,
+                "cancel_file_operation",
+                json!({ "id": "missing-job" })
+            )
+            .is_err(),
+            "renaming cancel_file_operation jobId argument must fail the Tauri decoder"
+        );
+
+        let bulk_src = fixture.0.join("bulk");
+        let bulk_dst = fixture.0.join("bulk-out");
+        fs::create_dir(&bulk_src).unwrap();
+        fs::create_dir(&bulk_dst).unwrap();
+        fs::write(bulk_src.join("item.txt"), vec![b'x'; 8 * 1024 * 1024]).unwrap();
+        let cancel_job: String = invoke_cmd(
+            &webview,
+            "start_file_operation",
+            json!({
+                "request": {
+                    "kind": "copy",
+                    "sources": [bulk_src.to_string_lossy()],
+                    "destination": bulk_dst.to_string_lossy(),
+                    "conflictPolicy": "error",
+                }
+            }),
+        )
+        .expect("start_file_operation bulk");
+        let _cancelled: bool = invoke_cmd(
+            &webview,
+            "cancel_file_operation",
+            json!({ "jobId": cancel_job }),
+        )
+        .expect("cancel_file_operation running job");
+    }
+
+    #[test]
+    fn command_boundary_compress_list_and_extract_use_frontend_argument_names() {
+        let fixture = TestDir::new();
+        let source = fixture.0.join("payload.txt");
+        fs::write(&source, b"archive boundary").unwrap();
+        let archive = fixture.0.join("payload.zip");
+        let extract_dir = fixture.0.join("extracted");
+        fs::create_dir(&extract_dir).unwrap();
+        let (_app, webview) = mock_desktop();
+
+        let compressed: CompressResult = invoke_cmd(
+            &webview,
+            "compress_files",
+            json!({
+                "paths": [source.to_string_lossy()],
+                "outputPath": archive.to_string_lossy(),
+                "format": "zip",
+                "compressionLevel": "fast",
+                "operationId": "compress-boundary",
+            }),
+        )
+        .expect("compress_files");
+        assert_eq!(compressed.output_path, archive.to_string_lossy());
+        assert!(archive.is_file());
+        assert!(
+            invoke_cmd::<Value>(
+                &webview,
+                "compress_files",
+                json!({
+                    "paths": [source.to_string_lossy()],
+                    "destination": archive.to_string_lossy(),
+                    "format": "zip",
+                    "compressionLevel": "fast",
+                    "operationId": "compress-boundary",
+                }),
+            )
+            .is_err(),
+            "renaming compress_files outputPath argument must fail the Tauri decoder"
+        );
+
+        let listed: ArchiveInfo = invoke_cmd(
+            &webview,
+            "list_archive",
+            json!({ "archivePath": archive.to_string_lossy() }),
+        )
+        .expect("list_archive");
+        assert!(
+            listed
+                .entries
+                .iter()
+                .any(|entry| entry.name.contains("payload.txt")),
+            "list_archive should include payload.txt, got {:?}",
+            listed.entries
+        );
+        assert!(
+            invoke_cmd::<Value>(
+                &webview,
+                "list_archive",
+                json!({ "path": archive.to_string_lossy() })
+            )
+            .is_err(),
+            "renaming list_archive archivePath argument must fail the Tauri decoder"
+        );
+
+        let extracted: ExtractResult = invoke_cmd(
+            &webview,
+            "extract_archive_cmd",
+            json!({
+                "archivePath": archive.to_string_lossy(),
+                "outputDir": extract_dir.to_string_lossy(),
+            }),
+        )
+        .expect("extract_archive_cmd");
+        assert_eq!(extracted.output_dir, extract_dir.to_string_lossy());
+        assert_eq!(
+            fs::read(extract_dir.join("payload.txt")).unwrap(),
+            b"archive boundary"
+        );
     }
 }

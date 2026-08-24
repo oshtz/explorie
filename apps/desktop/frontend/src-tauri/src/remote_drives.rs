@@ -8,7 +8,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter, Manager, Runtime};
 use uuid::Uuid;
 
 #[cfg(windows)]
@@ -81,7 +81,7 @@ pub struct RemoteDriveManager {
 }
 
 impl RemoteDriveManager {
-    pub fn environment(&self, app: &AppHandle) -> RemoteDriveEnvironment {
+    pub fn environment<R: Runtime>(&self, app: &AppHandle<R>) -> RemoteDriveEnvironment {
         let rclone = find_rclone(app);
         let version = rclone.as_ref().and_then(|path| rclone_version(path).ok());
         RemoteDriveEnvironment {
@@ -95,7 +95,7 @@ impl RemoteDriveManager {
         }
     }
 
-    pub fn list_remotes(&self, app: &AppHandle) -> Result<Vec<String>, String> {
+    pub fn list_remotes<R: Runtime>(&self, app: &AppHandle<R>) -> Result<Vec<String>, String> {
         let rclone = find_rclone(app).ok_or_else(missing_rclone)?;
         let output = Command::new(rclone)
             .args(["listremotes", "--ask-password=false"])
@@ -110,7 +110,7 @@ impl RemoteDriveManager {
         parse_remotes(&String::from_utf8_lossy(&output.stdout))
     }
 
-    pub fn configure_remotes(&self, app: &AppHandle) -> Result<(), String> {
+    pub fn configure_remotes<R: Runtime>(&self, app: &AppHandle<R>) -> Result<(), String> {
         let rclone = find_rclone(app).ok_or_else(missing_rclone)?;
 
         #[cfg(windows)]
@@ -216,9 +216,9 @@ impl RemoteDriveManager {
             .any(|mount| normalize_compare_path(&mount.mount_path) == candidate)
     }
 
-    pub fn connect(
+    pub fn connect<R: Runtime>(
         &self,
-        app: &AppHandle,
+        app: &AppHandle<R>,
         profile: RemoteDriveProfile,
     ) -> Result<RemoteDriveStatus, String> {
         validate_profile(&profile)?;
@@ -260,9 +260,9 @@ impl RemoteDriveManager {
         }
     }
 
-    fn connect_inner(
+    fn connect_inner<R: Runtime>(
         &self,
-        app: &AppHandle,
+        app: &AppHandle<R>,
         profile: &RemoteDriveProfile,
     ) -> Result<RemoteDriveStatus, String> {
         let rclone = find_rclone(app).ok_or_else(missing_rclone)?;
@@ -368,9 +368,9 @@ impl RemoteDriveManager {
         Ok(connected_status(&profile.id, &mount_path))
     }
 
-    pub fn disconnect(
+    pub fn disconnect<R: Runtime>(
         &self,
-        app: &AppHandle,
+        app: &AppHandle<R>,
         id: &str,
         force: bool,
     ) -> Result<DisconnectResult, String> {
@@ -460,7 +460,7 @@ impl RemoteDriveManager {
         })
     }
 
-    pub fn disconnect_all(&self, app: &AppHandle) {
+    pub fn disconnect_all<R: Runtime>(&self, app: &AppHandle<R>) {
         let ids: Vec<String> = self
             .mounts
             .lock()
@@ -473,7 +473,7 @@ impl RemoteDriveManager {
         }
     }
 
-    pub fn disconnect_all_if_clean(&self, app: &AppHandle) -> bool {
+    pub fn disconnect_all_if_clean<R: Runtime>(&self, app: &AppHandle<R>) -> bool {
         let ids: Vec<String> = self
             .mounts
             .lock()
@@ -646,7 +646,7 @@ fn parse_remotes(output: &str) -> Result<Vec<String>, String> {
     Ok(remotes)
 }
 
-fn find_rclone(app: &AppHandle) -> Option<PathBuf> {
+fn find_rclone<R: Runtime>(app: &AppHandle<R>) -> Option<PathBuf> {
     let binary_name = if cfg!(windows) {
         "rclone.exe"
     } else {
@@ -753,7 +753,7 @@ fn winfsp_available() -> Option<bool> {
     )
 }
 
-pub fn install_winfsp(app: &AppHandle) -> Result<(), String> {
+pub fn install_winfsp<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     #[cfg(windows)]
     {
         if winfsp_available() == Some(true) {
@@ -972,7 +972,7 @@ fn wait_or_kill(child: &mut Child) {
     let _ = child.wait();
 }
 
-fn emit_status(app: &AppHandle, status: RemoteDriveStatus) {
+fn emit_status<R: Runtime>(app: &AppHandle<R>, status: RemoteDriveStatus) {
     let _ = app.emit("remote-drive-status", status);
 }
 
