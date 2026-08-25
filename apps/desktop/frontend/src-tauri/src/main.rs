@@ -7,6 +7,7 @@ use explorie_core::archive::{
     ArchiveFormat, ArchiveInfo, ArchiveProgress, CompressOptions, CompressionLevel,
     create_archive_with_progress, extract_archive, is_archive, list_archive_contents,
 };
+use explorie_core::image_metadata;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -680,6 +681,25 @@ async fn read_text_preview(path: String, max_bytes: u64) -> Result<TextPreview, 
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn read_image_metadata(path: String) -> Result<image_metadata::ImageMetadata, String> {
+    tauri::async_runtime::spawn_blocking(move || image_metadata::read(Path::new(&path)))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn write_image_metadata(
+    path: String,
+    updates: Vec<image_metadata::MetadataUpdate>,
+) -> Result<image_metadata::ImageMetadata, String> {
+    tauri::async_runtime::spawn_blocking(move || image_metadata::write(Path::new(&path), &updates))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())
 }
 
 fn metadata_is_link(metadata: &fs::Metadata) -> bool {
@@ -2147,6 +2167,8 @@ fn main() {
             start_file_operation,
             cancel_file_operation,
             read_text_preview,
+            read_image_metadata,
+            write_image_metadata,
             rename_path,
             create_folder,
             create_note,

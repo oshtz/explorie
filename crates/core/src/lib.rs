@@ -58,6 +58,7 @@ use walkdir::WalkDir;
 pub mod archive;
 pub use archive::*;
 mod file_operations;
+pub mod image_metadata;
 pub use file_operations::*;
 
 /// Represents a file or directory entry in explorie.

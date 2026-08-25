@@ -356,6 +356,134 @@
   overflow-wrap: anywhere;
 }
 
+.imageMetadata {
+  display: flex;
+  flex-direction: column;
+  gap: var(--padding-sm);
+  padding-top: var(--padding-sm);
+  border-top: 1px solid var(--border-primary);
+}
+
+.imageMetadataHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--padding-sm);
+  color: var(--fg-title);
+  font-weight: 600;
+}
+
+.imageMetadataFormat {
+  color: var(--fg-tertiary);
+  font-size: calc(11px * var(--font-scale));
+  font-weight: 500;
+}
+
+.imageMetadataEditor,
+.imageMetadataGroup {
+  display: flex;
+  flex-direction: column;
+  gap: var(--padding-xs);
+  padding: var(--padding-sm);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-primary);
+}
+
+.imageMetadataGroupTitle,
+.imageMetadataGroup h3 {
+  margin: 0 0 var(--padding-xs);
+  color: var(--fg-secondary);
+  font-size: calc(11px * var(--font-scale));
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.imageMetadataInputRow {
+  display: grid;
+  grid-template-columns: minmax(110px, 0.7fr) minmax(0, 1fr);
+  align-items: center;
+  gap: var(--padding-sm);
+  color: var(--fg-secondary);
+  font-size: calc(11px * var(--font-scale));
+}
+
+.imageMetadataInputRow input {
+  width: 100%;
+  min-width: 0;
+  padding: var(--padding-xs) var(--padding-sm);
+  color: var(--fg-primary);
+  background: var(--bg-sunken);
+  border: 1px solid var(--border-primary);
+  border-radius: 0;
+  font: inherit;
+}
+
+.imageMetadataInputRow input:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 1px;
+}
+
+.imageMetadataSave {
+  align-self: flex-start;
+  margin-top: var(--padding-xs);
+  padding: var(--padding-xs) var(--padding-sm);
+  color: var(--fg-primary);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-secondary);
+  border-radius: 0;
+  cursor: pointer;
+  font: inherit;
+  font-size: calc(11px * var(--font-scale));
+}
+
+.imageMetadataSave:hover:not(:disabled) {
+  background: var(--bg-hover);
+}
+
+.imageMetadataSave:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
+.imageMetadataStatus,
+.imageMetadataError,
+.imageMetadataEmpty,
+.imageMetadataState {
+  color: var(--fg-tertiary);
+  font-size: calc(11px * var(--font-scale));
+  line-height: 1.35;
+}
+
+.imageMetadataError {
+  color: var(--state-error-fg, var(--fg-secondary));
+}
+
+.imageMetadataList {
+  display: flex;
+  flex-direction: column;
+  gap: var(--padding-xs);
+  margin: 0;
+}
+
+.imageMetadataRow {
+  display: grid;
+  grid-template-columns: minmax(110px, 0.7fr) minmax(0, 1fr);
+  gap: var(--padding-sm);
+  font-size: calc(11px * var(--font-scale));
+}
+
+.imageMetadataRow dt {
+  color: var(--fg-secondary);
+}
+
+.imageMetadataRow dd {
+  min-width: 0;
+  margin: 0;
+  color: var(--fg-primary);
+  overflow-wrap: anywhere;
+}
+
 .loadingState {
   position: absolute;
   inset: 0;

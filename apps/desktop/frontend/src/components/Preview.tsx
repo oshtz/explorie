@@ -3,6 +3,7 @@ import type { FileEntry } from '../store';
 import { useFileStore } from '../store';
 import { CustomFieldsEditor } from './CustomFieldsEditor';
 import { FinderTags } from './FinderTags';
+import { ImageMetadataEditor } from './ImageMetadataEditor';
 import styles from './Preview.module.css';
 import { formatLocalDateTime } from '../utils/date';
 import { areFinderTagsAvailable } from '../services/finderIntegration';
@@ -115,6 +116,21 @@ const TEXTUAL_EXTENSIONS = new Set([
 ]);
 
 const EXECUTABLE_SCRIPT_EXTENSIONS = new Set(['bat', 'cmd', 'ps1', 'psm1']);
+// Wider than the formats explorie can parse: unsupported images get an
+// explicit empty state in the panel rather than silently missing it.
+const IMAGE_METADATA_EXTENSIONS = new Set([
+  'jpg',
+  'jpeg',
+  'png',
+  'tif',
+  'tiff',
+  'gif',
+  'bmp',
+  'webp',
+  'avif',
+  'heic',
+  'heif',
+]);
 
 // Date formatting moved to utils/date for robustness
 
@@ -497,6 +513,7 @@ export function Preview({
           aria-labelledby={tabIds.metadata}
         >
           {renderFileMetadata()}
+          {IMAGE_METADATA_EXTENSIONS.has(ext ?? '') && <ImageMetadataEditor path={file.path} />}
         </div>
       )}
 

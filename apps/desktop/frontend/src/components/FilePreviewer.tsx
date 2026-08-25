@@ -345,7 +345,8 @@ export function FilePreviewer({ file, onClose, variant = 'panel' }: FilePreviewe
     return (
       <Preview
         file={{
-          name: file.name || file.path.split('/').pop() || file.path,
+          ...currentFile,
+          name: currentFile.name || file.path.split(/[/\\]/).pop() || file.path,
           path: file.path,
           type: 'error',
           url: undefined,

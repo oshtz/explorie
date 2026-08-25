@@ -73,6 +73,7 @@ vi.mock('./Preview', () => ({
   }) => (
     <section
       data-testid="preview"
+      data-file-id={file.id ?? ''}
       data-name={file.name ?? ''}
       data-path={file.path}
       data-type={file.type ?? ''}
@@ -425,15 +426,16 @@ describe('FilePreviewer', () => {
     expect(screen.getByTestId('preview')).toHaveAttribute('data-url', 'asset://preview/movie.png');
   });
 
-  it('shows actionable helper errors when external preview tools are missing', async () => {
-    mocks.invoke.mockRejectedValue(new Error('Install LibreOffice to preview Office files.'));
+  it('keeps image metadata reachable when an optional preview tool is missing', async () => {
+    mocks.invoke.mockRejectedValue(new Error('Install ImageMagick to preview this image format.'));
 
-    render(<FilePreviewer file={makeFile('C:/Docs/report.docx')} />);
+    render(<FilePreviewer file={makeFile('C:/Docs/scan.tif', { id: 'scan-id' })} />);
 
     await waitFor(() =>
       expect(screen.getByTestId('preview')).toHaveAttribute('data-type', 'error')
     );
-    expect(screen.getByTestId('preview-content-sample')).toHaveTextContent('Install LibreOffice');
+    expect(screen.getByTestId('preview')).toHaveAttribute('data-file-id', 'scan-id');
+    expect(screen.getByTestId('preview-content-sample')).toHaveTextContent('Install ImageMagick');
   });
 });
 
