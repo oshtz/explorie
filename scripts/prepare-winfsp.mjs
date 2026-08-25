@@ -13,7 +13,7 @@ export async function prepareWinFsp(platform = process.platform) {
   if (platform !== 'win32') return null;
 
   const repository = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-  const resources = path.join(repository, 'apps', 'desktop', 'frontend', 'src-tauri', 'resources');
+  const resources = path.join(repository, 'apps', 'desktop', 'native-assets', 'resources');
   const destination = path.join(resources, WINFSP_INSTALLER);
   await mkdir(resources, { recursive: true });
 

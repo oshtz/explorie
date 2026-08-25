@@ -1,4 +1,0 @@
-packages:
-  - 'apps/*'
-  - 'apps/desktop/frontend'
-  - 'packages/*'

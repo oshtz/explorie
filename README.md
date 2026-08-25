@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="apps/desktop/frontend/public/icon.png" alt="explorie logo" width="128" height="128">
+  <img src="apps/desktop/native-assets/icons/icon.png" alt="explorie logo" width="128" height="128">
 </p>
 
 # explorie
@@ -11,19 +11,19 @@ _MIT-licensed, built to be understandable, extensible, and easy to customize._
 
 ## Overview
 
-explorie is a Tauri + React file manager currently validated on **Windows**, with macOS support under active release validation. It uses plain JSON metadata and a themeable UI. The Rust core owns directory listing, file operations, size calculation, archives, and `.explorie.json` custom fields.
+explorie is a native GPUI file manager currently validated on **Windows**, with macOS support under active release validation. It uses plain JSON metadata and a themeable native UI. The Rust core owns directory listing, file operations, size calculation, archives, and `.explorie.json` custom fields; a Tauri-free service layer owns previews, jobs, recovery, remote drives, and OS integration.
 
 Key traits:
 
 - No paywalls, no telemetry.
-- Hackable front to back: CSS variables, `.explorie.json` metadata, Rust/TS helper crates.
+- Hackable front to back: native theme tokens, `.explorie.json` metadata, and readable Rust crates.
 - Fast-first: virtualization, cached folder sizes, and async previews.
 
 Current features:
 
 - **Multiple view modes:** List, Grid, and Finder-style Column views.
 - **Tabbed browsing:** Open multiple directories in tabs (Ctrl/Cmd+T).
-- **File previews:** Images, browser-playable videos, PDFs, code files with syntax highlighting, archive listings, and optional helper-generated previews.
+- **File previews:** Images, embedded audio/video, locally rendered PDFs, highlighted text/code, archive listings, and optional helper-generated previews.
 - **Custom metadata:** Read/write `.explorie.json` for custom fields per folder.
 - **Theming:** Dark/light/system themes, accent colors, local font stacks, UI scale, density, and more.
 - **Drag & drop:** Move files between folders with visual feedback.
@@ -35,11 +35,10 @@ Current features:
 
 ## Tech Stack
 
-- **UI:** React 19, Vite 6, PNPM 9, Zustand 5, @tanstack/react-virtual, pixelarticons.
-- **Desktop:** Tauri 2 (Rust 2024 edition), with filesystem and window integration.
+- **UI/Desktop:** Native GPUI pinned to an exact Zed revision with AccessKit semantics; Rust 2024 edition.
 - **CLI:** Rust binary sharing the core crate, with listing and FFmpeg command-preview modes.
-- **Libs:** `crates/core` (filesystem, metadata, archives, and file operations) and `crates/ffmpeg-wrapper` (FFmpeg command builder).
-- **Tests:** `cargo test`, Playwright e2e.
+- **Libs:** `crates/core` (filesystem, metadata, archives, and file operations), `crates/native-services` (desktop jobs and OS integration), and `crates/ffmpeg-wrapper` (FFmpeg command builder).
+- **Tests:** Rust unit/integration tests, GPUI-native rendered/input fixtures, and packaged-runtime smoke checks.
 
 ---
 
@@ -64,7 +63,7 @@ Current features:
 
 ### Platform Notes
 
-- **Windows:** Targets Windows 10/11. WebView2 runtime is usually pre-installed. When Remote Drives first need WinFsp, Explorie offers the bundled official installer with a native administrator prompt.
+- **Windows:** Targets Windows 10/11 and has no WebView2 dependency. When Remote Drives first need WinFsp, Explorie offers the bundled official installer with a native administrator prompt.
 - **macOS:** Builds target macOS 13+ and require Xcode Command Line Tools. Remote Drives use an administrator-approved, bundle-contained mount helper. Do not treat macOS as release-ready until the signed package passes the real-machine checklist below.
 
 ---
@@ -73,19 +72,14 @@ Current features:
 
 ```
 apps/
-  desktop/                 # Tauri runner (Rust backend in src-tauri/, React frontend in frontend/)
-    frontend/
-      src/
-        components/        # React components (ListView, GridView, ColumnView, Preview, etc.)
-        hooks/             # Custom React hooks (useTabs, useDragStart, useVirtualRows, etc.)
-        utils/             # Utilities (fs, date, highlight, customColumns)
-        workers/           # Web workers (sortWorker)
-      src-tauri/           # Tauri Rust backend with file system commands
+  desktop/
+    gpui/                  # Native GPUI desktop application
+    native-assets/         # Shared icons, sidecars, installers, licenses, macOS helpers
   cli/                     # CLI binary (Rust)
 crates/
   core/                    # Rust business logic for listing, sizes, metadata
+  native-services/         # Tauri-free jobs, previews, recovery, remote drives, OS integration
   ffmpeg-wrapper/          # FFmpeg command builder
-tests/                     # Playwright specs
 sample/                    # Demo data + .explorie.json examples
 ```
 
@@ -108,9 +102,8 @@ Platform-specific `SHA256SUMS` files are published alongside each release.
 git clone https://github.com/oshtz/explorie.git
 cd explorie
 
-pnpm install                             # install frontend deps
-pnpm desktop:dev                         # run Tauri dev (frontend + Rust)
-# or: pnpm desktop:web                   # web-only Vite dev
+pnpm install                             # install release-script tooling
+pnpm desktop:dev                         # run the native GPUI desktop app
 
 cargo run -p explorie-cli -- --help      # CLI help (listing and ffmpeg-preview)
 ```
@@ -121,24 +114,21 @@ cargo run -p explorie-cli -- --help      # CLI help (listing and ffmpeg-preview)
 
 ### Development
 
-| Command            | Description                                     |
-| ------------------ | ----------------------------------------------- |
-| `pnpm dev`         | Run Tauri dev (frontend + Rust)                 |
-| `pnpm dev:watch`   | Dev with Rust hot reload (requires cargo-watch) |
-| `pnpm desktop:web` | Web-only Vite dev server                        |
-| `pnpm rust:watch`  | Watch Rust crates and run tests on change       |
+| Command           | Description                                     |
+| ----------------- | ----------------------------------------------- |
+| `pnpm dev`        | Run the native GPUI desktop app                  |
+| `pnpm dev:watch`  | Dev with Rust hot reload (requires cargo-watch) |
+| `pnpm rust:watch` | Watch Rust crates and run tests on change       |
 
 ### Building & Testing
 
 | Command              | Description                                                            |
 | -------------------- | ---------------------------------------------------------------------- |
-| `pnpm desktop:build` | Build Tauri app for production                                         |
+| `pnpm desktop:build` | Build the GPUI app for production                                      |
 | `pnpm release:check` | Run local release-candidate checks and write `.release-checks` reports |
-| `pnpm test`          | Run all tests (Rust + Playwright)                                      |
-| `pnpm test:rust`     | Run Rust tests only                                                    |
-| `pnpm test:unit`     | Run frontend unit tests (Vitest)                                       |
-| `pnpm lint`          | Check formatting (cargo fmt + clippy)                                  |
-| `pnpm typecheck`     | TypeScript type checking                                               |
+| `pnpm test`          | Run the complete authoritative Rust workspace                          |
+| `pnpm test:rust`     | Run the complete authoritative Rust workspace                          |
+| `pnpm lint`          | Check Rust formatting and strict workspace clippy                      |
 
 For release-candidate verification, run `pnpm release:check` and use the release checklist below.
 
@@ -154,15 +144,9 @@ explorie ffmpeg-preview in.mp4 out.webm --vf scale=1280:720  # Preview FFmpeg ar
 
 ## Environment Variables
 
-Copy `.env.example` to `.env.local` for local overrides. See `apps/desktop/frontend/.env.example` for frontend-specific variables.
-
-| Variable            | Default                    | Description                                     |
-| ------------------- | -------------------------- | ----------------------------------------------- |
-| `RUST_LOG`          | `info,explorie_core=debug` | Rust logging level filter                       |
-| `VITE_DEV_PORT`     | `5173`                     | Vite dev server port                            |
-| `VITE_SOURCEMAP`    | `false`                    | Enable source maps in production                |
-| `VITE_DROP_CONSOLE` | `true`                     | Strip console.log in production                 |
-| `ANALYZE`           | `0`                        | Enable bundle analyzer (`ANALYZE=1 pnpm build`) |
+| Variable   | Default                    | Description               |
+| ---------- | -------------------------- | ------------------------- |
+| `RUST_LOG` | `info,explorie_core=debug` | Rust logging level filter |
 
 ---
 
@@ -174,9 +158,9 @@ Add screenshots or a short demo GIF here before publishing the final public repo
 
 ## Security and Filesystem Access
 
-explorie is a local file manager. To browse and preview files, the desktop app requests broad read access to common user folders, mounted volumes, and Windows drive roots through Tauri's filesystem and asset protocols. Write access is intended for explicit file operations that the user initiates, such as rename, move, copy, delete, archive, extract, and metadata edits.
+explorie is a local file manager. The GPUI process reads paths the user opens and delegates privileged or blocking work to typed native services. Write access is used only for explicit operations such as rename, move, copy, delete, archive, extract, metadata edits, and versioned app-local state.
 
-Review `apps/desktop/frontend/src-tauri/tauri.conf.json` before shipping forks or release artifacts. Treat custom builds and helper binaries with the same care as any other local file-management tool. Do not paste sensitive file contents, private paths, credentials, or exploit details into public issues.
+Review the native-service path protections and packaged resources before shipping forks or release artifacts. Treat custom builds and helper binaries with the same care as any other local file-management tool. Do not paste sensitive file contents, private paths, credentials, or exploit details into public issues.
 
 Security vulnerabilities should be reported through GitHub private vulnerability reporting for the release repository. If private reporting is unavailable, open a minimal public issue asking for a private contact route without including exploit details.
 
@@ -189,8 +173,7 @@ Remote Drives use the bundled, pinned rclone executable with the user's existing
 ## Known Limitations
 
 - Public binary releases still need real-machine packaged-app QA before broad distribution; macOS is explicitly not release-ready until that proof exists.
-- MP4, WebM, and M4V previews use the platform WebView video stack. Codec support depends on the OS/WebView; H.264/AAC MP4 is the expected happy path.
-- MOV, AVI, MKV, WMV, FLV, M2TS, MPEG/MPG, and 3GP previews use FFmpeg to generate a still thumbnail when FFmpeg is installed.
+- Video previews use an optional local FFmpeg process for probing and bounded native playback; unavailable helpers produce an actionable fallback.
 - Office/OpenDocument previews require LibreOffice. HEIC/HEIF/TIFF/PSD previews require ImageMagick.
 - macOS Finder/Quick Look integration and notarized DMG behavior should be checked on real machines for each release candidate.
 
@@ -205,9 +188,9 @@ cargo install cargo-audit --locked # once per machine
 pnpm release:check
 ```
 
-The command writes local evidence under `.release-checks/`, which is ignored by git. It requires a clean, version-aligned working tree; runs dependency audits, static checks, tests, Playwright on an isolated strict port, and a Tauri no-bundle build; then verifies the executable under the workspace `target/release` directory.
+The command writes local evidence under `.release-checks/`, which is ignored by git. It requires a clean, version-aligned working tree; runs dependency audits, Rust formatting, the full workspace tests, strict clippy, and a locked GPUI release build; then verifies the executable under the workspace `target/release` directory.
 
-Automated updates are disabled. Releases are immutable and version-tag based. Bump the matching versions in the root package, desktop package, and desktop Cargo manifest, then push a new `v<version>` tag. That tag builds the candidate packages once and attaches them to a draft release. After those exact assets pass the real-machine checklist below, manually dispatch the release workflow from that tag with the Windows and macOS attestations enabled. The dispatch verifies and publishes the existing draft without rebuilding it. Existing releases and assets are never replaced; failures are fixed in a new version.
+Automated updates are disabled. Releases are immutable and version-tag based. Bump the matching versions in the root package and GPUI Cargo manifest, then push a new `v<version>` tag. That tag builds the candidate packages once and attaches them to a draft release. After those exact assets pass the real-machine checklist below, manually dispatch the release workflow from that tag with the Windows and macOS attestations enabled. The dispatch verifies and publishes the existing draft without rebuilding it. Existing releases and assets are never replaced; failures are fixed in a new version.
 
 Protect `v*` tags and enable immutable releases in the GitHub repository settings before public distribution.
 
@@ -270,9 +253,9 @@ The metadata stays next to your files and is not synced by explorie itself.
 
 ## Third-Party Licenses and Attribution
 
-explorie source code is MIT-licensed. The current dependency graph is primarily MIT, Apache-2.0, Apache-2.0/MIT dual-licensed, BSD-2-Clause, BSD-3-Clause, ISC, MIT-0, and compatible permissive licenses. Current frontend tooling scans also show `caniuse-lite` under CC-BY-4.0, `argparse` under Python-2.0, and `type-fest` under MIT or CC0-1.0.
+explorie source code is MIT-licensed. The authoritative dependency graph is primarily MIT, Apache-2.0, Apache-2.0/MIT dual-licensed, BSD-2-Clause, BSD-3-Clause, ISC, MIT-0, and compatible permissive licenses.
 
-Notable runtime and UI dependencies include React, Vite, Tauri, Zustand, TanStack Virtual, highlight.js, Pixelarticons, and Rust crates for filesystem, archive, tracing, Tauri, and platform integration. Explorie bundles rclone v1.74.4 under its MIT license and includes the license in packaged applications. Windows packages also include the official, unmodified WinFsp installer: **WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos**, [source and license](https://github.com/winfsp/winfsp). Optional external helpers such as FFmpeg, LibreOffice, and ImageMagick are not bundled; their own licenses apply to user-installed copies.
+Notable runtime and UI dependencies include GPUI, AccessKit, and Rust crates for filesystem, archive, tracing, local media decoding, and platform integration. Explorie bundles rclone v1.74.4 under its MIT license and includes the license in packaged applications. Windows packages also include the official, unmodified WinFsp installer: **WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos**, [source and license](https://github.com/winfsp/winfsp). Optional external helpers such as FFmpeg, LibreOffice, and ImageMagick are not bundled; their own licenses apply to user-installed copies.
 
 App icons and sample assets in this repository are project assets unless replaced before release.
 

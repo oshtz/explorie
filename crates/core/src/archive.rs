@@ -1563,16 +1563,14 @@ pub fn list_rar_contents(archive_path: &Path) -> io::Result<ArchiveInfo> {
 pub fn create_7z_archive(
     sources: &[PathBuf],
     output_path: &Path,
-    _password: Option<&str>,
+    password: Option<&str>,
 ) -> io::Result<u64> {
     ensure_output_outside_sources(sources, output_path)?;
     with_atomic_archive_output(output_path, |output_file| {
         let mut total_bytes: u64 = 0;
-        let mut sz = sevenz_rust::SevenZWriter::new(output_file)
+        let mut sz = sevenz_rust::ArchiveWriter::new(output_file)
             .map_err(|error| io::Error::other(format!("Failed to create 7z: {error:?}")))?;
-        sz.set_content_methods(vec![sevenz_rust::SevenZMethodConfiguration::new(
-            sevenz_rust::SevenZMethod::LZMA2,
-        )]);
+        configure_7z_writer(&mut sz, password);
 
         for source in sources {
             match classify_source(source)? {
@@ -1594,17 +1592,15 @@ pub fn create_7z_archive(
 pub fn create_7z_archive_with_progress(
     sources: &[PathBuf],
     output_path: &Path,
-    _password: Option<&str>,
+    password: Option<&str>,
     progress: &mut impl FnMut(&Path, u64),
 ) -> io::Result<u64> {
     ensure_output_outside_sources(sources, output_path)?;
     with_atomic_archive_output(output_path, |output_file| {
         let mut total_bytes: u64 = 0;
-        let mut sz = sevenz_rust::SevenZWriter::new(output_file)
+        let mut sz = sevenz_rust::ArchiveWriter::new(output_file)
             .map_err(|error| io::Error::other(format!("Failed to create 7z: {error:?}")))?;
-        sz.set_content_methods(vec![sevenz_rust::SevenZMethodConfiguration::new(
-            sevenz_rust::SevenZMethod::LZMA2,
-        )]);
+        configure_7z_writer(&mut sz, password);
 
         for source in sources {
             match classify_source(source)? {
@@ -1628,8 +1624,23 @@ pub fn create_7z_archive_with_progress(
     })
 }
 
+fn configure_7z_writer<W: Write + io::Seek>(
+    writer: &mut sevenz_rust::ArchiveWriter<W>,
+    password: Option<&str>,
+) {
+    if let Some(password) = password.filter(|password| !password.is_empty()) {
+        writer.set_content_methods(vec![
+            sevenz_rust::encoder_options::AesEncoderOptions::new(SevenZPassword::from(password))
+                .into(),
+            sevenz_rust::EncoderMethod::LZMA2.into(),
+        ]);
+    } else {
+        writer.set_content_methods(vec![sevenz_rust::EncoderMethod::LZMA2.into()]);
+    }
+}
+
 fn add_directory_to_7z_with_progress<W: Write + io::Seek>(
-    sz: &mut sevenz_rust::SevenZWriter<W>,
+    sz: &mut sevenz_rust::ArchiveWriter<W>,
     dir_path: &Path,
     progress: &mut impl FnMut(&Path, u64),
 ) -> io::Result<u64> {
@@ -1653,7 +1664,7 @@ fn add_directory_to_7z_with_progress<W: Write + io::Seek>(
 }
 
 fn add_file_to_7z_with_progress<W: Write + io::Seek>(
-    sz: &mut sevenz_rust::SevenZWriter<W>,
+    sz: &mut sevenz_rust::ArchiveWriter<W>,
     file_path: &Path,
     archive_name: &str,
     progress: &mut impl FnMut(&Path, u64),
@@ -1664,7 +1675,7 @@ fn add_file_to_7z_with_progress<W: Write + io::Seek>(
 }
 
 fn add_directory_to_7z<W: Write + io::Seek>(
-    sz: &mut sevenz_rust::SevenZWriter<W>,
+    sz: &mut sevenz_rust::ArchiveWriter<W>,
     dir_path: &Path,
 ) -> io::Result<u64> {
     let mut total_bytes: u64 = 0;
@@ -1687,7 +1698,7 @@ fn add_directory_to_7z<W: Write + io::Seek>(
 }
 
 fn add_file_to_7z<W: Write + io::Seek>(
-    sz: &mut sevenz_rust::SevenZWriter<W>,
+    sz: &mut sevenz_rust::ArchiveWriter<W>,
     file_path: &Path,
     archive_name: &str,
 ) -> io::Result<u64> {
@@ -1695,9 +1706,7 @@ fn add_file_to_7z<W: Write + io::Seek>(
     let metadata = file.metadata()?;
     let size = metadata.len();
 
-    let mut entry = sevenz_rust::SevenZArchiveEntry::new();
-    entry.name = archive_name.to_string();
-    entry.has_stream = true;
+    let mut entry = sevenz_rust::ArchiveEntry::new_file(archive_name);
     entry.size = size;
     sz.push_archive_entry(entry, Some(&mut file))
         .map_err(|e| io::Error::other(format!("Failed to add file to 7z: {:?}", e)))?;
@@ -1722,12 +1731,11 @@ fn extract_7z_archive_into(
     password: Option<&str>,
 ) -> io::Result<u64> {
     let file = File::open(archive_path)?;
-    let len = file.metadata()?.len();
     let reader = BufReader::new(file);
     let password = password
         .map(SevenZPassword::from)
         .unwrap_or_else(SevenZPassword::empty);
-    let mut archive = sevenz_rust::SevenZReader::new(reader, len, password).map_err(|error| {
+    let mut archive = sevenz_rust::ArchiveReader::new(reader, password).map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("Failed to open 7z: {error:?}"),
@@ -1738,29 +1746,34 @@ fn extract_7z_archive_into(
     archive
         .for_each_entries(|entry, reader| {
             if entry.is_anti_item() {
-                return Err(sevenz_rust::Error::other(format!(
-                    "Unsupported 7z anti-item: {}",
-                    entry.name()
-                )));
+                return Err(sevenz_rust::Error::Other(
+                    format!("Unsupported 7z anti-item: {}", entry.name()).into(),
+                ));
             }
             let entry_path = Path::new(entry.name());
             let output_path = ensure_safe_extraction_path(output_dir, entry_path)
-                .map_err(sevenz_rust::Error::io)?;
+                .map_err(|error| sevenz_rust::Error::Io(error, "".into()))?;
             if entry.is_directory() {
-                fs::create_dir_all(&output_path).map_err(sevenz_rust::Error::io)?;
+                fs::create_dir_all(&output_path)
+                    .map_err(|error| sevenz_rust::Error::Io(error, "".into()))?;
             } else {
                 if let Some(parent) = output_path.parent() {
-                    fs::create_dir_all(parent).map_err(sevenz_rust::Error::io)?;
-                    ensure_no_link_ancestors(parent).map_err(sevenz_rust::Error::io)?;
+                    fs::create_dir_all(parent)
+                        .map_err(|error| sevenz_rust::Error::Io(error, "".into()))?;
+                    ensure_no_link_ancestors(parent)
+                        .map_err(|error| sevenz_rust::Error::Io(error, "".into()))?;
                 }
                 let mut output = OpenOptions::new()
                     .write(true)
                     .create(true)
                     .truncate(true)
                     .open(&output_path)
-                    .map_err(sevenz_rust::Error::io)?;
-                let written = io::copy(reader, &mut output).map_err(sevenz_rust::Error::io)?;
-                output.flush().map_err(sevenz_rust::Error::io)?;
+                    .map_err(|error| sevenz_rust::Error::Io(error, "".into()))?;
+                let written = io::copy(reader, &mut output)
+                    .map_err(|error| sevenz_rust::Error::Io(error, "".into()))?;
+                output
+                    .flush()
+                    .map_err(|error| sevenz_rust::Error::Io(error, "".into()))?;
                 total_bytes = total_bytes.saturating_add(written);
             }
             Ok(true)
@@ -1778,10 +1791,9 @@ fn extract_7z_archive_into(
 /// List contents of a 7Z archive
 pub fn list_7z_contents(archive_path: &Path) -> io::Result<ArchiveInfo> {
     let file = File::open(archive_path)?;
-    let len = file.metadata()?.len();
     let reader = BufReader::new(file);
-    let archive = sevenz_rust::SevenZReader::new(reader, len, sevenz_rust::Password::empty())
-        .map_err(|e| {
+    let archive =
+        sevenz_rust::ArchiveReader::new(reader, sevenz_rust::Password::empty()).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("Failed to open 7z: {:?}", e),
@@ -2262,9 +2274,8 @@ pub fn archive_needs_password(archive_path: &Path) -> io::Result<bool> {
         Some(ArchiveFormat::SevenZ) => {
             // For 7z, try opening without password; if it fails, assume password needed
             let file = File::open(archive_path)?;
-            let len = file.metadata()?.len();
             let reader = BufReader::new(file);
-            match sevenz_rust::SevenZReader::new(reader, len, sevenz_rust::Password::empty()) {
+            match sevenz_rust::ArchiveReader::new(reader, sevenz_rust::Password::empty()) {
                 Ok(_) => Ok(false),
                 Err(_) => Ok(true), // Assume password needed if can't open
             }
@@ -2386,6 +2397,50 @@ mod tests {
         let extracted_file = extract_dir.join("source/secret.txt");
         let content = fs::read_to_string(&extracted_file).unwrap();
         assert_eq!(content, "Top secret");
+    }
+
+    #[test]
+    fn seven_z_round_trip_supports_listing_and_passwords() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("hello.txt"), b"Hello from 7z").unwrap();
+
+        let archive_path = temp.path().join("plain.7z");
+        create_7z_archive(std::slice::from_ref(&source), &archive_path, None).unwrap();
+
+        let info = list_7z_contents(&archive_path).unwrap();
+        assert_eq!(info.format, "7z");
+        assert_eq!(info.entry_count, 1);
+        assert_eq!(info.entries[0].path, "source/hello.txt");
+        assert_eq!(info.entries[0].size, 13);
+
+        let extracted = temp.path().join("plain-extracted");
+        extract_7z_archive(&archive_path, &extracted, None).unwrap();
+        assert_eq!(
+            fs::read(extracted.join("source/hello.txt")).unwrap(),
+            b"Hello from 7z"
+        );
+
+        let protected_path = temp.path().join("protected.7z");
+        create_7z_archive(
+            std::slice::from_ref(&source),
+            &protected_path,
+            Some("password123"),
+        )
+        .unwrap();
+        assert!(archive_needs_password(&protected_path).unwrap());
+
+        let wrong = temp.path().join("wrong-password");
+        assert!(extract_7z_archive(&protected_path, &wrong, Some("wrong")).is_err());
+        assert!(!wrong.exists());
+
+        let protected_extracted = temp.path().join("protected-extracted");
+        extract_7z_archive(&protected_path, &protected_extracted, Some("password123")).unwrap();
+        assert_eq!(
+            fs::read(protected_extracted.join("source/hello.txt")).unwrap(),
+            b"Hello from 7z"
+        );
     }
 
     #[test]
@@ -2607,10 +2662,8 @@ mod tests {
         fs::write(output.join("sentinel.txt"), b"preserved").unwrap();
 
         let file = File::create(&archive_path).unwrap();
-        let mut archive = sevenz_rust::SevenZWriter::new(file).unwrap();
-        let mut entry = sevenz_rust::SevenZArchiveEntry::new();
-        entry.name = "../escape.txt".to_string();
-        entry.has_stream = true;
+        let mut archive = sevenz_rust::ArchiveWriter::new(file).unwrap();
+        let mut entry = sevenz_rust::ArchiveEntry::new_file("../escape.txt");
         entry.size = 7;
         archive
             .push_archive_entry(entry, Some(Cursor::new(b"escaped")))

@@ -5,9 +5,6 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const DEFAULT_TAIL_LINES = 120;
-const PLAYWRIGHT_RELEASE_PORT = '47173';
-const PLAYWRIGHT_RELEASE_BASE_URL = `http://127.0.0.1:${PLAYWRIGHT_RELEASE_PORT}`;
-
 export const DEFAULT_COMMANDS = [
   {
     display: 'pnpm install --frozen-lockfile --ignore-scripts',
@@ -15,24 +12,9 @@ export const DEFAULT_COMMANDS = [
     args: ['install', '--frozen-lockfile', '--ignore-scripts'],
   },
   {
-    display: 'pnpm --filter explorie-desktop prepare:native',
+    display: 'pnpm prepare:native',
     command: 'pnpm',
-    args: ['--filter', 'explorie-desktop', 'prepare:native'],
-  },
-  {
-    display: 'pnpm --filter explorie-desktop exec tsc --noEmit',
-    command: 'pnpm',
-    args: ['--filter', 'explorie-desktop', 'exec', 'tsc', '--noEmit'],
-  },
-  {
-    display: 'pnpm lint:ts',
-    command: 'pnpm',
-    args: ['lint:ts'],
-  },
-  {
-    display: 'pnpm format:check',
-    command: 'pnpm',
-    args: ['format:check'],
+    args: ['prepare:native'],
   },
   {
     display: 'cargo metadata --locked --format-version 1',
@@ -45,14 +27,22 @@ export const DEFAULT_COMMANDS = [
     args: ['fmt', '--all', '--', '--check'],
   },
   {
-    display: 'cargo test --workspace',
+    display: 'cargo test --workspace --no-fail-fast',
     command: 'cargo',
-    args: ['test', '--workspace'],
+    args: ['test', '--workspace', '--no-fail-fast'],
   },
   {
     display: 'cargo clippy --workspace --all-targets --all-features -- -D warnings',
     command: 'cargo',
-    args: ['clippy', '--workspace', '--all-targets', '--all-features', '--', '-D', 'warnings'],
+    args: [
+      'clippy',
+      '--workspace',
+      '--all-targets',
+      '--all-features',
+      '--',
+      '-D',
+      'warnings',
+    ],
   },
   {
     display: 'cargo audit',
@@ -60,39 +50,14 @@ export const DEFAULT_COMMANDS = [
     args: ['audit'],
   },
   {
-    display: 'pnpm --filter explorie-desktop test',
-    command: 'pnpm',
-    args: ['--filter', 'explorie-desktop', 'test'],
-  },
-  {
     display: 'corepack pnpm@11.13.0 audit --audit-level=moderate',
     command: 'corepack',
     args: ['pnpm@11.13.0', 'audit', '--audit-level=moderate'],
   },
   {
-    display: 'pnpm exec playwright test',
-    command: 'pnpm',
-    args: ['exec', 'playwright', 'test'],
-    env: {
-      CI: '1',
-      PLAYWRIGHT_BASE_URL: PLAYWRIGHT_RELEASE_BASE_URL,
-      PLAYWRIGHT_WEB_COMMAND: `pnpm --filter explorie-desktop exec vite --host 127.0.0.1 --port ${PLAYWRIGHT_RELEASE_PORT} --strictPort`,
-    },
-  },
-  {
-    display: 'pnpm --filter explorie-desktop exec -- tauri build --no-bundle -- --locked',
-    command: 'pnpm',
-    args: [
-      '--filter',
-      'explorie-desktop',
-      'exec',
-      '--',
-      'tauri',
-      'build',
-      '--no-bundle',
-      '--',
-      '--locked',
-    ],
+    display: 'cargo build -p explorie-gpui --release --locked',
+    command: 'cargo',
+    args: ['build', '-p', 'explorie-gpui', '--release', '--locked'],
   },
   {
     display: 'git diff --check',
@@ -114,10 +79,10 @@ export function tailText(value, maxLines = DEFAULT_TAIL_LINES) {
 
 export function getExpectedArtifacts(platform = process.platform) {
   if (platform === 'win32') {
-    return ['target/release/explorie-desktop.exe'];
+    return ['target/release/explorie-gpui.exe'];
   }
 
-  return ['target/release/explorie-desktop'];
+  return ['target/release/explorie-gpui'];
 }
 
 export function validateReleaseContext(context, { tag = null } = {}) {
@@ -132,8 +97,7 @@ export function validateReleaseContext(context, { tag = null } = {}) {
 
   const versions = [
     ['package.json', context.rootPackageVersion],
-    ['apps/desktop/frontend/package.json', context.desktopPackageVersion],
-    ['apps/desktop/frontend/src-tauri/Cargo.toml', context.tauriPackageVersion],
+    ['apps/desktop/gpui/Cargo.toml', context.gpuiPackageVersion],
   ];
   for (const [source, version] of versions) {
     if (!version) errors.push(`Version is missing from ${source}.`);
@@ -205,25 +169,13 @@ async function readJsonVersion(rootDir, relativePath) {
   }
 }
 
-async function readTauriPackageVersion(rootDir) {
-  const candidates = [
-    'apps/desktop/frontend/src-tauri/Cargo.toml',
-    'apps/desktop/src-tauri/Cargo.toml',
-  ];
-
-  for (const relativePath of candidates) {
-    try {
-      const content = await readFile(path.join(rootDir, relativePath), 'utf8');
-      const match = content.match(/^\s*version\s*=\s*"([^"]+)"/m);
-      if (match) {
-        return match[1];
-      }
-    } catch {
-      // Try the next known Tauri layout.
-    }
+async function readCargoPackageVersion(rootDir, relativePath) {
+  try {
+    const content = await readFile(path.join(rootDir, relativePath), 'utf8');
+    return content.match(/^\s*version\s*=\s*"([^"]+)"/m)?.[1] ?? null;
+  } catch {
+    return null;
   }
-
-  return null;
 }
 
 function spawnText(command, args, { cwd, env, timeoutMs = 10_000 } = {}) {
@@ -284,17 +236,13 @@ async function getGitDirty(rootDir) {
 }
 
 async function getToolVersions(rootDir) {
-  const [pnpm, rustc, cargo, tauri] = await Promise.all([
+  const [pnpm, rustc, cargo] = await Promise.all([
     spawnText('pnpm', ['--version'], { cwd: rootDir, env: process.env }),
     spawnText('rustc', ['--version'], { cwd: rootDir, env: process.env }),
     spawnText('cargo', ['--version'], { cwd: rootDir, env: process.env }),
-    spawnText('pnpm', ['--filter', 'explorie-desktop', 'exec', 'tauri', '--version'], {
-      cwd: rootDir,
-      env: process.env,
-    }),
   ]);
 
-  return { pnpm, rustc, cargo, tauri };
+  return { pnpm, rustc, cargo };
 }
 
 export async function collectReleaseContext({
@@ -309,15 +257,13 @@ export async function collectReleaseContext({
 
   const [
     rootPackageVersion,
-    desktopPackageVersion,
-    tauriPackageVersion,
+    gpuiPackageVersion,
     branch,
     shortCommit,
     toolVersions,
   ] = await Promise.all([
     readJsonVersion(rootDir, 'package.json'),
-    readJsonVersion(rootDir, 'apps/desktop/frontend/package.json'),
-    readTauriPackageVersion(rootDir),
+    readCargoPackageVersion(rootDir, 'apps/desktop/gpui/Cargo.toml'),
     getGitText(rootDir, ['rev-parse', '--abbrev-ref', 'HEAD']),
     getGitText(rootDir, ['rev-parse', '--short', 'HEAD']),
     getToolVersions(rootDir),
@@ -327,8 +273,7 @@ export async function collectReleaseContext({
     generatedAt: generatedAtIso,
     releaseTag: process.env.RELEASE_TAG || null,
     rootPackageVersion,
-    desktopPackageVersion,
-    tauriPackageVersion,
+    gpuiPackageVersion,
     branch,
     shortCommit,
     dirtyBefore: currentDirty,
@@ -432,8 +377,7 @@ export function renderMarkdownReport(report) {
     `- Dirty before: ${formatBoolean(report.context.dirtyBefore)}`,
     `- Dirty after: ${formatBoolean(report.context.dirtyAfter)}`,
     `- Root package version: ${report.context.rootPackageVersion ?? 'unknown'}`,
-    `- Desktop package version: ${report.context.desktopPackageVersion ?? 'unknown'}`,
-    `- Tauri package version: ${report.context.tauriPackageVersion ?? 'unknown'}`,
+    `- GPUI package version: ${report.context.gpuiPackageVersion ?? 'unknown'}`,
     `- Platform: ${report.context.os}/${report.context.arch}`,
     `- Node: ${report.context.nodeVersion}`,
     `- CPU count: ${report.context.cpuCount}`,
@@ -443,7 +387,6 @@ export function renderMarkdownReport(report) {
     `- pnpm: ${formatToolVersion(report.context.toolVersions?.pnpm)}`,
     `- rustc: ${formatToolVersion(report.context.toolVersions?.rustc)}`,
     `- cargo: ${formatToolVersion(report.context.toolVersions?.cargo)}`,
-    `- Tauri CLI: ${formatToolVersion(report.context.toolVersions?.tauri)}`,
     '',
     '## Expected Artifacts',
     '',
