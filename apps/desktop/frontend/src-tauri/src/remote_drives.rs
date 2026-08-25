@@ -8,7 +8,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter, Manager, Runtime};
 use uuid::Uuid;
 
 #[cfg(windows)]
@@ -368,9 +368,9 @@ impl RemoteDriveManager {
         Ok(connected_status(&profile.id, &mount_path))
     }
 
-    pub fn disconnect(
+    pub fn disconnect<R: Runtime>(
         &self,
-        app: &AppHandle,
+        app: &AppHandle<R>,
         id: &str,
         force: bool,
     ) -> Result<DisconnectResult, String> {
@@ -460,7 +460,7 @@ impl RemoteDriveManager {
         })
     }
 
-    pub fn disconnect_all(&self, app: &AppHandle) {
+    pub fn disconnect_all<R: Runtime>(&self, app: &AppHandle<R>) {
         let ids: Vec<String> = self
             .mounts
             .lock()
@@ -473,7 +473,7 @@ impl RemoteDriveManager {
         }
     }
 
-    pub fn disconnect_all_if_clean(&self, app: &AppHandle) -> bool {
+    pub fn disconnect_all_if_clean<R: Runtime>(&self, app: &AppHandle<R>) -> bool {
         let ids: Vec<String> = self
             .mounts
             .lock()
@@ -972,7 +972,7 @@ fn wait_or_kill(child: &mut Child) {
     let _ = child.wait();
 }
 
-fn emit_status(app: &AppHandle, status: RemoteDriveStatus) {
+fn emit_status<R: Runtime>(app: &AppHandle<R>, status: RemoteDriveStatus) {
     let _ = app.emit("remote-drive-status", status);
 }
 

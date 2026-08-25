@@ -24,7 +24,7 @@
     "release:check": "node scripts/release-check.mjs",
     "release:check:test": "node --test scripts/release-check.test.mjs",
     "test": "cargo test --workspace && pnpm exec playwright test",
-    "test:rust": "cargo test --workspace",
+    "test:rust": "node scripts/test-rust.mjs",
     "test:unit": "pnpm --filter explorie-desktop test",
     "format": "cargo fmt --all",
     "format:ts": "prettier --write \"apps/desktop/frontend/src/**/*.{ts,tsx,css}\"",

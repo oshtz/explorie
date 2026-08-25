@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -68,16 +68,16 @@ impl ActiveMutations {
     }
 }
 
-struct ActiveMutation(AppHandle);
+struct ActiveMutation<R: Runtime>(AppHandle<R>);
 
-impl ActiveMutation {
-    fn begin(app: &AppHandle) -> Self {
+impl<R: Runtime> ActiveMutation<R> {
+    fn begin(app: &AppHandle<R>) -> Self {
         app.state::<ActiveMutations>().begin();
         Self(app.clone())
     }
 }
 
-impl Drop for ActiveMutation {
+impl<R: Runtime> Drop for ActiveMutation<R> {
     fn drop(&mut self) {
         if self.0.state::<ActiveMutations>().finish()
             && self
@@ -271,7 +271,7 @@ fn set_system_integration(enabled: bool) -> Result<SystemIntegrationStatus, Stri
     }
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn list_files(
     path: String,
     calc_dir_size: Option<bool>,
@@ -545,13 +545,12 @@ async fn get_dir_info(path: String) -> Result<DirInfo, String> {
     .map_err(|e| e.to_string())?
 }
 
-fn emit_file_operation(app: &AppHandle, event: FileOperationEvent) {
+fn emit_file_operation<R: Runtime>(app: &AppHandle<R>, event: FileOperationEvent) {
     let _ = app.emit("file-operation", event);
 }
 
-#[tauri::command]
-fn start_file_operation(
-    app: AppHandle,
+fn start_file_operation_impl<R: Runtime>(
+    app: AppHandle<R>,
     jobs: tauri::State<'_, FileOperationJobs>,
     remote_drives: tauri::State<'_, RemoteDriveManager>,
     request: explorie_core::FileOperationRequest,
@@ -640,6 +639,16 @@ fn start_file_operation(
     });
 
     Ok(job_id)
+}
+
+#[tauri::command]
+fn start_file_operation<R: Runtime>(
+    app: AppHandle<R>,
+    jobs: tauri::State<'_, FileOperationJobs>,
+    remote_drives: tauri::State<'_, RemoteDriveManager>,
+    request: explorie_core::FileOperationRequest,
+) -> Result<String, String> {
+    start_file_operation_impl(app, jobs, remote_drives, request)
 }
 
 #[tauri::command]
@@ -1989,9 +1998,8 @@ struct ExtractResult {
     total_bytes: u64,
 }
 
-#[tauri::command]
-async fn compress_files(
-    window: tauri::Window,
+async fn compress_files_impl<R: Runtime>(
+    window: tauri::Window<R>,
     paths: Vec<String>,
     output_path: String,
     format: String,
@@ -2054,8 +2062,27 @@ async fn compress_files(
 }
 
 #[tauri::command]
-async fn extract_archive_cmd(
-    app: AppHandle,
+async fn compress_files<R: Runtime>(
+    window: tauri::Window<R>,
+    paths: Vec<String>,
+    output_path: String,
+    format: String,
+    compression_level: String,
+    operation_id: String,
+) -> Result<CompressResult, String> {
+    compress_files_impl(
+        window,
+        paths,
+        output_path,
+        format,
+        compression_level,
+        operation_id,
+    )
+    .await
+}
+
+async fn extract_archive_cmd_impl<R: Runtime>(
+    app: AppHandle<R>,
     archive_path: String,
     output_dir: String,
 ) -> Result<ExtractResult, String> {
@@ -2074,6 +2101,15 @@ async fn extract_archive_cmd(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn extract_archive_cmd<R: Runtime>(
+    app: AppHandle<R>,
+    archive_path: String,
+    output_dir: String,
+) -> Result<ExtractResult, String> {
+    extract_archive_cmd_impl(app, archive_path, output_dir).await
 }
 
 #[tauri::command]
@@ -2195,6 +2231,14 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{Value, json};
+    use std::time::{Duration, Instant};
+    use tauri::ipc::{CallbackFn, InvokeBody};
+    use tauri::test::{
+        INVOKE_KEY, MockRuntime, get_ipc_response, mock_builder, mock_context, noop_assets,
+    };
+    use tauri::webview::InvokeRequest;
+    use tauri::{WebviewWindow, WebviewWindowBuilder};
 
     struct TestDir(PathBuf);
 
@@ -2215,6 +2259,207 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    fn ipc_request(command: &str, args: Value) -> InvokeRequest {
+        InvokeRequest {
+            cmd: command.to_string(),
+            callback: CallbackFn(0),
+            error: CallbackFn(1),
+            url: if cfg!(any(windows, target_os = "android")) {
+                "http://tauri.localhost"
+            } else {
+                "tauri://localhost"
+            }
+            .parse()
+            .unwrap(),
+            body: InvokeBody::Json(args),
+            headers: Default::default(),
+            invoke_key: INVOKE_KEY.to_string(),
+        }
+    }
+
+    fn invoke_ipc(
+        window: &WebviewWindow<MockRuntime>,
+        command: &str,
+        args: Value,
+    ) -> Result<Value, Value> {
+        get_ipc_response(window, ipc_request(command, args))
+            .map(|body| body.deserialize::<Value>().expect("IPC response is JSON"))
+    }
+
+    // Register the production command functions so argument names and serde payloads stay covered.
+    fn with_ipc_window<T>(test: impl FnOnce(&WebviewWindow<MockRuntime>) -> T) -> T {
+        let app = mock_builder()
+            .manage(FileOperationJobs::default())
+            .manage(ActiveMutations::default())
+            .manage(RemoteDriveManager::default())
+            .invoke_handler(tauri::generate_handler![
+                list_files,
+                start_file_operation,
+                compress_files,
+                extract_archive_cmd,
+                list_archive,
+                check_is_archive,
+            ])
+            .build(mock_context(noop_assets()))
+            .expect("build Tauri test app");
+        let window = WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .expect("build Tauri test window");
+        test(&window)
+    }
+
+    fn wait_for(mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !condition() {
+            assert!(
+                Instant::now() < deadline,
+                "native file operation did not finish before the timeout"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn real_tauri_ipc_boundary_covers_filesystem_operations_and_payloads() {
+        let temp = TestDir::new();
+        let source_dir = temp.0.join("source");
+        let destination_dir = temp.0.join("destination");
+        fs::create_dir(&source_dir).unwrap();
+        fs::create_dir(&destination_dir).unwrap();
+
+        let source = source_dir.join("note.txt");
+        fs::write(&source, b"native boundary").unwrap();
+
+        with_ipc_window(|window| {
+            let list_response = invoke_ipc(
+                window,
+                "list_files",
+                json!({
+                    "path": source_dir,
+                    "calc_dir_size": false,
+                }),
+            )
+            .expect("list_files IPC call");
+            let entries: Vec<explorie_core::FileEntry> =
+                serde_json::from_value(list_response).expect("deserialize list_files payload");
+            let entry = entries
+                .iter()
+                .find(|entry| entry.path == source)
+                .expect("list_files returned the temporary file");
+            let payload = serde_json::to_value(entry).expect("serialize FileEntry payload");
+            for field in [
+                "id",
+                "path",
+                "size",
+                "modified",
+                "hidden",
+                "is_dir",
+                "custom",
+                "is_symlink",
+                "is_junction",
+                "has_xattrs",
+            ] {
+                assert!(
+                    payload.get(field).is_some(),
+                    "FileEntry payload is missing field {field}"
+                );
+            }
+            assert_eq!(payload["path"], json!(source));
+            let mut optional_payload_entry = entry.clone();
+            optional_payload_entry.is_symlink = true;
+            optional_payload_entry.link_target = Some("native-target".to_string());
+            let optional_payload = serde_json::to_value(optional_payload_entry)
+                .expect("serialize optional FileEntry fields");
+            assert_eq!(optional_payload["link_target"], "native-target");
+            let round_trip: explorie_core::FileEntry =
+                serde_json::from_value(payload).expect("round-trip FileEntry payload");
+            assert_eq!(round_trip.path, entry.path);
+            assert_eq!(round_trip.size, entry.size);
+            assert_eq!(round_trip.is_dir, entry.is_dir);
+
+            let job_id = invoke_ipc(
+                window,
+                "start_file_operation",
+                json!({
+                    "request": {
+                        "kind": "copy",
+                        "sources": [source],
+                        "destination": destination_dir,
+                        "conflictPolicy": "error",
+                    },
+                }),
+            )
+            .expect("start_file_operation copy IPC call");
+            assert!(job_id.as_str().is_some_and(|id| !id.is_empty()));
+            let copied = destination_dir.join("note.txt");
+            wait_for(|| copied.is_file());
+            assert_eq!(fs::read(&copied).unwrap(), b"native boundary");
+
+            let trash_source = temp.0.join("trash-me.txt");
+            fs::write(&trash_source, b"disposable").unwrap();
+            let trash_job = invoke_ipc(
+                window,
+                "start_file_operation",
+                json!({
+                    "request": {
+                        "kind": "trash",
+                        "sources": [trash_source],
+                        "destination": null,
+                        "conflictPolicy": "error",
+                    },
+                }),
+            )
+            .expect("start_file_operation trash IPC call");
+            assert!(trash_job.as_str().is_some_and(|id| !id.is_empty()));
+            wait_for(|| !trash_source.exists());
+
+            let archive_path = temp.0.join("bundle.zip");
+            let compress_response = invoke_ipc(
+                window,
+                "compress_files",
+                json!({
+                    "paths": [copied],
+                    "outputPath": archive_path,
+                    "format": "zip",
+                    "compressionLevel": "normal",
+                    "operationId": "ipc-boundary-test",
+                }),
+            )
+            .expect("compress_files IPC call");
+            assert_eq!(compress_response["output_path"], json!(archive_path));
+            assert!(archive_path.is_file());
+
+            let archive_info = invoke_ipc(
+                window,
+                "list_archive",
+                json!({ "archivePath": archive_path }),
+            )
+            .expect("list_archive IPC call");
+            assert!(
+                archive_info["entries"]
+                    .as_array()
+                    .is_some_and(|entries| !entries.is_empty()),
+                "list_archive returned no entries"
+            );
+
+            let extract_dir = temp.0.join("extracted");
+            let extract_response = invoke_ipc(
+                window,
+                "extract_archive_cmd",
+                json!({
+                    "archivePath": archive_path,
+                    "outputDir": extract_dir,
+                }),
+            )
+            .expect("extract_archive_cmd IPC call");
+            assert_eq!(extract_response["output_dir"], json!(extract_dir));
+            assert_eq!(
+                fs::read(extract_dir.join("note.txt")).unwrap(),
+                b"native boundary"
+            );
+        });
     }
 
     #[test]

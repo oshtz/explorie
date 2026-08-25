@@ -88,12 +88,9 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
-      - name: Prepare native dependencies
-        run: |
-          node scripts/prepare-rclone.mjs
-          node scripts/prepare-winfsp.mjs
-
       - name: Run tests with coverage
+        env:
+          TAURI_CONFIG: '{"bundle":{"externalBin":[],"resources":null}}'
         run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
 
       - name: Upload coverage report
@@ -114,7 +111,7 @@ jobs:
           fi
 
   test-rust-macos:
-    name: macOS Core Tests & Tauri Build
+    name: macOS Rust Tests & Tauri Build
     runs-on: macos-latest
 
     steps:
@@ -142,8 +139,8 @@ jobs:
         with:
           workspaces: './ -> target'
 
-      - name: Test native file operations on macOS
-        run: cargo test -p explorie-core
+      - name: Test real Tauri IPC boundary on macOS
+        run: pnpm test:rust
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
