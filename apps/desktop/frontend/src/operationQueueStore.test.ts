@@ -50,6 +50,60 @@ describe('operation queue store', () => {
     });
   });
 
+  it('holds a multi-file operation as one aggregate entry', () => {
+    const items = Array.from({ length: 10 }, (_, index) => ({
+      sourcePath: `/source/item-${index}.txt`,
+      size: 100,
+      name: `item-${index}.txt`,
+      isDir: false,
+    }));
+    useOperationQueueStore.getState().trackOperation({
+      ...trackedOperation,
+      items,
+      totalBytes: 1000,
+      totalItems: 10,
+    });
+    useOperationQueueStore.getState().updateProgress('job-1', {
+      processedBytes: 400,
+      processedItems: 4,
+      currentItem: '/source/item-3.txt',
+    });
+
+    const operations = useOperationQueueStore.getState().operations;
+    expect(operations).toHaveLength(1);
+    expect(operations[0]).toMatchObject({
+      id: 'job-1',
+      status: 'running',
+      totalItems: 10,
+      totalBytes: 1000,
+      processedItems: 4,
+      processedBytes: 400,
+    });
+    expect(useOperationQueueStore.getState().getRunningOperations()).toHaveLength(1);
+  });
+
+  it('retains the aggregate counts reached before a cancellation', () => {
+    useOperationQueueStore
+      .getState()
+      .trackOperation({ ...trackedOperation, totalBytes: 1000, totalItems: 10 });
+    useOperationQueueStore
+      .getState()
+      .updateProgress('job-1', { processedBytes: 400, processedItems: 4 });
+    useOperationQueueStore.getState().finishOperation('job-1', 'cancelled');
+
+    const [operation] = useOperationQueueStore.getState().operations;
+    expect(operation).toMatchObject({
+      status: 'cancelled',
+      processedItems: 4,
+      totalItems: 10,
+      error: undefined,
+    });
+    expect(operation.completedAt).toBeGreaterThan(0);
+    expect(useOperationQueueStore.getState().hasActiveOperations()).toBe(false);
+    useOperationQueueStore.getState().clearCompleted();
+    expect(useOperationQueueStore.getState().operations).toEqual([]);
+  });
+
   it('delegates cancellation to the native job', async () => {
     invoke.mockResolvedValue(true);
     useOperationQueueStore.getState().trackOperation(trackedOperation);

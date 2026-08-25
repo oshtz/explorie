@@ -91,7 +91,6 @@ describe('native-backed file operations', () => {
       expect.objectContaining({ type: 'delete' })
     );
     expect(mocks.deletePath).not.toHaveBeenCalled();
-    expect(refresh).not.toHaveBeenCalled();
     expect(showToast).toHaveBeenCalledWith(expect.stringContaining('Trash unavailable'), {
       type: 'error',
     });
@@ -106,16 +105,44 @@ describe('native-backed file operations', () => {
     expect(mocks.runNativeFileOperation).not.toHaveBeenCalled();
   });
 
-  it('fails closed before starting a non-atomic multi-item Trash request', async () => {
+  it('sends one aggregate Trash job for a multi-item delete', async () => {
+    const files = Array.from({ length: 10 }, (_, index) => file(`/source/item-${index}.txt`));
+
+    await expect(deleteWithUndo(files, showToast, refresh)).resolves.toBe(true);
+
+    expect(mocks.runNativeFileOperation).toHaveBeenCalledTimes(1);
+    expect(mocks.runNativeFileOperation).toHaveBeenCalledWith(
+      {
+        kind: 'trash',
+        sources: files.map((entry) => entry.path),
+        destination: null,
+        conflictPolicy: 'error',
+      },
+      expect.objectContaining({
+        type: 'delete',
+        items: files.map((entry) => ({
+          sourcePath: entry.path,
+          size: 128,
+          name: entry.name,
+          isDir: false,
+        })),
+      })
+    );
+    expect(mocks.deletePath).not.toHaveBeenCalled();
+    expect(showToast).toHaveBeenCalledWith('Moved 10 items to Trash', { type: 'success' });
+  });
+
+  it('reports a cancelled multi-item delete as cancelled and refreshes the view', async () => {
+    const abort = new Error('File operation cancelled');
+    abort.name = 'AbortError';
+    mocks.runNativeFileOperation.mockRejectedValueOnce(abort);
+
     await expect(
       deleteWithUndo([file('/source/one.txt'), file('/source/two.txt')], showToast, refresh)
     ).resolves.toBe(false);
 
-    expect(mocks.runNativeFileOperation).not.toHaveBeenCalled();
-    expect(mocks.deletePath).not.toHaveBeenCalled();
-    expect(showToast).toHaveBeenCalledWith(expect.stringContaining('one item at a time'), {
-      type: 'warning',
-    });
+    expect(showToast).toHaveBeenCalledWith('Delete cancelled', { type: 'warning' });
+    expect(refresh).toHaveBeenCalledTimes(1);
   });
 
   it('routes Replace through the transactional native copy policy', async () => {
@@ -206,6 +233,84 @@ describe('native-backed file operations', () => {
     ).resolves.toBe(false);
 
     expect(mocks.runNativeFileOperation).toHaveBeenCalledTimes(1);
+    expect(mocks.runNativeFileOperation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: 'copy',
+        sources: ['/source/one.txt', '/source/two.txt'],
+      }),
+      expect.objectContaining({
+        items: expect.arrayContaining([expect.anything(), expect.anything()]),
+      })
+    );
     expect(showToast).toHaveBeenCalledWith('Copy cancelled', { type: 'warning' });
+  });
+
+  it('uses one native job and one presentation operation for a multi-item copy', async () => {
+    mocks.runNativeFileOperation.mockResolvedValueOnce({
+      processedEntries: 2,
+      processedBytes: 256,
+      targets: ['/destination/one.txt', '/destination/two.txt'],
+    });
+
+    await expect(
+      copyWithUndoAndConflictResolution(
+        [file('/source/one.txt'), file('/source/two.txt')],
+        '/destination',
+        showToast,
+        refresh
+      )
+    ).resolves.toBe(true);
+
+    expect(mocks.runNativeFileOperation).toHaveBeenCalledTimes(1);
+    expect(mocks.runNativeFileOperation).toHaveBeenCalledWith(
+      {
+        kind: 'copy',
+        sources: ['/source/one.txt', '/source/two.txt'],
+        destination: '/destination',
+        conflictPolicy: 'error',
+      },
+      expect.objectContaining({
+        type: 'copy',
+        items: expect.arrayContaining([
+          expect.objectContaining({ sourcePath: '/source/one.txt' }),
+          expect.objectContaining({ sourcePath: '/source/two.txt' }),
+        ]),
+      })
+    );
+    expect(useUndoRedoStore.getState().undoStack).toHaveLength(1);
+  });
+
+  it('preflights duplicate source names as Keep Both conflicts in one copy job', async () => {
+    const first = file('/source-a/report.txt');
+    const second = file('/source-b/report.txt');
+    mocks.runNativeFileOperation.mockResolvedValueOnce({
+      processedEntries: 2,
+      processedBytes: 256,
+      targets: ['/destination/report.txt', '/destination/report (1).txt'],
+    });
+
+    await expect(
+      copyWithUndoAndConflictResolution([first, second], '/destination', showToast, refresh, {
+        conflictResolution: 'keepBoth',
+      })
+    ).resolves.toBe(true);
+
+    expect(mocks.checkForConflict).toHaveBeenCalledTimes(1);
+    expect(mocks.runNativeFileOperation).toHaveBeenCalledWith(
+      {
+        kind: 'copy',
+        sources: [first.path, second.path],
+        destination: '/destination',
+        conflictPolicy: 'error',
+        conflictPolicies: ['error', 'rename'],
+      },
+      expect.objectContaining({
+        type: 'copy',
+        items: expect.arrayContaining([
+          expect.objectContaining({ sourcePath: first.path }),
+          expect.objectContaining({ sourcePath: second.path }),
+        ]),
+      })
+    );
   });
 });

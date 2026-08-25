@@ -555,6 +555,7 @@ fn start_file_operation(
     jobs: tauri::State<'_, FileOperationJobs>,
     remote_drives: tauri::State<'_, RemoteDriveManager>,
     request: explorie_core::FileOperationRequest,
+    conflict_policies: Option<Vec<explorie_core::ConflictPolicy>>,
 ) -> Result<String, String> {
     if request
         .sources
@@ -581,18 +582,23 @@ fn start_file_operation(
         let progress_app = task_app.clone();
         let progress_job_id = task_job_id.clone();
         let operation = tauri::async_runtime::spawn_blocking(move || {
-            explorie_core::perform_file_operation(request, &cancelled, |progress| {
-                emit_file_operation(
-                    &progress_app,
-                    FileOperationEvent {
-                        job_id: progress_job_id.clone(),
-                        state: "running",
-                        progress: Some(progress),
-                        result: None,
-                        error: None,
-                    },
-                );
-            })
+            explorie_core::perform_file_operation_with_policies(
+                request,
+                conflict_policies,
+                &cancelled,
+                |progress| {
+                    emit_file_operation(
+                        &progress_app,
+                        FileOperationEvent {
+                            job_id: progress_job_id.clone(),
+                            state: "running",
+                            progress: Some(progress),
+                            result: None,
+                            error: None,
+                        },
+                    );
+                },
+            )
         })
         .await;
 

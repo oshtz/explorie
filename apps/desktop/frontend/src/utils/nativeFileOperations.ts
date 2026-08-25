@@ -10,6 +10,7 @@ export interface NativeFileOperationRequest {
   sources: string[];
   destination: string | null;
   conflictPolicy: NativeConflictPolicy;
+  conflictPolicies?: NativeConflictPolicy[];
 }
 
 export interface NativeFileOperationResult {
@@ -96,7 +97,11 @@ export async function runNativeFileOperation(
   });
 
   try {
-    jobId = await invoke<string>('start_file_operation', { request });
+    const { conflictPolicies, ...nativeRequest } = request;
+    jobId = await invoke<string>('start_file_operation', {
+      request: nativeRequest,
+      ...(conflictPolicies ? { conflictPolicies } : {}),
+    });
     useOperationQueueStore.getState().trackOperation({
       id: jobId,
       ...presentation,

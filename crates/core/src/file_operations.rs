@@ -99,22 +99,32 @@ impl<F: FnMut(FileOperationProgress)> ProgressTracker<'_, F> {
         self.progress.processed_entries = self.progress.processed_entries.saturating_add(1);
         self.emit(Some(path.to_path_buf()));
     }
+}
 
-    fn completed_plan(&mut self, plan: &SourcePlan) {
-        self.progress.processed_entries = self
-            .progress
-            .processed_entries
-            .saturating_add(plan.entries.len() as u64);
-        self.progress.processed_bytes = self
-            .progress
-            .processed_bytes
-            .saturating_add(plan.total_bytes);
-        self.emit(Some(plan.source.clone()));
-    }
+struct CommittedTarget {
+    target: PathBuf,
+    backup: Option<PathBuf>,
+}
+
+struct TrashItem {
+    source: PathBuf,
+    /// Resolved for overlap comparison only; the source itself is never followed.
+    canonical: PathBuf,
+    entries: u64,
+    bytes: u64,
 }
 
 pub fn perform_file_operation(
     request: FileOperationRequest,
+    cancelled: &AtomicBool,
+    on_progress: impl FnMut(FileOperationProgress),
+) -> io::Result<FileOperationResult> {
+    perform_file_operation_with_policies(request, None, cancelled, on_progress)
+}
+
+pub fn perform_file_operation_with_policies(
+    request: FileOperationRequest,
+    conflict_policies: Option<Vec<ConflictPolicy>>,
     cancelled: &AtomicBool,
     mut on_progress: impl FnMut(FileOperationProgress),
 ) -> io::Result<FileOperationResult> {
@@ -129,7 +139,7 @@ pub fn perform_file_operation(
         return trash_sources(request.sources, cancelled, on_progress);
     }
 
-    let destination = request.destination.ok_or_else(|| {
+    let destination = request.destination.clone().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             "copy and move operations require a destination directory",
@@ -147,10 +157,11 @@ pub fn perform_file_operation(
     let plans: Vec<SourcePlan> = request
         .sources
         .iter()
-        .map(|source| plan_source(source))
+        .map(|source| plan_source(source, cancelled))
         .collect::<io::Result<_>>()?;
     validate_sources(&plans, &destination_canonical)?;
 
+    let policies = operation_policies(&request, conflict_policies, plans.len())?;
     let total_entries = plans.iter().map(|plan| plan.entries.len() as u64).sum();
     let total_bytes = plans.iter().map(|plan| plan.total_bytes).sum();
     let mut tracker = ProgressTracker {
@@ -166,7 +177,7 @@ pub fn perform_file_operation(
     tracker.emit(None);
 
     let mut targets = Vec::with_capacity(plans.len());
-    for plan in &plans {
+    for (index, plan) in plans.iter().enumerate() {
         check_cancelled(cancelled)?;
         let file_name = plan.source.file_name().ok_or_else(|| {
             io::Error::new(
@@ -178,7 +189,7 @@ pub fn perform_file_operation(
             )
         })?;
         let requested_target = destination.join(file_name);
-        let target = resolve_target(&requested_target, request.conflict_policy)?;
+        let target = resolve_target_with_reserved(&requested_target, policies[index], &targets)?;
         if same_path(&plan.canonical, &target)? {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -186,24 +197,69 @@ pub fn perform_file_operation(
             ));
         }
 
-        match request.kind {
-            FileOperationKind::Copy => copy_plan(
-                plan,
-                &target,
-                request.conflict_policy,
-                cancelled,
-                &mut tracker,
-            )?,
-            FileOperationKind::Move => move_plan(
-                plan,
-                &target,
-                request.conflict_policy,
-                cancelled,
-                &mut tracker,
-            )?,
-            FileOperationKind::Trash => unreachable!(),
-        }
         targets.push(target);
+    }
+
+    let mut stages = Vec::with_capacity(plans.len());
+    let mut quarantines = Vec::with_capacity(plans.len());
+    let mut removed_quarantines = Vec::with_capacity(plans.len());
+    let mut committed = Vec::with_capacity(plans.len());
+    let operation = (|| {
+        for (plan, target) in plans.iter().zip(&targets) {
+            check_cancelled(cancelled)?;
+            let stage = temporary_sibling(
+                target,
+                match request.kind {
+                    FileOperationKind::Copy => "copy",
+                    FileOperationKind::Move => "move",
+                    FileOperationKind::Trash => unreachable!(),
+                },
+            );
+            stages.push(stage.clone());
+            copy_to_stage(plan, &stage, cancelled, &mut tracker)?;
+        }
+
+        if request.kind == FileOperationKind::Move {
+            for plan in &plans {
+                check_cancelled(cancelled)?;
+                let quarantine = temporary_sibling(&plan.source, "source");
+                rename_noreplace(&plan.source, &quarantine)?;
+                quarantines.push((plan.source.clone(), quarantine.clone()));
+                let unchanged = snapshot_entries(&quarantine, cancelled)? == plan.entries;
+                if !unchanged {
+                    return Err(io::Error::other("source changed while it was being copied"));
+                }
+            }
+
+            for ((plan, stage), quarantine) in
+                plans.iter().zip(stages.iter()).zip(quarantines.iter())
+            {
+                verify_staged_copy(&quarantine.1, stage, plan, cancelled)?;
+            }
+        }
+
+        for (index, (stage, target)) in stages.iter().zip(&targets).enumerate() {
+            check_cancelled(cancelled)?;
+            committed.push(commit_staged_target(stage, target, policies[index])?);
+        }
+        check_cancelled(cancelled)?;
+
+        if request.kind == FileOperationKind::Move {
+            for (index, (_, quarantine)) in quarantines.iter().enumerate() {
+                check_cancelled(cancelled)?;
+                remove_path(quarantine)?;
+                removed_quarantines.push(index);
+            }
+        }
+
+        cleanup_backups(&committed);
+        Ok::<(), io::Error>(())
+    })();
+
+    if let Err(error) = operation {
+        let rollback =
+            rollback_transaction(&stages, &quarantines, &removed_quarantines, &committed);
+        return Err(with_rollback_error(error, rollback));
     }
 
     tracker.emit(None);
@@ -217,49 +273,110 @@ pub fn perform_file_operation(
 fn trash_sources(
     sources: Vec<PathBuf>,
     cancelled: &AtomicBool,
+    on_progress: impl FnMut(FileOperationProgress),
+) -> io::Result<FileOperationResult> {
+    trash_sources_with(sources, cancelled, on_progress, |path| {
+        trash::delete(path).map_err(|error| io::Error::other(error.to_string()))
+    })
+}
+
+/// Move every source to the operating-system Trash as one job with one shared
+/// byte and entry count.
+///
+/// A Trash move cannot be rolled back through the `trash` crate on every
+/// platform, so the batch buys safety with ordering instead: every source is
+/// measured before any of them is touched, so a bad path fails while the
+/// filesystem is still intact, and each source is handed to the Trash whole.
+/// Cancelling or failing part way therefore leaves earlier items in the Trash,
+/// where the user can restore them, and never leaves an item half-deleted.
+fn trash_sources_with(
+    sources: Vec<PathBuf>,
+    cancelled: &AtomicBool,
     mut on_progress: impl FnMut(FileOperationProgress),
+    mut delete: impl FnMut(&Path) -> io::Result<()>,
 ) -> io::Result<FileOperationResult> {
     check_cancelled(cancelled)?;
-    if sources.len() != 1 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "batch Trash is disabled because operating-system Trash APIs cannot guarantee rollback after a partial failure",
-        ));
+    let mut planned = Vec::with_capacity(sources.len());
+    for source in &sources {
+        check_cancelled(cancelled)?;
+        let metadata = fs::symlink_metadata(source)?;
+        let (entries, bytes) = if is_link_metadata(&metadata) {
+            (1, 0)
+        } else {
+            let plan = plan_source(source, cancelled)?;
+            (plan.entries.len() as u64, plan.total_bytes)
+        };
+        planned.push(TrashItem {
+            source: source.clone(),
+            canonical: sibling_canonical(source)?,
+            entries,
+            bytes,
+        });
     }
-
-    let source = &sources[0];
-    let metadata = fs::symlink_metadata(source)?;
-    let (total_entries, total_bytes) = if is_link_metadata(&metadata) {
-        (1, 0)
-    } else {
-        let plan = plan_source(source)?;
-        (plan.entries.len() as u64, plan.total_bytes)
-    };
+    for (index, item) in planned.iter().enumerate() {
+        for other in planned.iter().skip(index + 1) {
+            if path_starts_with(&item.canonical, &other.canonical)
+                || path_starts_with(&other.canonical, &item.canonical)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "sources must not overlap",
+                ));
+            }
+        }
+    }
 
     let mut progress = FileOperationProgress {
         processed_entries: 0,
-        total_entries,
+        total_entries: planned.iter().map(|item| item.entries).sum(),
         processed_bytes: 0,
-        total_bytes,
+        total_bytes: planned.iter().map(|item| item.bytes).sum(),
         current_path: None,
     };
     on_progress(progress.clone());
-    check_cancelled(cancelled)?;
-    trash::delete(source).map_err(|error| io::Error::other(error.to_string()))?;
-    progress.processed_entries = total_entries;
-    progress.processed_bytes = total_bytes;
-    progress.current_path = Some(source.clone());
-    on_progress(progress.clone());
+
+    for (index, item) in planned.iter().enumerate() {
+        check_cancelled(cancelled).map_err(|error| with_trashed_count(error, index))?;
+        delete(&item.source).map_err(|error| with_trashed_count(error, index))?;
+        progress.processed_entries = progress.processed_entries.saturating_add(item.entries);
+        progress.processed_bytes = progress.processed_bytes.saturating_add(item.bytes);
+        progress.current_path = Some(item.source.clone());
+        on_progress(progress.clone());
+    }
+
     progress.current_path = None;
-    on_progress(progress);
+    on_progress(progress.clone());
     Ok(FileOperationResult {
-        processed_entries: total_entries,
-        processed_bytes: total_bytes,
+        processed_entries: progress.processed_entries,
+        processed_bytes: progress.processed_bytes,
         targets: Vec::new(),
     })
 }
 
-fn plan_source(source: &Path) -> io::Result<SourcePlan> {
+fn with_trashed_count(error: io::Error, trashed: usize) -> io::Error {
+    if trashed == 0 {
+        return error;
+    }
+    io::Error::new(
+        error.kind(),
+        format!("{error}; {trashed} item(s) already moved to Trash and can be restored from it"),
+    )
+}
+
+/// Resolve a path for comparison without following it, so a link is compared as
+/// itself rather than as its target.
+fn sibling_canonical(path: &Path) -> io::Result<PathBuf> {
+    let file_name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("cannot operate on filesystem root {}", path.display()),
+        )
+    })?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    Ok(fs::canonicalize(parent)?.join(file_name))
+}
+
+fn plan_source(source: &Path, cancelled: &AtomicBool) -> io::Result<SourcePlan> {
     let metadata = fs::symlink_metadata(source)?;
     if is_link_metadata(&metadata) {
         return Err(io::Error::new(
@@ -268,7 +385,7 @@ fn plan_source(source: &Path) -> io::Result<SourcePlan> {
         ));
     }
     let canonical = fs::canonicalize(source)?;
-    let entries = snapshot_entries(source)?;
+    let entries = snapshot_entries(source, cancelled)?;
     let total_bytes = entries.iter().map(|entry| entry.len).sum();
     Ok(SourcePlan {
         source: source.to_path_buf(),
@@ -278,7 +395,7 @@ fn plan_source(source: &Path) -> io::Result<SourcePlan> {
     })
 }
 
-fn snapshot_entries(root: &Path) -> io::Result<Vec<PlannedEntry>> {
+fn snapshot_entries(root: &Path, cancelled: &AtomicBool) -> io::Result<Vec<PlannedEntry>> {
     // ponytail: retain one path manifest for safe move verification; stream it
     // only if million-entry directories show measurable memory pressure.
     let mut entries = Vec::new();
@@ -294,6 +411,9 @@ fn snapshot_entries(root: &Path) -> io::Result<Vec<PlannedEntry>> {
         entries.push(planned_entry(PathBuf::new(), &metadata)?);
     } else if metadata.is_dir() {
         for entry in WalkDir::new(root).follow_links(false) {
+            // Planning walks the whole tree before a single byte is copied, so a
+            // cancel arriving during the walk must land here to stay prompt.
+            check_cancelled(cancelled)?;
             let entry = entry.map_err(io::Error::other)?;
             let metadata = entry.path().symlink_metadata()?;
             if is_link_metadata(&metadata) {
@@ -373,14 +493,54 @@ fn validate_sources(plans: &[SourcePlan], destination: &Path) -> io::Result<()> 
     Ok(())
 }
 
-fn resolve_target(target: &Path, policy: ConflictPolicy) -> io::Result<PathBuf> {
-    if !target.try_exists()? {
+fn operation_policies(
+    request: &FileOperationRequest,
+    conflict_policies: Option<Vec<ConflictPolicy>>,
+    source_count: usize,
+) -> io::Result<Vec<ConflictPolicy>> {
+    match conflict_policies {
+        Some(policies) if policies.len() != source_count => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "conflict policy count must match source count",
+        )),
+        Some(policies) => Ok(policies),
+        None => Ok(vec![request.conflict_policy; source_count]),
+    }
+}
+
+fn resolve_target_with_reserved(
+    target: &Path,
+    policy: ConflictPolicy,
+    reserved: &[PathBuf],
+) -> io::Result<PathBuf> {
+    let reserved_target = reserved.iter().any(|other| paths_equal(target, other));
+    let occupied = |candidate: &Path| {
+        candidate
+            .try_exists()
+            .map(|exists| exists || reserved.iter().any(|other| paths_equal(candidate, other)))
+    };
+
+    if !occupied(target)? {
         return Ok(target.to_path_buf());
     }
     match policy {
         ConflictPolicy::Error => Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
-            format!("destination already exists: {}", target.display()),
+            if reserved_target {
+                format!(
+                    "multiple sources resolve to destination {}",
+                    target.display()
+                )
+            } else {
+                format!("destination already exists: {}", target.display())
+            },
+        )),
+        ConflictPolicy::Replace if reserved_target => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "multiple sources cannot replace destination {}",
+                target.display()
+            ),
         )),
         ConflictPolicy::Replace => Ok(target.to_path_buf()),
         ConflictPolicy::Rename => {
@@ -399,7 +559,7 @@ fn resolve_target(target: &Path, policy: ConflictPolicy) -> io::Result<PathBuf> 
                     name.push(extension);
                 }
                 let candidate = target.with_file_name(name);
-                if !candidate.try_exists()? {
+                if !occupied(&candidate)? {
                     return Ok(candidate);
                 }
             }
@@ -408,91 +568,157 @@ fn resolve_target(target: &Path, policy: ConflictPolicy) -> io::Result<PathBuf> 
     }
 }
 
-fn copy_plan<F: FnMut(FileOperationProgress)>(
-    plan: &SourcePlan,
+fn commit_staged_target(
+    stage: &Path,
     target: &Path,
     policy: ConflictPolicy,
-    cancelled: &AtomicBool,
-    tracker: &mut ProgressTracker<'_, F>,
-) -> io::Result<()> {
-    let stage = temporary_sibling(target, "copy");
-    let result = (|| {
-        copy_to_stage(plan, &stage, cancelled, tracker)?;
-        check_cancelled(cancelled)?;
-        commit_stage(&stage, target, policy)
-    })();
-    if result.is_err() {
-        let _ = remove_path(&stage);
+) -> io::Result<CommittedTarget> {
+    if policy != ConflictPolicy::Replace || !target.try_exists()? {
+        rename_noreplace(stage, target)?;
+        return Ok(CommittedTarget {
+            target: target.to_path_buf(),
+            backup: None,
+        });
     }
-    result
+
+    let backup = temporary_sibling(target, "backup");
+    rename_noreplace(target, &backup)?;
+    if let Err(error) = rename_noreplace(stage, target) {
+        return match rename_noreplace(&backup, target) {
+            Ok(()) => Err(error),
+            Err(restore_error) => Err(io::Error::new(
+                restore_error.kind(),
+                format!(
+                    "{error}; destination recovery also failed, backup remains at {}: {restore_error}",
+                    backup.display()
+                ),
+            )),
+        };
+    }
+    Ok(CommittedTarget {
+        target: target.to_path_buf(),
+        backup: Some(backup),
+    })
 }
 
-fn move_plan<F: FnMut(FileOperationProgress)>(
-    plan: &SourcePlan,
-    target: &Path,
-    policy: ConflictPolicy,
-    cancelled: &AtomicBool,
-    tracker: &mut ProgressTracker<'_, F>,
-) -> io::Result<()> {
-    check_cancelled(cancelled)?;
-    if policy != ConflictPolicy::Replace {
-        match rename_noreplace(&plan.source, target) {
-            Ok(()) => {
-                tracker.completed_plan(plan);
-                return Ok(());
-            }
-            Err(error) if error.kind() == io::ErrorKind::CrossesDevices => {}
-            Err(error) => return Err(error),
-        }
-    }
+#[cfg(test)]
+fn commit_stage(stage: &Path, target: &Path, policy: ConflictPolicy) -> io::Result<()> {
+    let committed = commit_staged_target(stage, target, policy)?;
+    cleanup_backups(std::slice::from_ref(&committed));
+    Ok(())
+}
 
-    let stage = temporary_sibling(target, "move");
-    if policy == ConflictPolicy::Replace {
-        match rename_noreplace(&plan.source, &stage) {
-            Ok(()) => {
-                let commit =
-                    check_cancelled(cancelled).and_then(|()| commit_stage(&stage, target, policy));
-                if let Err(error) = commit {
-                    return Err(restore_quarantine(&stage, &plan.source, error));
-                }
-                tracker.completed_plan(plan);
-                return Ok(());
-            }
-            Err(error) if error.kind() == io::ErrorKind::CrossesDevices => {}
-            Err(error) => return Err(error),
-        }
-    }
-
-    let quarantine = temporary_sibling(&plan.source, "source");
-    let result = (|| {
-        copy_to_stage(plan, &stage, cancelled, tracker)?;
-        check_cancelled(cancelled)?;
-        rename_noreplace(&plan.source, &quarantine)?;
-
-        let precommit = (|| {
-            if snapshot_entries(&quarantine)? != plan.entries {
-                return Err(io::Error::other("source changed while it was being copied"));
-            }
-            verify_staged_copy(&quarantine, &stage, plan, cancelled)?;
-            check_cancelled(cancelled)?;
-            commit_stage(&stage, target, policy)
-        })();
-        if let Err(error) = precommit {
-            return Err(restore_quarantine(&quarantine, &plan.source, error));
-        }
-        if let Err(error) = remove_path(&quarantine) {
-            let error = io::Error::new(
-                error.kind(),
-                format!("destination committed but source cleanup failed: {error}"),
+fn cleanup_backups(committed: &[CommittedTarget]) {
+    for entry in committed {
+        if let Some(backup) = &entry.backup
+            && let Err(error) = remove_path(backup)
+        {
+            tracing::warn!(
+                path = ?backup,
+                error = %error,
+                "replacement committed; preserving backup after cleanup failure"
             );
-            return Err(restore_quarantine(&quarantine, &plan.source, error));
         }
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = remove_path(&stage);
     }
-    result
+}
+
+fn rollback_transaction(
+    stages: &[PathBuf],
+    quarantines: &[(PathBuf, PathBuf)],
+    removed_quarantines: &[usize],
+    committed: &[CommittedTarget],
+) -> io::Result<()> {
+    let mut errors = Vec::new();
+    let removed = |index: usize| removed_quarantines.contains(&index);
+
+    for &index in removed_quarantines.iter().rev() {
+        let Some((source, _)) = quarantines.get(index) else {
+            errors.push(format!("missing source quarantine {index}"));
+            continue;
+        };
+        let Some(commit) = committed.get(index) else {
+            errors.push(format!("missing committed target {index}"));
+            continue;
+        };
+        let result: io::Result<()> = (|| {
+            if source.try_exists()? {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("cannot restore moved source {}", source.display()),
+                ));
+            }
+            if !commit.target.try_exists()? {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("committed target is missing: {}", commit.target.display()),
+                ));
+            }
+            rename_noreplace(&commit.target, source)
+        })();
+        if let Err(error) = result {
+            errors.push(error.to_string());
+        }
+    }
+
+    for commit in committed.iter().rev() {
+        let result: io::Result<()> = (|| {
+            if commit.target.try_exists()? {
+                remove_path(&commit.target)?;
+            }
+            if let Some(backup) = &commit.backup
+                && backup.try_exists()?
+            {
+                rename_noreplace(backup, &commit.target)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            errors.push(error.to_string());
+        }
+    }
+
+    for (index, (source, quarantine)) in quarantines.iter().enumerate().rev() {
+        if removed(index) {
+            continue;
+        }
+        let result: io::Result<()> = (|| {
+            if !quarantine.try_exists()? {
+                return Ok(());
+            }
+            if source.try_exists()? {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("cannot restore moved source {}", source.display()),
+                ));
+            }
+            rename_noreplace(quarantine, source)
+        })();
+        if let Err(error) = result {
+            errors.push(error.to_string());
+        }
+    }
+
+    for stage in stages.iter().rev() {
+        if let Err(error) = remove_path(stage) {
+            errors.push(error.to_string());
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "rollback failed: {}",
+            errors.join("; ")
+        )))
+    }
+}
+
+fn with_rollback_error(cause: io::Error, rollback: io::Result<()>) -> io::Error {
+    match rollback {
+        Ok(()) => cause,
+        Err(error) => io::Error::new(error.kind(), format!("{cause}; {error}")),
+    }
 }
 
 fn copy_to_stage<F: FnMut(FileOperationProgress)>(
@@ -1149,48 +1375,6 @@ fn verify_staged_copy(
     Ok(())
 }
 
-fn restore_quarantine(quarantine: &Path, source: &Path, cause: io::Error) -> io::Error {
-    match rename_noreplace(quarantine, source) {
-        Ok(()) => cause,
-        Err(restore_error) => io::Error::new(
-            restore_error.kind(),
-            format!(
-                "{cause}; source recovery also failed, data remains at {}: {restore_error}",
-                quarantine.display()
-            ),
-        ),
-    }
-}
-
-fn commit_stage(stage: &Path, target: &Path, policy: ConflictPolicy) -> io::Result<()> {
-    if policy != ConflictPolicy::Replace || !target.try_exists()? {
-        return rename_noreplace(stage, target);
-    }
-
-    let backup = temporary_sibling(target, "backup");
-    rename_noreplace(target, &backup)?;
-    if let Err(error) = rename_noreplace(stage, target) {
-        return match rename_noreplace(&backup, target) {
-            Ok(()) => Err(error),
-            Err(restore_error) => Err(io::Error::new(
-                restore_error.kind(),
-                format!(
-                    "{error}; destination recovery also failed, backup remains at {}: {restore_error}",
-                    backup.display()
-                ),
-            )),
-        };
-    }
-    if let Err(error) = remove_path(&backup) {
-        tracing::warn!(
-            path = ?backup,
-            error = %error,
-            "Replacement committed; preserving backup after cleanup failure"
-        );
-    }
-    Ok(())
-}
-
 fn remove_path(path: &Path) -> io::Result<()> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -1475,6 +1659,182 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_batch_copy_leaves_no_completed_targets_or_staging_paths() {
+        let temp = tempdir().unwrap();
+        let source_dir = temp.path().join("sources");
+        let destination = temp.path().join("destination");
+        fs::create_dir(&source_dir).unwrap();
+        fs::create_dir(&destination).unwrap();
+        let sources: Vec<_> = (0..10)
+            .map(|index| {
+                let source = source_dir.join(format!("item-{index}.txt"));
+                fs::write(&source, format!("item-{index}")).unwrap();
+                source
+            })
+            .collect();
+        let cancelled = AtomicBool::new(false);
+        let request = FileOperationRequest {
+            kind: FileOperationKind::Copy,
+            sources: sources.clone(),
+            destination: Some(destination.clone()),
+            conflict_policy: ConflictPolicy::Error,
+        };
+
+        let result = perform_file_operation(request, &cancelled, |progress| {
+            if progress.processed_entries >= 1 {
+                cancelled.store(true, Ordering::Relaxed);
+            }
+        });
+
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        assert!(sources.iter().all(|source| source.exists()));
+        assert!(fs::read_dir(&destination).unwrap().next().is_none());
+        assert!(fs::read_dir(&destination).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".explorie-")
+        }));
+    }
+
+    fn batch_fixture(root: &Path) -> (PathBuf, PathBuf, Vec<PathBuf>) {
+        let source_dir = root.join("sources");
+        let destination = root.join("destination");
+        fs::create_dir(&source_dir).unwrap();
+        fs::create_dir(&destination).unwrap();
+        let sources = (0..10)
+            .map(|index| {
+                let source = source_dir.join(format!("item-{index}.txt"));
+                fs::write(&source, format!("item-{index}")).unwrap();
+                source
+            })
+            .collect();
+        (source_dir, destination, sources)
+    }
+
+    fn staging_paths(directory: &Path) -> Vec<PathBuf> {
+        fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(".explorie-"))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cancelled_batch_move_restores_every_source_and_leaves_no_staging_path() {
+        let temp = tempdir().unwrap();
+        let (source_dir, destination, sources) = batch_fixture(temp.path());
+        let cancelled = AtomicBool::new(false);
+        let request = FileOperationRequest {
+            kind: FileOperationKind::Move,
+            sources: sources.clone(),
+            destination: Some(destination.clone()),
+            conflict_policy: ConflictPolicy::Error,
+        };
+
+        let result = perform_file_operation(request, &cancelled, |progress| {
+            if progress.processed_entries >= 1 {
+                cancelled.store(true, Ordering::Relaxed);
+            }
+        });
+
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        for (index, source) in sources.iter().enumerate() {
+            assert_eq!(
+                fs::read(source).unwrap(),
+                format!("item-{index}").as_bytes()
+            );
+        }
+        assert!(fs::read_dir(&destination).unwrap().next().is_none());
+        assert!(staging_paths(&source_dir).is_empty());
+    }
+
+    #[test]
+    fn failed_batch_move_restores_sources_quarantined_before_the_failure() {
+        let temp = tempdir().unwrap();
+        let (source_dir, destination, sources) = batch_fixture(temp.path());
+        let mut injected_failure = false;
+        let request = FileOperationRequest {
+            kind: FileOperationKind::Move,
+            sources: sources.clone(),
+            destination: Some(destination.clone()),
+            conflict_policy: ConflictPolicy::Error,
+        };
+
+        // Every source is staged and quarantined before the first commit, so an
+        // external file appearing at the first target forces the rollback to
+        // walk back through all ten quarantines.
+        let result = perform_file_operation(request, &AtomicBool::new(false), |progress| {
+            if progress.processed_entries == 10 && !injected_failure {
+                injected_failure = true;
+                fs::write(destination.join("item-0.txt"), b"external").unwrap();
+            }
+        });
+
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert!(injected_failure);
+        for (index, source) in sources.iter().enumerate() {
+            assert_eq!(
+                fs::read(source).unwrap(),
+                format!("item-{index}").as_bytes()
+            );
+        }
+        assert_eq!(
+            fs::read(destination.join("item-0.txt")).unwrap(),
+            b"external"
+        );
+        assert!(staging_paths(&source_dir).is_empty());
+        assert!(staging_paths(&destination).is_empty());
+    }
+
+    #[test]
+    fn failed_batch_copy_rolls_back_targets_committed_before_failure() {
+        let temp = tempdir().unwrap();
+        let source_dir = temp.path().join("sources");
+        let destination = temp.path().join("destination");
+        fs::create_dir(&source_dir).unwrap();
+        fs::create_dir(&destination).unwrap();
+        let first = source_dir.join("first.txt");
+        let second = source_dir.join("second.txt");
+        fs::write(&first, b"first").unwrap();
+        fs::write(&second, b"second").unwrap();
+        let mut injected_failure = false;
+        let request = FileOperationRequest {
+            kind: FileOperationKind::Copy,
+            sources: vec![first.clone(), second.clone()],
+            destination: Some(destination.clone()),
+            conflict_policy: ConflictPolicy::Error,
+        };
+
+        let result = perform_file_operation(request, &AtomicBool::new(false), |progress| {
+            if progress.processed_entries == 2 && !injected_failure {
+                injected_failure = true;
+                fs::write(destination.join("second.txt"), b"external").unwrap();
+            }
+        });
+
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::read(destination.join("second.txt")).unwrap(),
+            b"external"
+        );
+        assert!(!destination.join("first.txt").exists());
+        assert!(first.exists());
+        assert!(second.exists());
+        assert!(fs::read_dir(&destination).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".explorie-")
+        }));
+    }
+
+    #[test]
     fn cancelled_move_replace_preserves_source_and_destination() {
         let temp = tempdir().unwrap();
         let source = temp.path().join("item.txt");
@@ -1524,6 +1884,55 @@ mod tests {
         assert_eq!(fs::read(destination.join("item.txt")).unwrap(), b"old");
         assert_eq!(fs::read(destination.join("item (1).txt")).unwrap(), b"new");
         assert_eq!(result.targets, vec![destination.join("item (1).txt")]);
+    }
+
+    #[test]
+    fn batch_rename_policy_keeps_duplicate_source_names_separate() {
+        for kind in [FileOperationKind::Copy, FileOperationKind::Move] {
+            let temp = tempdir().unwrap();
+            let first_dir = temp.path().join("first");
+            let second_dir = temp.path().join("second");
+            let destination = temp.path().join("destination");
+            fs::create_dir(&first_dir).unwrap();
+            fs::create_dir(&second_dir).unwrap();
+            fs::create_dir(&destination).unwrap();
+            let first = first_dir.join("report.txt");
+            let second = second_dir.join("report.txt");
+            fs::write(&first, b"first").unwrap();
+            fs::write(&second, b"second").unwrap();
+
+            let result = perform_file_operation(
+                FileOperationRequest {
+                    kind,
+                    sources: vec![first.clone(), second.clone()],
+                    destination: Some(destination.clone()),
+                    conflict_policy: ConflictPolicy::Rename,
+                },
+                &AtomicBool::new(false),
+                |_| {},
+            )
+            .unwrap();
+
+            assert_eq!(
+                result.targets,
+                vec![
+                    destination.join("report.txt"),
+                    destination.join("report (1).txt")
+                ]
+            );
+            assert_eq!(fs::read(destination.join("report.txt")).unwrap(), b"first");
+            assert_eq!(
+                fs::read(destination.join("report (1).txt")).unwrap(),
+                b"second"
+            );
+            if kind == FileOperationKind::Move {
+                assert!(!first.exists());
+                assert!(!second.exists());
+            } else {
+                assert!(first.exists());
+                assert!(second.exists());
+            }
+        }
     }
 
     #[test]
@@ -1579,7 +1988,7 @@ mod tests {
         let staged = temp.path().join("staged.txt");
         fs::write(&source, b"good").unwrap();
         fs::write(&staged, b"evil").unwrap();
-        let plan = plan_source(&source).unwrap();
+        let plan = plan_source(&source, &AtomicBool::new(false)).unwrap();
 
         let result = verify_staged_copy(&source, &staged, &plan, &AtomicBool::new(false));
 
@@ -1599,28 +2008,122 @@ mod tests {
         assert_eq!(fs::read(target).unwrap(), b"old");
     }
 
+    /// Ten files of ascending size, so an aggregate byte count cannot be
+    /// mistaken for a per-file one.
+    fn trash_fixture(temp: &Path) -> Vec<PathBuf> {
+        (0..10)
+            .map(|index| {
+                let source = temp.join(format!("item-{index}.txt"));
+                fs::write(&source, vec![b'x'; index + 1]).unwrap();
+                source
+            })
+            .collect()
+    }
+
+    #[test]
+    fn batch_trash_reports_one_aggregate_progress_entry() {
+        let temp = tempdir().unwrap();
+        let sources = trash_fixture(temp.path());
+        let mut trashed = Vec::new();
+        let mut progress = Vec::new();
+
+        let result = trash_sources_with(
+            sources.clone(),
+            &AtomicBool::new(false),
+            |update| progress.push(update),
+            |path| {
+                trashed.push(path.to_path_buf());
+                fs::remove_file(path)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(trashed, sources);
+        assert_eq!(result.processed_entries, 10);
+        assert_eq!(result.processed_bytes, 55);
+        assert!(
+            progress
+                .iter()
+                .all(|update| update.total_entries == 10 && update.total_bytes == 55)
+        );
+        assert_eq!(progress.first().unwrap().processed_entries, 0);
+        assert_eq!(progress.last().unwrap().processed_entries, 10);
+        assert_eq!(progress.last().unwrap().processed_bytes, 55);
+    }
+
+    #[test]
+    fn cancelled_batch_trash_stops_after_the_current_item() {
+        let temp = tempdir().unwrap();
+        let sources = trash_fixture(temp.path());
+        let cancelled = AtomicBool::new(false);
+        let mut trashed = Vec::new();
+
+        let result = trash_sources_with(
+            sources.clone(),
+            &cancelled,
+            |_| {},
+            |path| {
+                cancelled.store(true, Ordering::Relaxed);
+                trashed.push(path.to_path_buf());
+                fs::remove_file(path)
+            },
+        );
+
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(
+            error
+                .to_string()
+                .contains("1 item(s) already moved to Trash")
+        );
+        assert_eq!(trashed, sources[..1]);
+        assert!(sources[1..].iter().all(|source| source.exists()));
+    }
+
     #[test]
     fn batch_trash_fails_before_moving_any_source() {
         let temp = tempdir().unwrap();
-        let first = temp.path().join("first.txt");
-        let second = temp.path().join("second.txt");
-        fs::write(&first, b"first").unwrap();
-        fs::write(&second, b"second").unwrap();
+        let mut sources = trash_fixture(temp.path());
+        sources.push(temp.path().join("missing.txt"));
+        let mut trashed = Vec::new();
 
-        let result = perform_file_operation(
-            FileOperationRequest {
-                kind: FileOperationKind::Trash,
-                sources: vec![first.clone(), second.clone()],
-                destination: None,
-                conflict_policy: ConflictPolicy::Error,
-            },
+        let result = trash_sources_with(
+            sources.clone(),
             &AtomicBool::new(false),
             |_| {},
+            |path| {
+                trashed.push(path.to_path_buf());
+                fs::remove_file(path)
+            },
+        );
+
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::NotFound);
+        assert!(trashed.is_empty());
+        assert!(sources[..10].iter().all(|source| source.exists()));
+    }
+
+    #[test]
+    fn batch_trash_rejects_a_source_nested_in_another_source() {
+        let temp = tempdir().unwrap();
+        let parent = temp.path().join("parent");
+        let nested = parent.join("nested.txt");
+        fs::create_dir(&parent).unwrap();
+        fs::write(&nested, b"nested").unwrap();
+        let mut trashed = Vec::new();
+
+        let result = trash_sources_with(
+            vec![parent.clone(), nested.clone()],
+            &AtomicBool::new(false),
+            |_| {},
+            |path| {
+                trashed.push(path.to_path_buf());
+                remove_path(path)
+            },
         );
 
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
-        assert_eq!(fs::read(first).unwrap(), b"first");
-        assert_eq!(fs::read(second).unwrap(), b"second");
+        assert!(trashed.is_empty());
+        assert!(nested.exists());
     }
 
     #[cfg(windows)]

@@ -8,12 +8,12 @@ import type { FileEntry } from '../store';
 import type { CopyOperation, MoveOperation } from '../undoRedoStore';
 import { generateOperationId, useUndoRedoStore } from '../undoRedoStore';
 import { clearDirSizeCache } from '../dirSizeCache';
-import type { ConflictAction } from '../conflictResolutionStore';
+import type { ConflictAction, ConflictInfo } from '../conflictResolutionStore';
 import { checkForConflict, useConflictResolutionStore } from '../conflictResolutionStore';
 import { deletePath } from './fs';
 import { formatErrorMessage } from './errorMessages';
-import { describeFileEntry, formatItemCount, summarizeFailedItems } from './fileOperationFormat';
-import { getParentPath } from './path';
+import { describeFileEntry, formatItemCount } from './fileOperationFormat';
+import { getParentPath, joinPaths, pathsEqual } from './path';
 import {
   runNativeFileOperation,
   type NativeConflictPolicy,
@@ -57,9 +57,17 @@ function presentationPolicy(policy: NativeConflictPolicy): 'replace' | 'rename' 
 async function resolveConflictPolicy(
   file: FileEntry,
   targetDir: string,
-  options: ConflictResolutionOptions
+  options: ConflictResolutionOptions,
+  reservedTargets: ReadonlySet<string>
 ): Promise<NativeConflictPolicy | null> {
-  const conflict = await checkForConflict(file.path, targetDir, file.is_dir);
+  const descriptor = describeFileEntry(file);
+  const targetPath = joinPaths(targetDir, descriptor.name);
+  const hasReservedTarget = [...reservedTargets].some((reserved) =>
+    pathsEqual(targetPath, reserved)
+  );
+  const conflict = hasReservedTarget
+    ? reservedTargetConflict(file, targetPath, descriptor.name)
+    : await checkForConflict(file.path, targetDir, file.is_dir);
   if (!conflict) return 'error';
 
   let action: ConflictAction;
@@ -71,6 +79,18 @@ async function resolveConflictPolicy(
 
   if (action === 'skip') return null;
   return action === 'replace' ? 'replace' : 'rename';
+}
+
+function reservedTargetConflict(file: FileEntry, targetPath: string, name: string): ConflictInfo {
+  return {
+    sourcePath: file.path,
+    sourceName: name,
+    sourceSize: file.size,
+    sourceIsDir: file.is_dir,
+    destPath: targetPath,
+    destName: name,
+    destIsDir: file.is_dir,
+  };
 }
 
 async function runOne(
@@ -91,6 +111,34 @@ async function runOne(
       items: [presentationItem(file)],
       destinationPath: targetDir,
       conflictResolution: presentationPolicy(policy),
+    }
+  );
+}
+
+async function runBatch(
+  kind: 'copy' | 'move',
+  files: FileEntry[],
+  targetDir: string,
+  policies: NativeConflictPolicy[]
+): Promise<NativeFileOperationResult> {
+  const conflictPolicy = policies[0] ?? 'error';
+  const conflictPolicies = policies.every((policy) => policy === conflictPolicy)
+    ? undefined
+    : policies;
+  return runNativeFileOperation(
+    {
+      kind,
+      sources: files.map((file) => file.path),
+      destination: targetDir,
+      conflictPolicy,
+      ...(conflictPolicies ? { conflictPolicies } : {}),
+    },
+    {
+      type: kind,
+      items: files.map(presentationItem),
+      destinationPath: targetDir,
+      conflictResolution:
+        conflictPolicies === undefined ? presentationPolicy(conflictPolicy) : 'ask',
     }
   );
 }
@@ -135,14 +183,6 @@ export async function deleteWithUndo(
     }
   }
 
-  if (files.length > 1) {
-    showToast(
-      'Moving multiple items to Trash is temporarily disabled to guarantee failure-safe behavior. Move one item at a time.',
-      { type: 'warning' }
-    );
-    return false;
-  }
-
   try {
     await runNativeFileOperation(
       {
@@ -161,9 +201,14 @@ export async function deleteWithUndo(
     showToast(`Moved ${itemText} to Trash`, { type: 'success' });
     return true;
   } catch (error) {
-    showToast(`Failed to move items to Trash: ${formatErrorMessage(error)}`, {
-      type: 'error',
-    });
+    if (isCancellation(error)) {
+      showToast('Delete cancelled', { type: 'warning' });
+    } else {
+      showToast(`Failed to move items to Trash: ${formatErrorMessage(error)}`, {
+        type: 'error',
+      });
+    }
+    await refreshAfterMutation(onRefresh);
     return false;
   }
 }
@@ -178,50 +223,59 @@ export async function copyWithUndoAndConflictResolution(
   if (files.length === 0) return false;
   useConflictResolutionStore.getState().reset('copy');
 
-  const createdPaths: string[] = [];
-  const sourceItems: CopyOperation['sourceItems'] = [];
-  const completedFiles: FileEntry[] = [];
-  const completedPolicies: NativeConflictPolicy[] = [];
-  const failed: Array<{ name: string; error: string }> = [];
+  const selectedFiles: FileEntry[] = [];
+  const selectedPolicies: NativeConflictPolicy[] = [];
   const skipped: string[] = [];
-  let cancelled = false;
+  const reservedTargets = new Set<string>();
 
-  for (const file of files) {
-    const name = describeFileEntry(file).name;
-    try {
-      const policy = await resolveConflictPolicy(file, targetDir, options);
+  try {
+    for (const file of files) {
+      const name = describeFileEntry(file).name;
+      const policy = await resolveConflictPolicy(file, targetDir, options, reservedTargets);
       if (!policy) {
         skipped.push(name);
         continue;
       }
-      const result = await runOne('copy', file, targetDir, policy);
-      const target = result.targets[0];
-      if (!target) throw new Error('Native copy completed without a destination path');
-      createdPaths.push(target);
-      sourceItems.push({ path: file.path, name });
-      completedFiles.push(file);
-      completedPolicies.push(policy);
-    } catch (error) {
-      if (isCancellation(error)) {
-        cancelled = true;
-        break;
-      }
-      failed.push({ name, error: formatErrorMessage(error) });
+      selectedFiles.push(file);
+      selectedPolicies.push(policy);
+      reservedTargets.add(joinPaths(targetDir, name));
     }
-  }
-
-  if (createdPaths.length === 0) {
-    if (cancelled) {
-      showToast('Copy cancelled', { type: 'warning' });
-      return false;
-    }
-    if (skipped.length === files.length) {
-      showToast('All files were skipped', { type: 'info' });
-      return true;
-    }
-    showToast(`Failed to copy: ${failed[0]?.error || 'Unknown error'}`, { type: 'error' });
+  } catch (error) {
+    showToast(`Failed to copy: ${formatErrorMessage(error)}`, { type: 'error' });
     return false;
   }
+
+  if (selectedFiles.length === 0) {
+    showToast('All files were skipped', { type: 'info' });
+    return true;
+  }
+
+  let result: NativeFileOperationResult;
+  try {
+    result = await runBatch('copy', selectedFiles, targetDir, selectedPolicies);
+  } catch (error) {
+    if (isCancellation(error)) {
+      showToast('Copy cancelled', { type: 'warning' });
+    } else {
+      showToast(`Failed to copy: ${formatErrorMessage(error)}`, { type: 'error' });
+    }
+    return false;
+  }
+
+  if (result.targets.length !== selectedFiles.length) {
+    showToast('Failed to copy: native operation returned incomplete destination paths', {
+      type: 'error',
+    });
+    return false;
+  }
+
+  const createdPaths = result.targets;
+  const sourceItems: CopyOperation['sourceItems'] = selectedFiles.map((file) => ({
+    path: file.path,
+    name: describeFileEntry(file).name,
+  }));
+  const completedFiles = selectedFiles;
+  const completedPolicies = selectedPolicies;
 
   const operation: CopyOperation = {
     id: generateOperationId(),
@@ -263,14 +317,11 @@ export async function copyWithUndoAndConflictResolution(
     },
     redo: async () => {
       try {
-        const newPaths: string[] = [];
-        for (let index = 0; index < completedFiles.length; index++) {
-          const file = completedFiles[index];
-          const result = await runOne('copy', file, targetDir, completedPolicies[index]);
-          const target = result.targets[0];
-          if (!target) throw new Error('Native copy completed without a destination path');
-          newPaths.push(target);
+        const redoResult = await runBatch('copy', completedFiles, targetDir, completedPolicies);
+        if (redoResult.targets.length !== completedFiles.length) {
+          throw new Error('Native copy returned incomplete destination paths');
         }
+        const newPaths = redoResult.targets;
         operation.createdPaths = newPaths;
         await refreshAfterMutation(onRefresh);
         showToast(`Redid copy of ${newPaths.length} item(s)`, { type: 'info' });
@@ -284,33 +335,23 @@ export async function copyWithUndoAndConflictResolution(
   const canUndo = !completedPolicies.includes('replace');
   if (canUndo) useUndoRedoStore.getState().push(operation);
 
-  let message: string;
-  let type: 'success' | 'warning' | 'info' = 'success';
-  if (cancelled) {
-    message = `Copied ${createdPaths.length} item(s) before cancellation`;
-    type = 'warning';
-  } else if (failed.length > 0) {
-    message = `Copied ${createdPaths.length} item(s), but ${failed.length} failed: ${summarizeFailedItems(failed)}`;
-    type = 'warning';
-  } else if (skipped.length > 0) {
-    message = `Copied ${createdPaths.length} item(s), skipped ${skipped.length}`;
-    type = 'info';
-  } else {
-    message = `Copied ${formatItemCount(createdPaths.length, sourceItems[0].name)}`;
-  }
+  let message =
+    skipped.length > 0
+      ? `Copied ${createdPaths.length} item(s), skipped ${skipped.length}`
+      : `Copied ${formatItemCount(createdPaths.length, sourceItems[0].name)}`;
   if (!canUndo) message += '. Replaced items cannot be undone';
 
   showToast(
     message,
     canUndo
       ? {
-          type,
+          type: skipped.length > 0 ? 'info' : 'success',
           action: { label: 'Undo', onClick: () => void useUndoRedoStore.getState().undo() },
         }
-      : { type }
+      : { type: skipped.length > 0 ? 'info' : 'success' }
   );
   await refreshAfterMutation(onRefresh);
-  return !cancelled && failed.length === 0;
+  return true;
 }
 
 export async function moveWithUndoAndConflictResolution(
@@ -323,48 +364,59 @@ export async function moveWithUndoAndConflictResolution(
   if (files.length === 0) return false;
   useConflictResolutionStore.getState().reset('move');
 
-  const moveItems: MoveOperation['items'] = [];
-  const movedFiles: FileEntry[] = [];
-  const completedPolicies: NativeConflictPolicy[] = [];
-  const failed: Array<{ name: string; error: string }> = [];
+  const selectedFiles: FileEntry[] = [];
+  const selectedPolicies: NativeConflictPolicy[] = [];
   const skipped: string[] = [];
-  let cancelled = false;
+  const reservedTargets = new Set<string>();
 
-  for (const file of files) {
-    const name = describeFileEntry(file).name;
-    try {
-      const policy = await resolveConflictPolicy(file, targetDir, options);
+  try {
+    for (const file of files) {
+      const name = describeFileEntry(file).name;
+      const policy = await resolveConflictPolicy(file, targetDir, options, reservedTargets);
       if (!policy) {
         skipped.push(name);
         continue;
       }
-      const result = await runOne('move', file, targetDir, policy);
-      const target = result.targets[0];
-      if (!target) throw new Error('Native move completed without a destination path');
-      moveItems.push({ sourcePath: file.path, destPath: target, name });
-      movedFiles.push(file);
-      completedPolicies.push(policy);
-    } catch (error) {
-      if (isCancellation(error)) {
-        cancelled = true;
-        break;
-      }
-      failed.push({ name, error: formatErrorMessage(error) });
+      selectedFiles.push(file);
+      selectedPolicies.push(policy);
+      reservedTargets.add(joinPaths(targetDir, name));
     }
-  }
-
-  if (moveItems.length === 0) {
-    if (cancelled) {
-      showToast('Move cancelled', { type: 'warning' });
-      return false;
-    }
-    if (skipped.length === files.length) {
-      showToast('All files were skipped', { type: 'info' });
-      return true;
-    }
-    showToast(`Failed to move: ${failed[0]?.error || 'Unknown error'}`, { type: 'error' });
+  } catch (error) {
+    showToast(`Failed to move: ${formatErrorMessage(error)}`, { type: 'error' });
     return false;
   }
+
+  if (selectedFiles.length === 0) {
+    showToast('All files were skipped', { type: 'info' });
+    return true;
+  }
+
+  let result: NativeFileOperationResult;
+  try {
+    result = await runBatch('move', selectedFiles, targetDir, selectedPolicies);
+  } catch (error) {
+    if (isCancellation(error)) {
+      showToast('Move cancelled', { type: 'warning' });
+    } else {
+      showToast(`Failed to move: ${formatErrorMessage(error)}`, { type: 'error' });
+    }
+    return false;
+  }
+
+  if (result.targets.length !== selectedFiles.length) {
+    showToast('Failed to move: native operation returned incomplete destination paths', {
+      type: 'error',
+    });
+    return false;
+  }
+
+  const moveItems: MoveOperation['items'] = selectedFiles.map((file, index) => ({
+    sourcePath: file.path,
+    destPath: result.targets[index],
+    name: describeFileEntry(file).name,
+  }));
+  const movedFiles = selectedFiles;
+  const completedPolicies = selectedPolicies;
 
   const operation: MoveOperation = {
     id: generateOperationId(),
@@ -395,20 +447,18 @@ export async function moveWithUndoAndConflictResolution(
     },
     redo: async () => {
       try {
-        const nextItems: MoveOperation['items'] = [];
-        for (let index = 0; index < operation.items.length; index++) {
-          const item = operation.items[index];
-          const file = movedFiles[index];
-          const result = await runOne(
-            'move',
-            { ...file, path: item.sourcePath },
-            targetDir,
-            completedPolicies[index]
-          );
-          const target = result.targets[0];
-          if (!target) throw new Error('Native move completed without a destination path');
-          nextItems.push({ ...item, destPath: target });
+        const redoFiles = operation.items.map((item, index) => ({
+          ...movedFiles[index],
+          path: item.sourcePath,
+        }));
+        const redoResult = await runBatch('move', redoFiles, targetDir, completedPolicies);
+        if (redoResult.targets.length !== redoFiles.length) {
+          throw new Error('Native move returned incomplete destination paths');
         }
+        const nextItems: MoveOperation['items'] = operation.items.map((item, index) => ({
+          ...item,
+          destPath: redoResult.targets[index],
+        }));
         operation.items = nextItems;
         await refreshAfterMutation(onRefresh);
         showToast(`Redid move of ${nextItems.length} item(s)`, { type: 'info' });
@@ -422,31 +472,21 @@ export async function moveWithUndoAndConflictResolution(
   const canUndo = !completedPolicies.includes('replace');
   if (canUndo) useUndoRedoStore.getState().push(operation);
 
-  let message: string;
-  let type: 'success' | 'warning' | 'info' = 'success';
-  if (cancelled) {
-    message = `Moved ${moveItems.length} item(s) before cancellation`;
-    type = 'warning';
-  } else if (failed.length > 0) {
-    message = `Moved ${moveItems.length} item(s), but ${failed.length} failed: ${summarizeFailedItems(failed)}`;
-    type = 'warning';
-  } else if (skipped.length > 0) {
-    message = `Moved ${moveItems.length} item(s), skipped ${skipped.length}`;
-    type = 'info';
-  } else {
-    message = `Moved ${formatItemCount(moveItems.length, moveItems[0].name)}`;
-  }
+  let message =
+    skipped.length > 0
+      ? `Moved ${moveItems.length} item(s), skipped ${skipped.length}`
+      : `Moved ${formatItemCount(moveItems.length, moveItems[0].name)}`;
   if (!canUndo) message += '. Replaced items cannot be undone';
 
   showToast(
     message,
     canUndo
       ? {
-          type,
+          type: skipped.length > 0 ? 'info' : 'success',
           action: { label: 'Undo', onClick: () => void useUndoRedoStore.getState().undo() },
         }
-      : { type }
+      : { type: skipped.length > 0 ? 'info' : 'success' }
   );
   await refreshAfterMutation(onRefresh);
-  return !cancelled && failed.length === 0;
+  return true;
 }
