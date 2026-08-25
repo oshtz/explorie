@@ -6,13 +6,14 @@ import type { ThemeSpec } from '../store';
 import { normalizeThemeSpec } from '../store/slices/uiSlice';
 import { createFocusTrap } from '../utils/accessibility';
 import { Icon } from './Icon';
+import { KeyboardShortcutSettings } from './KeyboardShortcutSettings';
 
 interface SettingsPanelProps {
   open: boolean;
   onClose: () => void;
 }
 
-type SettingsTab = 'general' | 'integration' | 'appearance' | 'themes' | 'about';
+type SettingsTab = 'general' | 'keyboard' | 'integration' | 'appearance' | 'themes' | 'about';
 type AccentPreset = Exclude<ThemeSpec['accent'], 'custom'>;
 
 type SystemIntegrationStatus = {
@@ -22,6 +23,7 @@ type SystemIntegrationStatus = {
 
 const SETTINGS_TABS: { key: SettingsTab; label: string }[] = [
   { key: 'general', label: 'General' },
+  { key: 'keyboard', label: 'Keyboard' },
   { key: 'integration', label: 'System Integration' },
   { key: 'appearance', label: 'Appearance' },
   { key: 'themes', label: 'Themes' },
@@ -86,6 +88,7 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
     setConfirmBeforeDelete,
     enableErrorReporting,
     setEnableErrorReporting,
+    resetShortcuts,
   } = useFileStore();
 
   const dialogRef = React.useRef<HTMLDivElement>(null);
@@ -177,6 +180,7 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
     setGridMinWidth(140);
     setReduceMotion(false);
     setHighContrast(false);
+    resetShortcuts();
     setStatus('Settings restored to defaults');
   };
 
@@ -309,6 +313,13 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
                   </span>
                 </span>
               </label>
+            </div>
+          )}
+
+          {activeTab === 'keyboard' && (
+            <div className={styles.section}>
+              <h2 className={styles.sectionTitle}>Keyboard</h2>
+              <KeyboardShortcutSettings />
             </div>
           )}
 

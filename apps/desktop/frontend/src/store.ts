@@ -4,6 +4,7 @@ import { createFileSlice } from './store/slices/fileSlice';
 import { createUISlice } from './store/slices/uiSlice';
 import { createFavoritesSlice } from './store/slices/favoritesSlice';
 import { createWorkspaceSlice } from './store/slices/workspaceSlice';
+import { createKeyboardShortcutSlice } from './store/slices/keyboardShortcutSlice';
 
 export type {
   FileModified,
@@ -35,4 +36,5 @@ export const useFileStore = create<StoreState>()((...args) => ({
   ...createUISlice(...args),
   ...createFavoritesSlice(...args),
   ...createWorkspaceSlice(...args),
+  ...createKeyboardShortcutSlice(...args),
 }));

@@ -1,6 +1,8 @@
 import React from 'react';
 import { cleanup, render } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { useFileStore } from '../store';
+import { cloneShortcutMap, DEFAULT_SHORTCUTS } from '../utils/shortcuts';
 import { useAppKeyboardShortcuts } from './useAppKeyboardShortcuts';
 
 function ShortcutHarness(props: Partial<Parameters<typeof useAppKeyboardShortcuts>[0]>) {
@@ -42,6 +44,7 @@ function ShortcutHarness(props: Partial<Parameters<typeof useAppKeyboardShortcut
 describe('useAppKeyboardShortcuts', () => {
   afterEach(() => {
     cleanup();
+    useFileStore.setState({ shortcuts: cloneShortcutMap(DEFAULT_SHORTCUTS) });
   });
 
   it('dispatches app shortcuts from the window', () => {
@@ -161,5 +164,16 @@ describe('useAppKeyboardShortcuts', () => {
 
     expect(addTab).not.toHaveBeenCalled();
     modal.remove();
+  });
+
+  it('dispatches rebound shortcuts from the stored map', () => {
+    const addTab = vi.fn();
+    useFileStore.getState().setShortcut('newTab', { key: 'n', mod: true });
+    render(React.createElement(ShortcutHarness, { addTab }));
+
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 't', ctrlKey: true }));
+    expect(addTab).not.toHaveBeenCalled();
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'n', ctrlKey: true }));
+    expect(addTab).toHaveBeenCalledTimes(1);
   });
 });

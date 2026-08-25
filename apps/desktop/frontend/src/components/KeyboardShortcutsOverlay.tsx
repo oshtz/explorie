@@ -1,86 +1,8 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import styles from './KeyboardShortcutsOverlay.module.css';
 import { createFocusTrap } from '../utils/accessibility';
-
-interface Shortcut {
-  keys: string;
-  description: string;
-}
-
-interface ShortcutCategory {
-  name: string;
-  shortcuts: Shortcut[];
-}
-
-const SHORTCUT_CATEGORIES: ShortcutCategory[] = [
-  {
-    name: 'Navigation',
-    shortcuts: [
-      { keys: 'Alt + Left', description: 'Go back' },
-      { keys: 'Alt + Right', description: 'Go forward' },
-      { keys: 'Ctrl + G', description: 'Go to folder' },
-      { keys: 'Enter', description: 'Open selected item' },
-      { keys: 'Backspace', description: 'Go up one directory' },
-      { keys: 'Arrow Keys', description: 'Navigate between files' },
-      { keys: 'Home', description: 'Select first item' },
-      { keys: 'End', description: 'Select last item' },
-    ],
-  },
-  {
-    name: 'File Operations',
-    shortcuts: [
-      { keys: 'Delete', description: 'Delete selected item' },
-      { keys: 'F2', description: 'Rename selected item' },
-      { keys: 'Ctrl + C', description: 'Copy selected items' },
-      { keys: 'Ctrl + X', description: 'Cut selected items' },
-      { keys: 'Ctrl + V', description: 'Paste items' },
-      { keys: 'Ctrl + Z', description: 'Undo last action' },
-      { keys: 'Ctrl + Y', description: 'Redo last action' },
-      { keys: 'Ctrl + D', description: 'Add to favorites' },
-    ],
-  },
-  {
-    name: 'Selection',
-    shortcuts: [
-      { keys: 'Ctrl + A', description: 'Select all items' },
-      { keys: 'Ctrl + Click', description: 'Toggle item selection' },
-      { keys: 'Shift + Click', description: 'Select range of items' },
-      { keys: 'Escape', description: 'Clear selection' },
-      { keys: 'Type letters', description: 'Select by filename' },
-    ],
-  },
-  {
-    name: 'View',
-    shortcuts: [
-      { keys: 'Ctrl + 1', description: 'List view' },
-      { keys: 'Ctrl + 2', description: 'Grid view' },
-      { keys: 'Ctrl + 3', description: 'Column view' },
-      { keys: 'Ctrl + H', description: 'Toggle hidden files' },
-      { keys: 'F5', description: 'Refresh' },
-      { keys: 'Space', description: 'Quick Look preview' },
-      { keys: '+', description: 'Increase thumbnail size (Grid)' },
-      { keys: '-', description: 'Decrease thumbnail size (Grid)' },
-    ],
-  },
-  {
-    name: 'Tabs',
-    shortcuts: [
-      { keys: 'Ctrl + T', description: 'New tab' },
-      { keys: 'Ctrl + W', description: 'Close current tab' },
-      { keys: 'Ctrl + Tab', description: 'Next tab' },
-      { keys: 'Ctrl + Shift + Tab', description: 'Previous tab' },
-      { keys: 'Alt + Up/Down', description: 'Reorder focused Favorite' },
-    ],
-  },
-  {
-    name: 'Search & Commands',
-    shortcuts: [
-      { keys: 'Ctrl + F', description: 'Search files' },
-      { keys: 'Ctrl + Shift + P', description: 'Open command palette' },
-      { keys: '?', description: 'Show keyboard shortcuts' },
-    ],
-  },
-];
+import { useFileStore } from '../store';
+import { buildOverlayShortcuts, overlayCategories } from '../utils/shortcuts';
 
 interface KeyboardShortcutsOverlayProps {
   open: boolean;
@@ -88,10 +10,19 @@ interface KeyboardShortcutsOverlayProps {
 }
 
 export function KeyboardShortcutsOverlay({ open, onClose }: KeyboardShortcutsOverlayProps) {
+  const shortcuts = useFileStore((state) => state.shortcuts);
   const [searchQuery, setSearchQuery] = useState('');
   const inputRef = useRef<HTMLInputElement>(null);
   const overlayRef = useRef<HTMLDivElement>(null);
   const focusTrapRef = useRef<ReturnType<typeof createFocusTrap> | null>(null);
+
+  const categories = useMemo(() => {
+    const items = buildOverlayShortcuts(shortcuts);
+    return overlayCategories(shortcuts).map((name) => ({
+      name,
+      shortcuts: items.filter((item) => item.category === name),
+    }));
+  }, [shortcuts]);
 
   useEffect(() => {
     if (!open || !overlayRef.current) return;
@@ -107,19 +38,21 @@ export function KeyboardShortcutsOverlay({ open, onClose }: KeyboardShortcutsOve
   // Filter shortcuts based on search query
   const filteredCategories = useMemo(() => {
     if (!searchQuery.trim()) {
-      return SHORTCUT_CATEGORIES;
+      return categories;
     }
 
     const query = searchQuery.toLowerCase();
-    return SHORTCUT_CATEGORIES.map((category) => ({
-      ...category,
-      shortcuts: category.shortcuts.filter(
-        (shortcut) =>
-          shortcut.keys.toLowerCase().includes(query) ||
-          shortcut.description.toLowerCase().includes(query)
-      ),
-    })).filter((category) => category.shortcuts.length > 0);
-  }, [searchQuery]);
+    return categories
+      .map((category) => ({
+        ...category,
+        shortcuts: category.shortcuts.filter(
+          (shortcut) =>
+            shortcut.keys.toLowerCase().includes(query) ||
+            shortcut.description.toLowerCase().includes(query)
+        ),
+      }))
+      .filter((category) => category.shortcuts.length > 0);
+  }, [categories, searchQuery]);
 
   // Focus search input when opened
   useEffect(() => {
@@ -211,7 +144,7 @@ export function KeyboardShortcutsOverlay({ open, onClose }: KeyboardShortcutsOve
                   <h3 className={styles.categoryTitle}>{category.name}</h3>
                   <div className={styles.shortcuts}>
                     {category.shortcuts.map((shortcut) => (
-                      <div key={shortcut.keys} className={styles.shortcutItem}>
+                      <div key={shortcut.id} className={styles.shortcutItem}>
                         <span className={styles.description}>{shortcut.description}</span>
                         <kbd className={styles.keys}>{shortcut.keys}</kbd>
                       </div>

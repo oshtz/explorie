@@ -2,6 +2,8 @@ import React from 'react';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { useFileStore } from '../store';
+import { cloneShortcutMap, DEFAULT_SHORTCUTS } from '../utils/shortcuts';
 import { KeyboardShortcutsOverlay } from './KeyboardShortcutsOverlay';
 
 function renderOverlay(
@@ -25,6 +27,7 @@ describe('KeyboardShortcutsOverlay', () => {
   afterEach(() => {
     cleanup();
     vi.clearAllMocks();
+    useFileStore.setState({ shortcuts: cloneShortcutMap(DEFAULT_SHORTCUTS) });
   });
 
   it('does not render while closed', () => {
@@ -88,5 +91,14 @@ describe('KeyboardShortcutsOverlay', () => {
     expect(onClose).not.toHaveBeenCalled();
     fireEvent.keyDown(screen.getByPlaceholderText('Search shortcuts...'), { key: 'Escape' });
     expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it('stays in sync with rebound shortcut bindings', () => {
+    useFileStore.getState().setShortcut('commandPalette', { key: 'k', mod: true, shift: true });
+    renderOverlay();
+
+    expect(screen.getByText('Ctrl + Shift + K')).toBeInTheDocument();
+    expect(screen.queryByText('Ctrl + Shift + P')).not.toBeInTheDocument();
+    expect(screen.getByText('Open command palette')).toBeInTheDocument();
   });
 });

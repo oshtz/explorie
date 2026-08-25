@@ -234,13 +234,15 @@ Before creating a new tag, manually verify:
 
 ## Keyboard Shortcuts
 
+Defaults below. Rebind them in Settings → Keyboard. Bindings persist locally with other settings. Space (Quick Look) and Escape (dismiss) stay reserved. A chord already used by another action is refused.
+
 | Shortcut     | Action                                               |
 | ------------ | ---------------------------------------------------- |
 | `Space`      | Open or close Quick Look for the selected file       |
 | `Escape`     | Close dialogs, menus, Quick Look, or command palette |
 | `Ctrl/Cmd+T` | New tab                                              |
 | `Ctrl/Cmd+W` | Close tab                                            |
-| `Ctrl/Cmd+P` | Command palette                                      |
+| `Ctrl/Cmd+Shift+P` | Command palette                                |
 | `Ctrl/Cmd+F` | Focus search                                         |
 | `Ctrl/Cmd+,` | Settings                                             |
 | `Arrow keys` | Navigate file views                                  |

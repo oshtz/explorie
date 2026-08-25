@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { useFileStore, type FileEntry, type SmartFolderCriteria, type ThemeSpec } from './store';
 import type { StoreState } from './store/types';
 import { loadRemoteDrivesEnabled, normalizeThemeSpec } from './store/slices/uiSlice';
+import { cloneShortcutMap, DEFAULT_SHORTCUTS } from './utils/shortcuts';
 
 const initialState = useFileStore.getState();
 
@@ -91,6 +92,7 @@ function resetStore(overrides: Partial<StoreState> = {}) {
       lastWorkspaceId: null,
       smartFolders: {},
       activeSmartFolderId: null,
+      shortcuts: cloneShortcutMap(DEFAULT_SHORTCUTS),
       ...overrides,
     },
     true

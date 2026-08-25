@@ -1,5 +1,7 @@
 import { useEffect } from 'react';
 import type { ViewMode } from '../components/ViewModeToggle';
+import { useFileStore } from '../store';
+import { matchShortcut, SHORTCUT_META, type ShortcutId } from '../utils/shortcuts';
 
 export interface UseAppKeyboardShortcutsInput {
   activeTabId: string;
@@ -69,94 +71,106 @@ export function useAppKeyboardShortcuts({
   focusSearch,
   typeToSelect,
 }: UseAppKeyboardShortcutsInput): void {
+  const shortcuts = useFileStore((state) => state.shortcuts);
+
   useEffect(() => {
+    const run = (id: ShortcutId): boolean => {
+      switch (id) {
+        case 'deleteSelection':
+          deleteSelection();
+          return true;
+        case 'goUp':
+          goUp();
+          return true;
+        case 'refresh':
+          refresh();
+          return true;
+        case 'viewList':
+          setViewMode('list');
+          return true;
+        case 'viewGrid':
+          setViewMode('grid');
+          return true;
+        case 'viewColumn':
+          setViewMode('column');
+          return true;
+        case 'toggleHidden':
+          toggleHidden();
+          return true;
+        case 'nextTab':
+          activateTabOffset(1);
+          return true;
+        case 'prevTab':
+          activateTabOffset(-1);
+          return true;
+        case 'focusSearch':
+          focusSearch();
+          return true;
+        case 'newTab':
+          addTab();
+          return true;
+        case 'closeTab':
+          closeTab(activeTabId);
+          return true;
+        case 'goBack':
+          goBack();
+          return true;
+        case 'goForward':
+          goForward();
+          return true;
+        case 'quickLook':
+          if (!isQuickLookOpen && selectedFileIsPreviewable) {
+            openQuickLook();
+            return true;
+          }
+          return false;
+        case 'goToFolder':
+          openGoToFolder();
+          return true;
+        case 'commandPalette':
+          openCommandPalette();
+          return true;
+        case 'addFavorite':
+          if (currentPath) addFavorite(currentPath);
+          return true;
+        case 'showShortcuts':
+          toggleShortcutsOverlay();
+          return true;
+        case 'undo':
+          if (canUndo) void undo();
+          return true;
+        case 'redo':
+          if (canRedo) void redo();
+          return true;
+        case 'increaseThumbnail':
+          if (viewMode === 'grid') {
+            increaseThumbnailSize();
+            return true;
+          }
+          return false;
+        case 'decreaseThumbnail':
+          if (viewMode === 'grid') {
+            decreaseThumbnailSize();
+            return true;
+          }
+          return false;
+        default:
+          return false;
+      }
+    };
+
     const onKey = (event: KeyboardEvent) => {
       if (document.querySelector('[aria-modal="true"]')) return;
 
       const ctrlOrMeta = event.ctrlKey || event.metaKey;
       const isInputField = isEditableShortcutTarget(event.target);
+      const id = matchShortcut(shortcuts, event);
 
-      if (!isInputField && event.key === 'Delete' && !ctrlOrMeta && !event.altKey) {
-        event.preventDefault();
-        deleteSelection();
-        return;
-      }
-
-      if (!isInputField && event.key === 'Backspace' && !ctrlOrMeta && !event.altKey) {
-        event.preventDefault();
-        goUp();
-        return;
-      }
-
-      if (!isInputField && event.key === 'F5') {
-        event.preventDefault();
-        refresh();
-        return;
-      }
-
-      if (ctrlOrMeta && ['1', '2', '3'].includes(event.key)) {
-        event.preventDefault();
-        setViewMode(event.key === '1' ? 'list' : event.key === '2' ? 'grid' : 'column');
-        return;
-      }
-
-      if (ctrlOrMeta && (event.key === 'h' || event.key === 'H') && !isInputField) {
-        event.preventDefault();
-        toggleHidden();
-        return;
-      }
-
-      if (ctrlOrMeta && event.key === 'Tab') {
-        event.preventDefault();
-        activateTabOffset(event.shiftKey ? -1 : 1);
-        return;
-      }
-
-      if (ctrlOrMeta && (event.key === 'f' || event.key === 'F')) {
-        event.preventDefault();
-        focusSearch();
-        return;
-      }
-
-      if (ctrlOrMeta && (event.key === 't' || event.key === 'T')) {
-        event.preventDefault();
-        addTab();
-        return;
-      }
-
-      if (ctrlOrMeta && (event.key === 'w' || event.key === 'W')) {
-        event.preventDefault();
-        closeTab(activeTabId);
-        return;
-      }
-
-      if (event.altKey && event.key === 'ArrowLeft') {
-        event.preventDefault();
-        goBack();
-        return;
-      }
-
-      if (event.altKey && event.key === 'ArrowRight') {
-        event.preventDefault();
-        goForward();
-        return;
-      }
-
-      if (event.key === ' ' && !isInputField && !isQuickLookOpen && selectedFileIsPreviewable) {
-        event.preventDefault();
-        openQuickLook();
-        return;
-      }
-
-      if (ctrlOrMeta && (event.key === 'g' || event.key === 'G') && !isInputField) {
-        event.preventDefault();
-        openGoToFolder();
-        return;
-      }
-
-      if (ctrlOrMeta && event.shiftKey && (event.key === 'p' || event.key === 'P')) {
-        event.preventDefault();
-        openCommandPalette();
+      if (id) {
+        if (isInputField && SHORTCUT_META[id].suppressInEditable) return;
+        if (run(id)) {
+          event.preventDefault();
+        }
         return;
       }
 
@@ -168,67 +182,6 @@ export function useAppKeyboardShortcuts({
       ) {
         event.preventDefault();
         toggleDebugPanel();
-        return;
-      }
-
-      if (ctrlOrMeta && (event.key === 'd' || event.key === 'D') && !isInputField) {
-        event.preventDefault();
-        if (currentPath) addFavorite(currentPath);
-        return;
-      }
-
-      if (event.key === '?' && !isInputField && !event.ctrlKey && !event.metaKey && !event.altKey) {
-        event.preventDefault();
-        toggleShortcutsOverlay();
-        return;
-      }
-
-      if (
-        ctrlOrMeta &&
-        (event.key === 'z' || event.key === 'Z') &&
-        !event.shiftKey &&
-        !isInputField
-      ) {
-        event.preventDefault();
-        if (canUndo) void undo();
-        return;
-      }
-
-      if (
-        ctrlOrMeta &&
-        (event.key === 'y' ||
-          event.key === 'Y' ||
-          ((event.key === 'z' || event.key === 'Z') && event.shiftKey)) &&
-        !isInputField
-      ) {
-        event.preventDefault();
-        if (canRedo) void redo();
-        return;
-      }
-
-      if (
-        (event.key === '+' || event.key === '=') &&
-        !isInputField &&
-        !event.ctrlKey &&
-        !event.metaKey &&
-        !event.altKey &&
-        viewMode === 'grid'
-      ) {
-        event.preventDefault();
-        increaseThumbnailSize();
-        return;
-      }
-
-      if (
-        event.key === '-' &&
-        !isInputField &&
-        !event.ctrlKey &&
-        !event.metaKey &&
-        !event.altKey &&
-        viewMode === 'grid'
-      ) {
-        event.preventDefault();
-        decreaseThumbnailSize();
         return;
       }
 
@@ -270,6 +223,7 @@ export function useAppKeyboardShortcuts({
     refresh,
     selectedFileIsPreviewable,
     setViewMode,
+    shortcuts,
     toggleDebugPanel,
     toggleShortcutsOverlay,
     toggleHidden,

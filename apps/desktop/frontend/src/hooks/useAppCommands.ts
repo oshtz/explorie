@@ -1,7 +1,9 @@
 import { useMemo } from 'react';
 import type { Command } from '../components/CommandPalette';
 import type { ViewMode } from '../components/ViewModeToggle';
+import { useFileStore } from '../store';
 import type { ThemeMode } from '../store/types';
+import { COMMAND_SHORTCUT_IDS, formatChordDisplay, type ShortcutMap } from '../utils/shortcuts';
 
 interface AppCommandHandlers {
   goBack: () => void;
@@ -34,32 +36,39 @@ interface UseAppCommandsInput {
   handlers: AppCommandHandlers;
 }
 
+function shortcutFor(commandId: string, shortcuts: ShortcutMap) {
+  const id = COMMAND_SHORTCUT_IDS[commandId];
+  return id ? formatChordDisplay(shortcuts[id]) : undefined;
+}
+
 export function useAppCommands({
   showHidden,
   showPreviewPanel,
   showStatusBar,
   handlers,
 }: UseAppCommandsInput): Command[] {
+  const shortcuts = useFileStore((state) => state.shortcuts);
+
   return useMemo<Command[]>(
     () => [
       {
         id: 'nav-back',
         name: 'Go Back',
-        shortcut: 'Alt+Left',
+        shortcut: shortcutFor('nav-back', shortcuts),
         category: 'navigation',
         action: handlers.goBack,
       },
       {
         id: 'nav-forward',
         name: 'Go Forward',
-        shortcut: 'Alt+Right',
+        shortcut: shortcutFor('nav-forward', shortcuts),
         category: 'navigation',
         action: handlers.goForward,
       },
       {
         id: 'nav-go-to-folder',
         name: 'Go to Folder...',
-        shortcut: 'Ctrl+G',
+        shortcut: shortcutFor('nav-go-to-folder', shortcuts),
         category: 'navigation',
         action: handlers.goToFolder,
       },
@@ -78,24 +87,28 @@ export function useAppCommands({
       {
         id: 'view-list',
         name: 'Switch to List View',
+        shortcut: shortcutFor('view-list', shortcuts),
         category: 'view',
         action: () => handlers.setViewMode('list'),
       },
       {
         id: 'view-grid',
         name: 'Switch to Grid View',
+        shortcut: shortcutFor('view-grid', shortcuts),
         category: 'view',
         action: () => handlers.setViewMode('grid'),
       },
       {
         id: 'view-column',
         name: 'Switch to Column View',
+        shortcut: shortcutFor('view-column', shortcuts),
         category: 'view',
         action: () => handlers.setViewMode('column'),
       },
       {
         id: 'view-toggle-hidden',
         name: showHidden ? 'Hide Hidden Files' : 'Show Hidden Files',
+        shortcut: shortcutFor('view-toggle-hidden', shortcuts),
         category: 'view',
         action: handlers.toggleHidden,
       },
@@ -114,21 +127,21 @@ export function useAppCommands({
       {
         id: 'view-refresh',
         name: 'Refresh',
-        shortcut: 'F5',
+        shortcut: shortcutFor('view-refresh', shortcuts),
         category: 'view',
         action: handlers.refresh,
       },
       {
         id: 'tab-new',
         name: 'New Tab',
-        shortcut: 'Ctrl+T',
+        shortcut: shortcutFor('tab-new', shortcuts),
         category: 'tab',
         action: handlers.addTab,
       },
       {
         id: 'tab-close',
         name: 'Close Tab',
-        shortcut: 'Ctrl+W',
+        shortcut: shortcutFor('tab-close', shortcuts),
         category: 'tab',
         action: handlers.closeActiveTab,
       },
@@ -141,14 +154,14 @@ export function useAppCommands({
       {
         id: 'edit-undo',
         name: 'Undo',
-        shortcut: 'Ctrl+Z',
+        shortcut: shortcutFor('edit-undo', shortcuts),
         category: 'file',
         action: handlers.undo,
       },
       {
         id: 'edit-redo',
         name: 'Redo',
-        shortcut: 'Ctrl+Y',
+        shortcut: shortcutFor('edit-redo', shortcuts),
         category: 'file',
         action: handlers.redo,
       },
@@ -179,14 +192,14 @@ export function useAppCommands({
       {
         id: 'nav-add-favorite',
         name: 'Add Current Folder to Favorites',
-        shortcut: 'Ctrl+D',
+        shortcut: shortcutFor('nav-add-favorite', shortcuts),
         category: 'navigation',
         action: handlers.addFavorite,
       },
       {
         id: 'help-keyboard-shortcuts',
         name: 'Show Keyboard Shortcuts',
-        shortcut: '?',
+        shortcut: shortcutFor('help-keyboard-shortcuts', shortcuts),
         category: 'settings',
         action: handlers.showKeyboardShortcuts,
       },
@@ -203,6 +216,6 @@ export function useAppCommands({
         action: handlers.saveWorkspace,
       },
     ],
-    [handlers, showHidden, showPreviewPanel, showStatusBar]
+    [handlers, shortcuts, showHidden, showPreviewPanel, showStatusBar]
   );
 }

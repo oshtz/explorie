@@ -3,6 +3,7 @@ import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { SettingsPanel } from './SettingsPanel';
+import { cloneShortcutMap, DEFAULT_SHORTCUTS } from '../utils/shortcuts';
 
 type MockState = Record<string, unknown>;
 
@@ -93,6 +94,9 @@ function createStoreState(overrides: MockState = {}): MockState {
     setConfirmBeforeDelete: storeSetter('confirmBeforeDelete'),
     enableErrorReporting: false,
     setEnableErrorReporting: storeSetter('enableErrorReporting'),
+    shortcuts: cloneShortcutMap(DEFAULT_SHORTCUTS),
+    setShortcut: vi.fn(() => ({ ok: true, map: cloneShortcutMap(DEFAULT_SHORTCUTS) })),
+    resetShortcuts: vi.fn(),
     themes: {},
     saveTheme: vi.fn(),
     deleteTheme: vi.fn(),
@@ -156,8 +160,15 @@ describe('SettingsPanel', () => {
     const navigation = screen.getByRole('navigation', { name: 'Settings sections' });
     const sectionButtons = navigation.querySelectorAll('button');
 
-    expect(sectionButtons).toHaveLength(5);
+    expect(sectionButtons).toHaveLength(6);
     expect(screen.getByRole('button', { name: 'General' })).toHaveAttribute('aria-current', 'page');
+  });
+
+  it('opens the keyboard shortcut rebind section', async () => {
+    const { user } = renderPanel();
+    await user.click(screen.getByRole('button', { name: 'Keyboard' }));
+    expect(screen.getByRole('button', { name: 'Reset shortcuts' })).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Rebind New tab' })).toHaveTextContent('Ctrl + T');
   });
 
   it('does not expose prototype controls', async () => {
@@ -331,6 +342,7 @@ describe('SettingsPanel', () => {
     expect(mocks.state.setEnableErrorReporting).toHaveBeenCalledWith(false);
     expect(mocks.state.setListRowHeight).toHaveBeenCalledWith(34);
     expect(mocks.state.setGridMinWidth).toHaveBeenCalledWith(140);
+    expect(mocks.state.resetShortcuts).toHaveBeenCalledTimes(1);
     expect(screen.getByRole('status')).toHaveTextContent('Settings restored to defaults');
   });
 });

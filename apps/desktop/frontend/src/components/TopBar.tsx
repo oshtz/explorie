@@ -15,6 +15,7 @@ import { useUndoRedoStore, useCanUndo, useCanRedo } from '../undoRedoStore';
 import { basename } from '../utils/path';
 import { useToast } from './Toast';
 import { reportError } from '../utils/errorReporter';
+import { formatChordAria, formatChordDisplay } from '../utils/shortcuts';
 import { useShallow } from 'zustand/shallow';
 import { TextInputDialog } from './TextInputDialog';
 
@@ -88,6 +89,7 @@ export function TopBar({
     setPathStack,
     addSmartFolder,
     files,
+    shortcuts,
   } = useFileStore(
     useShallow((state) => ({
       setViewMode: state.setViewMode,
@@ -111,6 +113,7 @@ export function TopBar({
       setPathStack: state.setPathStack,
       addSmartFolder: state.addSmartFolder,
       files: state.files,
+      shortcuts: state.shortcuts,
     }))
   );
   // Local search input state for immediate feedback, debounced to store
@@ -434,9 +437,9 @@ export function TopBar({
         <button
           ref={backButtonRef}
           className={styles.upButton}
-          title="Back (Alt+Left) - Right-click for history"
+          title={`Back (${formatChordDisplay(shortcuts.goBack)}) - Right-click for history`}
           aria-label="Go back"
-          aria-keyshortcuts="Alt+ArrowLeft"
+          aria-keyshortcuts={formatChordAria(shortcuts.goBack)}
           aria-expanded={backHistoryOpen}
           aria-controls={backHistory.length > 0 ? popoverIds.backHistory : undefined}
           onClick={onBack}
@@ -490,9 +493,9 @@ export function TopBar({
         <button
           ref={forwardButtonRef}
           className={styles.upButton}
-          title="Forward (Alt+Right) - Right-click for history"
+          title={`Forward (${formatChordDisplay(shortcuts.goForward)}) - Right-click for history`}
           aria-label="Go forward"
-          aria-keyshortcuts="Alt+ArrowRight"
+          aria-keyshortcuts={formatChordAria(shortcuts.goForward)}
           aria-expanded={forwardHistoryOpen}
           aria-controls={forwardHistory.length > 0 ? popoverIds.forwardHistory : undefined}
           onClick={onForward}
@@ -928,16 +931,22 @@ function UndoRedoButtons() {
   const redoAction = useUndoRedoStore((s) => s.redo);
   const lastUndoOp = useUndoRedoStore((s) => s.undoStack[s.undoStack.length - 1]);
   const lastRedoOp = useUndoRedoStore((s) => s.redoStack[s.redoStack.length - 1]);
+  const undoChord = useFileStore((s) => s.shortcuts.undo);
+  const redoChord = useFileStore((s) => s.shortcuts.redo);
+  const undoLabel = formatChordDisplay(undoChord);
+  const redoLabel = formatChordDisplay(redoChord);
 
   return (
     <div className={styles.controlsContainer} role="group" aria-label="Undo and redo">
       <button
         className={styles.controlButton}
         title={
-          canUndo ? `Undo: ${lastUndoOp?.description || 'last action'} (Ctrl+Z)` : 'Undo (Ctrl+Z)'
+          canUndo
+            ? `Undo: ${lastUndoOp?.description || 'last action'} (${undoLabel})`
+            : `Undo (${undoLabel})`
         }
         aria-label={canUndo ? `Undo ${lastUndoOp?.description || 'last action'}` : 'Undo'}
-        aria-keyshortcuts="Control+Z"
+        aria-keyshortcuts={formatChordAria(undoChord)}
         onClick={() => canUndo && undoAction()}
         disabled={!canUndo}
       >
@@ -946,10 +955,12 @@ function UndoRedoButtons() {
       <button
         className={styles.controlButton}
         title={
-          canRedo ? `Redo: ${lastRedoOp?.description || 'last action'} (Ctrl+Y)` : 'Redo (Ctrl+Y)'
+          canRedo
+            ? `Redo: ${lastRedoOp?.description || 'last action'} (${redoLabel})`
+            : `Redo (${redoLabel})`
         }
         aria-label={canRedo ? `Redo ${lastRedoOp?.description || 'last action'}` : 'Redo'}
-        aria-keyshortcuts="Control+Y"
+        aria-keyshortcuts={formatChordAria(redoChord)}
         onClick={() => canRedo && redoAction()}
         disabled={!canRedo}
       >

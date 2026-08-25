@@ -1,5 +1,7 @@
 import { renderHook } from '@testing-library/react';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { useFileStore } from '../store';
+import { cloneShortcutMap, DEFAULT_SHORTCUTS } from '../utils/shortcuts';
 import { useAppCommands } from './useAppCommands';
 
 function renderCommands(overrides: Partial<Parameters<typeof useAppCommands>[0]> = {}) {
@@ -39,6 +41,10 @@ function renderCommands(overrides: Partial<Parameters<typeof useAppCommands>[0]>
 }
 
 describe('useAppCommands', () => {
+  afterEach(() => {
+    useFileStore.setState({ shortcuts: cloneShortcutMap(DEFAULT_SHORTCUTS) });
+  });
+
   it('builds stable command ids and dynamic labels', () => {
     const { result } = renderCommands({
       showHidden: true,
@@ -68,5 +74,12 @@ describe('useAppCommands', () => {
     expect(handlers.goBack).toHaveBeenCalledTimes(1);
     expect(handlers.setTheme).toHaveBeenCalledWith('light');
     expect(handlers.saveWorkspace).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps command palette chords in sync with the stored map', () => {
+    useFileStore.getState().setShortcut('newTab', { key: 'n', mod: true });
+    const { result } = renderCommands();
+    expect(result.current.find((command) => command.id === 'tab-new')?.shortcut).toBe('Ctrl+N');
+    expect(result.current.find((command) => command.id === 'nav-back')?.shortcut).toBe('Alt+Left');
   });
 });

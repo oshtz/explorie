@@ -72,6 +72,9 @@ export interface LocalStorageSchema {
 
   // Undo/Redo
   'explorie:undoTimeoutMinutes': number;
+
+  // Keyboard shortcuts
+  'explorie:shortcuts': Record<string, string>;
 }
 
 /**
