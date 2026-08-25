@@ -998,7 +998,10 @@ function ColumnViewInner({
           });
         }
       } catch (e) {
-        reportError('Delete failed', e, { toast: showToast });
+        reportError('Delete failed', e, {
+          toast: showToast,
+          retry: () => performDelete(files, permanent),
+        });
       }
     },
     [pathStackState, setPathStackStore, showToast, setSelectionByPath]
@@ -1202,6 +1205,7 @@ function ColumnViewInner({
                                 reportError('Rename failed', error, {
                                   toast: showToast,
                                   context: { path: entry.path },
+                                  retry: () => renamePath(entry.path, (newName || '').trim()),
                                 });
                               } finally {
                                 setEditingId(null);

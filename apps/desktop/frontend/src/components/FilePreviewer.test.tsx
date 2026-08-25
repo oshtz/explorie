@@ -435,6 +435,26 @@ describe('FilePreviewer', () => {
     );
     expect(screen.getByTestId('preview-content-sample')).toHaveTextContent('Install LibreOffice');
   });
+
+  it('keeps helper install guidance from a structured AppError', async () => {
+    mocks.invoke.mockRejectedValue({
+      code: 'helper_missing',
+      message: 'Install LibreOffice to preview Office and OpenDocument files.',
+      retryable: true,
+    });
+
+    render(<FilePreviewer file={makeFile('C:/Docs/budget.docx')} />);
+
+    await waitFor(() =>
+      expect(screen.getByTestId('preview')).toHaveAttribute('data-type', 'error')
+    );
+    expect(screen.getByTestId('preview-content-sample')).toHaveTextContent(
+      'Install LibreOffice to preview Office'
+    );
+    expect(screen.getByTestId('preview-content-sample').textContent).not.toContain(
+      'A required helper is not available'
+    );
+  });
 });
 
 function makeFile(path: string, overrides: Partial<FileEntry> = {}): FileEntry {

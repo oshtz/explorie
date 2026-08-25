@@ -48,7 +48,9 @@ export function Sidebar({
     invoke<SystemLocations>('list_system_locations')
       .then(setLocations)
       .catch((error) => {
-        const formatted = reportError('Failed to load system locations', error);
+        const formatted = reportError('Failed to load system locations', error, {
+          retry: loadLocations,
+        });
         setLocationsError(formatted.message);
       });
   }, []);

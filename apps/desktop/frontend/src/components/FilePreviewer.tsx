@@ -5,7 +5,7 @@ import type { FileEntry } from '../store';
 import { useFileStore } from '../store';
 import { Preview } from './Preview';
 import { getCachedPreview, setCachedPreview } from '../utils/previewCache';
-import { formatErrorMessage } from '../utils/errorMessages';
+import { formatUserFacingError } from '../utils/errorMessages';
 import { normalizePath } from '../utils/path';
 import { getPreviewProviderKind } from '../utils/previewProviders';
 
@@ -268,7 +268,7 @@ export function FilePreviewer({ file, onClose, variant = 'panel' }: FilePreviewe
         .catch((e: unknown) => {
           if (!cancelled) {
             setTextContent(undefined);
-            setError('Failed to load text: ' + formatErrorMessage(e));
+            setError('Failed to load text: ' + formatUserFacingError(e));
             finishLoading();
           }
         });
@@ -288,7 +288,7 @@ export function FilePreviewer({ file, onClose, variant = 'panel' }: FilePreviewe
         })
         .catch((e: unknown) => {
           if (!cancelled) {
-            setError('Failed to load archive preview: ' + formatErrorMessage(e));
+            setError('Failed to load archive preview: ' + formatUserFacingError(e));
             finishLoading();
           }
         });
@@ -314,7 +314,7 @@ export function FilePreviewer({ file, onClose, variant = 'panel' }: FilePreviewe
         })
         .catch((e: unknown) => {
           if (!cancelled) {
-            setError('Failed to generate preview: ' + formatErrorMessage(e));
+            setError('Failed to generate preview: ' + formatUserFacingError(e));
             finishLoading();
           }
         });

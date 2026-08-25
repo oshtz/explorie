@@ -186,6 +186,33 @@ describe('SettingsPanel', () => {
     expect(screen.getByRole('status')).toHaveTextContent('Windows integration enabled');
   });
 
+  it('shows a user-safe next step when Windows integration returns AppError', async () => {
+    mocks.invoke.mockImplementation((command: string) => {
+      if (command === 'get_system_integration_status') {
+        return Promise.resolve({ supported: true, enabled: false });
+      }
+      if (command === 'set_system_integration') {
+        return Promise.reject({
+          code: 'permission',
+          message: "You don't have permission for this operation",
+          retryable: false,
+          detail: String.raw`Access is denied: C:\Windows\System32`,
+        });
+      }
+      return Promise.reject(new Error(`Unexpected command: ${command}`));
+    });
+
+    const { user } = renderPanel();
+    await user.click(screen.getByRole('button', { name: 'System Integration' }));
+    await user.click(await screen.findByRole('checkbox', { name: /Open folders with Explorie/i }));
+
+    const status = await screen.findByRole('status');
+    expect(status).toHaveTextContent("You don't have permission for this operation");
+    expect(status).toHaveTextContent('Check folder permissions');
+    expect(status).not.toHaveTextContent('[object Object]');
+    expect(status).not.toHaveTextContent('C:\\Windows');
+  });
+
   it('updates general settings from checkbox controls', async () => {
     const { user } = renderPanel();
 

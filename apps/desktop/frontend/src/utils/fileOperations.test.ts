@@ -97,6 +97,26 @@ describe('native-backed file operations', () => {
     });
   });
 
+  it('offers Retry when a retryable copy error includes a next step', async () => {
+    mocks.runNativeFileOperation.mockRejectedValueOnce({
+      code: 'remote_unavailable',
+      message: 'The remote drive is unavailable',
+      retryable: true,
+    });
+
+    await expect(
+      copyWithUndoAndConflictResolution([file()], '/destination', showToast, refresh)
+    ).resolves.toBe(false);
+
+    expect(showToast).toHaveBeenCalledWith(
+      expect.stringContaining('Check the remote connection and retry'),
+      expect.objectContaining({
+        type: 'error',
+        action: expect.objectContaining({ label: 'Retry' }),
+      })
+    );
+  });
+
   it('permanently deletes only when explicitly requested', async () => {
     await expect(deleteWithUndo([file()], showToast, refresh, { permanent: true })).resolves.toBe(
       true

@@ -78,4 +78,50 @@ describe('runNativeFileOperation', () => {
     });
     expect(mocks.unlisten).toHaveBeenCalledTimes(1);
   });
+
+  it('preserves structured AppError on a failed native job', async () => {
+    mocks.invoke.mockImplementation(async () => {
+      mocks.handler?.({
+        payload: {
+          jobId: 'job-2',
+          state: 'failed',
+          error: {
+            code: 'remote_unavailable',
+            message: 'The remote drive is unavailable',
+            retryable: true,
+            operation: 'file_operation',
+            detail: 'rclone mount secret --password=hunter2',
+          },
+        },
+      });
+      return 'job-2';
+    });
+
+    const run = runNativeFileOperation(
+      {
+        kind: 'copy',
+        sources: ['/source/a.txt'],
+        destination: '/target',
+        conflictPolicy: 'error',
+      },
+      {
+        type: 'copy',
+        items: [{ sourcePath: '/source/a.txt', size: 7, name: 'a.txt', isDir: false }],
+        destinationPath: '/target',
+        conflictResolution: 'ask',
+      }
+    );
+
+    await expect(run).rejects.toMatchObject({
+      message: 'The remote drive is unavailable',
+      code: 'remote_unavailable',
+      retryable: true,
+    });
+    expect(useOperationQueueStore.getState().operations[0]).toMatchObject({
+      id: 'job-2',
+      status: 'failed',
+      error: expect.stringContaining('Check the remote connection and retry'),
+    });
+    expect(useOperationQueueStore.getState().operations[0].error).not.toContain('hunter2');
+  });
 });

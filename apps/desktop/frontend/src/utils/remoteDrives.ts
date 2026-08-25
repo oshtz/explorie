@@ -1,3 +1,4 @@
+import { formatUserFacingError, persistInvokeError, type AppErrorPayload } from './errorMessages';
 import { getJsonWithDefault, setJson } from './localStorage';
 
 export interface RemoteDriveProfile {
@@ -16,11 +17,13 @@ export type RemoteDriveState =
   | 'approval-required'
   | 'error';
 
+export type RemoteDriveError = AppErrorPayload | string;
+
 export interface RemoteDriveStatus {
   id: string;
   state: RemoteDriveState;
   mountPath?: string | null;
-  error?: string | null;
+  error?: RemoteDriveError | null;
 }
 
 export interface RemoteDriveEnvironment {
@@ -72,6 +75,15 @@ const sanitizeProfile = (value: unknown): RemoteDriveProfile | null => {
     mountTarget: profile.mountTarget,
   };
 };
+
+export function remoteDriveErrorText(error?: RemoteDriveError | null): string | undefined {
+  if (error == null || error === '') return undefined;
+  return formatUserFacingError(error);
+}
+
+export function persistRemoteDriveError(error: unknown): RemoteDriveError {
+  return persistInvokeError(error);
+}
 
 export function loadRemoteDrives(): RemoteDriveProfile[] {
   return (getJsonWithDefault('explorie:remoteDrives', []) as unknown[])

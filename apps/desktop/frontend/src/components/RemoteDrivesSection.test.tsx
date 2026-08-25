@@ -3,14 +3,20 @@ import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { RemoteDrivesSection } from './RemoteDrivesSection';
 
-const invokeMock = vi.fn();
+const mocks = vi.hoisted(() => ({
+  invoke: vi.fn(),
+  listeners: new Map<string, (event: { payload: unknown }) => void>(),
+}));
 
 vi.mock('@tauri-apps/api/core', () => ({
-  invoke: (command: string, args?: unknown) => invokeMock(command, args),
+  invoke: (command: string, args?: unknown) => mocks.invoke(command, args),
 }));
 
 vi.mock('@tauri-apps/api/event', () => ({
-  listen: vi.fn().mockResolvedValue(vi.fn()),
+  listen: vi.fn((event: string, handler: (event: { payload: unknown }) => void) => {
+    mocks.listeners.set(event, handler);
+    return Promise.resolve(() => mocks.listeners.delete(event));
+  }),
 }));
 
 const environment = {
@@ -26,8 +32,9 @@ const environment = {
 describe('RemoteDrivesSection', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.listeners.clear();
     window.localStorage.clear();
-    invokeMock.mockImplementation((command: string, args?: { profile?: { id: string } }) => {
+    mocks.invoke.mockImplementation((command: string, args?: { profile?: { id: string } }) => {
       if (command === 'get_remote_drive_environment') return Promise.resolve(environment);
       if (command === 'list_rclone_remotes') return Promise.resolve(['cloud', 'backup']);
       if (command === 'get_remote_drive_statuses') return Promise.resolve([]);
@@ -56,7 +63,7 @@ describe('RemoteDrivesSection', () => {
     await user.click(screen.getByRole('button', { name: 'Save & Connect' }));
 
     await waitFor(() =>
-      expect(invokeMock).toHaveBeenCalledWith(
+      expect(mocks.invoke).toHaveBeenCalledWith(
         'connect_remote_drive',
         expect.objectContaining({ profile: expect.objectContaining({ name: 'Projects' }) })
       )
@@ -90,7 +97,7 @@ describe('RemoteDrivesSection', () => {
       },
     ];
     window.localStorage.setItem('explorie:remoteDrives', JSON.stringify(profiles));
-    invokeMock.mockImplementation((command: string, args?: { profile?: { id: string } }) => {
+    mocks.invoke.mockImplementation((command: string, args?: { profile?: { id: string } }) => {
       if (command === 'get_remote_drive_environment') return Promise.resolve(environment);
       if (command === 'list_rclone_remotes') return Promise.resolve(['cloud', 'backup']);
       if (command === 'get_remote_drive_statuses') return Promise.resolve([]);
@@ -106,7 +113,7 @@ describe('RemoteDrivesSection', () => {
     render(<RemoteDrivesSection onSelectLocation={vi.fn()} />);
 
     await waitFor(() => {
-      const connects = invokeMock.mock.calls.filter(
+      const connects = mocks.invoke.mock.calls.filter(
         ([command]) => command === 'connect_remote_drive'
       );
       expect(connects.map(([, args]) => args.profile.id)).toEqual(profiles.map(({ id }) => id));
@@ -114,10 +121,92 @@ describe('RemoteDrivesSection', () => {
     expect(await screen.findByText('Second')).toBeInTheDocument();
   });
 
+  it('renders a user-safe next step when connect rejects a structured AppError', async () => {
+    const profiles = [
+      {
+        id: '672ce77a-b72d-4e16-a9e8-55e0ac5bc580',
+        name: 'First',
+        remote: 'cloud',
+        remotePath: '',
+        mountTarget: 'E:',
+      },
+    ];
+    window.localStorage.setItem('explorie:remoteDrives', JSON.stringify(profiles));
+    mocks.invoke.mockImplementation((command: string) => {
+      if (command === 'get_remote_drive_environment') return Promise.resolve(environment);
+      if (command === 'list_rclone_remotes') return Promise.resolve(['cloud']);
+      if (command === 'get_remote_drive_statuses') return Promise.resolve([]);
+      if (command === 'connect_remote_drive') {
+        return Promise.reject({
+          code: 'helper_missing',
+          message: 'WinFsp is not installed on this computer',
+          retryable: true,
+          detail: 'Install WinFsp before mounting remote drives on Windows.',
+        });
+      }
+      return Promise.resolve(undefined);
+    });
+
+    render(<RemoteDrivesSection onSelectLocation={vi.fn()} />);
+
+    const drive = await screen.findByRole('button', { name: 'First' });
+    await waitFor(() =>
+      expect(drive).toHaveAttribute(
+        'title',
+        'WinFsp is not installed on this computer. Install or approve the required helper, then retry'
+      )
+    );
+    expect(drive.getAttribute('title')).not.toContain('[object Object]');
+  });
+
+  it('keeps code, retryable, and next-step from remote-drive-status events', async () => {
+    const profiles = [
+      {
+        id: '672ce77a-b72d-4e16-a9e8-55e0ac5bc580',
+        name: 'Archive',
+        remote: 'cloud',
+        remotePath: '',
+        mountTarget: 'E:',
+      },
+    ];
+    window.localStorage.setItem('explorie:remoteDrives', JSON.stringify(profiles));
+    mocks.invoke.mockImplementation((command: string) => {
+      if (command === 'get_remote_drive_environment') {
+        return Promise.resolve({ ...environment, rcloneAvailable: false });
+      }
+      if (command === 'get_remote_drive_statuses') return Promise.resolve([]);
+      return Promise.resolve(undefined);
+    });
+
+    render(<RemoteDrivesSection onSelectLocation={vi.fn()} />);
+
+    const drive = await screen.findByRole('button', { name: 'Archive' });
+    await waitFor(() => expect(mocks.listeners.has('remote-drive-status')).toBe(true));
+    mocks.listeners.get('remote-drive-status')?.({
+      payload: {
+        id: profiles[0].id,
+        state: 'error',
+        error: {
+          code: 'remote_unavailable',
+          message: 'The remote drive is unavailable',
+          retryable: true,
+        },
+      },
+    });
+
+    await waitFor(() =>
+      expect(drive).toHaveAttribute(
+        'title',
+        'The remote drive is unavailable. Check the remote connection and retry'
+      )
+    );
+    expect(drive.getAttribute('title')).not.toContain('[object Object]');
+  });
+
   it('offers the bundled WinFsp installer and refreshes after installation', async () => {
     const user = userEvent.setup();
     let environmentChecks = 0;
-    invokeMock.mockImplementation((command: string) => {
+    mocks.invoke.mockImplementation((command: string) => {
       if (command === 'get_remote_drive_environment') {
         environmentChecks += 1;
         return Promise.resolve({
@@ -140,7 +229,7 @@ describe('RemoteDrivesSection', () => {
     );
     await user.click(install);
 
-    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith('install_winfsp', undefined));
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('install_winfsp', undefined));
     await waitFor(() =>
       expect(screen.queryByRole('button', { name: 'Install WinFsp' })).not.toBeInTheDocument()
     );
@@ -152,7 +241,7 @@ describe('RemoteDrivesSection', () => {
 
     await user.click(await screen.findByRole('button', { name: 'Configure' }));
 
-    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith('configure_rclone', undefined));
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('configure_rclone', undefined));
     expect(await screen.findByRole('dialog', { name: 'Remote Drive' })).toBeInTheDocument();
     expect(screen.getByLabelText('rclone remote')).toHaveValue('cloud');
   });

@@ -323,6 +323,10 @@ export function useFileDragAndDrop({
     }).catch(async (error) => {
       reportError(`${operation === 'copy' ? 'Copy' : 'Move'} failed`, error, {
         toast: showToast,
+        retry: () =>
+          mutate(entries, targetPath, showToast, refreshVisibleViews, {
+            conflictResolution: 'ask',
+          }),
       });
       await refreshVisibleViews().catch(() => undefined);
     });

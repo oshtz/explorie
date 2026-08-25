@@ -89,10 +89,13 @@ describe('errorReporter', () => {
     expect(mocks.logger.warn).toHaveBeenCalledTimes(1);
     expect(mocks.logger.error).not.toHaveBeenCalled();
     expect(getErrorReportCount()).toBe(0);
-    expect(toast).toHaveBeenCalledWith('Preview warning: The file is in use by another program', {
-      type: 'warning',
-      duration: 1234,
-    });
+    expect(toast).toHaveBeenCalledWith(
+      'Preview warning: The file is in use by another program. Close any programs using the file and try again',
+      {
+        type: 'warning',
+        duration: 1234,
+      }
+    );
   });
 
   it('adds retry actions for recoverable errors and reports retry failures silently', async () => {
@@ -123,10 +126,13 @@ describe('errorReporter', () => {
 
     scopedReport('Scoped failure', 'Disk full', { silent: true });
 
-    expect(toast).toHaveBeenCalledWith('Scoped failure: Not enough disk space', {
-      type: 'error',
-      duration: 6000,
-    });
+    expect(toast).toHaveBeenCalledWith(
+      'Scoped failure: Not enough disk space. Free up disk space and try again',
+      {
+        type: 'error',
+        duration: 6000,
+      }
+    );
     expect(mocks.logger.error).not.toHaveBeenCalled();
 
     await expect(withErrorReporting('Load data', async () => 'ok')).resolves.toBe('ok');
@@ -166,7 +172,7 @@ describe('errorReporter', () => {
 
     reportBatchErrors('Copy failed', [{ item: 'a.txt', error: 'Permission denied' }], { toast });
     expect(toast).toHaveBeenLastCalledWith(
-      "Copy failed: Access denied - you don't have permission for this operation",
+      "Copy failed: Access denied - you don't have permission for this operation. Check folder permissions, then try a different location",
       { type: 'error', duration: 6000 }
     );
 
@@ -179,7 +185,7 @@ describe('errorReporter', () => {
       { toast, duration: 2500 }
     );
     expect(toast).toHaveBeenLastCalledWith(
-      "Copy failed: Access denied - you don't have permission for this operation (2 items)",
+      "Copy failed: Access denied - you don't have permission for this operation. Check folder permissions, then try a different location (2 items)",
       { type: 'error', duration: 2500 }
     );
 
@@ -207,5 +213,24 @@ describe('errorReporter', () => {
 
     clearErrorReports();
     expect(getErrorReports()).toEqual([]);
+  });
+
+  it('keeps raw diagnostics out of toasts for structured AppError payloads', () => {
+    const toast = vi.fn();
+    reportError(
+      'Connect failed',
+      {
+        code: 'remote_unavailable',
+        message: 'The remote drive is unavailable',
+        retryable: true,
+        detail: String.raw`rclone mount secret C:\Users\oshtz\secret --password=hunter2`,
+      },
+      { toast }
+    );
+
+    expect(toast.mock.calls[0][0]).toContain('The remote drive is unavailable');
+    expect(toast.mock.calls[0][0]).toContain('Check the remote connection and retry');
+    expect(toast.mock.calls[0][0]).not.toContain('hunter2');
+    expect(toast.mock.calls[0][0]).not.toContain('rclone mount');
   });
 });

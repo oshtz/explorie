@@ -173,4 +173,20 @@ describe('fs utils', () => {
     );
     expect(errorSpy).toHaveBeenCalled();
   });
+
+  it('preserves structured AppError fields from native mutations', async () => {
+    const { renamePath } = await import('./fs');
+    invokeMock.mockRejectedValueOnce({
+      code: 'conflict',
+      message: 'A file or folder with this name already exists',
+      retryable: false,
+      operation: 'rename_path',
+    });
+
+    await expect(renamePath('/source/file.txt', 'taken.txt')).rejects.toMatchObject({
+      message: 'A file or folder with this name already exists',
+      code: 'conflict',
+      retryable: false,
+    });
+  });
 });

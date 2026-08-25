@@ -2,6 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import type { ConflictResolution, OperationItem, OperationType } from '../operationQueueStore';
 import { useOperationQueueStore } from '../operationQueueStore';
+import { formatUserFacingError, toStructuredError, type AppErrorPayload } from './errorMessages';
 
 export type NativeConflictPolicy = 'error' | 'rename' | 'replace';
 
@@ -31,7 +32,7 @@ interface NativeFileOperationEvent {
   state: 'running' | 'completed' | 'cancelled' | 'failed';
   progress?: NativeProgress;
   result?: NativeFileOperationResult;
-  error?: string;
+  error?: AppErrorPayload | string;
 }
 
 interface OperationPresentation {
@@ -80,8 +81,8 @@ export async function runNativeFileOperation(
       store.finishOperation(jobId, 'completed');
       resolveCompletion(result);
     } else if (payload.state === 'failed') {
-      const error = new Error(payload.error || 'File operation failed');
-      store.finishOperation(jobId, 'failed', error.message);
+      const error = toStructuredError(payload.error || 'File operation failed');
+      store.finishOperation(jobId, 'failed', formatUserFacingError(payload.error || error));
       rejectCompletion(error);
     } else if (payload.state === 'cancelled') {
       const error = new Error('File operation cancelled');

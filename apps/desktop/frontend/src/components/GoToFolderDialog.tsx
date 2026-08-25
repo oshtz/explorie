@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import styles from './GoToFolderDialog.module.css';
 import { basename, normalizePathForCompare } from '../utils/path';
 import { createFocusTrap } from '../utils/accessibility';
+import { formatError, formatUserFacingError } from '../utils/errorMessages';
 import { Icon } from './Icon';
 
 interface GoToFolderDialogProps {
@@ -230,19 +231,19 @@ export function GoToFolderDialog({
         onNavigate(expandedPath);
         onClose();
       } catch (err: unknown) {
-        const errStr = err instanceof Error ? err.message : String(err ?? 'Unknown error');
-        if (errStr.includes('not a directory') || errStr.includes('Not a directory')) {
+        const formatted = formatError(err);
+        if (formatted.code === 'type_mismatch' || formatted.category === 'type') {
           setError('Path is not a directory');
         } else if (
-          errStr.includes('No such file') ||
-          errStr.includes('cannot find') ||
-          errStr.includes('The system cannot find')
+          formatted.code === 'missing_path' ||
+          formatted.category === 'missing_path' ||
+          formatted.category === 'not_found'
         ) {
           setError('Path does not exist');
-        } else if (errStr.includes('Access') || errStr.includes('Permission')) {
+        } else if (formatted.code === 'permission' || formatted.category === 'permission') {
           setError('Access denied');
         } else {
-          setError('Invalid path');
+          setError(formatUserFacingError(err));
         }
       } finally {
         setIsValidating(false);

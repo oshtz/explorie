@@ -1,11 +1,13 @@
 import { describe, it, expect } from 'vitest';
 import {
   formatErrorMessage,
+  formatUserFacingError,
+  persistInvokeError,
+  toStructuredError,
   formatError,
   formatOperationError,
   formatBatchErrors,
   createOperationErrorMessage,
-  type FormattedError,
 } from './errorMessages';
 
 describe('errorMessages', () => {
@@ -144,6 +146,104 @@ describe('errorMessages', () => {
       expect(createOperationErrorMessage('delete', 'File not found')).toBe(
         'Failed to delete: File or folder not found'
       );
+    });
+  });
+
+  describe('structured AppError mappings', () => {
+    const mappings = [
+      {
+        code: 'permission',
+        message: "You don't have permission for this operation",
+        retryable: false,
+        category: 'permission',
+        next: 'permissions',
+      },
+      {
+        code: 'missing_path',
+        message: 'This file or folder is no longer available',
+        retryable: false,
+        category: 'missing_path',
+        next: 'Refresh',
+      },
+      {
+        code: 'conflict',
+        message: 'A file or folder with this name already exists',
+        retryable: false,
+        category: 'conflict',
+        next: 'Rename',
+      },
+      {
+        code: 'cancelled',
+        message: 'The operation was cancelled',
+        retryable: true,
+        category: 'cancelled',
+        next: 'again',
+      },
+      {
+        code: 'helper_missing',
+        message: 'FFmpeg is not installed on this computer',
+        retryable: true,
+        category: 'helper_missing',
+        next: 'helper',
+      },
+      {
+        code: 'remote_unavailable',
+        message: 'The remote drive is unavailable',
+        retryable: true,
+        category: 'remote_unavailable',
+        next: 'remote',
+      },
+    ] as const;
+
+    it.each(mappings)('maps $code to an actionable next step', (mapping) => {
+      const payload = {
+        code: mapping.code,
+        message: mapping.message,
+        retryable: mapping.retryable,
+        operation: 'list_files',
+        detail: String.raw`rclone mount secret C:\Users\oshtz\secret --password=hunter2`,
+      };
+
+      const formatted = formatError(payload);
+      expect(formatted.message).toBe(mapping.message);
+      expect(formatted.category).toBe(mapping.category);
+      expect(formatted.recoverable).toBe(mapping.retryable);
+      expect(formatted.code).toBe(mapping.code);
+      expect(formatted.suggestion?.toLowerCase()).toContain(mapping.next.toLowerCase());
+      expect(formatErrorMessage(payload)).toBe(mapping.message);
+      expect(formatErrorMessage(payload)).not.toContain('hunter2');
+      expect(formatErrorMessage(payload)).not.toContain('C:\\Users');
+      expect(formatErrorMessage(payload)).not.toContain('rclone mount');
+      expect(formatUserFacingError(payload)).toBe(`${mapping.message}. ${formatted.suggestion}`);
+      expect(formatUserFacingError(payload)).not.toContain('hunter2');
+      expect(formatUserFacingError(payload)).not.toContain('rclone mount');
+      const structured = toStructuredError(payload);
+      expect(structured.message).toBe(mapping.message);
+      expect(structured).toMatchObject({
+        code: mapping.code,
+        retryable: mapping.retryable,
+      });
+    });
+
+    it('accepts a JSON string and a wrapped Tauri reject payload', () => {
+      const payload = {
+        code: 'cancelled' as const,
+        message: 'The operation was cancelled',
+        retryable: true,
+      };
+      expect(formatError(JSON.stringify(payload)).category).toBe('cancelled');
+      expect(formatError({ error: payload }).category).toBe('cancelled');
+    });
+
+    it('persists structured AppError payloads for later UI mapping', () => {
+      const payload = {
+        code: 'helper_missing' as const,
+        message: 'Install LibreOffice to preview Office and OpenDocument files.',
+        retryable: true,
+      };
+      expect(persistInvokeError(payload)).toEqual(payload);
+      expect(persistInvokeError({ data: payload })).toEqual(payload);
+      expect(persistInvokeError('Access is denied')).toContain('permission');
     });
   });
 

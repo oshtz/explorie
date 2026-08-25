@@ -4,6 +4,8 @@ import { listen } from '@tauri-apps/api/event';
 import { Icon } from './Icon';
 import {
   loadRemoteDrives,
+  persistRemoteDriveError,
+  remoteDriveErrorText,
   saveRemoteDrives,
   type DisconnectResult,
   type RemoteDriveEnvironment,
@@ -11,6 +13,7 @@ import {
   type RemoteDriveProfile,
   type RemoteDriveStatus,
 } from '../utils/remoteDrives';
+import { formatUserFacingError } from '../utils/errorMessages';
 import styles from './RemoteDrivesSection.module.css';
 
 const WINDOWS_LETTERS = Array.from({ length: 23 }, (_, index) =>
@@ -47,7 +50,7 @@ export function RemoteDrivesSection({
         setRemotes(await invoke<string[]>('list_rclone_remotes'));
       }
     } catch (error) {
-      setSetupError(String(error));
+      setSetupError(formatUserFacingError(error));
     }
   }, []);
 
@@ -57,7 +60,7 @@ export function RemoteDrivesSection({
       try {
         updateStatus(await invoke<RemoteDriveStatus>('connect_remote_drive', { profile }));
       } catch (error) {
-        updateStatus({ id: profile.id, state: 'error', error: String(error) });
+        updateStatus({ id: profile.id, state: 'error', error: persistRemoteDriveError(error) });
       }
     },
     [updateStatus]
@@ -132,7 +135,7 @@ export function RemoteDrivesSection({
       const result = await disconnect(previous);
       if (result.blocked) {
         const confirmed = window.confirm(
-          `${result.status.error ?? `This drive still has ${result.pendingUploads} upload(s) or ${result.erroredFiles} error(s).`} Disconnect while preserving its cache?`
+          `${remoteDriveErrorText(result.status.error) ?? `This drive still has ${result.pendingUploads} upload(s) or ${result.erroredFiles} error(s).`} Disconnect while preserving its cache?`
         );
         if (!confirmed) return;
         await disconnect(previous, true);
@@ -148,7 +151,7 @@ export function RemoteDrivesSection({
       const result = await disconnect(profile);
       if (result.blocked) {
         window.alert(
-          result.status.error ??
+          remoteDriveErrorText(result.status.error) ??
             `Wait for ${result.pendingUploads} upload(s) and resolve ${result.erroredFiles} error(s) before removing this drive.`
         );
         return;
@@ -160,7 +163,7 @@ export function RemoteDrivesSection({
         return next;
       });
     } catch (error) {
-      updateStatus({ id: profile.id, state: 'error', error: String(error) });
+      updateStatus({ id: profile.id, state: 'error', error: persistRemoteDriveError(error) });
     }
   };
 
@@ -169,11 +172,11 @@ export function RemoteDrivesSection({
       const result = await disconnect(profile);
       if (!result.blocked) return;
       const confirmed = window.confirm(
-        `${result.status.error ?? `This drive still has ${result.pendingUploads} upload(s) or ${result.erroredFiles} error(s).`} Disconnect while preserving its cache?`
+        `${remoteDriveErrorText(result.status.error) ?? `This drive still has ${result.pendingUploads} upload(s) or ${result.erroredFiles} error(s).`} Disconnect while preserving its cache?`
       );
       if (confirmed) await disconnect(profile, true);
     } catch (error) {
-      updateStatus({ id: profile.id, state: 'error', error: String(error) });
+      updateStatus({ id: profile.id, state: 'error', error: persistRemoteDriveError(error) });
     }
   };
 
@@ -185,7 +188,7 @@ export function RemoteDrivesSection({
         await invoke('open_remote_drive_helper_settings');
       }
     } catch (error) {
-      setSetupError(String(error));
+      setSetupError(formatUserFacingError(error));
     }
   };
 
@@ -196,7 +199,7 @@ export function RemoteDrivesSection({
       await invoke('install_winfsp');
       await refreshEnvironment();
     } catch (error) {
-      setSetupError(String(error));
+      setSetupError(formatUserFacingError(error));
     } finally {
       setInstallingWinFsp(false);
     }
@@ -232,7 +235,7 @@ export function RemoteDrivesSection({
       if (next.length > 0) openEditor(undefined, next);
       else setSetupError('rclone finished without creating a remote.');
     } catch (error) {
-      setSetupError(String(error));
+      setSetupError(formatUserFacingError(error));
     } finally {
       setConfiguringRemotes(false);
     }
@@ -313,7 +316,11 @@ export function RemoteDrivesSection({
               <button
                 type="button"
                 className={styles.drive}
-                title={driveStatus.error ?? driveStatus.mountPath ?? profile.mountTarget}
+                title={
+                  remoteDriveErrorText(driveStatus.error) ??
+                  driveStatus.mountPath ??
+                  profile.mountTarget
+                }
                 onClick={() =>
                   canOpen ? onSelectLocation(driveStatus.mountPath!) : void connect(profile)
                 }

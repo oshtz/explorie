@@ -15,6 +15,7 @@ import {
   createFinderTagWithColor,
   areFinderTagsAvailable,
 } from '../services/finderIntegration';
+import { formatUserFacingError } from '../utils/errorMessages';
 import { Icon } from './Icon';
 import styles from './FinderTags.module.css';
 
@@ -81,7 +82,7 @@ export function FinderTags({
         setTags(parsed);
       })
       .catch((e) => {
-        setError(e instanceof Error ? e.message : String(e));
+        setError(formatUserFacingError(e));
         setTags([]);
       })
       .finally(() => setLoading(false));
@@ -97,7 +98,7 @@ export function FinderTags({
         setTags(newTags);
         onTagsChange?.(newTags.map((t) => t.raw));
       } catch (e) {
-        setError(e instanceof Error ? e.message : String(e));
+        setError(formatUserFacingError(e));
       }
     },
     [path, tags, editable, onTagsChange]
@@ -125,7 +126,7 @@ export function FinderTags({
       setNewTagColor('None');
       setIsAdding(false);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(formatUserFacingError(e));
     }
   }, [path, newTagName, newTagColor, tags, editable, onTagsChange]);
 

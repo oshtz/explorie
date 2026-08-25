@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { formatErrorMessage } from '../utils/errorMessages';
+import { formatUserFacingError } from '../utils/errorMessages';
 
 export type SystemLocations = {
   desktop?: string;
@@ -114,7 +114,7 @@ export function useInitialPath() {
         }
       } catch (error) {
         if (!cancelled) {
-          setInitializationError(formatErrorMessage(error));
+          setInitializationError(formatUserFacingError(error));
         }
       }
     };

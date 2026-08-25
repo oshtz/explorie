@@ -1,7 +1,10 @@
 // Prevents a terminal window from appearing on Windows
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod error;
 mod remote_drives;
+
+use error::AppError;
 
 use explorie_core::archive::{
     ArchiveFormat, ArchiveInfo, ArchiveProgress, CompressOptions, CompressionLevel,
@@ -25,6 +28,10 @@ use remote_drives::{
     DisconnectResult, RemoteDriveEnvironment, RemoteDriveManager, RemoteDriveProfile,
     RemoteDriveStatus,
 };
+
+fn cmd_err(operation: &'static str, error: impl ToString) -> AppError {
+    AppError::from_raw(operation, error.to_string())
+}
 
 #[derive(Default)]
 struct FileOperationJobs {
@@ -97,7 +104,7 @@ struct FileOperationEvent {
     state: &'static str,
     progress: Option<explorie_core::FileOperationProgress>,
     result: Option<explorie_core::FileOperationResult>,
-    error: Option<String>,
+    error: Option<AppError>,
 }
 
 #[derive(Serialize)]
@@ -238,7 +245,7 @@ mod windows_integration {
 }
 
 #[tauri::command]
-fn get_system_integration_status() -> Result<SystemIntegrationStatus, String> {
+fn get_system_integration_status() -> Result<SystemIntegrationStatus, AppError> {
     #[cfg(target_os = "windows")]
     {
         windows_integration::enabled()
@@ -246,7 +253,7 @@ fn get_system_integration_status() -> Result<SystemIntegrationStatus, String> {
                 supported: true,
                 enabled,
             })
-            .map_err(|error| error.to_string())
+            .map_err(|error| AppError::from_io("get_system_integration_status", error))
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -257,17 +264,21 @@ fn get_system_integration_status() -> Result<SystemIntegrationStatus, String> {
 }
 
 #[tauri::command]
-fn set_system_integration(enabled: bool) -> Result<SystemIntegrationStatus, String> {
+fn set_system_integration(enabled: bool) -> Result<SystemIntegrationStatus, AppError> {
     #[cfg(target_os = "windows")]
     {
-        windows_integration::set_enabled(enabled).map_err(|error| error.to_string())?;
+        windows_integration::set_enabled(enabled)
+            .map_err(|error| AppError::from_io("set_system_integration", error))?;
         get_system_integration_status()
     }
 
     #[cfg(not(target_os = "windows"))]
     {
         let _ = enabled;
-        Err("System integration is currently available only on Windows.".to_string())
+        Err(cmd_err(
+            "set_system_integration",
+            "System integration is currently available only on Windows.",
+        ))
     }
 }
 
@@ -275,15 +286,15 @@ fn set_system_integration(enabled: bool) -> Result<SystemIntegrationStatus, Stri
 async fn list_files(
     path: String,
     calc_dir_size: Option<bool>,
-) -> Result<Vec<explorie_core::FileEntry>, String> {
+) -> Result<Vec<explorie_core::FileEntry>, AppError> {
     let calc = calc_dir_size.unwrap_or(false);
     tauri::async_runtime::spawn_blocking(move || {
         let p = std::path::Path::new(&path);
         explorie_core::list_dir_with_sizes(p, calc)
     })
     .await
-    .map_err(|e| e.to_string())?
-    .map_err(|e| e.to_string())
+    .map_err(|e| cmd_err("list_files", e))?
+    .map_err(|e| cmd_err("list_files", e))
 }
 
 fn find_syncthing_root(path: &Path) -> Option<PathBuf> {
@@ -314,26 +325,30 @@ fn get_remote_drive_environment(
 fn list_rclone_remotes(
     app: AppHandle,
     manager: tauri::State<'_, RemoteDriveManager>,
-) -> Result<Vec<String>, String> {
-    manager.list_remotes(&app)
+) -> Result<Vec<String>, AppError> {
+    manager
+        .list_remotes(&app)
+        .map_err(|error| cmd_err("list_rclone_remotes", error))
 }
 
 #[tauri::command]
-async fn install_winfsp(app: AppHandle) -> Result<(), String> {
+async fn install_winfsp(app: AppHandle) -> Result<(), AppError> {
     tauri::async_runtime::spawn_blocking(move || remote_drives::install_winfsp(&app))
         .await
-        .map_err(|error| error.to_string())?
+        .map_err(|error| cmd_err("install_winfsp", error))?
+        .map_err(|error| cmd_err("install_winfsp", error))
 }
 
 #[tauri::command]
 async fn configure_rclone(
     app: AppHandle,
     manager: tauri::State<'_, RemoteDriveManager>,
-) -> Result<(), String> {
+) -> Result<(), AppError> {
     let manager = manager.inner().clone();
     tauri::async_runtime::spawn_blocking(move || manager.configure_remotes(&app))
         .await
-        .map_err(|error| error.to_string())?
+        .map_err(|error| cmd_err("configure_rclone", error))?
+        .map_err(|error| cmd_err("configure_rclone", error))
 }
 
 #[tauri::command]
@@ -341,11 +356,12 @@ async fn connect_remote_drive(
     app: AppHandle,
     manager: tauri::State<'_, RemoteDriveManager>,
     profile: RemoteDriveProfile,
-) -> Result<RemoteDriveStatus, String> {
+) -> Result<RemoteDriveStatus, AppError> {
     let manager = manager.inner().clone();
     tauri::async_runtime::spawn_blocking(move || manager.connect(&app, profile))
         .await
-        .map_err(|error| error.to_string())?
+        .map_err(|error| cmd_err("connect_remote_drive", error))?
+        .map_err(|error| cmd_err("connect_remote_drive", error))
 }
 
 #[tauri::command]
@@ -354,25 +370,26 @@ async fn disconnect_remote_drive(
     manager: tauri::State<'_, RemoteDriveManager>,
     id: String,
     force: bool,
-) -> Result<DisconnectResult, String> {
+) -> Result<DisconnectResult, AppError> {
     let manager = manager.inner().clone();
     tauri::async_runtime::spawn_blocking(move || manager.disconnect(&app, &id, force))
         .await
-        .map_err(|error| error.to_string())?
+        .map_err(|error| cmd_err("disconnect_remote_drive", error))?
+        .map_err(|error| cmd_err("disconnect_remote_drive", error))
 }
 
 #[tauri::command]
 async fn force_remote_drive_shutdown(
     app: AppHandle,
     manager: tauri::State<'_, RemoteDriveManager>,
-) -> Result<(), String> {
+) -> Result<(), AppError> {
     let manager = manager.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         manager.disconnect_all(&app);
         app.exit(0);
     })
     .await
-    .map_err(|error| error.to_string())
+    .map_err(|error| cmd_err("force_remote_drive_shutdown", error))
 }
 
 #[tauri::command]
@@ -383,31 +400,35 @@ fn get_remote_drive_statuses(
 }
 
 #[tauri::command]
-fn register_remote_drive_helper() -> Result<String, String> {
+fn register_remote_drive_helper() -> Result<String, AppError> {
     remote_drives::register_macos_helper()
+        .map_err(|error| cmd_err("register_remote_drive_helper", error))
 }
 
 #[tauri::command]
 fn unregister_remote_drive_helper(
     app: AppHandle,
     manager: tauri::State<'_, RemoteDriveManager>,
-) -> Result<(), String> {
+) -> Result<(), AppError> {
     manager.disconnect_all(&app);
     remote_drives::unregister_macos_helper()
+        .map_err(|error| cmd_err("unregister_remote_drive_helper", error))
 }
 
 #[tauri::command]
-fn open_remote_drive_helper_settings() -> Result<(), String> {
+fn open_remote_drive_helper_settings() -> Result<(), AppError> {
     remote_drives::open_macos_helper_settings()
+        .map_err(|error| cmd_err("open_remote_drive_helper_settings", error))
 }
 
 #[tauri::command]
 fn create_explorie_schema(
     dir_path: String,
     fields: HashMap<String, HashMap<String, Value>>,
-) -> Result<(), String> {
+) -> Result<(), AppError> {
     let path = Path::new(&dir_path);
-    explorie_core::create_explorie_schema(path, fields).map_err(|e| e.to_string())
+    explorie_core::create_explorie_schema(path, fields)
+        .map_err(|e| cmd_err("create_explorie_schema", e))
 }
 
 #[tauri::command]
@@ -415,9 +436,10 @@ fn update_custom_fields(
     dir_path: String,
     file_name: String,
     custom_fields: HashMap<String, Value>,
-) -> Result<(), String> {
+) -> Result<(), AppError> {
     let path = Path::new(&dir_path);
-    explorie_core::update_custom_fields(path, &file_name, custom_fields).map_err(|e| e.to_string())
+    explorie_core::update_custom_fields(path, &file_name, custom_fields)
+        .map_err(|e| cmd_err("update_custom_fields", e))
 }
 
 #[derive(Serialize)]
@@ -451,7 +473,7 @@ struct PreviewArtifact {
 #[tauri::command]
 fn list_system_locations(
     remote_drives: tauri::State<'_, RemoteDriveManager>,
-) -> Result<SystemLocations, String> {
+) -> Result<SystemLocations, AppError> {
     use dirs::*;
     use sysinfo::Disks;
 
@@ -483,7 +505,7 @@ fn list_system_locations(
 }
 
 #[tauri::command]
-fn get_disk_info(path: String) -> Result<DiskInfo, String> {
+fn get_disk_info(path: String) -> Result<DiskInfo, AppError> {
     use std::path::Path;
     use sysinfo::Disks;
 
@@ -513,19 +535,22 @@ fn get_disk_info(path: String) -> Result<DiskInfo, String> {
             available_space: disk.available_space(),
             name: disk.name().to_string_lossy().to_string(),
         }),
-        None => Err("Could not find disk for the given path".to_string()),
+        None => Err(cmd_err(
+            "get_disk_info",
+            "Could not find disk for the given path",
+        )),
     }
 }
 
 #[tauri::command]
-async fn get_dir_size(path: String) -> Result<u64, String> {
+async fn get_dir_size(path: String) -> Result<u64, AppError> {
     tauri::async_runtime::spawn_blocking(move || {
         let p = std::path::Path::new(&path);
         explorie_core::dir_size(p)
     })
     .await
-    .map_err(|e| e.to_string())?
-    .map_err(|e| e.to_string())
+    .map_err(|e| cmd_err("get_dir_size", e))?
+    .map_err(|e| cmd_err("get_dir_size", e))
 }
 
 #[derive(Serialize)]
@@ -536,13 +561,14 @@ struct DirInfo {
 
 /// Get directory info (item count and total size) for secure delete confirmation
 #[tauri::command]
-async fn get_dir_info(path: String) -> Result<DirInfo, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+async fn get_dir_info(path: String) -> Result<DirInfo, AppError> {
+    tauri::async_runtime::spawn_blocking(move || -> Result<DirInfo, String> {
         let (count, size) = explorie_core::dir_info(Path::new(&path)).map_err(|e| e.to_string())?;
         Ok(DirInfo { count, size })
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| cmd_err("get_dir_info", e))?
+    .map_err(|e| cmd_err("get_dir_info", e))
 }
 
 fn emit_file_operation(app: &AppHandle, event: FileOperationEvent) {
@@ -555,13 +581,16 @@ fn start_file_operation(
     jobs: tauri::State<'_, FileOperationJobs>,
     remote_drives: tauri::State<'_, RemoteDriveManager>,
     request: explorie_core::FileOperationRequest,
-) -> Result<String, String> {
+) -> Result<String, AppError> {
     if request
         .sources
         .iter()
         .any(|source| remote_drives.is_mount_root(source))
     {
-        return Err("Refusing to mutate a managed remote-drive root".to_string());
+        return Err(cmd_err(
+            "start_file_operation",
+            "Refusing to mutate a managed remote-drive root",
+        ));
     }
     let mutation = ActiveMutation::begin(&app);
     let job_id = format!(
@@ -625,14 +654,14 @@ fn start_file_operation(
                 state: "failed",
                 progress: None,
                 result: None,
-                error: Some(error.to_string()),
+                error: Some(AppError::from_io("file_operation", error)),
             },
             Err(error) => FileOperationEvent {
                 job_id: task_job_id,
                 state: "failed",
                 progress: None,
                 result: None,
-                error: Some(error.to_string()),
+                error: Some(cmd_err("file_operation", error)),
             },
         };
         emit_file_operation(&task_app, event);
@@ -674,12 +703,13 @@ fn read_text_preview_impl(path: &Path, max_bytes: u64) -> Result<TextPreview, St
 }
 
 #[tauri::command]
-async fn read_text_preview(path: String, max_bytes: u64) -> Result<TextPreview, String> {
+async fn read_text_preview(path: String, max_bytes: u64) -> Result<TextPreview, AppError> {
     tauri::async_runtime::spawn_blocking(move || {
         read_text_preview_impl(Path::new(&path), max_bytes)
     })
     .await
-    .map_err(|error| error.to_string())?
+    .map_err(|error| cmd_err("read_text_preview", error))?
+    .map_err(|error| cmd_err("read_text_preview", error))
 }
 
 fn metadata_is_link(metadata: &fs::Metadata) -> bool {
@@ -865,11 +895,14 @@ fn rename_path(
     remote_drives: tauri::State<'_, RemoteDriveManager>,
     source_path: String,
     new_base_name: String,
-) -> Result<String, String> {
+) -> Result<String, AppError> {
     if remote_drives.is_mount_root(Path::new(&source_path)) {
-        return Err("Refusing to rename a managed remote-drive root".to_string());
+        return Err(cmd_err(
+            "rename_path",
+            "Refusing to rename a managed remote-drive root",
+        ));
     }
-    rename_path_impl(source_path, new_base_name)
+    rename_path_impl(source_path, new_base_name).map_err(|error| cmd_err("rename_path", error))
 }
 
 fn rename_path_impl(source_path: String, new_base_name: String) -> Result<String, String> {
@@ -896,45 +929,58 @@ fn rename_path_impl(source_path: String, new_base_name: String) -> Result<String
 }
 
 #[tauri::command]
-fn create_folder(dir_path: String, base_name: String) -> Result<String, String> {
-    let directory = PathBuf::from(dir_path);
-    validate_real_directory(&directory)?;
-    let name = validate_file_name(&base_name)?;
-    let path = create_unique_path(&directory, &name, false, |candidate| {
-        fs::create_dir(candidate)
-    })?;
-    Ok(path.to_string_lossy().into_owned())
+fn create_folder(dir_path: String, base_name: String) -> Result<String, AppError> {
+    (|| -> Result<String, String> {
+        let directory = PathBuf::from(dir_path);
+        validate_real_directory(&directory)?;
+        let name = validate_file_name(&base_name)?;
+        let path = create_unique_path(&directory, &name, false, |candidate| {
+            fs::create_dir(candidate)
+        })?;
+        Ok(path.to_string_lossy().into_owned())
+    })()
+    .map_err(|error| cmd_err("create_folder", error))
 }
 
 #[tauri::command]
-fn create_note(dir_path: String, base_name: String) -> Result<String, String> {
-    let directory = PathBuf::from(dir_path);
-    validate_real_directory(&directory)?;
-    let name = validate_file_name(&ensure_extension(&base_name, ".md"))?;
-    let path = create_unique_path(&directory, &name, true, |candidate| {
-        write_new_text_file(candidate, b"# New Note\n")
-    })?;
-    Ok(path.to_string_lossy().into_owned())
+fn create_note(dir_path: String, base_name: String) -> Result<String, AppError> {
+    (|| -> Result<String, String> {
+        let directory = PathBuf::from(dir_path);
+        validate_real_directory(&directory)?;
+        let name = validate_file_name(&ensure_extension(&base_name, ".md"))?;
+        let path = create_unique_path(&directory, &name, true, |candidate| {
+            write_new_text_file(candidate, b"# New Note\n")
+        })?;
+        Ok(path.to_string_lossy().into_owned())
+    })()
+    .map_err(|error| cmd_err("create_note", error))
 }
 
 #[tauri::command]
-fn create_website_link(dir_path: String, base_name: String, url: String) -> Result<String, String> {
-    let directory = PathBuf::from(dir_path);
-    validate_real_directory(&directory)?;
-    let name = validate_file_name(&ensure_extension(&base_name, ".url"))?;
-    let url = url.trim();
-    if url.chars().any(char::is_control) {
-        return Err("Website URL cannot contain control characters".to_string());
-    }
-    let normalized = url.to_ascii_lowercase();
-    if !normalized.starts_with("https://") && !normalized.starts_with("http://") {
-        return Err("Website URL must use http or https".to_string());
-    }
-    let contents = format!("[InternetShortcut]\nURL={url}\n");
-    let path = create_unique_path(&directory, &name, true, |candidate| {
-        write_new_text_file(candidate, contents.as_bytes())
-    })?;
-    Ok(path.to_string_lossy().into_owned())
+fn create_website_link(
+    dir_path: String,
+    base_name: String,
+    url: String,
+) -> Result<String, AppError> {
+    (|| -> Result<String, String> {
+        let directory = PathBuf::from(dir_path);
+        validate_real_directory(&directory)?;
+        let name = validate_file_name(&ensure_extension(&base_name, ".url"))?;
+        let url = url.trim();
+        if url.chars().any(char::is_control) {
+            return Err("Website URL cannot contain control characters".to_string());
+        }
+        let normalized = url.to_ascii_lowercase();
+        if !normalized.starts_with("https://") && !normalized.starts_with("http://") {
+            return Err("Website URL must use http or https".to_string());
+        }
+        let contents = format!("[InternetShortcut]\nURL={url}\n");
+        let path = create_unique_path(&directory, &name, true, |candidate| {
+            write_new_text_file(candidate, contents.as_bytes())
+        })?;
+        Ok(path.to_string_lossy().into_owned())
+    })()
+    .map_err(|error| cmd_err("create_website_link", error))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1052,74 +1098,82 @@ async fn delete_path_permanently(
     remote_drives: tauri::State<'_, RemoteDriveManager>,
     path: String,
     recursive: bool,
-) -> Result<(), String> {
+) -> Result<(), AppError> {
     if remote_drives.is_mount_root(Path::new(&path)) {
-        return Err("Refusing to delete a managed remote-drive root".to_string());
+        return Err(cmd_err(
+            "delete_path_permanently",
+            "Refusing to delete a managed remote-drive root",
+        ));
     }
     tauri::async_runtime::spawn_blocking(move || {
         delete_path_permanently_impl(Path::new(&path), recursive)
     })
     .await
-    .map_err(|error| error.to_string())?
+    .map_err(|error| cmd_err("delete_path_permanently", error))?
+    .map_err(|error| cmd_err("delete_path_permanently", error))
 }
 
 #[tauri::command]
-fn open_path(path: String) -> Result<(), String> {
-    // Launch using OS default handler; detached to avoid blocking the app.
-    open::that_detached(&path).map_err(|e| e.to_string())
+fn open_path(path: String) -> Result<(), AppError> {
+    open::that_detached(&path).map_err(|e| cmd_err("open_path", e))
 }
 
 /// Reveal a file or folder in the native file manager (Finder on macOS, Explorer on Windows)
 #[tauri::command]
-fn reveal_in_file_manager(path: String) -> Result<(), String> {
+fn reveal_in_file_manager(path: String) -> Result<(), AppError> {
     #[cfg(target_os = "macos")]
     {
         Command::new("open")
-            .args(["-R", &path]) // -R reveals the file in Finder
+            .args(["-R", &path])
             .spawn()
-            .map_err(|e| format!("Failed to reveal in Finder: {}", e))?;
+            .map_err(|e| cmd_err("reveal_in_file_manager", e))?;
         Ok(())
     }
 
     #[cfg(target_os = "windows")]
     {
-        // Use explorer with /select to highlight the file
         Command::new("explorer")
             .args(["/select,", &path])
             .spawn()
-            .map_err(|e| format!("Failed to reveal in Explorer: {}", e))?;
+            .map_err(|e| cmd_err("reveal_in_file_manager", e))?;
         Ok(())
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         let _ = path;
-        Err("Reveal in file manager is not supported on this platform.".to_string())
+        Err(cmd_err(
+            "reveal_in_file_manager",
+            "Reveal in file manager is not supported on this platform.",
+        ))
     }
 }
 
 /// Open Quick Look preview for a file (macOS only)
 #[cfg(target_os = "macos")]
 #[tauri::command]
-fn quick_look(path: String) -> Result<(), String> {
+fn quick_look(path: String) -> Result<(), AppError> {
     Command::new("qlmanage")
         .args(["-p", &path])
         .spawn()
-        .map_err(|e| format!("Failed to open Quick Look: {}", e))?;
+        .map_err(|e| cmd_err("quick_look", e))?;
     Ok(())
 }
 
 #[cfg(not(target_os = "macos"))]
 #[tauri::command]
-fn quick_look(_path: String) -> Result<(), String> {
-    Err("Quick Look is only available on macOS.".to_string())
+fn quick_look(_path: String) -> Result<(), AppError> {
+    Err(cmd_err(
+        "quick_look",
+        "Quick Look is only available on macOS.",
+    ))
 }
 
 /// Get Finder tags for a file (macOS only)
 /// Returns a list of tag names
 #[cfg(target_os = "macos")]
 #[tauri::command]
-fn get_finder_tags(path: String) -> Result<Vec<String>, String> {
+fn get_finder_tags(path: String) -> Result<Vec<String>, AppError> {
     use std::ffi::CString;
 
     let c_path = CString::new(path.as_bytes()).map_err(|_| "Invalid path")?;
@@ -1189,7 +1243,7 @@ fn get_finder_tags(path: String) -> Result<Vec<String>, String> {
 
 #[cfg(not(target_os = "macos"))]
 #[tauri::command]
-fn get_finder_tags(_path: String) -> Result<Vec<String>, String> {
+fn get_finder_tags(_path: String) -> Result<Vec<String>, AppError> {
     // Return empty list on non-macOS platforms
     Ok(Vec::new())
 }
@@ -1197,7 +1251,7 @@ fn get_finder_tags(_path: String) -> Result<Vec<String>, String> {
 /// Set Finder tags for a file (macOS only)
 #[cfg(target_os = "macos")]
 #[tauri::command]
-fn set_finder_tags(path: String, tags: Vec<String>) -> Result<(), String> {
+fn set_finder_tags(path: String, tags: Vec<String>) -> Result<(), AppError> {
     // Use xattr command to set tags (more reliable than direct xattr manipulation)
     // Tags are stored in com.apple.metadata:_kMDItemUserTags as a binary plist
 
@@ -1238,8 +1292,7 @@ fn set_finder_tags(path: String, tags: Vec<String>) -> Result<(), String> {
     let temp_dir = std::env::temp_dir();
     let temp_file = temp_dir.join(format!("explorie_tags_{}.plist", std::process::id()));
 
-    std::fs::write(&temp_file, plist_content)
-        .map_err(|e| format!("Failed to write temp file: {}", e))?;
+    std::fs::write(&temp_file, plist_content).map_err(|e| cmd_err("set_finder_tags", e))?;
 
     // Convert plist to binary and set as xattr
     let output = Command::new("plutil")
@@ -1249,12 +1302,14 @@ fn set_finder_tags(path: String, tags: Vec<String>) -> Result<(), String> {
 
     if !output.status.success() {
         let _ = std::fs::remove_file(&temp_file);
-        return Err("Failed to convert plist to binary".to_string());
+        return Err(cmd_err(
+            "set_finder_tags",
+            "Failed to convert plist to binary",
+        ));
     }
 
     // Read the binary plist
-    let binary_data =
-        std::fs::read(&temp_file).map_err(|e| format!("Failed to read binary plist: {}", e))?;
+    let binary_data = std::fs::read(&temp_file).map_err(|e| cmd_err("set_finder_tags", e))?;
 
     let _ = std::fs::remove_file(&temp_file);
 
@@ -1276,9 +1331,9 @@ fn set_finder_tags(path: String, tags: Vec<String>) -> Result<(), String> {
     };
 
     if result < 0 {
-        return Err(format!(
-            "Failed to set xattr: {}",
-            std::io::Error::last_os_error()
+        return Err(AppError::from_io(
+            "set_finder_tags",
+            std::io::Error::last_os_error(),
         ));
     }
 
@@ -1287,14 +1342,17 @@ fn set_finder_tags(path: String, tags: Vec<String>) -> Result<(), String> {
 
 #[cfg(not(target_os = "macos"))]
 #[tauri::command]
-fn set_finder_tags(_path: String, _tags: Vec<String>) -> Result<(), String> {
-    Err("Finder tags are only available on macOS.".to_string())
+fn set_finder_tags(_path: String, _tags: Vec<String>) -> Result<(), AppError> {
+    Err(cmd_err(
+        "set_finder_tags",
+        "Finder tags are only available on macOS.",
+    ))
 }
 
 /// Get available Finder tag colors (macOS only)
 /// Returns a mapping of color names to their index
 #[tauri::command]
-fn get_finder_tag_colors() -> Result<HashMap<String, u8>, String> {
+fn get_finder_tag_colors() -> Result<HashMap<String, u8>, AppError> {
     let mut colors = HashMap::new();
     colors.insert("None".to_string(), 0);
     colors.insert("Gray".to_string(), 1);
@@ -1311,28 +1369,31 @@ fn get_finder_tag_colors() -> Result<HashMap<String, u8>, String> {
 /// Uses the `open` command with -a flag to specify the application
 #[cfg(target_os = "macos")]
 #[tauri::command]
-fn open_with_app(path: String, app_name: String) -> Result<(), String> {
+fn open_with_app(path: String, app_name: String) -> Result<(), AppError> {
     Command::new("open")
         .args(["-a", &app_name, &path])
         .spawn()
-        .map_err(|e| format!("Failed to open with {}: {}", app_name, e))?;
+        .map_err(|e| cmd_err("open_with_app", e))?;
     Ok(())
 }
 
 #[cfg(target_os = "windows")]
 #[tauri::command]
-fn open_with_app(path: String, _app_name: String) -> Result<(), String> {
+fn open_with_app(path: String, _app_name: String) -> Result<(), AppError> {
     Command::new("rundll32.exe")
         .args(["shell32.dll,OpenAs_RunDLL", &path])
         .spawn()
-        .map_err(|err| format!("Failed to open Windows Open with: {err}"))?;
+        .map_err(|err| cmd_err("open_with_app", err))?;
     Ok(())
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 #[tauri::command]
-fn open_with_app(_path: String, _app_name: String) -> Result<(), String> {
-    Err("Open With is unavailable on this platform.".to_string())
+fn open_with_app(_path: String, _app_name: String) -> Result<(), AppError> {
+    Err(cmd_err(
+        "open_with_app",
+        "Open With is unavailable on this platform.",
+    ))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1345,7 +1406,7 @@ struct AppInfo {
 /// Get list of applications that can open a specific file type (macOS only)
 #[cfg(target_os = "macos")]
 #[tauri::command]
-fn get_apps_for_file(path: String) -> Result<Vec<AppInfo>, String> {
+fn get_apps_for_file(path: String) -> Result<Vec<AppInfo>, AppError> {
     use std::collections::HashSet;
 
     // Use mdfind to find apps that can open this file type based on UTI
@@ -1460,7 +1521,7 @@ fn get_apps_for_file(path: String) -> Result<Vec<AppInfo>, String> {
 
 #[cfg(target_os = "windows")]
 #[tauri::command]
-fn get_apps_for_file(_path: String) -> Result<Vec<AppInfo>, String> {
+fn get_apps_for_file(_path: String) -> Result<Vec<AppInfo>, AppError> {
     Ok(vec![AppInfo {
         name: "Choose another app…".to_string(),
         path: String::new(),
@@ -1470,7 +1531,7 @@ fn get_apps_for_file(_path: String) -> Result<Vec<AppInfo>, String> {
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 #[tauri::command]
-fn get_apps_for_file(_path: String) -> Result<Vec<AppInfo>, String> {
+fn get_apps_for_file(_path: String) -> Result<Vec<AppInfo>, AppError> {
     Ok(Vec::new())
 }
 
@@ -1576,10 +1637,11 @@ fn get_file_icon_impl(_path: String) -> Result<Option<String>, String> {
 }
 
 #[tauri::command]
-async fn get_file_icon(path: String) -> Result<Option<String>, String> {
+async fn get_file_icon(path: String) -> Result<Option<String>, AppError> {
     tauri::async_runtime::spawn_blocking(move || get_file_icon_impl(path))
         .await
-        .map_err(|err| err.to_string())?
+        .map_err(|err| cmd_err("get_file_icon", err))?
+        .map_err(|err| cmd_err("get_file_icon", err))
 }
 
 fn thumbnail_cache_path(path: &Path, max_size: u32) -> Result<PathBuf, String> {
@@ -1765,10 +1827,11 @@ fn get_file_thumbnail_impl(path: String, max_size: u32) -> Result<Option<String>
 }
 
 #[tauri::command]
-async fn get_file_thumbnail(path: String, max_size: u32) -> Result<Option<String>, String> {
+async fn get_file_thumbnail(path: String, max_size: u32) -> Result<Option<String>, AppError> {
     tauri::async_runtime::spawn_blocking(move || get_file_thumbnail_impl(path, max_size))
         .await
-        .map_err(|err| err.to_string())?
+        .map_err(|err| cmd_err("get_file_thumbnail", err))?
+        .map_err(|err| cmd_err("get_file_thumbnail", err))
 }
 
 fn sanitize_preview_stem(path: &Path) -> String {
@@ -1943,17 +2006,18 @@ fn generate_preview_artifact_impl(path: String) -> Result<PreviewArtifact, Strin
 }
 
 #[tauri::command]
-async fn generate_preview_artifact(path: String) -> Result<PreviewArtifact, String> {
+async fn generate_preview_artifact(path: String) -> Result<PreviewArtifact, AppError> {
     tauri::async_runtime::spawn_blocking(move || generate_preview_artifact_impl(path))
         .await
-        .map_err(|err| err.to_string())?
+        .map_err(|err| cmd_err("generate_preview_artifact", err))?
+        .map_err(|err| cmd_err("generate_preview_artifact", err))
 }
 
 #[tauri::command]
-fn get_home_dir() -> Result<String, String> {
+fn get_home_dir() -> Result<String, AppError> {
     dirs::home_dir()
         .map(|p| p.to_string_lossy().to_string())
-        .ok_or_else(|| "Could not determine home directory".into())
+        .ok_or_else(|| cmd_err("get_home_dir", "Could not determine home directory"))
 }
 
 #[tauri::command]
@@ -1997,7 +2061,7 @@ async fn compress_files(
     format: String,
     compression_level: String,
     operation_id: String,
-) -> Result<CompressResult, String> {
+) -> Result<CompressResult, AppError> {
     let mutation = ActiveMutation::begin(window.app_handle());
     let window = window.clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -2050,7 +2114,8 @@ async fn compress_files(
         })
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| cmd_err("compress_files", e))?
+    .map_err(|e| cmd_err("compress_files", e))
 }
 
 #[tauri::command]
@@ -2058,9 +2123,9 @@ async fn extract_archive_cmd(
     app: AppHandle,
     archive_path: String,
     output_dir: String,
-) -> Result<ExtractResult, String> {
+) -> Result<ExtractResult, AppError> {
     let mutation = ActiveMutation::begin(&app);
-    tauri::async_runtime::spawn_blocking(move || {
+    tauri::async_runtime::spawn_blocking(move || -> Result<ExtractResult, String> {
         let _mutation = mutation;
         let archive = PathBuf::from(&archive_path);
         let output = PathBuf::from(&output_dir);
@@ -2073,17 +2138,19 @@ async fn extract_archive_cmd(
         })
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| cmd_err("extract_archive_cmd", e))?
+    .map_err(|e| cmd_err("extract_archive_cmd", e))
 }
 
 #[tauri::command]
-async fn list_archive(archive_path: String) -> Result<ArchiveInfo, String> {
+async fn list_archive(archive_path: String) -> Result<ArchiveInfo, AppError> {
     tauri::async_runtime::spawn_blocking(move || {
         let archive = PathBuf::from(&archive_path);
         list_archive_contents(&archive).map_err(|e| e.to_string())
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| cmd_err("list_archive", e))?
+    .map_err(|e| cmd_err("list_archive", e))
 }
 
 #[tauri::command]
@@ -2451,5 +2518,35 @@ mod tests {
 
         assert!(!source.exists());
         assert_eq!(fs::read(outside.join("keep.txt")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn file_operation_event_serializes_structured_error() {
+        let event = FileOperationEvent {
+            job_id: "job-1".into(),
+            state: "failed",
+            progress: None,
+            result: None,
+            error: Some(AppError::from_raw(
+                "file_operation",
+                "Access is denied. (os error 5)",
+            )),
+        };
+        let json = serde_json::to_value(&event).expect("serialize");
+        assert_eq!(json["jobId"], "job-1");
+        assert_eq!(json["state"], "failed");
+        assert_eq!(json["error"]["code"], "permission");
+        assert_eq!(json["error"]["retryable"], false);
+        assert_eq!(json["error"]["operation"], "file_operation");
+        assert_eq!(
+            json["error"]["message"],
+            error::user_message(error::AppErrorCode::Permission)
+        );
+        assert!(
+            !json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("os error")
+        );
     }
 }

@@ -126,7 +126,10 @@ export function CustomFieldsEditor({ file, onUpdate }: CustomFieldsEditorProps) 
         });
       }
     } catch (error) {
-      reportError('Failed to save custom field', error, { toast: showToast });
+      reportError('Failed to save custom field', error, {
+        toast: showToast,
+        retry: () => handleAddField(),
+      });
       // Revert on error
       setFields(file.custom || {});
     }
@@ -172,7 +175,10 @@ export function CustomFieldsEditor({ file, onUpdate }: CustomFieldsEditorProps) 
         });
       }
     } catch (error) {
-      reportError(`Failed to update field "${field}"`, error, { toast: showToast });
+      reportError(`Failed to update field "${field}"`, error, {
+        toast: showToast,
+        retry: () => handleUpdateField(field, value),
+      });
       // Revert on error
       setFields(file.custom || {});
     }
@@ -206,7 +212,10 @@ export function CustomFieldsEditor({ file, onUpdate }: CustomFieldsEditorProps) 
         });
       }
     } catch (error) {
-      reportError(`Failed to remove field "${field}"`, error, { toast: showToast });
+      reportError(`Failed to remove field "${field}"`, error, {
+        toast: showToast,
+        retry: () => handleRemoveField(field),
+      });
       // Revert on error
       setFields(file.custom || {});
     }

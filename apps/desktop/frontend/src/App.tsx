@@ -27,7 +27,7 @@ import { useAppCommands } from './hooks/useAppCommands';
 import { useAppKeyboardShortcuts } from './hooks/useAppKeyboardShortcuts';
 import { calculatePaneLayout, useAppLayoutPersistence } from './hooks/useAppLayoutPersistence';
 import { useQuickLookController } from './hooks/useQuickLookController';
-import { formatErrorMessage } from './utils/errorMessages';
+import { formatUserFacingError } from './utils/errorMessages';
 import { DragOverlay } from './components/DragOverlay';
 import { deleteWithUndo } from './utils/fileOperations';
 import { chooseFolder } from './utils/folderPicker';
@@ -701,7 +701,7 @@ function AppContent() {
             );
           }
         } catch (err: unknown) {
-          setError(formatErrorMessage(err));
+          setError(formatUserFacingError(err));
         } finally {
           setLoading(false);
         }
@@ -802,7 +802,7 @@ function AppContent() {
             }
           }
         } catch (err: unknown) {
-          setError(formatErrorMessage(err));
+          setError(formatUserFacingError(err));
         } finally {
           setLoading(false);
         }
@@ -947,7 +947,7 @@ function AppContent() {
         setColumnFiles(refreshed);
       }
     } catch (refreshError) {
-      setError(formatErrorMessage(refreshError));
+      setError(formatUserFacingError(refreshError));
     }
   }, [
     viewMode,
@@ -1144,7 +1144,7 @@ function AppContent() {
         navigateToChosenFolder(selectedPath);
       }
     } catch (pickerError) {
-      setFolderPickerError(formatErrorMessage(pickerError));
+      setFolderPickerError(formatUserFacingError(pickerError));
     } finally {
       setChoosingFolder(false);
     }

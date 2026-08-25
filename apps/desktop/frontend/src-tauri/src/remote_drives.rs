@@ -1,3 +1,4 @@
+use crate::error::AppError;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -9,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
+use tracing::warn;
 use uuid::Uuid;
 
 #[cfg(windows)]
@@ -46,7 +48,7 @@ pub struct RemoteDriveStatus {
     pub id: String,
     pub state: &'static str,
     pub mount_path: Option<String>,
-    pub error: Option<String>,
+    pub error: Option<AppError>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -189,7 +191,10 @@ impl RemoteDriveManager {
                     id: id.clone(),
                     state: "error",
                     mount_path: Some(mount.mount_path.to_string_lossy().into_owned()),
-                    error: Some(format!("rclone exited with {status}")),
+                    error: Some(AppError::from_raw(
+                        "remote_drive_status",
+                        format!("rclone exited with {status}"),
+                    )),
                 },
                 Ok(None) => RemoteDriveStatus {
                     id: id.clone(),
@@ -201,7 +206,7 @@ impl RemoteDriveManager {
                     id: id.clone(),
                     state: "error",
                     mount_path: Some(mount.mount_path.to_string_lossy().into_owned()),
-                    error: Some(error.to_string()),
+                    error: Some(AppError::from_io("remote_drive_status", error)),
                 },
             })
             .collect()
@@ -254,7 +259,8 @@ impl RemoteDriveManager {
                 Ok(status)
             }
             Err(error) => {
-                emit_status(app, status(&profile.id, "error", None, Some(error.clone())));
+                let safe = AppError::from_raw("connect_remote_drive", &error);
+                emit_status(app, status(&profile.id, "error", None, Some(safe)));
                 Err(error)
             }
         }
@@ -403,7 +409,10 @@ impl RemoteDriveManager {
                         id,
                         "connected",
                         Some(mount_path),
-                        Some(format!("Unable to verify pending remote writes: {error}")),
+                        Some(AppError::from_raw(
+                            "disconnect_remote_drive",
+                            format!("Unable to verify pending remote writes: {error}"),
+                        )),
                     ),
                     pending_uploads: 0,
                     errored_files: 0,
@@ -491,8 +500,8 @@ impl RemoteDriveManager {
                 Ok(result) if result.blocked => {
                     blocker.pending_uploads += result.pending_uploads;
                     blocker.errored_files += result.errored_files;
-                    if result.status.error.is_some() {
-                        blocker.error = result.status.error;
+                    if let Some(error) = result.status.error {
+                        blocker.error = Some(error.message);
                     }
                 }
                 Ok(_) => {}
@@ -980,7 +989,7 @@ fn status(
     id: &str,
     state: &'static str,
     mount_path: Option<String>,
-    error: Option<String>,
+    error: Option<AppError>,
 ) -> RemoteDriveStatus {
     RemoteDriveStatus {
         id: id.to_string(),
@@ -1009,12 +1018,9 @@ fn normalize_compare_path(path: &Path) -> String {
 }
 
 fn command_error(prefix: &str, stderr: &[u8]) -> String {
-    let detail = String::from_utf8_lossy(stderr).trim().to_string();
-    if detail.is_empty() {
-        prefix.to_string()
-    } else {
-        format!("{prefix}: {detail}")
-    }
+    let detail = String::from_utf8_lossy(stderr);
+    warn!(prefix, detail = %detail.trim(), "remote drive helper failed");
+    prefix.to_string()
 }
 
 fn missing_rclone() -> String {
@@ -1219,6 +1225,22 @@ mod tests {
         assert!(ensure_mount_target_available(&target).is_err());
         fs::remove_dir(&target).unwrap();
         assert!(ensure_mount_target_available(&target).is_ok());
+    }
+
+    #[test]
+    fn status_events_persist_structured_app_error() {
+        let error = AppError::from_raw("remote_drive_status", "rclone exited with exit code: 1");
+        let payload = status("drive-1", "error", None, Some(error));
+        let json = serde_json::to_value(&payload).expect("serialize");
+        assert_eq!(json["id"], "drive-1");
+        assert_eq!(json["state"], "error");
+        assert_eq!(json["error"]["code"], "remote_unavailable");
+        assert_eq!(json["error"]["retryable"], true);
+        assert_eq!(json["error"]["operation"], "remote_drive_status");
+        assert_eq!(
+            json["error"]["message"],
+            crate::error::user_message(crate::error::AppErrorCode::RemoteUnavailable)
+        );
     }
 
     #[test]

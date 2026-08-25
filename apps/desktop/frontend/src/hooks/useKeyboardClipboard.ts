@@ -123,7 +123,10 @@ export function useKeyboardClipboardManager({
         );
       }
     } catch (e) {
-      reportError('Paste failed', e, { toast: showToast });
+      reportError('Paste failed', e, {
+        toast: showToast,
+        retry: () => handlePaste(),
+      });
     }
 
     return true;

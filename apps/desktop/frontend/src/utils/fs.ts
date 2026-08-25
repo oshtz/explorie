@@ -5,7 +5,7 @@ import { readTextFile, readDir, exists, stat } from '@tauri-apps/plugin-fs';
 import { clearDirSizeCache } from '../dirSizeCache';
 import { invoke } from '@tauri-apps/api/core';
 import { validateFileName } from './fileName';
-import { formatErrorMessage } from './errorMessages';
+import { toStructuredError } from './errorMessages';
 import type { CustomFields, CustomFieldValue } from './customFieldTypes';
 
 export type { DirEntry } from '@tauri-apps/plugin-fs';
@@ -22,7 +22,7 @@ export {
 } from './errorMessages';
 
 function toFsError(error: unknown): Error {
-  return new Error(formatErrorMessage(error));
+  return toStructuredError(error);
 }
 
 function ensureValidFileName(name: string): string {

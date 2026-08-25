@@ -134,9 +134,38 @@ const ERROR_PATTERNS: Array<{ pattern: RegExp; message: string; category: ErrorC
   },
 ];
 
+export type AppErrorCode =
+  | 'permission'
+  | 'missing_path'
+  | 'conflict'
+  | 'cancelled'
+  | 'helper_missing'
+  | 'remote_unavailable'
+  | 'invalid_name'
+  | 'in_use'
+  | 'disk_full'
+  | 'archive'
+  | 'path'
+  | 'type_mismatch'
+  | 'unsupported'
+  | 'unknown';
+
+export interface AppErrorPayload {
+  code: AppErrorCode;
+  message: string;
+  retryable: boolean;
+  operation?: string;
+  detail?: string;
+}
+
 export type ErrorCategory =
   | 'permission'
   | 'not_found'
+  | 'missing_path'
+  | 'conflict'
+  | 'cancelled'
+  | 'helper_missing'
+  | 'remote_unavailable'
   | 'type'
   | 'in_use'
   | 'space'
@@ -149,16 +178,43 @@ export type ErrorCategory =
   | 'unknown';
 
 export interface FormattedError {
-  /** User-friendly message */
   message: string;
-  /** Error category for potential special handling */
   category: ErrorCategory;
-  /** Original technical message (for debugging) */
   technical: string;
-  /** Whether this error might be recoverable */
   recoverable: boolean;
-  /** Suggested action for the user */
   suggestion?: string;
+  code?: AppErrorCode;
+  operation?: string;
+}
+
+const APP_ERROR_CODES = new Set<AppErrorCode>([
+  'permission',
+  'missing_path',
+  'conflict',
+  'cancelled',
+  'helper_missing',
+  'remote_unavailable',
+  'invalid_name',
+  'in_use',
+  'disk_full',
+  'archive',
+  'path',
+  'type_mismatch',
+  'unsupported',
+  'unknown',
+]);
+
+export function isAppErrorPayload(error: unknown): error is AppErrorPayload {
+  if (!error || typeof error !== 'object') {
+    return false;
+  }
+  const value = error as Record<string, unknown>;
+  return (
+    typeof value.code === 'string' &&
+    APP_ERROR_CODES.has(value.code as AppErrorCode) &&
+    typeof value.message === 'string' &&
+    typeof value.retryable === 'boolean'
+  );
 }
 
 /**
@@ -168,10 +224,53 @@ export function formatErrorMessage(error: unknown): string {
   return formatError(error).message;
 }
 
+export function formatUserFacingError(error: unknown): string {
+  const formatted = formatError(error);
+  return formatted.suggestion ? `${formatted.message}. ${formatted.suggestion}` : formatted.message;
+}
+
+export function persistInvokeError(error: unknown): AppErrorPayload | string {
+  return extractAppError(error) ?? formatUserFacingError(error);
+}
+
+export function toStructuredError(error: unknown): Error {
+  if (error instanceof Error && isAppErrorPayload(error)) {
+    return error;
+  }
+
+  const formatted = formatError(error);
+  const next = new Error(formatted.message) as Error & Partial<AppErrorPayload>;
+  if (formatted.code) {
+    next.code = formatted.code;
+    next.retryable = formatted.recoverable;
+    if (formatted.operation) {
+      next.operation = formatted.operation;
+    }
+    if (formatted.technical && formatted.technical !== formatted.message) {
+      next.detail = formatted.technical;
+    }
+  }
+  return next;
+}
+
 /**
  * Convert a raw error into a structured FormattedError object.
  */
 export function formatError(error: unknown): FormattedError {
+  const structured = extractAppError(error);
+  if (structured) {
+    const category = categoryFromCode(structured.code);
+    return {
+      message: structured.message,
+      category,
+      technical: structured.detail || structured.message,
+      recoverable: structured.retryable,
+      suggestion: getSuggestion(category),
+      code: structured.code,
+      operation: structured.operation,
+    };
+  }
+
   const technical = extractErrorMessage(error);
 
   if (!technical) {
@@ -183,7 +282,6 @@ export function formatError(error: unknown): FormattedError {
     };
   }
 
-  // Check against known patterns
   for (const { pattern, message, category } of ERROR_PATTERNS) {
     if (pattern.test(technical)) {
       return {
@@ -196,7 +294,6 @@ export function formatError(error: unknown): FormattedError {
     }
   }
 
-  // If no pattern matches, try to clean up the message
   return {
     message: cleanupTechnicalMessage(technical),
     category: 'unknown',
@@ -267,6 +364,76 @@ export function formatBatchErrors(
 /**
  * Extract the error message string from various error types.
  */
+function extractAppError(error: unknown): AppErrorPayload | null {
+  if (isAppErrorPayload(error)) {
+    return error;
+  }
+
+  if (typeof error === 'string') {
+    const trimmed = error.trim();
+    if (trimmed.startsWith('{') && trimmed.includes('"code"')) {
+      try {
+        const parsed: unknown = JSON.parse(trimmed);
+        if (isAppErrorPayload(parsed)) {
+          return parsed;
+        }
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+
+  if (error instanceof Error && error.message.trim().startsWith('{')) {
+    return extractAppError(error.message);
+  }
+
+  if (error && typeof error === 'object') {
+    const obj = error as Record<string, unknown>;
+    if (isAppErrorPayload(obj.error)) {
+      return obj.error;
+    }
+    if (isAppErrorPayload(obj.data)) {
+      return obj.data;
+    }
+  }
+
+  return null;
+}
+
+function categoryFromCode(code: AppErrorCode): ErrorCategory {
+  switch (code) {
+    case 'permission':
+      return 'permission';
+    case 'missing_path':
+      return 'missing_path';
+    case 'conflict':
+      return 'conflict';
+    case 'cancelled':
+      return 'cancelled';
+    case 'helper_missing':
+      return 'helper_missing';
+    case 'remote_unavailable':
+      return 'remote_unavailable';
+    case 'invalid_name':
+      return 'name';
+    case 'in_use':
+      return 'in_use';
+    case 'disk_full':
+      return 'space';
+    case 'archive':
+      return 'archive';
+    case 'path':
+      return 'path';
+    case 'type_mismatch':
+      return 'type';
+    case 'unsupported':
+      return 'system';
+    default:
+      return 'unknown';
+  }
+}
+
 function extractErrorMessage(error: unknown): string {
   if (error === null || error === undefined) {
     return '';
@@ -280,7 +447,6 @@ function extractErrorMessage(error: unknown): string {
     return error.message;
   }
 
-  // Handle Tauri error objects
   if (typeof error === 'object') {
     const obj = error as Record<string, unknown>;
     if (typeof obj.message === 'string') return obj.message;
@@ -339,27 +505,37 @@ function isRecoverable(category: ErrorCategory): boolean {
     case 'in_use':
     case 'network':
     case 'space':
+    case 'cancelled':
+    case 'helper_missing':
+    case 'remote_unavailable':
       return true;
     default:
       return false;
   }
 }
 
-/**
- * Get a helpful suggestion for an error category.
- */
 function getSuggestion(category: ErrorCategory): string | undefined {
   switch (category) {
     case 'permission':
-      return 'Try running as administrator or check folder permissions';
+      return 'Check folder permissions, then try a different location';
+    case 'missing_path':
+    case 'not_found':
+      return 'Refresh the view and confirm the item still exists';
+    case 'conflict':
+    case 'exists':
+      return 'Rename the item or choose a different destination';
+    case 'cancelled':
+      return 'Run the operation again if you still need it';
+    case 'helper_missing':
+      return 'Install or approve the required helper, then retry';
+    case 'remote_unavailable':
+      return 'Check the remote connection and retry';
     case 'in_use':
       return 'Close any programs using the file and try again';
     case 'space':
       return 'Free up disk space and try again';
     case 'network':
       return 'Check your network connection and try again';
-    case 'exists':
-      return 'Rename the file or choose a different location';
     case 'name':
       return 'Try a different file name without special characters';
     default:
@@ -402,6 +578,9 @@ export function createOperationErrorMessage(
 
 export default {
   formatErrorMessage,
+  formatUserFacingError,
+  persistInvokeError,
+  toStructuredError,
   formatError,
   formatOperationError,
   formatBatchErrors,

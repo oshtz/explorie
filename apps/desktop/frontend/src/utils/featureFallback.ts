@@ -4,6 +4,8 @@
  * Tracks which features have failed and provides fallback behavior.
  */
 
+import { formatErrorMessage } from './errorMessages';
+
 type FeatureName =
   | 'dirSize'
   | 'thumbnail'
@@ -60,7 +62,7 @@ export function isFeatureEnabled(feature: FeatureName): boolean {
  */
 export function recordFeatureFailure(feature: FeatureName, error?: unknown): void {
   const current = getFeatureStatus(feature);
-  const errorMessage = error instanceof Error ? error.message : String(error || 'Unknown error');
+  const errorMessage = formatErrorMessage(error || 'Unknown error');
 
   const newStatus: FeatureStatus = {
     ...current,

@@ -171,9 +171,11 @@ describe('CustomFieldsEditor', () => {
     await user.click(within(getFieldRow('status')).getByRole('button', { name: 'Remove' }));
 
     await waitFor(() =>
-      expect(mocks.reportError).toHaveBeenCalledWith('Failed to remove field "status"', error, {
-        toast: mocks.showToast,
-      })
+      expect(mocks.reportError).toHaveBeenCalledWith(
+        'Failed to remove field "status"',
+        error,
+        expect.objectContaining({ toast: mocks.showToast, retry: expect.any(Function) })
+      )
     );
     expect(screen.getByText('Todo')).toBeInTheDocument();
   });

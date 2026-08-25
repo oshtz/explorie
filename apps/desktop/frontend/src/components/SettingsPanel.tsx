@@ -5,6 +5,7 @@ import { useFileStore } from '../store';
 import type { ThemeSpec } from '../store';
 import { normalizeThemeSpec } from '../store/slices/uiSlice';
 import { createFocusTrap } from '../utils/accessibility';
+import { formatUserFacingError } from '../utils/errorMessages';
 import { Icon } from './Icon';
 
 interface SettingsPanelProps {
@@ -149,7 +150,7 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
       setSystemIntegration(next);
       setStatus(enabled ? 'Windows integration enabled' : 'Windows integration removed');
     } catch (error) {
-      setStatus(`Could not update Windows integration: ${String(error)}`);
+      setStatus(`Could not update Windows integration: ${formatUserFacingError(error)}`);
     } finally {
       setSystemIntegrationBusy(false);
     }

@@ -11,7 +11,7 @@ import { clearDirSizeCache } from '../dirSizeCache';
 import type { ConflictAction } from '../conflictResolutionStore';
 import { checkForConflict, useConflictResolutionStore } from '../conflictResolutionStore';
 import { deletePath } from './fs';
-import { formatErrorMessage } from './errorMessages';
+import { formatError, formatUserFacingError } from './errorMessages';
 import { describeFileEntry, formatItemCount, summarizeFailedItems } from './fileOperationFormat';
 import { getParentPath } from './path';
 import {
@@ -104,6 +104,21 @@ function isCancellation(error: unknown): boolean {
   return error instanceof Error && error.name === 'AbortError';
 }
 
+function toastFailure(
+  showToast: ShowToastFn,
+  prefix: string,
+  error: unknown,
+  retry?: () => unknown
+): void {
+  const formatted = formatError(error);
+  showToast(`${prefix}: ${formatUserFacingError(error)}`, {
+    type: 'error',
+    ...(retry && formatted.recoverable
+      ? { action: { label: 'Retry', onClick: () => void retry() } }
+      : {}),
+  });
+}
+
 /**
  * Move items to the operating system Trash. A Trash failure is terminal and
  * never falls back to permanent deletion.
@@ -128,9 +143,9 @@ export async function deleteWithUndo(
       showToast(`Permanently deleted ${itemText}`, { type: 'warning' });
       return true;
     } catch (error) {
-      showToast(`Failed to permanently delete items: ${formatErrorMessage(error)}`, {
-        type: 'error',
-      });
+      toastFailure(showToast, 'Failed to permanently delete items', error, () =>
+        deleteWithUndo(files, showToast, onRefresh, options)
+      );
       return false;
     }
   }
@@ -161,9 +176,9 @@ export async function deleteWithUndo(
     showToast(`Moved ${itemText} to Trash`, { type: 'success' });
     return true;
   } catch (error) {
-    showToast(`Failed to move items to Trash: ${formatErrorMessage(error)}`, {
-      type: 'error',
-    });
+    toastFailure(showToast, 'Failed to move items to Trash', error, () =>
+      deleteWithUndo(files, showToast, onRefresh, options)
+    );
     return false;
   }
 }
@@ -185,6 +200,7 @@ export async function copyWithUndoAndConflictResolution(
   const failed: Array<{ name: string; error: string }> = [];
   const skipped: string[] = [];
   let cancelled = false;
+  let firstFailure: unknown;
 
   for (const file of files) {
     const name = describeFileEntry(file).name;
@@ -206,7 +222,8 @@ export async function copyWithUndoAndConflictResolution(
         cancelled = true;
         break;
       }
-      failed.push({ name, error: formatErrorMessage(error) });
+      firstFailure ??= error;
+      failed.push({ name, error: formatUserFacingError(error) });
     }
   }
 
@@ -219,7 +236,9 @@ export async function copyWithUndoAndConflictResolution(
       showToast('All files were skipped', { type: 'info' });
       return true;
     }
-    showToast(`Failed to copy: ${failed[0]?.error || 'Unknown error'}`, { type: 'error' });
+    toastFailure(showToast, 'Failed to copy', firstFailure ?? 'Unknown error', () =>
+      copyWithUndoAndConflictResolution(files, targetDir, showToast, onRefresh, options)
+    );
     return false;
   }
 
@@ -257,7 +276,7 @@ export async function copyWithUndoAndConflictResolution(
         showToast(`Undid copy of ${operation.createdPaths.length} item(s)`, { type: 'info' });
         return true;
       } catch (error) {
-        showToast(`Failed to undo copy: ${formatErrorMessage(error)}`, { type: 'error' });
+        toastFailure(showToast, 'Failed to undo copy', error, () => operation.undo());
         return false;
       }
     },
@@ -276,7 +295,7 @@ export async function copyWithUndoAndConflictResolution(
         showToast(`Redid copy of ${newPaths.length} item(s)`, { type: 'info' });
         return true;
       } catch (error) {
-        showToast(`Failed to redo copy: ${formatErrorMessage(error)}`, { type: 'error' });
+        toastFailure(showToast, 'Failed to redo copy', error, () => operation.redo());
         return false;
       }
     },
@@ -329,6 +348,7 @@ export async function moveWithUndoAndConflictResolution(
   const failed: Array<{ name: string; error: string }> = [];
   const skipped: string[] = [];
   let cancelled = false;
+  let firstFailure: unknown;
 
   for (const file of files) {
     const name = describeFileEntry(file).name;
@@ -349,7 +369,8 @@ export async function moveWithUndoAndConflictResolution(
         cancelled = true;
         break;
       }
-      failed.push({ name, error: formatErrorMessage(error) });
+      firstFailure ??= error;
+      failed.push({ name, error: formatUserFacingError(error) });
     }
   }
 
@@ -362,7 +383,9 @@ export async function moveWithUndoAndConflictResolution(
       showToast('All files were skipped', { type: 'info' });
       return true;
     }
-    showToast(`Failed to move: ${failed[0]?.error || 'Unknown error'}`, { type: 'error' });
+    toastFailure(showToast, 'Failed to move', firstFailure ?? 'Unknown error', () =>
+      moveWithUndoAndConflictResolution(files, targetDir, showToast, onRefresh, options)
+    );
     return false;
   }
 
@@ -389,7 +412,7 @@ export async function moveWithUndoAndConflictResolution(
         showToast(`Undid move of ${operation.items.length} item(s)`, { type: 'info' });
         return true;
       } catch (error) {
-        showToast(`Failed to undo move: ${formatErrorMessage(error)}`, { type: 'error' });
+        toastFailure(showToast, 'Failed to undo move', error, () => operation.undo());
         return false;
       }
     },
@@ -414,7 +437,7 @@ export async function moveWithUndoAndConflictResolution(
         showToast(`Redid move of ${nextItems.length} item(s)`, { type: 'info' });
         return true;
       } catch (error) {
-        showToast(`Failed to redo move: ${formatErrorMessage(error)}`, { type: 'error' });
+        toastFailure(showToast, 'Failed to redo move', error, () => operation.redo());
         return false;
       }
     },

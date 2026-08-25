@@ -27,7 +27,7 @@
  *   report('Delete failed', error);
  */
 
-import { formatError, type FormattedError } from './errorMessages';
+import { formatError, formatUserFacingError, type FormattedError } from './errorMessages';
 import { logger } from './logger';
 
 /**
@@ -162,7 +162,7 @@ export interface ReportOptions {
   /** Toast function to show user notification. If not provided, only logs to console. */
   toast?: ToastFn | null;
   /** Retry function for recoverable errors. Adds "Retry" button to toast. */
-  retry?: () => void | Promise<void>;
+  retry?: () => unknown;
   /** Custom toast duration in ms. Default: 6000 for errors, 5000 for warnings */
   duration?: number;
   /** Whether to treat as warning instead of error. Default: false */
@@ -237,7 +237,7 @@ export function reportError(
       toastOptions.duration = (duration ?? defaultDuration) + 2000; // Extra time for retry button
     }
 
-    toast(`${operation}: ${formatted.message}`, toastOptions);
+    toast(`${operation}: ${formatUserFacingError(error)}`, toastOptions);
   }
 
   return formatted;
@@ -336,11 +336,10 @@ export function reportBatchErrors(
   // Show consolidated toast
   if (toast) {
     const errorCount = errors.length;
-    const sampleError = formatError(errors[0].error);
 
     let message: string;
     if (errorCount === 1) {
-      message = `${operation}: ${sampleError.message}`;
+      message = `${operation}: ${formatUserFacingError(errors[0].error)}`;
     } else {
       // Group by error category
       const categories = new Map<string, number>();
@@ -350,7 +349,7 @@ export function reportBatchErrors(
       }
 
       if (categories.size === 1) {
-        message = `${operation}: ${sampleError.message} (${errorCount} items)`;
+        message = `${operation}: ${formatUserFacingError(errors[0].error)} (${errorCount} items)`;
       } else {
         message = `${operation}: ${errorCount} items failed with various errors`;
       }

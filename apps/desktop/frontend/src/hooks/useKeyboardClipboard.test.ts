@@ -183,9 +183,11 @@ describe('useKeyboardClipboardManager', () => {
     await act(async () => {
       await expect(failed.result.current.handlePaste()).resolves.toBe(true);
     });
-    expect(mocks.reportError).toHaveBeenCalledWith('Paste failed', error, {
-      toast: failed.props.showToast,
-    });
+    expect(mocks.reportError).toHaveBeenCalledWith(
+      'Paste failed',
+      error,
+      expect.objectContaining({ toast: failed.props.showToast, retry: expect.any(Function) })
+    );
   });
 
   it('handles global keyboard shortcuts while ignoring editable targets', () => {

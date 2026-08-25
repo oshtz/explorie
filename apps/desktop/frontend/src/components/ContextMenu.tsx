@@ -356,7 +356,10 @@ export function ContextMenu({
     try {
       await deleteWithUndo(state.files, showToast ?? (() => {}), onRefresh ?? (() => {}));
     } catch (e) {
-      reportError('Delete failed', e, { toast: showToast });
+      reportError('Delete failed', e, {
+        toast: showToast,
+        retry: () => deleteWithUndo(state.files, showToast ?? (() => {}), onRefresh ?? (() => {})),
+      });
     }
     onClose();
   }, [state.files, confirmBeforeDelete, onDeleteConfirm, onRefresh, onClose, showToast]);
@@ -394,7 +397,10 @@ export function ContextMenu({
         );
       }
     } catch (e) {
-      reportError('Paste failed', e, { toast: showToast });
+      reportError('Paste failed', e, {
+        toast: showToast,
+        retry: () => handlePaste(),
+      });
     }
     onClose();
   }, [clipboard, state.containerPath, setClipboard, onRefresh, onClose, showToast]);
@@ -467,7 +473,10 @@ export function ContextMenu({
       try {
         await revealInFileManager(state.files[0].path);
       } catch (e) {
-        reportError('Failed to reveal in file manager', e, { toast: showToast });
+        reportError('Failed to reveal in file manager', e, {
+          toast: showToast,
+          retry: () => revealInFileManager(state.files[0].path),
+        });
       }
     }
     onClose();
@@ -479,7 +488,10 @@ export function ContextMenu({
       try {
         await quickLook(state.files[0].path);
       } catch (e) {
-        reportError('Quick Look failed', e, { toast: showToast });
+        reportError('Quick Look failed', e, {
+          toast: showToast,
+          retry: () => quickLook(state.files[0].path),
+        });
       }
     }
     onClose();
@@ -492,7 +504,10 @@ export function ContextMenu({
         try {
           await openWithApp(state.files[0].path, app.name);
         } catch (e) {
-          reportError(`Failed to open with ${app.name}`, e, { toast: showToast });
+          reportError(`Failed to open with ${app.name}`, e, {
+            toast: showToast,
+            retry: () => openWithApp(state.files[0].path, app.name),
+          });
         }
       }
       onClose();

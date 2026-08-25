@@ -398,7 +398,11 @@ export function TopBar({
         );
       }
     } catch (e) {
-      reportError('Refresh failed', e, { toast: showToast, warning: true });
+      reportError('Refresh failed', e, {
+        toast: showToast,
+        warning: true,
+        retry: () => refreshAfterFsChange(),
+      });
     }
   }, [currentPath, setFiles, viewMode, setPathStack, pathStack, showToast]);
 
@@ -417,7 +421,10 @@ export function TopBar({
     try {
       await createNoteIn(currentPath);
     } catch (e) {
-      reportError('Create note failed', e, { toast: showToast });
+      reportError('Create note failed', e, {
+        toast: showToast,
+        retry: () => createNoteIn(currentPath),
+      });
     }
     setCreateOpen(false);
     await refreshAfterFsChange();
@@ -912,7 +919,10 @@ export function TopBar({
             await refreshAfterFsChange();
             setInputDialog(null);
           } catch (error) {
-            reportError('Create website link failed', error, { toast: showToast });
+            reportError('Create website link failed', error, {
+              toast: showToast,
+              retry: () => createWebsiteLinkIn(currentPath, url),
+            });
           }
         }}
       />

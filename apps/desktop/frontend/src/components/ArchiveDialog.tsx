@@ -3,7 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import type { FileEntry } from '../store';
 import { Icon } from './Icon';
-import { formatErrorMessage } from '../utils/errorMessages';
+import { formatUserFacingError } from '../utils/errorMessages';
 import { createFocusTrap } from '../utils/accessibility';
 import styles from './ArchiveDialog.module.css';
 
@@ -131,7 +131,7 @@ export function ArchiveDialog({
       const info = await invoke<ArchiveInfo>('list_archive', { archivePath: path });
       setArchiveInfo(info);
     } catch (e) {
-      setError(`Failed to read archive: ${formatErrorMessage(e)}`);
+      setError(`Failed to read archive: ${formatUserFacingError(e)}`);
     } finally {
       setLoadingInfo(false);
     }
@@ -211,7 +211,7 @@ export function ArchiveDialog({
         await onSuccess?.();
       }, 500);
     } catch (e) {
-      setError(`Compression failed: ${formatErrorMessage(e)}`);
+      setError(`Compression failed: ${formatUserFacingError(e)}`);
     } finally {
       if (unlisten) {
         unlisten();
@@ -243,7 +243,7 @@ export function ArchiveDialog({
         await onSuccess?.();
       }, 500);
     } catch (e) {
-      setError(`Extraction failed: ${formatErrorMessage(e)}`);
+      setError(`Extraction failed: ${formatUserFacingError(e)}`);
     } finally {
       setProcessing(false);
     }

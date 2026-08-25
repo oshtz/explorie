@@ -880,6 +880,7 @@ function GridViewInner({
         reportError('Rename failed', error, {
           toast: showToast,
           context: { path: file.path },
+          retry: () => renamePath(file.path, (newName || '').trim()),
         });
       } finally {
         setEditingId(null);
@@ -912,7 +913,10 @@ function GridViewInner({
           setSelectedIds(new Set());
         }
       } catch (e) {
-        reportError('Delete failed', e, { toast: showToast });
+        reportError('Delete failed', e, {
+          toast: showToast,
+          retry: () => performDelete(files, permanent),
+        });
       }
     },
     [currentPath, setFiles, setSelectedIds, showToast]
@@ -984,7 +988,10 @@ function GridViewInner({
                 }
                 return true;
               } catch (e) {
-                reportError('Batch rename undo failed', e, { toast: showToast });
+                reportError('Batch rename undo failed', e, {
+                  toast: showToast,
+                  retry: () => operation.undo(),
+                });
                 return false;
               }
             },
@@ -996,7 +1003,10 @@ function GridViewInner({
                 }
                 return true;
               } catch (e) {
-                reportError('Batch rename redo failed', e, { toast: showToast });
+                reportError('Batch rename redo failed', e, {
+                  toast: showToast,
+                  retry: () => operation.redo(),
+                });
                 return false;
               }
             },
@@ -1168,6 +1178,7 @@ function GridViewInner({
                           reportError('Open failed', err, {
                             toast: showToast,
                             context: { path: file.path },
+                            retry: () => invoke('open_path', { path: file.path }),
                           })
                         );
                     }}
@@ -1179,6 +1190,7 @@ function GridViewInner({
                             reportError('Open failed', err, {
                               toast: showToast,
                               context: { path: file.path },
+                              retry: () => invoke('open_path', { path: file.path }),
                             })
                           );
                       } else if (e.key === ' ') {
