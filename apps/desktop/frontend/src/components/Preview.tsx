@@ -25,8 +25,17 @@ type PreviewFile = {
       size: number;
       compressed_size: number;
       is_dir: boolean;
+      name?: string;
     }>;
   };
+  archivePasswordRequired?: boolean;
+  archivePassword?: string;
+  archiveCanGoBack?: boolean;
+  onArchiveNavigate?: (entryPath: string) => void;
+  onArchiveBack?: () => void;
+  onArchiveExtract?: () => void;
+  onArchivePasswordChange?: (password: string) => void;
+  onArchivePasswordSubmit?: () => void;
 };
 
 type PreviewProps = {
@@ -36,6 +45,11 @@ type PreviewProps = {
   loading?: boolean;
   onReady?: () => void;
   onContentError?: () => void;
+  onArchiveNavigate?: (entryPath: string) => void;
+  onArchiveBack?: () => void;
+  onArchiveExtract?: () => void;
+  onArchivePasswordChange?: (password: string) => void;
+  onArchivePasswordSubmit?: () => void;
   variant?: 'panel' | 'quicklook';
 };
 
@@ -116,6 +130,18 @@ const TEXTUAL_EXTENSIONS = new Set([
 
 const EXECUTABLE_SCRIPT_EXTENSIONS = new Set(['bat', 'cmd', 'ps1', 'psm1']);
 
+function isArchiveEntryName(path: string): boolean {
+  const name = path.split(/[\\/]/).pop()?.toLowerCase() ?? '';
+  return (
+    name.endsWith('.zip') ||
+    name.endsWith('.tar.gz') ||
+    name.endsWith('.tgz') ||
+    name.endsWith('.tar') ||
+    name.endsWith('.7z') ||
+    name.endsWith('.rar')
+  );
+}
+
 // Date formatting moved to utils/date for robustness
 
 export function Preview({
@@ -125,6 +151,11 @@ export function Preview({
   loading = false,
   onReady,
   onContentError,
+  onArchiveNavigate,
+  onArchiveBack,
+  onArchiveExtract,
+  onArchivePasswordChange,
+  onArchivePasswordSubmit,
   variant = 'panel',
 }: PreviewProps) {
   // State for the active tab
@@ -270,7 +301,39 @@ export function Preview({
 
     if (previewFile?.type === 'application/x-explorie-archive') {
       const archive = previewFile.archiveInfo;
+      const archiveNavigate = previewFile.onArchiveNavigate ?? onArchiveNavigate;
+      const archiveBack = previewFile.onArchiveBack ?? onArchiveBack;
+      const archiveExtract = previewFile.onArchiveExtract ?? onArchiveExtract;
+      const archivePasswordChange = previewFile.onArchivePasswordChange ?? onArchivePasswordChange;
+      const archivePasswordSubmit = previewFile.onArchivePasswordSubmit ?? onArchivePasswordSubmit;
+      const passwordPrompt = previewFile.archivePasswordRequired && (
+        <form
+          className={styles.archivePasswordPrompt}
+          onSubmit={(event) => {
+            event.preventDefault();
+            archivePasswordSubmit?.();
+          }}
+        >
+          <label htmlFor="archive-preview-password">Archive password</label>
+          <div className={styles.archivePasswordRow}>
+            <input
+              id="archive-preview-password"
+              aria-label="Archive password"
+              type="password"
+              value={previewFile.archivePassword ?? ''}
+              onChange={(event) => archivePasswordChange?.(event.target.value)}
+              autoFocus
+            />
+            <button type="submit" disabled={!previewFile.archivePassword}>
+              Unlock archive
+            </button>
+          </div>
+        </form>
+      );
       if (!archive) {
+        if (passwordPrompt) {
+          return <div className={styles.previewArchive}>{passwordPrompt}</div>;
+        }
         if (isLoading) return null;
         return renderUnsupportedPreview(
           'Cannot preview this archive (no archive listing available).'
@@ -289,16 +352,55 @@ export function Preview({
               <span>{formatFileSize(archive.compressed_size)} compressed</span>
             </div>
           </div>
+          <div className={styles.archiveToolbar}>
+            {previewFile.archiveCanGoBack && archiveBack && (
+              <button type="button" onClick={archiveBack}>
+                Back
+              </button>
+            )}
+            <span className={styles.archiveLocation}>Archive contents</span>
+            {archiveExtract && (
+              <button type="button" onClick={archiveExtract}>
+                Extract archive
+              </button>
+            )}
+          </div>
+          {passwordPrompt}
           <div className={styles.archiveEntries} role="list" aria-label="Archive contents">
-            {archive.entries.slice(0, 200).map((entry) => (
-              <div key={entry.path} className={styles.archiveEntry} role="listitem">
-                <span className={styles.archiveEntryKind}>{entry.is_dir ? 'DIR' : 'FILE'}</span>
-                <span className={styles.archiveEntryPath}>{entry.path}</span>
-                <span className={styles.archiveEntrySize}>
-                  {entry.is_dir ? '' : formatFileSize(entry.size)}
-                </span>
-              </div>
-            ))}
+            {archive.entries.slice(0, 200).map((entry) => {
+              const canNavigate = entry.is_dir || isArchiveEntryName(entry.path);
+              const content = (
+                <>
+                  <span className={styles.archiveEntryKind}>
+                    {entry.is_dir ? 'DIR' : canNavigate ? 'ARCHIVE' : 'FILE'}
+                  </span>
+                  <span className={styles.archiveEntryPath}>{entry.path}</span>
+                  <span className={styles.archiveEntrySize}>
+                    {entry.is_dir ? '' : formatFileSize(entry.size)}
+                  </span>
+                </>
+              );
+              return canNavigate && archiveNavigate ? (
+                <div
+                  key={entry.path}
+                  className={`${styles.archiveEntry} ${styles.archiveEntryInteractive}`}
+                  role="listitem"
+                >
+                  <button
+                    type="button"
+                    className={styles.archiveEntryButton}
+                    onClick={() => archiveNavigate(entry.path)}
+                    aria-label={`Open ${entry.path}`}
+                  >
+                    {content}
+                  </button>
+                </div>
+              ) : (
+                <div key={entry.path} className={styles.archiveEntry} role="listitem">
+                  {content}
+                </div>
+              );
+            })}
           </div>
           {archive.entries.length > 200 && (
             <div className={styles.archiveMore}>

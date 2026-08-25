@@ -295,6 +295,40 @@
   color: var(--fg-tertiary);
 }
 
+.passwordPrompt {
+  display: flex;
+  flex-direction: column;
+  gap: var(--padding-sm);
+  padding: var(--padding-lg);
+  background: var(--bg-sunken);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--border-radius-sm, 4px);
+}
+
+.passwordRow {
+  display: flex;
+  gap: var(--padding-sm);
+}
+
+.passwordRow .input {
+  min-width: 0;
+  flex: 1;
+}
+
+.passwordButton {
+  flex-shrink: 0;
+  border: 1px solid var(--border-primary);
+  border-radius: var(--border-radius-sm, 4px);
+  padding: var(--padding-md) var(--padding-lg);
+  color: var(--fg-primary);
+  background: var(--bg-elevated);
+  cursor: pointer;
+}
+
+.passwordButton:hover:not(:disabled) {
+  background: var(--bg-tertiary, var(--bg-secondary));
+}
+
 /* Archive preview (for extraction) */
 .archivePreview {
   background: var(--bg-sunken);
@@ -334,6 +368,51 @@
   border-top: 1px solid var(--border-primary);
   padding-top: 8px;
   margin-top: 8px;
+}
+
+.archiveToolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--padding-sm);
+  margin-bottom: var(--padding-sm);
+}
+
+.archiveLocation {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--fg-tertiary);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.archiveToolbar button,
+.archiveEntryButton {
+  border: 1px solid var(--border-primary);
+  border-radius: var(--border-radius-sm, 4px);
+  padding: 3px 8px;
+  color: var(--fg-primary);
+  background: var(--bg-elevated);
+  cursor: pointer;
+}
+
+.archiveToolbar button:hover:not(:disabled),
+.archiveEntryButton:hover:not(:disabled) {
+  background: var(--bg-hover);
+}
+
+.archiveEntryButton {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  text-align: left;
+  font: inherit;
+}
+
+.archiveEntryButton:disabled,
+.archiveToolbar button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 .archiveSearch {

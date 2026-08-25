@@ -249,6 +249,183 @@ describe('ArchiveDialog', () => {
     expect(await screen.findByText(/Extraction failed: Extract failed/)).toBeVisible();
   });
 
+  it('prompts for and forwards a password for protected archives', async () => {
+    const archive = file('secret.zip');
+    mocks.invoke.mockImplementation(async (command: string, args: Record<string, unknown>) => {
+      if (command === 'list_archive') {
+        if (!args.password) throw new Error('Archive password required');
+        return {
+          format: 'zip',
+          total_size: 128,
+          compressed_size: 64,
+          entry_count: 1,
+          entries: [
+            {
+              name: 'secret.txt',
+              path: 'secret.txt',
+              size: 128,
+              compressed_size: 64,
+              is_dir: false,
+            },
+          ],
+        };
+      }
+      if (command === 'extract_archive_cmd') {
+        return { output_dir: '/workspace/output', total_bytes: 128 };
+      }
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    const { user } = renderDialog({
+      mode: 'extract',
+      files: [archive],
+      currentPath: '/workspace/output',
+    });
+
+    expect(await screen.findByText(/password-protected/)).toBeVisible();
+    await user.type(screen.getByLabelText('Archive password'), 'correct horse');
+    await user.click(screen.getByRole('button', { name: 'Unlock archive' }));
+
+    await waitFor(() =>
+      expect(mocks.invoke).toHaveBeenCalledWith('list_archive', {
+        archivePath: '/workspace/secret.zip',
+        password: 'correct horse',
+      })
+    );
+    expect(await screen.findByText('secret.txt')).toBeVisible();
+    await user.click(screen.getByRole('button', { name: 'Extract' }));
+    await waitFor(() =>
+      expect(mocks.invoke).toHaveBeenCalledWith('extract_archive_cmd', {
+        archivePath: '/workspace/secret.zip',
+        outputDir: '/workspace/output',
+        password: 'correct horse',
+      })
+    );
+  });
+
+  it('opens nested archive entries and extracts the selected archive', async () => {
+    const archive = file('bundle.zip');
+    mocks.invoke.mockImplementation(async (command: string, args: Record<string, unknown>) => {
+      if (command === 'list_archive') {
+        const path = args.archivePath as string;
+        if (path === '/workspace/bundle.zip') {
+          return {
+            format: 'zip',
+            total_size: 2048,
+            compressed_size: 1024,
+            entry_count: 1,
+            entries: [
+              { name: 'nested', path: 'nested', size: 0, compressed_size: 0, is_dir: true },
+            ],
+          };
+        }
+        if (path === '/workspace/bundle.zip::nested') {
+          return {
+            format: 'zip',
+            total_size: 1024,
+            compressed_size: 512,
+            entry_count: 1,
+            entries: [
+              {
+                name: 'inner.zip',
+                path: 'inner.zip',
+                size: 1024,
+                compressed_size: 512,
+                is_dir: false,
+              },
+            ],
+          };
+        }
+        return {
+          format: 'zip',
+          total_size: 128,
+          compressed_size: 64,
+          entry_count: 1,
+          entries: [
+            {
+              name: 'payload.txt',
+              path: 'payload.txt',
+              size: 128,
+              compressed_size: 64,
+              is_dir: false,
+            },
+          ],
+        };
+      }
+      if (command === 'extract_archive_cmd') {
+        return { output_dir: '/workspace/output', total_bytes: 128 };
+      }
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    const { user } = renderDialog({
+      mode: 'extract',
+      files: [archive],
+      currentPath: '/workspace/output',
+    });
+
+    await user.click(await screen.findByRole('button', { name: 'Open nested' }));
+    await user.click(await screen.findByRole('button', { name: 'Open inner.zip' }));
+    expect(await screen.findByText('payload.txt')).toBeVisible();
+    await user.click(screen.getByRole('button', { name: 'Extract' }));
+
+    await waitFor(() =>
+      expect(mocks.invoke).toHaveBeenCalledWith('extract_archive_cmd', {
+        archivePath: '/workspace/bundle.zip::nested::inner.zip',
+        outputDir: '/workspace/output',
+      })
+    );
+  });
+
+  it('reuses an unlocked password when extracting a nested archive location', async () => {
+    const nestedArchive = file('inner.zip', {
+      path: '/workspace/bundle.zip::inner.zip',
+    });
+    mocks.invoke.mockImplementation(async (command: string, args: Record<string, unknown>) => {
+      if (command === 'list_archive') {
+        expect(args.password).toBe('correct horse');
+        return {
+          format: 'zip',
+          total_size: 128,
+          compressed_size: 64,
+          entry_count: 1,
+          entries: [
+            {
+              name: 'payload.txt',
+              path: 'payload.txt',
+              size: 128,
+              compressed_size: 64,
+              is_dir: false,
+            },
+          ],
+        };
+      }
+      if (command === 'extract_archive_cmd') {
+        expect(args.password).toBe('correct horse');
+        return { output_dir: '/workspace/output', total_bytes: 128 };
+      }
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    const { user } = renderDialog({
+      mode: 'extract',
+      files: [nestedArchive],
+      currentPath: '/workspace/output',
+      initialPassword: 'correct horse',
+    });
+
+    expect(await screen.findByText('payload.txt')).toBeVisible();
+    await user.click(screen.getByRole('button', { name: 'Extract' }));
+
+    await waitFor(() =>
+      expect(mocks.invoke).toHaveBeenCalledWith('extract_archive_cmd', {
+        archivePath: '/workspace/bundle.zip::inner.zip',
+        outputDir: '/workspace/output',
+        password: 'correct horse',
+      })
+    );
+  });
+
   it('limits long file lists and disables processing without required inputs', async () => {
     const files = Array.from({ length: 7 }, (_, index) => file(`file-${index}.txt`));
     const { user } = renderDialog({ files });

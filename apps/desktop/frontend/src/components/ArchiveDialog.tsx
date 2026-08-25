@@ -49,6 +49,7 @@ interface ArchiveDialogProps {
   mode: ArchiveMode;
   files: FileEntry[];
   currentPath: string;
+  initialPassword?: string;
   onClose: () => void;
   onSuccess?: () => void | Promise<void>;
 }
@@ -78,7 +79,11 @@ function getDefaultArchiveName(files: FileEntry[]): string {
 
 // Helper to check if file is an archive
 function isArchiveFile(file: FileEntry): boolean {
-  const name = (file.name || file.path).toLowerCase();
+  return isArchivePath(file.name || file.path);
+}
+
+function isArchivePath(path: string): boolean {
+  const name = path.split('::').pop()?.toLowerCase() || path.toLowerCase();
   return (
     name.endsWith('.zip') ||
     name.endsWith('.tar.gz') ||
@@ -89,11 +94,25 @@ function isArchiveFile(file: FileEntry): boolean {
   );
 }
 
+function archiveLocationName(location: string): string {
+  const entryPath = location.split('::').pop() ?? location;
+  return entryPath.split(/[/\\]/).pop() || entryPath;
+}
+
+function isArchiveEntryName(path: string): boolean {
+  return isArchivePath(path);
+}
+
+function isArchivePasswordError(error: unknown): boolean {
+  return /(password|encrypted|decrypt|authentication)/i.test(formatErrorMessage(error));
+}
+
 export function ArchiveDialog({
   open,
   mode,
   files,
   currentPath,
+  initialPassword,
   onClose,
   onSuccess,
 }: ArchiveDialogProps) {
@@ -109,6 +128,10 @@ export function ArchiveDialog({
   const [archiveInfo, setArchiveInfo] = useState<ArchiveInfo | null>(null);
   const [loadingInfo, setLoadingInfo] = useState(false);
   const [entrySearch, setEntrySearch] = useState('');
+  const [password, setPassword] = useState(initialPassword ?? '');
+  const [passwordPrompt, setPasswordPrompt] = useState(false);
+  const [archiveLocation, setArchiveLocation] = useState(files[0]?.path ?? '');
+  const [archiveHistory, setArchiveHistory] = useState<string[]>([]);
   const dialogRef = useRef<HTMLDivElement>(null);
   const focusTrapRef = useRef<ReturnType<typeof createFocusTrap> | null>(null);
 
@@ -124,14 +147,24 @@ export function ArchiveDialog({
   }, [open]);
 
   // Load archive info for extraction preview
-  const loadArchiveInfo = useCallback(async (path: string) => {
+  const loadArchiveInfo = useCallback(async (path: string, archivePassword?: string) => {
     setLoadingInfo(true);
     setError(null);
     try {
-      const info = await invoke<ArchiveInfo>('list_archive', { archivePath: path });
+      const args = {
+        archivePath: path,
+        ...(archivePassword ? { password: archivePassword } : {}),
+      };
+      const info = await invoke<ArchiveInfo>('list_archive', args);
       setArchiveInfo(info);
+      setPasswordPrompt(false);
     } catch (e) {
-      setError(`Failed to read archive: ${formatErrorMessage(e)}`);
+      if (isArchivePasswordError(e)) {
+        setPasswordPrompt(true);
+        setError('This archive is password-protected. Enter the password to continue.');
+      } else {
+        setError(`Failed to read archive: ${formatErrorMessage(e)}`);
+      }
     } finally {
       setLoadingInfo(false);
     }
@@ -150,13 +183,17 @@ export function ArchiveDialog({
       setSuccess(null);
       setArchiveInfo(null);
       setEntrySearch('');
+      setPassword(initialPassword ?? '');
+      setPasswordPrompt(false);
+      setArchiveLocation(files[0]?.path ?? '');
+      setArchiveHistory([]);
 
       // If extracting, load archive info
       if (mode === 'extract' && files.length === 1 && isArchiveFile(files[0])) {
-        loadArchiveInfo(files[0].path);
+        loadArchiveInfo(files[0].path, initialPassword || undefined);
       }
     }
-  }, [open, mode, files, currentPath, loadArchiveInfo]);
+  }, [open, mode, files, currentPath, initialPassword, loadArchiveInfo]);
 
   // Get output path for compression
   const outputPath = useMemo(() => {
@@ -222,7 +259,7 @@ export function ArchiveDialog({
 
   // Handle extract
   const handleExtract = useCallback(async () => {
-    if (processing || files.length !== 1) return;
+    if (processing || files.length !== 1 || !isArchivePath(archiveLocation)) return;
 
     setProcessing(true);
     setProgress(0);
@@ -230,10 +267,12 @@ export function ArchiveDialog({
     setSuccess(null);
 
     try {
-      const result = await invoke<ExtractResult>('extract_archive_cmd', {
-        archivePath: files[0].path,
+      const args = {
+        archivePath: archiveLocation,
         outputDir,
-      });
+        ...(password ? { password } : {}),
+      };
+      const result = await invoke<ExtractResult>('extract_archive_cmd', args);
 
       setProgress(100);
       setSuccess(`Extracted ${formatSize(result.total_bytes)} to ${result.output_dir}`);
@@ -243,11 +282,51 @@ export function ArchiveDialog({
         await onSuccess?.();
       }, 500);
     } catch (e) {
-      setError(`Extraction failed: ${formatErrorMessage(e)}`);
+      if (isArchivePasswordError(e)) {
+        setPasswordPrompt(true);
+        setError(
+          password
+            ? 'The archive password was not accepted. Check it and try again.'
+            : 'This archive is password-protected. Enter the password to continue.'
+        );
+      } else {
+        setError(`Extraction failed: ${formatErrorMessage(e)}`);
+      }
     } finally {
       setProcessing(false);
     }
-  }, [processing, files, outputDir, onSuccess]);
+  }, [processing, files, archiveLocation, outputDir, password, onSuccess]);
+
+  const handleArchiveNavigate = useCallback(
+    (entryPath: string) => {
+      const nextLocation = `${archiveLocation}::${entryPath}`;
+      setArchiveHistory((history) => [...history, archiveLocation]);
+      setArchiveLocation(nextLocation);
+      setArchiveInfo(null);
+      setEntrySearch('');
+      void loadArchiveInfo(nextLocation, password || undefined);
+    },
+    [archiveLocation, loadArchiveInfo, password]
+  );
+
+  const handleArchiveBack = useCallback(() => {
+    const previous = archiveHistory[archiveHistory.length - 1];
+    if (!previous) return;
+    setArchiveHistory((history) => history.slice(0, -1));
+    setArchiveLocation(previous);
+    setArchiveInfo(null);
+    setEntrySearch('');
+    void loadArchiveInfo(previous, password || undefined);
+  }, [archiveHistory, loadArchiveInfo, password]);
+
+  const handlePasswordSubmit = useCallback(async () => {
+    if (!password || processing || files.length !== 1) return;
+    if (archiveInfo) {
+      await handleExtract();
+    } else {
+      await loadArchiveInfo(archiveLocation, password);
+    }
+  }, [archiveInfo, archiveLocation, files, handleExtract, loadArchiveInfo, password, processing]);
 
   // Handle backdrop click
   const handleBackdropClick = useCallback(
@@ -264,7 +343,7 @@ export function ArchiveDialog({
   const isCompress = mode === 'compress';
   const canProcess = isCompress
     ? files.length > 0 && archiveName.trim() && !processing
-    : files.length === 1 && outputDir.trim() && !processing;
+    : files.length === 1 && outputDir.trim() && !processing && isArchivePath(archiveLocation);
 
   return (
     <div className={styles.backdrop} onClick={handleBackdropClick}>
@@ -293,7 +372,7 @@ export function ArchiveDialog({
             <span className={styles.subtitle}>
               {isCompress
                 ? `${files.length} item${files.length !== 1 ? 's' : ''} selected`
-                : files[0]?.name || 'Archive'}
+                : archiveLocationName(archiveLocation || files[0]?.name || 'Archive')}
             </span>
           </div>
           <button
@@ -348,6 +427,16 @@ export function ArchiveDialog({
                   </span>
                 </div>
               </div>
+              <div className={styles.archiveToolbar}>
+                {archiveHistory.length > 0 && (
+                  <button type="button" onClick={handleArchiveBack} disabled={loadingInfo}>
+                    Back
+                  </button>
+                )}
+                <span className={styles.archiveLocation}>
+                  {archiveLocationName(archiveLocation)}
+                </span>
+              </div>
               {archiveInfo.entries.length > 0 && (
                 <>
                   <div className={styles.archiveSearch}>
@@ -366,15 +455,36 @@ export function ArchiveDialog({
                   </div>
                   {filteredEntries.length > 0 ? (
                     <div className={styles.archiveContents}>
-                      {filteredEntries.slice(0, 10).map((entry) => (
-                        <div key={entry.path} className={styles.archiveEntry}>
-                          <span className={styles.archiveEntryIcon}>
-                            <Icon name={entry.is_dir ? 'folder' : 'file'} />
-                          </span>
-                          <span className={styles.archiveEntryName}>{entry.path}</span>
-                          <span className={styles.archiveEntrySize}>{formatSize(entry.size)}</span>
-                        </div>
-                      ))}
+                      {filteredEntries.slice(0, 10).map((entry) => {
+                        const canNavigate = entry.is_dir || isArchiveEntryName(entry.path);
+                        const content = (
+                          <>
+                            <span className={styles.archiveEntryIcon}>
+                              <Icon name={entry.is_dir ? 'folder' : 'file'} />
+                            </span>
+                            <span className={styles.archiveEntryName}>{entry.path}</span>
+                            <span className={styles.archiveEntrySize}>
+                              {formatSize(entry.size)}
+                            </span>
+                          </>
+                        );
+                        return canNavigate ? (
+                          <button
+                            key={entry.path}
+                            type="button"
+                            className={styles.archiveEntryButton}
+                            onClick={() => handleArchiveNavigate(entry.path)}
+                            disabled={loadingInfo}
+                            aria-label={`Open ${entry.path}`}
+                          >
+                            {content}
+                          </button>
+                        ) : (
+                          <div key={entry.path} className={styles.archiveEntry}>
+                            {content}
+                          </div>
+                        );
+                      })}
                       {filteredEntries.length > 10 && (
                         <div className={styles.moreFiles}>
                           ... and {filteredEntries.length - 10} more entries
@@ -393,6 +503,39 @@ export function ArchiveDialog({
             <div className={styles.progressSection}>
               <span className={styles.progressLabel}>Loading archive contents...</span>
             </div>
+          )}
+
+          {!isCompress && passwordPrompt && (
+            <form
+              className={styles.passwordPrompt}
+              onSubmit={(event) => {
+                event.preventDefault();
+                void handlePasswordSubmit();
+              }}
+            >
+              <label className={styles.label} htmlFor="archive-password">
+                Archive Password
+              </label>
+              <div className={styles.passwordRow}>
+                <input
+                  id="archive-password"
+                  aria-label="Archive password"
+                  type="password"
+                  className={styles.input}
+                  value={password}
+                  onChange={(event) => setPassword(event.target.value)}
+                  disabled={processing}
+                  autoFocus
+                />
+                <button
+                  type="submit"
+                  className={styles.passwordButton}
+                  disabled={!password || processing}
+                >
+                  Unlock archive
+                </button>
+              </div>
+            </form>
           )}
 
           {/* Options */}

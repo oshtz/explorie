@@ -5,7 +5,7 @@ mod remote_drives;
 
 use explorie_core::archive::{
     ArchiveFormat, ArchiveInfo, ArchiveProgress, CompressOptions, CompressionLevel,
-    create_archive_with_progress, extract_archive, is_archive, list_archive_contents,
+    create_archive_with_progress, extract_archive_location, is_archive, list_archive_location,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -1968,6 +1968,20 @@ fn get_app_version(app: AppHandle) -> String {
 
 // --- Archive operations ---
 
+fn parse_archive_location(value: &str) -> Result<(PathBuf, Vec<String>), String> {
+    let mut parts = value.split("::");
+    let archive_path = parts
+        .next()
+        .filter(|path| !path.trim().is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| "Archive path is empty".to_string())?;
+    let nested_entries = parts.map(str::to_owned).collect::<Vec<_>>();
+    if nested_entries.iter().any(|entry| entry.is_empty()) {
+        return Err("Archive entry path is empty".to_string());
+    }
+    Ok((archive_path, nested_entries))
+}
+
 #[derive(Debug, Serialize)]
 struct CompressResult {
     output_path: String,
@@ -2058,14 +2072,17 @@ async fn extract_archive_cmd(
     app: AppHandle,
     archive_path: String,
     output_dir: String,
+    password: Option<String>,
 ) -> Result<ExtractResult, String> {
     let mutation = ActiveMutation::begin(&app);
     tauri::async_runtime::spawn_blocking(move || {
         let _mutation = mutation;
-        let archive = PathBuf::from(&archive_path);
+        let (archive, nested_entries) = parse_archive_location(&archive_path)?;
         let output = PathBuf::from(&output_dir);
 
-        let total_bytes = extract_archive(&archive, &output).map_err(|e| e.to_string())?;
+        let total_bytes =
+            extract_archive_location(&archive, &nested_entries, &output, password.as_deref())
+                .map_err(|e| e.to_string())?;
 
         Ok(ExtractResult {
             output_dir,
@@ -2077,10 +2094,14 @@ async fn extract_archive_cmd(
 }
 
 #[tauri::command]
-async fn list_archive(archive_path: String) -> Result<ArchiveInfo, String> {
+async fn list_archive(
+    archive_path: String,
+    password: Option<String>,
+) -> Result<ArchiveInfo, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let archive = PathBuf::from(&archive_path);
-        list_archive_contents(&archive).map_err(|e| e.to_string())
+        let (archive, nested_entries) = parse_archive_location(&archive_path)?;
+        list_archive_location(&archive, &nested_entries, password.as_deref())
+            .map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())?

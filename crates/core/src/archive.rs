@@ -1508,14 +1508,25 @@ fn extract_rar_archive_into(
 
 /// List contents of a RAR archive
 pub fn list_rar_contents(archive_path: &Path) -> io::Result<ArchiveInfo> {
-    let archive = unrar::Archive::new(archive_path)
-        .open_for_listing()
-        .map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Failed to open RAR: {:?}", e),
-            )
-        })?;
+    list_rar_contents_with_password(archive_path, None)
+}
+
+fn list_rar_contents_with_password(
+    archive_path: &Path,
+    password: Option<&str>,
+) -> io::Result<ArchiveInfo> {
+    let archive = if let Some(password) = password {
+        unrar::Archive::with_password(archive_path, password)
+    } else {
+        unrar::Archive::new(archive_path)
+    }
+    .open_for_listing()
+    .map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Failed to open RAR: {:?}", e),
+        )
+    })?;
 
     let mut entries = Vec::new();
     let mut total_size: u64 = 0;
@@ -1775,18 +1786,23 @@ fn extract_7z_archive_into(
     Ok(total_bytes)
 }
 
-/// List contents of a 7Z archive
-pub fn list_7z_contents(archive_path: &Path) -> io::Result<ArchiveInfo> {
+/// List contents of a 7Z archive with an optional password.
+pub fn list_7z_contents_with_password(
+    archive_path: &Path,
+    password: Option<&str>,
+) -> io::Result<ArchiveInfo> {
     let file = File::open(archive_path)?;
     let len = file.metadata()?.len();
     let reader = BufReader::new(file);
-    let archive = sevenz_rust::SevenZReader::new(reader, len, sevenz_rust::Password::empty())
-        .map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Failed to open 7z: {:?}", e),
-            )
-        })?;
+    let password = password
+        .map(SevenZPassword::from)
+        .unwrap_or_else(SevenZPassword::empty);
+    let archive = sevenz_rust::SevenZReader::new(reader, len, password).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Failed to open 7z: {:?}", e),
+        )
+    })?;
 
     let mut entries = Vec::new();
     let mut total_size: u64 = 0;
@@ -1822,14 +1838,31 @@ pub fn list_7z_contents(archive_path: &Path) -> io::Result<ArchiveInfo> {
     })
 }
 
+/// List contents of a 7Z archive without a password.
+pub fn list_7z_contents(archive_path: &Path) -> io::Result<ArchiveInfo> {
+    list_7z_contents_with_password(archive_path, None)
+}
+
 /// Detect archive format and list its contents
 pub fn list_archive_contents(archive_path: &Path) -> io::Result<ArchiveInfo> {
+    list_archive_contents_with_password(archive_path, None)
+}
+
+/// Detect archive format and list its contents with an optional password.
+pub fn list_archive_contents_with_password(
+    archive_path: &Path,
+    password: Option<&str>,
+) -> io::Result<ArchiveInfo> {
+    if password.is_none() && archive_needs_password(archive_path)? {
+        return Err(password_required_error());
+    }
+
     match ArchiveFormat::from_path(archive_path) {
         Some(ArchiveFormat::Zip) => list_zip_contents(archive_path),
         Some(ArchiveFormat::TarGz) => list_tar_contents(archive_path, true),
         Some(ArchiveFormat::Tar) => list_tar_contents(archive_path, false),
-        Some(ArchiveFormat::Rar) => list_rar_contents(archive_path),
-        Some(ArchiveFormat::SevenZ) => list_7z_contents(archive_path),
+        Some(ArchiveFormat::Rar) => list_rar_contents_with_password(archive_path, password),
+        Some(ArchiveFormat::SevenZ) => list_7z_contents_with_password(archive_path, password),
         None => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "Unsupported archive format",
@@ -1848,6 +1881,10 @@ pub fn extract_archive_with_password(
     output_dir: &Path,
     password: Option<&str>,
 ) -> io::Result<u64> {
+    if password.is_none() && archive_needs_password(archive_path)? {
+        return Err(password_required_error());
+    }
+
     match ArchiveFormat::from_path(archive_path) {
         Some(ArchiveFormat::Zip) => {
             if password.is_some() {
@@ -1876,6 +1913,509 @@ pub fn extract_zip_archive_with_password(
     with_staged_extraction(output_dir, |staging| {
         extract_zip_archive_into(archive_path, staging, password)
     })
+}
+
+fn password_required_error() -> io::Error {
+    io::Error::new(io::ErrorKind::PermissionDenied, "Archive password required")
+}
+
+fn normalized_archive_entry_name(name: &str) -> io::Result<String> {
+    let normalized = name.replace('\\', "/");
+    let trimmed = normalized.trim_end_matches('/');
+    if trimmed.is_empty() || trimmed.contains("::") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Invalid archive entry path",
+        ));
+    }
+    validate_archive_entry_path(Path::new(trimmed))?;
+    Ok(trimmed.to_string())
+}
+
+fn archive_entry_name(path: &str) -> String {
+    path.trim_end_matches('/')
+        .split('/')
+        .next_back()
+        .unwrap_or(path)
+        .to_string()
+}
+
+fn archive_entry_at<'a>(info: &'a ArchiveInfo, requested: &str) -> Option<&'a ArchiveEntry> {
+    info.entries.iter().find(|entry| {
+        normalized_archive_entry_name(&entry.path).is_ok_and(|path| path == requested)
+    })
+}
+
+fn archive_entry_has_children(info: &ArchiveInfo, requested: &str) -> bool {
+    let prefix = format!("{requested}/");
+    info.entries.iter().any(|entry| {
+        normalized_archive_entry_name(&entry.path).is_ok_and(|path| path.starts_with(&prefix))
+    })
+}
+
+fn nested_archive_temp_path(entry_path: &str) -> io::Result<PathBuf> {
+    let format = ArchiveFormat::from_path(Path::new(entry_path)).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Nested entry is not a supported archive",
+        )
+    })?;
+    let directory = std::env::temp_dir().join("explorie-nested-archives");
+    fs::create_dir_all(&directory)?;
+    let path = directory.join(format!("{}.{}", Uuid::new_v4(), format.extension()));
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    Ok(path)
+}
+
+fn remove_nested_archive_temp(path: &Path) {
+    let _ = fs::remove_file(path);
+}
+
+fn write_zip_entry_to_path(
+    archive_path: &Path,
+    entry_path: &str,
+    output_path: &Path,
+    password: Option<&str>,
+) -> io::Result<()> {
+    let file = File::open(archive_path)?;
+    let reader = BufReader::new(file);
+    let mut archive = ZipArchive::new(reader)?;
+    let mut matching_index = None;
+
+    for index in 0..archive.len() {
+        let entry = archive.by_index_raw(index)?;
+        let name = normalized_archive_entry_name(entry.name())?;
+        if name == entry_path {
+            matching_index = Some(index);
+            break;
+        }
+    }
+
+    let index = matching_index.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("Archive entry not found: {entry_path}"),
+        )
+    })?;
+    let mut entry = if let Some(password) = password {
+        archive.by_index_decrypt(index, password.as_bytes())?
+    } else {
+        archive.by_index(index)?
+    };
+    if entry.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Nested archive entry is a directory",
+        ));
+    }
+    if entry
+        .unix_mode()
+        .is_some_and(|mode| mode & 0o170000 == 0o120000)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Nested archive entry is a symbolic link",
+        ));
+    }
+
+    let mut output = OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(output_path)?;
+    io::copy(&mut entry, &mut output)?;
+    output.flush()
+}
+
+fn write_tar_entry_to_path<R: Read>(
+    archive: &mut tar::Archive<R>,
+    entry_path: &str,
+    output_path: &Path,
+) -> io::Result<()> {
+    for entry_result in archive.entries()? {
+        let mut entry = entry_result?;
+        let path = entry.path()?.to_string_lossy().to_string();
+        let path = normalized_archive_entry_name(&path)?;
+        if path != entry_path {
+            continue;
+        }
+        if !entry.header().entry_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Nested archive entry is not a regular file",
+            ));
+        }
+        let mut output = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(output_path)?;
+        io::copy(&mut entry, &mut output)?;
+        output.flush()?;
+        return Ok(());
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("Archive entry not found: {entry_path}"),
+    ))
+}
+
+fn write_rar_entry_to_path(
+    archive_path: &Path,
+    entry_path: &str,
+    output_path: &Path,
+    password: Option<&str>,
+) -> io::Result<()> {
+    let archive = if let Some(password) = password {
+        unrar::Archive::with_password(archive_path, password)
+    } else {
+        unrar::Archive::new(archive_path)
+    };
+    let mut archive = archive.open_for_processing().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Failed to open RAR: {error:?}"),
+        )
+    })?;
+
+    while let Some(header) = archive.read_header().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Failed to read RAR header: {error:?}"),
+        )
+    })? {
+        let path = header.entry().filename.to_string_lossy().to_string();
+        let path = normalized_archive_entry_name(&path)?;
+        if path != entry_path {
+            archive = header.skip().map_err(|error| {
+                io::Error::other(format!("Failed to process RAR entry: {error:?}"))
+            })?;
+            continue;
+        }
+
+        if header.entry().is_directory() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Nested archive entry is a directory",
+            ));
+        }
+        let attributes = header.entry().file_attr;
+        let unix_kind = attributes & 0o170000;
+        const WINDOWS_REPARSE_ATTRIBUTE: u32 = 0x400;
+        if unix_kind == 0o120000 || attributes & WINDOWS_REPARSE_ATTRIBUTE != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Nested archive entry is a link or reparse point",
+            ));
+        }
+        let _archive = header
+            .extract_to(output_path)
+            .map_err(|error| io::Error::other(format!("Failed to extract RAR entry: {error:?}")))?;
+        let metadata = fs::symlink_metadata(output_path)?;
+        if metadata_is_link_or_reparse(&metadata)
+            || !metadata.is_file()
+            || file_has_multiple_hard_links(output_path)?
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Nested RAR entry produced an unsafe output",
+            ));
+        }
+        return Ok(());
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("Archive entry not found: {entry_path}"),
+    ))
+}
+
+fn write_7z_entry_to_path(
+    archive_path: &Path,
+    entry_path: &str,
+    output_path: &Path,
+    password: Option<&str>,
+) -> io::Result<()> {
+    let file = File::open(archive_path)?;
+    let len = file.metadata()?.len();
+    let reader = BufReader::new(file);
+    let password = password
+        .map(SevenZPassword::from)
+        .unwrap_or_else(SevenZPassword::empty);
+    let mut archive = sevenz_rust::SevenZReader::new(reader, len, password).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Failed to open 7z: {error:?}"),
+        )
+    })?;
+    let mut found = false;
+
+    archive
+        .for_each_entries(|entry, reader| {
+            let name =
+                normalized_archive_entry_name(entry.name()).map_err(sevenz_rust::Error::io)?;
+            if name == entry_path {
+                if entry.is_directory() {
+                    return Err(sevenz_rust::Error::other(
+                        "Nested archive entry is a directory",
+                    ));
+                }
+                let mut output = OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(output_path)
+                    .map_err(sevenz_rust::Error::io)?;
+                io::copy(reader, &mut output).map_err(sevenz_rust::Error::io)?;
+                output.flush().map_err(sevenz_rust::Error::io)?;
+                found = true;
+                Ok(false)
+            } else {
+                io::copy(reader, &mut io::sink()).map_err(sevenz_rust::Error::io)?;
+                Ok(true)
+            }
+        })
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Failed to read 7z entry: {error:?}"),
+            )
+        })?;
+
+    if found {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("Archive entry not found: {entry_path}"),
+        ))
+    }
+}
+
+fn materialize_archive_entry(
+    archive_path: &Path,
+    entry_path: &str,
+    password: Option<&str>,
+) -> io::Result<PathBuf> {
+    let format = ArchiveFormat::from_path(archive_path)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Unsupported archive format"))?;
+    if password.is_none() && archive_needs_password(archive_path)? {
+        return Err(password_required_error());
+    }
+
+    let output_path = nested_archive_temp_path(entry_path)?;
+    let result = match format {
+        ArchiveFormat::Zip => {
+            write_zip_entry_to_path(archive_path, entry_path, &output_path, password)
+        }
+        ArchiveFormat::TarGz => {
+            let file = File::open(archive_path)?;
+            let decoder = flate2::read::GzDecoder::new(BufReader::new(file));
+            let mut archive = tar::Archive::new(decoder);
+            write_tar_entry_to_path(&mut archive, entry_path, &output_path)
+        }
+        ArchiveFormat::Tar => {
+            let file = File::open(archive_path)?;
+            let mut archive = tar::Archive::new(BufReader::new(file));
+            write_tar_entry_to_path(&mut archive, entry_path, &output_path)
+        }
+        ArchiveFormat::Rar => {
+            let _ = fs::remove_file(&output_path);
+            write_rar_entry_to_path(archive_path, entry_path, &output_path, password)
+        }
+        ArchiveFormat::SevenZ => {
+            write_7z_entry_to_path(archive_path, entry_path, &output_path, password)
+        }
+    };
+
+    if let Err(error) = result {
+        remove_nested_archive_temp(&output_path);
+        return Err(error);
+    }
+    Ok(output_path)
+}
+
+struct ResolvedArchiveLocation {
+    archive_path: PathBuf,
+    directory: Option<String>,
+    temporary_paths: Vec<PathBuf>,
+}
+
+#[derive(Default)]
+struct TemporaryArchivePaths {
+    paths: Vec<PathBuf>,
+}
+
+impl TemporaryArchivePaths {
+    fn push(&mut self, path: PathBuf) {
+        self.paths.push(path);
+    }
+
+    fn into_paths(mut self) -> Vec<PathBuf> {
+        std::mem::take(&mut self.paths)
+    }
+}
+
+impl Drop for TemporaryArchivePaths {
+    fn drop(&mut self) {
+        for path in &self.paths {
+            remove_nested_archive_temp(path);
+        }
+    }
+}
+
+impl Drop for ResolvedArchiveLocation {
+    fn drop(&mut self) {
+        for path in &self.temporary_paths {
+            remove_nested_archive_temp(path);
+        }
+    }
+}
+
+fn resolve_archive_location(
+    archive_path: &Path,
+    nested_entries: &[String],
+    password: Option<&str>,
+) -> io::Result<ResolvedArchiveLocation> {
+    if ArchiveFormat::from_path(archive_path).is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Unsupported archive format",
+        ));
+    }
+    classify_source(archive_path)?;
+
+    let mut current_archive = archive_path.to_path_buf();
+    let mut directory = String::new();
+    let mut temporary_paths = TemporaryArchivePaths::default();
+
+    for requested in nested_entries {
+        let requested = normalized_archive_entry_name(requested)?;
+        let candidate = if directory.is_empty() {
+            requested
+        } else {
+            format!("{directory}/{requested}")
+        };
+        let info = list_archive_contents_with_password(&current_archive, password)?;
+        let exact = archive_entry_at(&info, &candidate);
+        if exact.is_some_and(|entry| entry.is_dir)
+            || (exact.is_none() && archive_entry_has_children(&info, &candidate))
+        {
+            directory = candidate;
+            continue;
+        }
+
+        let entry = exact.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Archive entry not found: {candidate}"),
+            )
+        })?;
+        if entry.is_dir {
+            directory = candidate;
+            continue;
+        }
+        if ArchiveFormat::from_path(Path::new(&candidate)).is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Archive location must point to a directory or nested archive",
+            ));
+        }
+        let nested_path = materialize_archive_entry(&current_archive, &candidate, password)?;
+        temporary_paths.push(nested_path.clone());
+        current_archive = nested_path;
+        directory.clear();
+    }
+
+    Ok(ResolvedArchiveLocation {
+        archive_path: current_archive,
+        directory: (!directory.is_empty()).then_some(directory),
+        temporary_paths: temporary_paths.into_paths(),
+    })
+}
+
+fn filter_archive_info_to_directory(mut info: ArchiveInfo, directory: &str) -> ArchiveInfo {
+    let prefix = (!directory.is_empty()).then(|| format!("{directory}/"));
+    let mut entries = Vec::new();
+    let mut seen_directories = Vec::new();
+
+    for mut entry in info.entries {
+        let Ok(path) = normalized_archive_entry_name(&entry.path) else {
+            continue;
+        };
+        let remainder = if let Some(prefix) = &prefix {
+            let Some(remainder) = path.strip_prefix(prefix) else {
+                continue;
+            };
+            remainder
+        } else {
+            path.as_str()
+        };
+        let remainder = remainder.trim_matches('/');
+        if remainder.is_empty() {
+            continue;
+        }
+        let mut components = remainder.splitn(2, '/');
+        let first = components.next().unwrap_or_default();
+        if components.next().is_some() {
+            if !seen_directories.iter().any(|name| name == first) {
+                seen_directories.push(first.to_string());
+                entries.push(ArchiveEntry {
+                    name: first.to_string(),
+                    path: first.to_string(),
+                    size: 0,
+                    compressed_size: 0,
+                    is_dir: true,
+                });
+            }
+            continue;
+        }
+        if entry.is_dir {
+            if seen_directories.iter().any(|name| name == first) {
+                continue;
+            }
+            seen_directories.push(first.to_string());
+        }
+        entry.name = archive_entry_name(remainder);
+        entry.path = remainder.to_string();
+        entries.push(entry);
+    }
+
+    info.entry_count = entries.len();
+    info.entries = entries;
+    info
+}
+
+/// List an archive or a directory/nested archive within it.
+pub fn list_archive_location(
+    archive_path: &Path,
+    nested_entries: &[String],
+    password: Option<&str>,
+) -> io::Result<ArchiveInfo> {
+    let resolved = resolve_archive_location(archive_path, nested_entries, password)?;
+    let info = list_archive_contents_with_password(&resolved.archive_path, password)?;
+    match resolved.directory.as_deref() {
+        Some(directory) => Ok(filter_archive_info_to_directory(info, directory)),
+        None => Ok(filter_archive_info_to_directory(info, "")),
+    }
+}
+
+/// Extract an archive or a nested archive location to a directory.
+pub fn extract_archive_location(
+    archive_path: &Path,
+    nested_entries: &[String],
+    output_dir: &Path,
+    password: Option<&str>,
+) -> io::Result<u64> {
+    let resolved = resolve_archive_location(archive_path, nested_entries, password)?;
+    if resolved.directory.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Extraction requires an archive file, not an archive directory",
+        ));
+    }
+    extract_archive_with_password(&resolved.archive_path, output_dir, password)
 }
 
 /// Create an archive from sources with the specified format
@@ -2706,5 +3246,259 @@ mod tests {
         symlink(&outside, output.join("link")).unwrap();
         assert!(extract_tar_archive(&archive_path, &output, false).is_err());
         assert!(!outside.join("escaped.txt").exists());
+    }
+
+    #[test]
+    fn nested_archive_location_lists_directories_and_extracts_inner_archive() {
+        let temp = TempDir::new().unwrap();
+        let inner_source = temp.path().join("inner.txt");
+        fs::write(&inner_source, b"nested content").unwrap();
+        let inner_archive = temp.path().join("inner.zip");
+        create_zip_archive(
+            std::slice::from_ref(&inner_source),
+            &inner_archive,
+            CompressionLevel::Normal,
+        )
+        .unwrap();
+
+        let container = temp.path().join("container");
+        fs::create_dir(&container).unwrap();
+        fs::copy(&inner_archive, container.join("inner.zip")).unwrap();
+        fs::write(container.join("readme.txt"), b"container").unwrap();
+        let outer_archive = temp.path().join("outer.tar.gz");
+        create_tar_archive(
+            std::slice::from_ref(&container),
+            &outer_archive,
+            true,
+            CompressionLevel::Normal,
+        )
+        .unwrap();
+
+        let root = list_archive_location(&outer_archive, &[], None).unwrap();
+        let archive_totals = list_tar_contents(&outer_archive, true).unwrap();
+        assert_eq!(root.total_size, archive_totals.total_size);
+        assert_eq!(root.compressed_size, archive_totals.compressed_size);
+        assert!(
+            root.entries
+                .iter()
+                .any(|entry| entry.path.trim_end_matches('/').ends_with("container"))
+        );
+
+        let container_view =
+            list_archive_location(&outer_archive, &["container".to_string()], None).unwrap();
+        assert_eq!(container_view.total_size, archive_totals.total_size);
+        assert_eq!(
+            container_view.compressed_size,
+            archive_totals.compressed_size
+        );
+        assert!(
+            container_view
+                .entries
+                .iter()
+                .any(|entry| entry.path == "inner.zip")
+        );
+
+        let nested_location = ["container/".to_string(), "inner.zip".to_string()];
+        let inner_view = list_archive_location(&outer_archive, &nested_location, None).unwrap();
+        let inner_totals = list_zip_contents(&inner_archive).unwrap();
+        assert_eq!(inner_view.total_size, inner_totals.total_size);
+        assert_eq!(inner_view.compressed_size, inner_totals.compressed_size);
+        assert!(
+            inner_view
+                .entries
+                .iter()
+                .any(|entry| entry.path == "inner.txt")
+        );
+
+        let output = temp.path().join("nested-output");
+        extract_archive_location(&outer_archive, &nested_location, &output, None).unwrap();
+        assert_eq!(
+            fs::read(output.join("inner.txt")).unwrap(),
+            b"nested content"
+        );
+    }
+
+    #[test]
+    fn temporary_nested_archive_paths_are_cleaned_on_drop() {
+        let temp = TempDir::new().unwrap();
+        let first = temp.path().join("first.zip");
+        let second = temp.path().join("second.zip");
+        fs::write(&first, b"first").unwrap();
+        fs::write(&second, b"second").unwrap();
+
+        {
+            let mut paths = TemporaryArchivePaths::default();
+            paths.push(first.clone());
+            paths.push(second.clone());
+        }
+
+        assert!(!first.exists());
+        assert!(!second.exists());
+    }
+
+    #[test]
+    fn zip_in_zip_round_trip_lists_and_extracts_nested_archive() {
+        let temp = TempDir::new().unwrap();
+        let payload = temp.path().join("payload.txt");
+        fs::write(&payload, b"zip nested content").unwrap();
+
+        let inner = temp.path().join("inner.zip");
+        create_zip_archive(
+            std::slice::from_ref(&payload),
+            &inner,
+            CompressionLevel::Normal,
+        )
+        .unwrap();
+        let outer = temp.path().join("outer.zip");
+        create_zip_archive(
+            std::slice::from_ref(&inner),
+            &outer,
+            CompressionLevel::Normal,
+        )
+        .unwrap();
+
+        let nested = list_archive_location(&outer, &["inner.zip".to_string()], None).unwrap();
+        assert!(
+            nested
+                .entries
+                .iter()
+                .any(|entry| entry.path == "payload.txt")
+        );
+
+        let output = temp.path().join("output");
+        extract_archive_location(&outer, &["inner.zip".to_string()], &output, None).unwrap();
+        assert_eq!(
+            fs::read(output.join("payload.txt")).unwrap(),
+            b"zip nested content"
+        );
+    }
+
+    #[test]
+    fn tar_gz_in_zip_round_trip_lists_and_extracts_nested_archive() {
+        let temp = TempDir::new().unwrap();
+        let payload = temp.path().join("payload.txt");
+        fs::write(&payload, b"tar gzip nested content").unwrap();
+
+        let inner = temp.path().join("inner.tar.gz");
+        create_tar_archive(
+            std::slice::from_ref(&payload),
+            &inner,
+            true,
+            CompressionLevel::Normal,
+        )
+        .unwrap();
+        let outer = temp.path().join("outer.zip");
+        create_zip_archive(
+            std::slice::from_ref(&inner),
+            &outer,
+            CompressionLevel::Normal,
+        )
+        .unwrap();
+
+        let nested = list_archive_location(&outer, &["inner.tar.gz".to_string()], None).unwrap();
+        assert!(
+            nested
+                .entries
+                .iter()
+                .any(|entry| entry.path == "payload.txt")
+        );
+
+        let output = temp.path().join("output");
+        extract_archive_location(&outer, &["inner.tar.gz".to_string()], &output, None).unwrap();
+        assert_eq!(
+            fs::read(output.join("payload.txt")).unwrap(),
+            b"tar gzip nested content"
+        );
+    }
+
+    #[test]
+    fn nested_archive_path_traversal_is_rejected_before_extraction() {
+        let temp = TempDir::new().unwrap();
+        let payload = temp.path().join("payload.txt");
+        fs::write(&payload, b"safe content").unwrap();
+        let inner = temp.path().join("inner.zip");
+        create_zip_archive(
+            std::slice::from_ref(&payload),
+            &inner,
+            CompressionLevel::Normal,
+        )
+        .unwrap();
+        let outer = temp.path().join("outer.zip");
+        create_zip_archive(
+            std::slice::from_ref(&inner),
+            &outer,
+            CompressionLevel::Normal,
+        )
+        .unwrap();
+
+        let traversal = vec!["..".to_string(), "inner.zip".to_string()];
+        assert!(list_archive_location(&outer, &traversal, None).is_err());
+
+        let output = temp.path().join("output");
+        assert!(extract_archive_location(&outer, &traversal, &output, None).is_err());
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn nested_password_archive_requires_and_accepts_password() {
+        let temp = TempDir::new().unwrap();
+        let inner_source = temp.path().join("secret.txt");
+        fs::write(&inner_source, b"secret nested content").unwrap();
+        let inner_archive = temp.path().join("secret.zip");
+        create_zip_archive_with_password(
+            std::slice::from_ref(&inner_source),
+            &inner_archive,
+            CompressionLevel::Normal,
+            Some("correct horse"),
+        )
+        .unwrap();
+
+        let outer_archive = temp.path().join("outer.zip");
+        create_zip_archive(
+            std::slice::from_ref(&inner_archive),
+            &outer_archive,
+            CompressionLevel::Normal,
+        )
+        .unwrap();
+
+        let missing_listing =
+            list_archive_location(&outer_archive, &["secret.zip".to_string()], None).unwrap_err();
+        assert!(
+            missing_listing
+                .to_string()
+                .to_lowercase()
+                .contains("password")
+        );
+
+        let output = temp.path().join("without-password");
+        let missing =
+            extract_archive_location(&outer_archive, &["secret.zip".to_string()], &output, None)
+                .unwrap_err();
+        assert!(missing.to_string().to_lowercase().contains("password"));
+
+        let unlocked = list_archive_location(
+            &outer_archive,
+            &["secret.zip".to_string()],
+            Some("correct horse"),
+        )
+        .unwrap();
+        assert!(
+            unlocked
+                .entries
+                .iter()
+                .any(|entry| entry.path == "secret.txt")
+        );
+
+        extract_archive_location(
+            &outer_archive,
+            &["secret.zip".to_string()],
+            &temp.path().join("with-password"),
+            Some("correct horse"),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(temp.path().join("with-password/secret.txt")).unwrap(),
+            b"secret nested content"
+        );
     }
 }

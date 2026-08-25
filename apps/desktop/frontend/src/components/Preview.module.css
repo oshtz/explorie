@@ -234,6 +234,36 @@
   color: var(--fg-secondary);
 }
 
+.archiveToolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--padding-sm);
+  padding: var(--padding-sm) var(--padding-md);
+  border-bottom: 1px solid var(--border-primary);
+  background: var(--bg-elevated);
+}
+
+.archiveToolbar button,
+.archivePasswordPrompt button {
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius, 4px);
+  padding: 3px 8px;
+  color: var(--fg-primary);
+  background: var(--bg-hover);
+  cursor: pointer;
+}
+
+.archiveToolbar button:hover,
+.archivePasswordPrompt button:hover {
+  background: var(--bg-active);
+}
+
+.archiveLocation {
+  flex: 1;
+  color: var(--fg-secondary);
+  font-size: calc(11px * var(--font-scale));
+}
+
 .archiveStats {
   text-align: right;
   flex-shrink: 0;
@@ -254,6 +284,26 @@
   align-items: center;
   padding: var(--padding-sm) var(--padding-md);
   border-bottom: 1px solid var(--border-subtle);
+}
+
+.archiveEntryInteractive {
+  display: block;
+  padding: 0;
+}
+
+.archiveEntryButton {
+  width: 100%;
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr) auto;
+  gap: var(--padding-sm);
+  align-items: center;
+  padding: var(--padding-sm) var(--padding-md);
+  border: 0;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  background: transparent;
+  cursor: pointer;
 }
 
 .archiveEntry:hover {
@@ -282,6 +332,31 @@
   color: var(--fg-tertiary);
   font-size: calc(12px * var(--font-scale));
   text-align: center;
+}
+
+.archivePasswordPrompt {
+  display: flex;
+  flex-direction: column;
+  gap: var(--padding-xs);
+  padding: var(--padding-sm) var(--padding-md);
+  border-bottom: 1px solid var(--border-primary);
+  color: var(--fg-secondary);
+  font-size: calc(12px * var(--font-scale));
+}
+
+.archivePasswordRow {
+  display: flex;
+  gap: var(--padding-sm);
+}
+
+.archivePasswordRow input {
+  min-width: 0;
+  flex: 1;
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius, 4px);
+  padding: 4px 7px;
+  color: var(--fg-primary);
+  background: var(--bg-sunken);
 }
 
 .fileInfo {

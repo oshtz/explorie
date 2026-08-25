@@ -28,6 +28,14 @@ type PreviewFile = {
       is_dir: boolean;
     }>;
   };
+  archivePasswordRequired?: boolean;
+  archivePassword?: string;
+  archiveCanGoBack?: boolean;
+  onArchiveNavigate?: (entryPath: string) => void;
+  onArchiveBack?: () => void;
+  onArchiveExtract?: () => void;
+  onArchivePasswordChange?: (password: string) => void;
+  onArchivePasswordSubmit?: () => void;
 };
 
 const mocks = vi.hoisted(() => ({
@@ -295,6 +303,87 @@ describe('Preview', () => {
     expect(screen.getByText('2 entries')).toBeVisible();
     expect(screen.getByText('docs/readme.md')).toBeVisible();
     expect(screen.getByText('assets/')).toBeVisible();
+  });
+
+  it('navigates archive directories and nested archives and exposes extraction', async () => {
+    const user = userEvent.setup();
+    const onArchiveNavigate = vi.fn();
+    const onArchiveBack = vi.fn();
+    const onArchiveExtract = vi.fn();
+
+    render(
+      <Preview
+        file={previewFile({
+          name: 'bundle.zip',
+          path: '/workspace/bundle.zip',
+          type: 'application/x-explorie-archive',
+          archiveCanGoBack: true,
+          onArchiveNavigate,
+          onArchiveBack,
+          onArchiveExtract,
+          archiveInfo: {
+            format: 'zip',
+            entry_count: 2,
+            total_size: 4096,
+            compressed_size: 1024,
+            entries: [
+              { path: 'nested/', size: 0, compressed_size: 0, is_dir: true },
+              { path: 'nested/inner.tar.gz', size: 2048, compressed_size: 512, is_dir: false },
+            ],
+          },
+        })}
+      />
+    );
+
+    await user.click(screen.getByRole('button', { name: 'Open nested/' }));
+    await user.click(screen.getByRole('button', { name: 'Open nested/inner.tar.gz' }));
+    await user.click(screen.getByRole('button', { name: 'Back' }));
+    await user.click(screen.getByRole('button', { name: 'Extract archive' }));
+
+    expect(onArchiveNavigate).toHaveBeenNthCalledWith(1, 'nested/');
+    expect(onArchiveNavigate).toHaveBeenNthCalledWith(2, 'nested/inner.tar.gz');
+    expect(onArchiveBack).toHaveBeenCalledTimes(1);
+    expect(onArchiveExtract).toHaveBeenCalledTimes(1);
+  });
+
+  it('prompts for a password when archive contents require one', async () => {
+    const user = userEvent.setup();
+    const onArchivePasswordChange = vi.fn();
+    const onArchivePasswordSubmit = vi.fn();
+
+    const { rerender } = render(
+      <Preview
+        file={previewFile({
+          name: 'secret.zip',
+          path: '/workspace/secret.zip',
+          type: 'application/x-explorie-archive',
+          archivePasswordRequired: true,
+          archivePassword: '',
+        })}
+        onArchivePasswordChange={onArchivePasswordChange}
+        onArchivePasswordSubmit={onArchivePasswordSubmit}
+      />
+    );
+
+    const input = screen.getByLabelText('Archive password');
+    await user.type(input, 'correct horse');
+    expect(onArchivePasswordChange).toHaveBeenCalled();
+    rerender(
+      <Preview
+        file={previewFile({
+          name: 'secret.zip',
+          path: '/workspace/secret.zip',
+          type: 'application/x-explorie-archive',
+          archivePasswordRequired: true,
+          archivePassword: 'correct horse',
+        })}
+        onArchivePasswordChange={onArchivePasswordChange}
+        onArchivePasswordSubmit={onArchivePasswordSubmit}
+      />
+    );
+    expect(screen.getByRole('button', { name: 'Unlock archive' })).toBeEnabled();
+    await user.click(screen.getByRole('button', { name: 'Unlock archive' }));
+    expect(onArchivePasswordSubmit).toHaveBeenCalledTimes(1);
   });
 
   it('renders Quick Look variant without side-panel tabs', () => {

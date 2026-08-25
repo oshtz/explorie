@@ -4,6 +4,7 @@ import { readFile as readBinaryFile } from '@tauri-apps/plugin-fs';
 import type { FileEntry } from '../store';
 import { useFileStore } from '../store';
 import { Preview } from './Preview';
+import { ArchiveDialog } from './ArchiveDialog';
 import { getCachedPreview, setCachedPreview } from '../utils/previewCache';
 import { formatErrorMessage } from '../utils/errorMessages';
 import { normalizePath } from '../utils/path';
@@ -42,6 +43,7 @@ interface FilePreviewerProps {
 }
 
 type ArchivePreviewEntry = {
+  name?: string;
   path: string;
   size: number;
   compressed_size: number;
@@ -70,6 +72,22 @@ type TextPreview = {
 
 const TEXT_PREVIEW_LIMIT = 128 * 1024;
 
+function isArchivePasswordError(error: unknown): boolean {
+  const message = formatErrorMessage(error);
+  return /(password|encrypted|decrypt|authentication)/i.test(message);
+}
+
+function archiveLocationName(location: string): string {
+  const archiveEntry = location.split('::').pop() ?? location;
+  return archiveEntry.split(/[/\\]/).pop() || archiveEntry;
+}
+
+function parentPath(path: string): string {
+  const trimmed = path.replace(/[/\\]+$/, '');
+  const separator = Math.max(trimmed.lastIndexOf('/'), trimmed.lastIndexOf('\\'));
+  return separator > 0 ? trimmed.slice(0, separator) : '.';
+}
+
 /**
  * FilePreviewer: handles loading and previewing files
  * Accepts an onClose prop to allow closing the preview panel.
@@ -86,6 +104,14 @@ export function FilePreviewer({ file, onClose, variant = 'panel' }: FilePreviewe
   const [currentFile, setCurrentFile] = React.useState<FileEntry>(file);
   const [isLoading, setIsLoading] = React.useState<boolean>(true);
   const [archiveInfo, setArchiveInfo] = React.useState<ArchivePreviewInfo | undefined>(undefined);
+  const [archiveLocation, setArchiveLocation] = React.useState(file.path);
+  const [archiveHistory, setArchiveHistory] = React.useState<string[]>([]);
+  const [archivePassword, setArchivePassword] = React.useState('');
+  const [archivePasswordRequired, setArchivePasswordRequired] = React.useState(false);
+  const [archivePasswordRequest, setArchivePasswordRequest] = React.useState<
+    { value: string } | undefined
+  >(undefined);
+  const [extractArchiveOpen, setExtractArchiveOpen] = React.useState(false);
   const [externalTool, setExternalTool] = React.useState<string | undefined>(undefined);
   const fallbackHandlerRef = React.useRef<(() => Promise<void>) | null>(null);
   const fallbackInFlightRef = React.useRef(false);
@@ -110,6 +136,15 @@ export function FilePreviewer({ file, onClose, variant = 'panel' }: FilePreviewe
     setError('Failed to load image preview.');
     setIsLoading(false);
   }, []);
+
+  React.useEffect(() => {
+    setArchiveLocation(file.path);
+    setArchiveHistory([]);
+    setArchivePassword('');
+    setArchivePasswordRequired(false);
+    setArchivePasswordRequest(undefined);
+    setExtractArchiveOpen(false);
+  }, [file.id, file.path]);
 
   const toPreviewSrc = React.useCallback(
     (inputPath: string | undefined | null): string | undefined => {
@@ -164,6 +199,7 @@ export function FilePreviewer({ file, onClose, variant = 'panel' }: FilePreviewe
     setError(undefined);
     setIsTruncated(false);
     setArchiveInfo(undefined);
+    setArchivePasswordRequired(false);
     setExternalTool(undefined);
 
     const finishLoading = () => {
@@ -279,16 +315,28 @@ export function FilePreviewer({ file, onClose, variant = 'panel' }: FilePreviewe
 
     // Archive preview
     if (file.path && providerKind === 'archive') {
-      invoke<ArchivePreviewInfo>('list_archive', { archivePath: file.path })
+      const archiveArgs = {
+        archivePath: archiveLocation,
+        ...(archivePasswordRequest?.value ? { password: archivePasswordRequest.value } : {}),
+      };
+      invoke<ArchivePreviewInfo>('list_archive', archiveArgs)
         .then((info) => {
           if (cancelled) return;
           setArchiveInfo(info);
           setFileType('application/x-explorie-archive');
+          setArchivePasswordRequired(false);
           finishLoading();
         })
         .catch((e: unknown) => {
           if (!cancelled) {
-            setError('Failed to load archive preview: ' + formatErrorMessage(e));
+            if (isArchivePasswordError(e)) {
+              setArchiveInfo(undefined);
+              setFileType('application/x-explorie-archive');
+              setArchivePasswordRequired(true);
+              setError(undefined);
+            } else {
+              setError('Failed to load archive preview: ' + formatErrorMessage(e));
+            }
             finishLoading();
           }
         });
@@ -328,7 +376,15 @@ export function FilePreviewer({ file, onClose, variant = 'panel' }: FilePreviewe
     return () => {
       cancelled = true;
     };
-  }, [file, file.path, file.id, toPreviewSrc, previewExecutableScripts]);
+  }, [
+    file,
+    file.path,
+    file.id,
+    toPreviewSrc,
+    previewExecutableScripts,
+    archiveLocation,
+    archivePasswordRequest,
+  ]);
 
   // Handle file updates from the custom fields editor
   const handleFileUpdate = (updatedFile: FileEntry) => {
@@ -339,6 +395,48 @@ export function FilePreviewer({ file, onClose, variant = 'panel' }: FilePreviewe
     const updatedFiles = files.map((f: FileEntry) => (f.id === updatedFile.id ? updatedFile : f));
     setFiles(updatedFiles);
   };
+
+  const handleArchiveNavigate = React.useCallback(
+    (entryPath: string) => {
+      setArchiveHistory((history) => [...history, archiveLocation]);
+      setArchiveLocation(`${archiveLocation}::${entryPath}`);
+      setArchiveInfo(undefined);
+      setArchivePasswordRequired(false);
+      setIsLoading(true);
+    },
+    [archiveLocation]
+  );
+
+  const handleArchiveBack = React.useCallback(() => {
+    setArchiveHistory((history) => {
+      const previous = history[history.length - 1];
+      if (!previous) return history;
+      setArchiveLocation(previous);
+      setArchiveInfo(undefined);
+      setArchivePasswordRequired(false);
+      setIsLoading(true);
+      return history.slice(0, -1);
+    });
+  }, []);
+
+  const handleArchivePasswordSubmit = React.useCallback(() => {
+    if (!archivePassword) return;
+    setArchivePasswordRequired(false);
+    setArchiveInfo(undefined);
+    setIsLoading(true);
+    setArchivePasswordRequest({ value: archivePassword });
+  }, [archivePassword]);
+
+  const archivePreviewFile = React.useMemo<FileEntry>(
+    () => ({
+      ...currentFile,
+      id: `${currentFile.id}:archive:${archiveLocation}`,
+      name: archiveLocationName(archiveLocation),
+      path: archiveLocation,
+      is_dir: false,
+    }),
+    [archiveLocation, currentFile]
+  );
 
   // If there was an error loading the file, show it in the preview
   if (error) {
@@ -361,18 +459,37 @@ export function FilePreviewer({ file, onClose, variant = 'panel' }: FilePreviewe
     url?: string;
     content?: string;
     archiveInfo?: ArchivePreviewInfo;
+    archivePasswordRequired?: boolean;
+    archivePassword?: string;
+    archiveCanGoBack?: boolean;
+    onArchiveNavigate?: (entryPath: string) => void;
+    onArchiveBack?: () => void;
+    onArchiveExtract?: () => void;
+    onArchivePasswordChange?: (password: string) => void;
+    onArchivePasswordSubmit?: () => void;
     externalTool?: string;
   };
 
   // Create preview payload that carries both metadata (FileEntry) and preview url/content.
   const previewFile = {
     ...currentFile,
-    name: currentFile.name ?? file.path.split(/[/\\]/).pop() ?? file.path,
-    path: currentFile.path,
+    name:
+      getPreviewProviderKind(file.path) === 'archive'
+        ? archiveLocationName(archiveLocation)
+        : (currentFile.name ?? file.path.split(/[/\\]/).pop() ?? file.path),
+    path: getPreviewProviderKind(file.path) === 'archive' ? archiveLocation : currentFile.path,
     type: fileType || '',
     url: dataUrl,
     content: textContent,
     archiveInfo,
+    archivePasswordRequired,
+    archivePassword,
+    archiveCanGoBack: archiveHistory.length > 0,
+    onArchiveNavigate: handleArchiveNavigate,
+    onArchiveBack: handleArchiveBack,
+    onArchiveExtract: archiveInfo ? () => setExtractArchiveOpen(true) : undefined,
+    onArchivePasswordChange: setArchivePassword,
+    onArchivePasswordSubmit: handleArchivePasswordSubmit,
     externalTool,
   } as PreviewFilePayload;
 
@@ -385,8 +502,24 @@ export function FilePreviewer({ file, onClose, variant = 'panel' }: FilePreviewe
         loading={isLoading}
         onReady={handlePreviewReady}
         onContentError={handlePreviewError}
+        onArchiveNavigate={handleArchiveNavigate}
+        onArchiveBack={handleArchiveBack}
+        onArchiveExtract={archiveInfo ? () => setExtractArchiveOpen(true) : undefined}
+        onArchivePasswordChange={setArchivePassword}
+        onArchivePasswordSubmit={handleArchivePasswordSubmit}
         variant={variant}
       />
+      {extractArchiveOpen && (
+        <ArchiveDialog
+          open
+          mode="extract"
+          files={[archivePreviewFile]}
+          currentPath={parentPath(file.path)}
+          initialPassword={archivePassword || undefined}
+          onClose={() => setExtractArchiveOpen(false)}
+          onSuccess={() => setExtractArchiveOpen(false)}
+        />
+      )}
       {fileType.startsWith('text') && typeof textContent === 'string' && isTruncated && (
         <div role="status" style={{ textAlign: 'center' }}>
           Preview limited to the first 128 KB
