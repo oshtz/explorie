@@ -1,5 +1,6 @@
 import React, { useEffect, useState, useCallback, useMemo, useRef } from 'react';
 import { invoke, isTauri } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { watch } from '@tauri-apps/plugin-fs';
 import { useFileStore } from './store';
 import { ListView } from './components/ListView';
@@ -244,6 +245,23 @@ function AppContent() {
 
   const activeSmartFolder = activeSmartFolderId ? smartFolders[activeSmartFolderId] : null;
   const shouldUseDevMockEntries = isDevBuild && !tauri;
+  const [documentIndexRevision, setDocumentIndexRevision] = useState(0);
+
+  useEffect(() => {
+    if (!tauri || !activeSmartFolder?.criteria.contentSearch?.trim()) return;
+    let active = true;
+    let unlisten = () => {};
+    void listen('document-index-updated', () => {
+      if (active) setDocumentIndexRevision((revision) => revision + 1);
+    }).then((dispose) => {
+      if (active) unlisten = dispose;
+      else dispose();
+    });
+    return () => {
+      active = false;
+      unlisten();
+    };
+  }, [activeSmartFolder?.criteria.contentSearch, tauri]);
 
   useEffect(() => {
     if (activeSmartFolderId && !activeSmartFolder) {
@@ -720,6 +738,7 @@ function AppContent() {
     showFolderSizes,
     pathInitializing,
     activeSmartFolder,
+    documentIndexRevision,
     shouldUseDevMockEntries,
   ]);
 

@@ -1,13 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { FileEntry, SmartFolderCriteria } from '../store';
 import { runSmartFolderSearch } from './smartFolderSearch';
+import { resetDocumentIndexConfiguration } from './documentIndex';
 
 vi.mock('@tauri-apps/api/core', () => ({
   invoke: vi.fn(),
-}));
-
-vi.mock('./fs', () => ({
-  readFile: vi.fn(),
 }));
 
 type MockInvoke = ReturnType<typeof vi.fn>;
@@ -38,15 +35,12 @@ const criteria = (overrides: Partial<SmartFolderCriteria> = {}): SmartFolderCrit
 
 describe('runSmartFolderSearch', () => {
   let invokeMock: MockInvoke;
-  let readFileMock: MockInvoke;
 
   beforeEach(async () => {
     const tauri = await import('@tauri-apps/api/core');
-    const fs = await import('./fs');
     invokeMock = tauri.invoke as unknown as MockInvoke;
-    readFileMock = fs.readFile as unknown as MockInvoke;
     invokeMock.mockReset();
-    readFileMock.mockReset();
+    resetDocumentIndexConfiguration();
   });
 
   it('returns matching files from recursive search paths without revisiting duplicates', async () => {
@@ -144,16 +138,18 @@ describe('runSmartFolderSearch', () => {
     expect(results.map((entry) => entry.path)).toEqual(['/workspace/report.txt']);
   });
 
-  it('matches file contents while skipping directories, large files, and read failures', async () => {
-    invokeMock.mockResolvedValue([
-      folder('/workspace/docs'),
-      file('/workspace/small.txt', { size: 100 }),
-      file('/workspace/large.txt', { size: 6 * 1024 * 1024 }),
-      file('/workspace/broken.txt', { size: 100 }),
-    ]);
-    readFileMock.mockImplementation(async (path: string) => {
-      if (path.endsWith('small.txt')) return 'The secret phrase is here';
-      throw new Error('unreadable');
+  it('matches indexed multi-word content without reading candidates at query time', async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === 'configure_document_index') return null;
+      if (command === 'query_document_index') {
+        return { paths: ['/workspace/small.txt'], ready: true, indexing: false };
+      }
+      return [
+        folder('/workspace/docs'),
+        file('/workspace/small.txt', { size: 100 }),
+        file('/workspace/large.txt', { size: 6 * 1024 * 1024 }),
+        file('/workspace/broken.txt', { size: 100 }),
+      ];
     });
 
     const results = await runSmartFolderSearch(
@@ -165,7 +161,10 @@ describe('runSmartFolderSearch', () => {
     );
 
     expect(results.map((entry) => entry.path)).toEqual(['/workspace/small.txt']);
-    expect(readFileMock).toHaveBeenCalledTimes(2);
+    expect(invokeMock).toHaveBeenCalledWith('query_document_index', {
+      paths: ['/workspace'],
+      query: 'SECRET phrase',
+    });
   });
 
   it('returns all entries when an invalid name regex removes the name filter', async () => {

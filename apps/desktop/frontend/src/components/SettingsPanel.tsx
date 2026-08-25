@@ -5,6 +5,12 @@ import { useFileStore } from '../store';
 import type { ThemeSpec } from '../store';
 import { normalizeThemeSpec } from '../store/slices/uiSlice';
 import { createFocusTrap } from '../utils/accessibility';
+import {
+  configureDocumentIndex,
+  DEFAULT_DOCUMENT_INDEX_CONFIG,
+  getDocumentIndexConfig,
+  normalizeDocumentIndexPatterns,
+} from '../utils/documentIndex';
 import { Icon } from './Icon';
 
 interface SettingsPanelProps {
@@ -12,7 +18,7 @@ interface SettingsPanelProps {
   onClose: () => void;
 }
 
-type SettingsTab = 'general' | 'integration' | 'appearance' | 'themes' | 'about';
+type SettingsTab = 'general' | 'integration' | 'search' | 'appearance' | 'themes' | 'about';
 type AccentPreset = Exclude<ThemeSpec['accent'], 'custom'>;
 
 type SystemIntegrationStatus = {
@@ -23,6 +29,7 @@ type SystemIntegrationStatus = {
 const SETTINGS_TABS: { key: SettingsTab; label: string }[] = [
   { key: 'general', label: 'General' },
   { key: 'integration', label: 'System Integration' },
+  { key: 'search', label: 'Document Search' },
   { key: 'appearance', label: 'Appearance' },
   { key: 'themes', label: 'Themes' },
   { key: 'about', label: 'About' },
@@ -98,6 +105,9 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
     null
   );
   const [systemIntegrationBusy, setSystemIntegrationBusy] = React.useState(false);
+  const [indexIncludePatterns, setIndexIncludePatterns] = React.useState('');
+  const [indexExcludePatterns, setIndexExcludePatterns] = React.useState('');
+  const [indexConfigBusy, setIndexConfigBusy] = React.useState(false);
   const themes = useFileStore((s) => s.themes);
 
   React.useEffect(() => {
@@ -105,6 +115,9 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
     setActiveTab('general');
     setStatus('');
     setSystemIntegration(null);
+    const indexConfig = getDocumentIndexConfig();
+    setIndexIncludePatterns(indexConfig.includePatterns.join('\n'));
+    setIndexExcludePatterns(indexConfig.excludePatterns.join('\n'));
     void invoke<SystemIntegrationStatus>('get_system_integration_status')
       .then(setSystemIntegration)
       .catch(() => setSystemIntegration({ supported: false, enabled: false }));
@@ -177,6 +190,9 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
     setGridMinWidth(140);
     setReduceMotion(false);
     setHighContrast(false);
+    setIndexIncludePatterns(DEFAULT_DOCUMENT_INDEX_CONFIG.includePatterns.join('\n'));
+    setIndexExcludePatterns(DEFAULT_DOCUMENT_INDEX_CONFIG.excludePatterns.join('\n'));
+    void configureDocumentIndex(DEFAULT_DOCUMENT_INDEX_CONFIG).catch(() => undefined);
     setStatus('Settings restored to defaults');
   };
 
@@ -344,6 +360,69 @@ export function SettingsPanel({ open, onClose }: SettingsPanelProps) {
                   </div>
                 </div>
               )}
+            </div>
+          )}
+
+          {activeTab === 'search' && (
+            <div className={styles.section}>
+              <h2 className={styles.sectionTitle}>Document Search</h2>
+              <p className={styles.rowHint}>
+                Content search builds a local index in the app cache in the background. One glob
+                pattern per line (or comma-separated); leave Include empty for supported text
+                documents. PDF and Office bodies stay deferred without an optional helper.
+              </p>
+              <div className={styles.row}>
+                <div className={styles.rowLabel}>Include patterns</div>
+                <div className={`${styles.controls} ${styles.flex1}`}>
+                  <textarea
+                    aria-label="Include patterns"
+                    className={styles.importTextarea}
+                    placeholder="**/*.md\n**/*.txt"
+                    value={indexIncludePatterns}
+                    onChange={(event) => setIndexIncludePatterns(event.target.value)}
+                  />
+                </div>
+              </div>
+              <div className={styles.row}>
+                <div className={styles.rowLabel}>Exclude patterns</div>
+                <div className={`${styles.controls} ${styles.flex1}`}>
+                  <textarea
+                    aria-label="Exclude patterns"
+                    className={styles.importTextarea}
+                    placeholder="node_modules/**\n.git/**"
+                    value={indexExcludePatterns}
+                    onChange={(event) => setIndexExcludePatterns(event.target.value)}
+                  />
+                </div>
+              </div>
+              <div className={styles.row}>
+                <div className={styles.rowLabel}>Apply</div>
+                <div className={styles.controls}>
+                  <button
+                    type="button"
+                    disabled={indexConfigBusy}
+                    onClick={async () => {
+                      setIndexConfigBusy(true);
+                      try {
+                        const config = {
+                          includePatterns: normalizeDocumentIndexPatterns(indexIncludePatterns),
+                          excludePatterns: normalizeDocumentIndexPatterns(indexExcludePatterns),
+                        };
+                        await configureDocumentIndex(config);
+                        setIndexIncludePatterns(config.includePatterns.join('\n'));
+                        setIndexExcludePatterns(config.excludePatterns.join('\n'));
+                        setStatus('Document search indexing settings saved');
+                      } catch {
+                        setStatus('Could not save document search indexing settings');
+                      } finally {
+                        setIndexConfigBusy(false);
+                      }
+                    }}
+                  >
+                    {indexConfigBusy ? 'Saving…' : 'Save indexing settings'}
+                  </button>
+                </div>
+              </div>
             </div>
           )}
 

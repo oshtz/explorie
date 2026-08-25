@@ -1,6 +1,7 @@
 // Prevents a terminal window from appearing on Windows
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod document_index;
 mod remote_drives;
 
 use explorie_core::archive::{
@@ -21,6 +22,10 @@ use tauri::{AppHandle, Emitter, Manager};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+use document_index::{
+    DocumentIndexConfig, DocumentIndexManager, DocumentIndexQueryResult, DocumentIndexStatus,
+    IndexCompletion,
+};
 use remote_drives::{
     DisconnectResult, RemoteDriveEnvironment, RemoteDriveManager, RemoteDriveProfile,
     RemoteDriveStatus,
@@ -284,6 +289,90 @@ async fn list_files(
     .await
     .map_err(|e| e.to_string())?
     .map_err(|e| e.to_string())
+}
+
+fn document_index_cache_path(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_cache_dir()
+        .map(|path| DocumentIndexManager::default_cache_path(&path))
+        .map_err(|error| format!("Could not determine document index cache directory: {error}"))
+}
+
+fn document_index_completion(app: AppHandle) -> IndexCompletion {
+    Arc::new(move || {
+        let _ = app.emit("document-index-updated", ());
+    })
+}
+
+#[tauri::command]
+async fn configure_document_index(
+    app: AppHandle,
+    manager: tauri::State<'_, DocumentIndexManager>,
+    config: DocumentIndexConfig,
+) -> Result<(), String> {
+    let cache_path = document_index_cache_path(&app)?;
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        manager.initialize(cache_path)?;
+        manager.configure(config)?;
+        let _ = app.emit("document-index-updated", ());
+        Ok(())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn query_document_index(
+    app: AppHandle,
+    manager: tauri::State<'_, DocumentIndexManager>,
+    paths: Vec<String>,
+    query: String,
+) -> Result<DocumentIndexQueryResult, String> {
+    let cache_path = document_index_cache_path(&app)?;
+    let manager = manager.inner().clone();
+    let completion = document_index_completion(app);
+    tauri::async_runtime::spawn_blocking(move || {
+        manager.initialize(cache_path)?;
+        manager.query(
+            paths.into_iter().map(PathBuf::from).collect(),
+            &query,
+            Some(completion),
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn document_index_status(
+    app: AppHandle,
+    manager: tauri::State<'_, DocumentIndexManager>,
+    paths: Vec<String>,
+) -> Result<DocumentIndexStatus, String> {
+    let cache_path = document_index_cache_path(&app)?;
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        manager.initialize(cache_path)?;
+        manager.status(paths.into_iter().map(PathBuf::from).collect())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn build_document_index(
+    app: AppHandle,
+    manager: tauri::State<'_, DocumentIndexManager>,
+    paths: Vec<String>,
+) -> Result<(), String> {
+    manager.initialize(document_index_cache_path(&app)?)?;
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        manager.build_now(paths.into_iter().map(PathBuf::from).collect())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 fn find_syncthing_root(path: &Path) -> Option<PathBuf> {
@@ -2120,11 +2209,16 @@ fn main() {
         }))
         .manage(FileOperationJobs::default())
         .manage(ActiveMutations::default())
+        .manage(DocumentIndexManager::default())
         .manage(RemoteDriveManager::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .invoke_handler(tauri::generate_handler![
             list_files,
+            configure_document_index,
+            query_document_index,
+            document_index_status,
+            build_document_index,
             get_syncthing_root,
             list_system_locations,
             get_launch_path,

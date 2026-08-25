@@ -125,6 +125,9 @@ describe('SettingsPanel', () => {
       if (command === 'set_system_integration') {
         return Promise.resolve({ supported: true, enabled: true });
       }
+      if (command === 'configure_document_index') {
+        return Promise.resolve(null);
+      }
       return Promise.reject(new Error(`Unexpected command: ${command}`));
     });
   });
@@ -156,7 +159,7 @@ describe('SettingsPanel', () => {
     const navigation = screen.getByRole('navigation', { name: 'Settings sections' });
     const sectionButtons = navigation.querySelectorAll('button');
 
-    expect(sectionButtons).toHaveLength(5);
+    expect(sectionButtons).toHaveLength(6);
     expect(screen.getByRole('button', { name: 'General' })).toHaveAttribute('aria-current', 'page');
   });
 
@@ -184,6 +187,29 @@ describe('SettingsPanel', () => {
     expect(mocks.invoke).toHaveBeenCalledWith('set_system_integration', { enabled: true });
     expect(checkbox).toBeChecked();
     expect(screen.getByRole('status')).toHaveTextContent('Windows integration enabled');
+  });
+
+  it('saves local document index include and exclude patterns', async () => {
+    const { user } = renderPanel();
+
+    await user.click(screen.getByRole('button', { name: 'Document Search' }));
+    await user.type(screen.getByLabelText('Include patterns'), '**/*.md\n**/*.txt');
+    await user.type(screen.getByLabelText('Exclude patterns'), 'node_modules/**\n.git/**');
+    await user.click(screen.getByRole('button', { name: 'Save indexing settings' }));
+
+    expect(mocks.invoke).toHaveBeenCalledWith('configure_document_index', {
+      config: {
+        includePatterns: ['**/*.md', '**/*.txt'],
+        excludePatterns: ['node_modules/**', '.git/**'],
+      },
+    });
+    expect(JSON.parse(window.localStorage.getItem('explorie:documentIndexConfig') ?? '{}')).toEqual(
+      {
+        includePatterns: ['**/*.md', '**/*.txt'],
+        excludePatterns: ['node_modules/**', '.git/**'],
+      }
+    );
+    expect(screen.getByRole('status')).toHaveTextContent('Document search indexing settings saved');
   });
 
   it('updates general settings from checkbox controls', async () => {

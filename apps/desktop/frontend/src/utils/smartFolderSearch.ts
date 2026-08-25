@@ -1,10 +1,8 @@
 import { invoke } from '@tauri-apps/api/core';
-import { readFile } from './fs';
 import { parseToMs } from './date';
 import { basename, normalizePathForCompare } from './path';
 import type { FileEntry, SmartFolderCriteria } from '../store';
-
-const MAX_CONTENT_BYTES = 5 * 1024 * 1024;
+import { queryDocumentIndex } from './documentIndex';
 
 type NameMatcher = (name: string) => boolean;
 
@@ -62,17 +60,10 @@ function matchesModified(entry: FileEntry, after?: number, before?: number): boo
   return true;
 }
 
-async function matchesContent(entry: FileEntry, query?: string): Promise<boolean> {
-  const needle = query?.trim().toLowerCase();
-  if (!needle) return true;
+function matchesContent(entry: FileEntry, contentMatches: Set<string>): boolean {
   if (entry.is_dir) return false;
-  if (entry.size > MAX_CONTENT_BYTES) return false;
-  try {
-    const text = await readFile(entry.path);
-    return text.toLowerCase().includes(needle);
-  } catch {
-    return false;
-  }
+  const normalized = normalizePathForCompare(entry.path);
+  return contentMatches.has(normalized) || contentMatches.has(normalized.toLowerCase());
 }
 
 async function listFiles(path: string): Promise<FileEntry[]> {
@@ -92,7 +83,8 @@ async function matchesCriteria(
   criteria: SmartFolderCriteria,
   nameMatcher: NameMatcher | null,
   excludeMatcher: NameMatcher | null,
-  extensions: string[]
+  extensions: string[],
+  contentMatches: Set<string>
 ): Promise<boolean> {
   const name = entry.name ?? basename(entry.path) ?? '';
   if (excludeMatcher && excludeMatcher(name)) {
@@ -120,7 +112,7 @@ async function matchesCriteria(
     );
   }
   if (criteria.contentSearch?.trim()) {
-    checks.push(async () => matchesContent(entry, criteria.contentSearch));
+    checks.push(async () => matchesContent(entry, contentMatches));
   }
 
   if (checks.length === 0) return true;
@@ -148,6 +140,15 @@ export async function runSmartFolderSearch(criteria: SmartFolderCriteria): Promi
   const nameMatcher = buildNameMatcher(criteria.namePattern, criteria.nameRegex);
   const excludeMatcher = buildNameMatcher(criteria.excludePattern, criteria.nameRegex);
   const extensions = normalizeExtensions(criteria.extensions);
+  const contentMatches = new Set<string>();
+  if (criteria.contentSearch?.trim()) {
+    const indexed = await queryDocumentIndex(searchPaths, criteria.contentSearch);
+    for (const path of indexed?.paths ?? []) {
+      const normalized = normalizePathForCompare(path);
+      contentMatches.add(normalized);
+      contentMatches.add(normalized.toLowerCase());
+    }
+  }
 
   const results: FileEntry[] = [];
   const visitedPaths = new Set<string>();
@@ -169,7 +170,16 @@ export async function runSmartFolderSearch(criteria: SmartFolderCriteria): Promi
         pending.push(entry.path);
       }
 
-      if (await matchesCriteria(entry, criteria, nameMatcher, excludeMatcher, extensions)) {
+      if (
+        await matchesCriteria(
+          entry,
+          criteria,
+          nameMatcher,
+          excludeMatcher,
+          extensions,
+          contentMatches
+        )
+      ) {
         if (!resultPaths.has(entryKey)) {
           resultPaths.add(entryKey);
           results.push(entry);
