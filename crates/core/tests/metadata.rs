@@ -89,6 +89,23 @@ fn malformed_metadata_is_reported_and_never_overwritten() {
         std::io::ErrorKind::InvalidData
     );
     assert_eq!(
+        create_explorie_schema(root, HashMap::new())
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::InvalidData
+    );
+    let mut replacement = HashMap::new();
+    replacement.insert(
+        "notes.txt".to_string(),
+        HashMap::from([("tag".to_string(), json!("docs"))]),
+    );
+    assert_eq!(
+        create_explorie_schema(root, replacement)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::InvalidData
+    );
+    assert_eq!(
         fs::read_to_string(metadata_path).unwrap(),
         "{ definitely not valid json"
     );
@@ -131,18 +148,116 @@ fn schema_replacement_invalidates_the_listing_cache() {
     let mut first = HashMap::new();
     first.insert(
         "notes.txt".to_string(),
-        HashMap::from([("status".to_string(), json!("first"))]),
+        HashMap::from([("status".to_string(), json!("Todo"))]),
     );
     create_explorie_schema(root, first).unwrap();
-    assert_eq!(list_dir(root).unwrap()[0].custom["status"], json!("first"));
+    assert_eq!(list_dir(root).unwrap()[0].custom["status"], json!("Todo"));
 
     let mut second = HashMap::new();
     second.insert(
         "notes.txt".to_string(),
-        HashMap::from([("status".to_string(), json!("second"))]),
+        HashMap::from([("status".to_string(), json!("Done"))]),
     );
     create_explorie_schema(root, second).unwrap();
-    assert_eq!(list_dir(root).unwrap()[0].custom["status"], json!("second"));
+    assert_eq!(list_dir(root).unwrap()[0].custom["status"], json!("Done"));
+}
+
+#[test]
+fn typed_date_url_enum_values_are_accepted() {
+    let temp_dir = tempdir().expect("temp dir");
+    let root = temp_dir.path();
+    fs::write(root.join("notes.txt"), b"notes").unwrap();
+
+    let mut created = HashMap::new();
+    created.insert(
+        "notes.txt".to_string(),
+        HashMap::from([
+            ("dueDate".to_string(), json!("2024-02-29")),
+            ("url".to_string(), json!("https://example.com/docs")),
+            ("status".to_string(), json!("In Progress")),
+            ("priority".to_string(), json!("High")),
+            ("type".to_string(), json!("Document")),
+            ("category".to_string(), json!("Work")),
+            ("label".to_string(), json!("freeform")),
+        ]),
+    );
+    create_explorie_schema(root, created).unwrap();
+
+    let mut updated = HashMap::new();
+    updated.insert("dueDate".to_string(), json!("2024-03-01"));
+    updated.insert("url".to_string(), json!("http://localhost:3000/path"));
+    updated.insert("status".to_string(), json!("Done"));
+    updated.insert("priority".to_string(), json!("Urgent"));
+    updated.insert("type".to_string(), json!("Code"));
+    updated.insert("category".to_string(), json!("Project"));
+    updated.insert("rating".to_string(), json!(5));
+    update_custom_fields(root, "notes.txt", updated).unwrap();
+
+    let entries = list_dir(root).expect("list dir");
+    let entry = entries
+        .iter()
+        .find(|entry| entry.path.file_name().unwrap() == "notes.txt")
+        .expect("notes.txt entry");
+    assert_eq!(entry.custom.get("dueDate"), Some(&json!("2024-03-01")));
+    assert_eq!(
+        entry.custom.get("url"),
+        Some(&json!("http://localhost:3000/path"))
+    );
+    assert_eq!(entry.custom.get("status"), Some(&json!("Done")));
+    assert_eq!(entry.custom.get("priority"), Some(&json!("Urgent")));
+    assert_eq!(entry.custom.get("type"), Some(&json!("Code")));
+    assert_eq!(entry.custom.get("category"), Some(&json!("Project")));
+    assert_eq!(entry.custom.get("rating"), Some(&json!(5)));
+}
+
+#[test]
+fn invalid_date_url_enum_values_are_rejected() {
+    let temp_dir = tempdir().expect("temp dir");
+    let root = temp_dir.path();
+    fs::write(root.join("notes.txt"), b"notes").unwrap();
+    let metadata_path = root.join(".explorie.json");
+
+    let mut initial = HashMap::new();
+    initial.insert(
+        "notes.txt".to_string(),
+        HashMap::from([("label".to_string(), json!("kept"))]),
+    );
+    create_explorie_schema(root, initial).unwrap();
+    let original = fs::read_to_string(&metadata_path).unwrap();
+
+    let invalid_cases = [
+        ("dueDate", json!("not-a-date")),
+        ("dueDate", json!("2024-13-01")),
+        ("dueDate", json!("2023-02-29")),
+        ("dueDate", json!("01/01/2024")),
+        ("url", json!("example.com")),
+        ("url", json!("javascript:alert(1)")),
+        ("url", json!("http://")),
+        ("status", json!("Later")),
+        ("priority", json!("Critical")),
+        ("type", json!("Design")),
+        ("category", json!("Other")),
+    ];
+
+    for (field, value) in invalid_cases {
+        let mut fields = HashMap::new();
+        fields.insert(field.to_string(), value.clone());
+        let error = update_custom_fields(root, "notes.txt", fields).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData, "{field}");
+        assert!(
+            error.to_string().contains(field),
+            "error should name {field}: {error}"
+        );
+
+        let mut document = HashMap::new();
+        document.insert(
+            "notes.txt".to_string(),
+            HashMap::from([(field.to_string(), value)]),
+        );
+        let error = create_explorie_schema(root, document).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData, "{field}");
+        assert_eq!(fs::read_to_string(&metadata_path).unwrap(), original);
+    }
 }
 
 #[cfg(unix)]
