@@ -24,6 +24,28 @@ export type CustomFieldArray = string[];
  */
 export type CustomFieldValue = CustomFieldPrimitive | CustomFieldArray | null;
 
+/** Types supported by the optional `$schema` declaration in `.explorie.json`. */
+export type CustomFieldType =
+  | 'string'
+  | 'number'
+  | 'boolean'
+  | 'string-array'
+  | 'date'
+  | 'url'
+  | 'enum';
+
+export interface CustomFieldDefinition {
+  type: CustomFieldType;
+  required?: boolean;
+  values?: readonly string[];
+}
+
+export interface CustomFieldsSchemaDeclaration {
+  fields: Record<string, CustomFieldDefinition>;
+}
+
+export type CustomFieldSchema = CustomFieldsSchemaDeclaration;
+
 // ============================================================================
 // Predefined Field Types
 // ============================================================================
@@ -91,6 +113,9 @@ export interface KnownFieldTypes {
  */
 export type CustomFields = Record<string, CustomFieldValue | undefined>;
 
+/** JSON document entries accepted by the schema-creation IPC command. */
+export type CustomFieldsDocument = Record<string, CustomFields | CustomFieldsSchemaDeclaration>;
+
 /**
  * Strongly-typed custom fields for when you know you're working with
  * predefined fields. Use this when setting/getting known fields.
@@ -111,6 +136,126 @@ export function isCustomFieldValue(value: unknown): value is CustomFieldValue {
     return value.every((item) => typeof item === 'string');
   }
   return false;
+}
+
+function isValidDateValue(value: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const year = Number(value.slice(0, 4));
+  const month = Number(value.slice(5, 7));
+  const day = Number(value.slice(8, 10));
+  if (year === 0 || month < 1 || month > 12 || day < 1) return false;
+
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = month === 2 ? (leapYear ? 29 : 28) : [4, 6, 9, 11].includes(month) ? 30 : 31;
+  return day <= daysInMonth;
+}
+
+function isValidUrlValue(value: string): boolean {
+  // Match the core parser's strict input policy before applying WHATWG URL
+  // parsing. The browser otherwise normalizes whitespace in paths and around
+  // the URL, while the stored metadata value is not normalized by the core.
+  if (
+    value.length === 0 ||
+    value.trim() !== value ||
+    /[\s\p{Cc}]/u.test(value) ||
+    /%(?![0-9a-f]{2})/iu.test(value)
+  ) {
+    return false;
+  }
+
+  try {
+    const url = new URL(value);
+    return Boolean(url.protocol && url.hostname);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Validate a value against a typed schema definition.
+ * Returns null for valid values and a user-visible reason otherwise.
+ */
+export function validateCustomFieldValue(
+  value: unknown,
+  definition: CustomFieldDefinition
+): string | null {
+  if (value === null) return `Expected ${definition.type}, got null`;
+
+  const valid = (() => {
+    switch (definition.type) {
+      case 'string':
+        return typeof value === 'string';
+      case 'number':
+        return typeof value === 'number' && Number.isFinite(value);
+      case 'boolean':
+        return typeof value === 'boolean';
+      case 'string-array':
+        return Array.isArray(value) && value.every((item) => typeof item === 'string');
+      case 'date':
+        return typeof value === 'string' && isValidDateValue(value);
+      case 'url':
+        return typeof value === 'string' && isValidUrlValue(value);
+      case 'enum':
+        return (
+          typeof value === 'string' &&
+          (definition.values?.length ?? 0) > 0 &&
+          definition.values?.includes(value)
+        );
+    }
+  })();
+
+  return valid ? null : `Expected ${definition.type}`;
+}
+
+/** Return field-specific validation reasons for an object of custom fields. */
+export function validateCustomFields(
+  fields: Record<string, unknown>,
+  schema: CustomFieldsSchemaDeclaration
+): Record<string, string> {
+  const errors: Record<string, string> = {};
+  for (const [field, definition] of Object.entries(schema.fields)) {
+    const value = fields[field];
+    if (value === undefined) {
+      if (definition.required) errors[field] = 'This field is required';
+      continue;
+    }
+    const reason = validateCustomFieldValue(value, definition);
+    if (reason) errors[field] = reason;
+  }
+  for (const [field, value] of Object.entries(fields)) {
+    if (!(field in schema.fields) && !isCustomFieldValue(value)) {
+      errors[field] = 'Expected a supported custom value';
+    }
+  }
+  return errors;
+}
+
+/** Convert the editor's text representation into the declared JSON value. */
+export function parseCustomFieldInput(value: string, definition?: CustomFieldDefinition): unknown {
+  if (!definition) return value;
+
+  switch (definition.type) {
+    case 'number':
+      return value.trim() === '' ? Number.NaN : Number(value);
+    case 'boolean':
+      if (value === 'true') return true;
+      if (value === 'false') return false;
+      return value;
+    case 'string-array':
+      return value
+        .split(/[\n,]/)
+        .map((item) => item.trim())
+        .filter(Boolean);
+    default:
+      return value;
+  }
+}
+
+/** Convert a stored JSON value into the editor's text representation. */
+export function formatCustomFieldInput(value: unknown): string {
+  if (Array.isArray(value)) return value.join(', ');
+  if (value === null || value === undefined) return '';
+  return String(value);
 }
 
 /**

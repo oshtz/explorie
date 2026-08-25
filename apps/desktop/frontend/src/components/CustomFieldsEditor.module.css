@@ -18,6 +18,20 @@
   border-bottom: 1px solid var(--border-primary);
 }
 
+.validationError,
+.fieldError {
+  color: var(--accent-red);
+  font-size: calc(11px * var(--font-scale));
+}
+
+.validationError {
+  margin-bottom: var(--padding-sm);
+}
+
+.fieldError {
+  margin-top: var(--padding-xs);
+}
+
 .fieldsContainer {
   display: flex;
   flex-direction: column;

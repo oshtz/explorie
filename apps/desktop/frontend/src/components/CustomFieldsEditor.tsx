@@ -1,26 +1,84 @@
 import React, { useState, useEffect, useRef } from 'react';
 import type { FileEntry } from '../store';
-import { updateCustomFields } from '../utils/fs';
+import { getCustomFieldsSchema, updateCustomFields } from '../utils/fs';
 import { useToast } from './Toast';
 import { reportError } from '../utils/errorReporter';
 import styles from './CustomFieldsEditor.module.css';
 import {
   type CustomFields,
+  type CustomFieldDefinition,
+  type CustomFieldSchema,
   type CustomFieldValue,
   FIELD_SUGGESTIONS,
+  formatCustomFieldInput,
   getValueSuggestions,
+  parseCustomFieldInput,
+  validateCustomFields,
 } from '../utils/customFieldTypes';
 
 interface CustomFieldsEditorProps {
   file: FileEntry;
   onUpdate?: (updatedFile: FileEntry) => void;
+  /** Pass a schema when the caller already loaded the directory metadata. */
+  schema?: CustomFieldSchema | null;
 }
 
-export function CustomFieldsEditor({ file, onUpdate }: CustomFieldsEditorProps) {
+function splitFilePath(filePath: string): { dirPath: string; fileName: string } {
+  const lastSlash = Math.max(filePath.lastIndexOf('/'), filePath.lastIndexOf('\\'));
+  const dirPath =
+    lastSlash < 0
+      ? '.'
+      : lastSlash === 0
+        ? filePath.slice(0, 1)
+        : lastSlash === 2 && filePath[1] === ':'
+          ? filePath.slice(0, 3)
+          : filePath.slice(0, lastSlash);
+  return { dirPath, fileName: filePath.slice(lastSlash + 1) };
+}
+
+function errorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  return typeof error === 'string' ? error : 'The custom field value is invalid';
+}
+
+function validationSummary(errors: Record<string, string>): string {
+  const [field, reason] = Object.entries(errors)[0] ?? [];
+  return field && reason ? `${field}: ${reason}` : 'The custom field values are invalid';
+}
+
+function inputTypeFor(definition?: CustomFieldDefinition): string {
+  switch (definition?.type) {
+    case 'number':
+      return 'number';
+    case 'date':
+      return 'date';
+    case 'url':
+      return 'url';
+    default:
+      return 'text';
+  }
+}
+
+function readSchema(dirPath: string): Promise<CustomFieldSchema | null> {
+  // Keep the editor usable in web-only tests/dev mocks that do not expose
+  // native commands; the native app always provides this function.
+  return typeof getCustomFieldsSchema === 'function'
+    ? getCustomFieldsSchema(dirPath)
+    : Promise.resolve(null);
+}
+
+export function CustomFieldsEditor({
+  file,
+  onUpdate,
+  schema: schemaProp,
+}: CustomFieldsEditorProps) {
   const { show: showToast } = useToast();
 
   // State for the current fields
   const [fields, setFields] = useState<CustomFields>(file.custom || {});
+  const [schema, setSchema] = useState<CustomFieldSchema | null>(schemaProp ?? null);
+  const [validationError, setValidationError] = useState<string | null>(null);
+  const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
 
   // State for a new field being added
   const [newFieldName, setNewFieldName] = useState('');
@@ -73,7 +131,9 @@ export function CustomFieldsEditor({ file, onUpdate }: CustomFieldsEditorProps) 
   );
 
   const filteredValueSuggestions = (field: string): readonly string[] => {
-    const suggestions = getValueSuggestions(field);
+    const definition = fieldDefinition(field);
+    if (definition?.type === 'enum' || definition?.type === 'boolean') return [];
+    const suggestions = definition?.values ?? getValueSuggestions(field);
     if (suggestions.length === 0) return [];
 
     const fieldValue = fields[field];
@@ -85,40 +145,85 @@ export function CustomFieldsEditor({ file, onUpdate }: CustomFieldsEditorProps) 
     );
   };
 
+  const clearFieldError = (field: string) => {
+    setValidationError(null);
+    setFieldErrors((current) => {
+      if (!(field in current)) return current;
+      const next = { ...current };
+      delete next[field];
+      return next;
+    });
+  };
+
+  const validateBeforeSave = (updatedFields: Record<string, unknown>): boolean => {
+    if (!schema) return true;
+    const errors = validateCustomFields(updatedFields, schema);
+    if (Object.keys(errors).length === 0) return true;
+    setFieldErrors(errors);
+    setValidationError(validationSummary(errors));
+    return false;
+  };
+
+  const fieldDefinition = (field: string): CustomFieldDefinition | undefined =>
+    schema?.fields[field];
+
+  const inputValueFor = (value: unknown): string => formatCustomFieldInput(value);
+
+  const valueForInput = (
+    field: string,
+    value: string,
+    existingValue?: unknown
+  ): CustomFieldValue => {
+    const definition = fieldDefinition(field);
+    if (definition) return parseCustomFieldInput(value, definition) as CustomFieldValue;
+    if (field.toLowerCase() === 'tags' && !Array.isArray(existingValue)) {
+      return [value];
+    }
+    return value;
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    const { dirPath } = splitFilePath(file.path);
+    setSchema(schemaProp ?? null);
+    if (schemaProp !== undefined) return;
+
+    void readSchema(dirPath)
+      .then((loadedSchema) => {
+        if (!cancelled) setSchema(loadedSchema);
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) setValidationError(errorMessage(error));
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [file.path, schemaProp]);
+
   // Add a new field
   const handleAddField = async () => {
     if (!newFieldName.trim()) return;
+    const fieldName = newFieldName.trim();
 
-    // Get directory path and filename
-    const filePath = file.path;
-    const lastSlashIndex = filePath.lastIndexOf('/');
-    const lastBackslashIndex = filePath.lastIndexOf('\\');
-    const lastIndex = Math.max(lastSlashIndex, lastBackslashIndex);
-    const dirPath = filePath.substring(0, lastIndex);
-    const fileName = filePath.substring(lastIndex + 1);
+    const { dirPath, fileName } = splitFilePath(file.path);
 
-    // Special case handling for tags field
-    const newValue =
-      newFieldName.toLowerCase() === 'tags' && !Array.isArray(fields[newFieldName])
-        ? [newFieldValue] // Make tags an array
-        : newFieldValue;
+    const newValue = valueForInput(fieldName, newFieldValue, fields[fieldName]);
 
-    // Update locally first
-    const updatedFields = {
+    const updatedFields: CustomFields = {
       ...fields,
-      [newFieldName]: newValue,
+      [fieldName]: newValue,
     };
+    clearFieldError(fieldName);
+    if (!validateBeforeSave(updatedFields)) return;
 
-    // Update state
     setFields(updatedFields);
-    setNewFieldName('');
-    setNewFieldValue('');
 
     try {
-      // Update in the filesystem
       await updateCustomFields(dirPath, fileName, updatedFields);
+      setNewFieldName('');
+      setNewFieldValue('');
 
-      // Notify parent if needed
       if (onUpdate) {
         onUpdate({
           ...file,
@@ -127,6 +232,8 @@ export function CustomFieldsEditor({ file, onUpdate }: CustomFieldsEditorProps) 
       }
     } catch (error) {
       reportError('Failed to save custom field', error, { toast: showToast });
+      setValidationError(errorMessage(error));
+      setFieldErrors((current) => ({ ...current, [fieldName]: errorMessage(error) }));
       // Revert on error
       setFields(file.custom || {});
     }
@@ -134,13 +241,8 @@ export function CustomFieldsEditor({ file, onUpdate }: CustomFieldsEditorProps) 
 
   // Update an existing field
   const handleUpdateField = async (field: string, value: CustomFieldValue) => {
-    // Get directory path and filename
-    const filePath = file.path;
-    const lastSlashIndex = filePath.lastIndexOf('/');
-    const lastBackslashIndex = filePath.lastIndexOf('\\');
-    const lastIndex = Math.max(lastSlashIndex, lastBackslashIndex);
-    const dirPath = filePath.substring(0, lastIndex);
-    const fileName = filePath.substring(lastIndex + 1);
+    clearFieldError(field);
+    const { dirPath, fileName } = splitFilePath(file.path);
 
     // Special case handling for adding to tags array
     const existingTags = fields[field];
@@ -156,12 +258,11 @@ export function CustomFieldsEditor({ file, onUpdate }: CustomFieldsEditorProps) 
       ...fields,
       [field]: value,
     };
+    if (!validateBeforeSave(updatedFields)) return;
 
-    // Update state
     setFields(updatedFields);
 
     try {
-      // Update in the filesystem
       await updateCustomFields(dirPath, fileName, updatedFields);
 
       // Notify parent if needed
@@ -173,6 +274,8 @@ export function CustomFieldsEditor({ file, onUpdate }: CustomFieldsEditorProps) 
       }
     } catch (error) {
       reportError(`Failed to update field "${field}"`, error, { toast: showToast });
+      setValidationError(errorMessage(error));
+      setFieldErrors((current) => ({ ...current, [field]: errorMessage(error) }));
       // Revert on error
       setFields(file.custom || {});
     }
@@ -180,18 +283,13 @@ export function CustomFieldsEditor({ file, onUpdate }: CustomFieldsEditorProps) 
 
   // Remove a field
   const handleRemoveField = async (field: string) => {
-    // Get directory path and filename
-    const filePath = file.path;
-    const lastSlashIndex = filePath.lastIndexOf('/');
-    const lastBackslashIndex = filePath.lastIndexOf('\\');
-    const lastIndex = Math.max(lastSlashIndex, lastBackslashIndex);
-    const dirPath = filePath.substring(0, lastIndex);
-    const fileName = filePath.substring(lastIndex + 1);
+    clearFieldError(field);
+    const { dirPath, fileName } = splitFilePath(file.path);
 
     // Create a copy without the field
     const { [field]: _, ...updatedFields } = fields;
+    if (!validateBeforeSave(updatedFields)) return;
 
-    // Update state
     setFields(updatedFields);
 
     try {
@@ -207,6 +305,8 @@ export function CustomFieldsEditor({ file, onUpdate }: CustomFieldsEditorProps) 
       }
     } catch (error) {
       reportError(`Failed to remove field "${field}"`, error, { toast: showToast });
+      setValidationError(errorMessage(error));
+      setFieldErrors((current) => ({ ...current, [field]: errorMessage(error) }));
       // Revert on error
       setFields(file.custom || {});
     }
@@ -235,7 +335,10 @@ export function CustomFieldsEditor({ file, onUpdate }: CustomFieldsEditorProps) 
   const handleValueSuggestion = (suggestion: string) => {
     if (editingField) {
       // Updating existing field
-      handleUpdateField(editingField, suggestion);
+      void handleUpdateField(
+        editingField,
+        valueForInput(editingField, suggestion, fields[editingField])
+      );
       setEditingField(null);
     } else {
       // Adding new field
@@ -248,15 +351,16 @@ export function CustomFieldsEditor({ file, onUpdate }: CustomFieldsEditorProps) 
   const handleEditField = (field: string) => {
     setEditingField(field);
     const fieldValue = fields[field];
-    setNewFieldValue(fieldValue != null ? String(fieldValue) : '');
-    setShowValueSuggestions(getValueSuggestions(field).length > 0);
+    setNewFieldValue(inputValueFor(fieldValue));
+    setShowValueSuggestions(filteredValueSuggestions(field).length > 0);
   };
 
   // Save edited field
   const handleSaveEdit = () => {
     if (!editingField) return;
 
-    handleUpdateField(editingField, newFieldValue);
+    const value = valueForInput(editingField, newFieldValue, fields[editingField]);
+    void handleUpdateField(editingField, value);
     setEditingField(null);
     setNewFieldValue('');
   };
@@ -271,11 +375,69 @@ export function CustomFieldsEditor({ file, onUpdate }: CustomFieldsEditorProps) 
   // Update fields when file changes
   useEffect(() => {
     setFields(file.custom || {});
+    setValidationError(null);
+    setFieldErrors({});
   }, [file]);
+
+  const renderValueInput = (
+    field: string,
+    value: string,
+    onChange: (value: string) => void,
+    options: {
+      id?: string;
+      placeholder?: string;
+      autoFocus?: boolean;
+      onFocus?: () => void;
+      onBlur?: () => void;
+      className: string;
+    }
+  ) => {
+    const definition = fieldDefinition(field);
+    if (definition?.type === 'enum' || definition?.type === 'boolean') {
+      const values = definition.type === 'enum' ? (definition.values ?? []) : ['true', 'false'];
+      return (
+        <select
+          id={options.id}
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+          onFocus={options.onFocus}
+          onBlur={options.onBlur}
+          className={options.className}
+          autoFocus={options.autoFocus}
+        >
+          <option value="">Select a value</option>
+          {values.map((option) => (
+            <option key={option} value={option}>
+              {option}
+            </option>
+          ))}
+        </select>
+      );
+    }
+
+    return (
+      <input
+        id={options.id}
+        type={inputTypeFor(definition)}
+        placeholder={options.placeholder}
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        onFocus={options.onFocus}
+        onBlur={options.onBlur}
+        className={options.className}
+        autoFocus={options.autoFocus}
+      />
+    );
+  };
 
   return (
     <div className={styles.container}>
       <h3 className={styles.title}>Custom Fields</h3>
+      {validationError && (
+        <div className={styles.validationError} role="alert" aria-live="polite">
+          {validationError}
+        </div>
+      )}
 
       {/* Existing fields */}
       <div className={styles.fieldsContainer}>
@@ -286,15 +448,13 @@ export function CustomFieldsEditor({ file, onUpdate }: CustomFieldsEditorProps) 
               <>
                 <label className={styles.fieldLabel}>{field}</label>
                 <div className={styles.editInputContainer}>
-                  <input
-                    type="text"
-                    value={newFieldValue}
-                    onChange={(e) => setNewFieldValue(e.target.value)}
-                    onFocus={() => setShowValueSuggestions(getValueSuggestions(field).length > 0)}
-                    onBlur={hideValueSuggestionsSoon}
-                    className={styles.fieldInput}
-                    autoFocus
-                  />
+                  {renderValueInput(field, newFieldValue, setNewFieldValue, {
+                    onFocus: () =>
+                      setShowValueSuggestions(filteredValueSuggestions(field).length > 0),
+                    onBlur: hideValueSuggestionsSoon,
+                    className: styles.fieldInput,
+                    autoFocus: true,
+                  })}
 
                   {/* Value suggestions */}
                   {showValueSuggestions && filteredValueSuggestions(field).length > 0 && (
@@ -367,6 +527,11 @@ export function CustomFieldsEditor({ file, onUpdate }: CustomFieldsEditorProps) 
                 )}
               </>
             )}
+            {fieldErrors[field] && (
+              <div className={styles.fieldError} role="alert" aria-live="polite">
+                {fieldErrors[field]}
+              </div>
+            )}
           </div>
         ))}
       </div>
@@ -402,20 +567,17 @@ export function CustomFieldsEditor({ file, onUpdate }: CustomFieldsEditorProps) 
           </div>
 
           <div className={styles.fieldValueContainer}>
-            <input
-              id="new-field-value"
-              type="text"
-              placeholder="Value"
-              value={newFieldValue}
-              onChange={(e) => setNewFieldValue(e.target.value)}
-              onFocus={() => {
-                if (getValueSuggestions(newFieldName).length > 0) {
+            {renderValueInput(newFieldName, newFieldValue, setNewFieldValue, {
+              id: 'new-field-value',
+              placeholder: 'Value',
+              onFocus: () => {
+                if (filteredValueSuggestions(newFieldName).length > 0) {
                   setShowValueSuggestions(true);
                 }
-              }}
-              onBlur={hideValueSuggestionsSoon}
-              className={styles.fieldValueInput}
-            />
+              },
+              onBlur: hideValueSuggestionsSoon,
+              className: styles.fieldValueInput,
+            })}
 
             {/* Value suggestions for new field */}
             {!editingField &&
@@ -443,6 +605,11 @@ export function CustomFieldsEditor({ file, onUpdate }: CustomFieldsEditorProps) 
         >
           Add Field
         </button>
+        {fieldErrors[newFieldName.trim()] && (
+          <div className={styles.fieldError} role="alert" aria-live="polite">
+            {fieldErrors[newFieldName.trim()]}
+          </div>
+        )}
       </div>
     </div>
   );

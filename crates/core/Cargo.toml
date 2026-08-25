@@ -20,6 +20,7 @@ unrar = "0.5"
 sevenz-rust = { version = "0.6", features = ["aes256", "compress"] }
 tracing = "0.1"
 trash = "5.2.6"
+url = "2.5"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

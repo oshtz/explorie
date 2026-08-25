@@ -6,7 +6,12 @@ import { clearDirSizeCache } from '../dirSizeCache';
 import { invoke } from '@tauri-apps/api/core';
 import { validateFileName } from './fileName';
 import { formatErrorMessage } from './errorMessages';
-import type { CustomFields, CustomFieldValue } from './customFieldTypes';
+import type {
+  CustomFields,
+  CustomFieldsDocument,
+  CustomFieldSchema,
+  CustomFieldValue,
+} from './customFieldTypes';
 
 export type { DirEntry } from '@tauri-apps/plugin-fs';
 
@@ -161,7 +166,19 @@ export async function createWebsiteLinkIn(
  * Interface for custom fields schema for a directory
  */
 export interface CustomFieldsSchema {
-  [filename: string]: Record<string, CustomFieldValue>;
+  [filename: string]: CustomFields;
+}
+
+/** Read the optional typed custom-field schema for a directory. */
+export async function getCustomFieldsSchema(dirPath: string): Promise<CustomFieldSchema | null> {
+  try {
+    return await invoke<CustomFieldSchema | null>('get_custom_fields_schema', {
+      dir_path: dirPath,
+    });
+  } catch (error) {
+    console.error(`Failed to read custom fields schema at ${dirPath}:`, error);
+    throw error;
+  }
 }
 
 /**
@@ -171,7 +188,7 @@ export interface CustomFieldsSchema {
  */
 export async function createExplorieSchemaBatch(
   dirPath: string,
-  schema: CustomFieldsSchema
+  schema: CustomFieldsDocument
 ): Promise<void> {
   try {
     await invoke<void>('create_explorie_schema', { dir_path: dirPath, fields: schema });
@@ -200,6 +217,25 @@ export async function updateCustomFields(
     });
   } catch (error) {
     console.error(`Failed to update custom fields for ${fileName} at ${dirPath}:`, error);
+    throw error;
+  }
+}
+
+/**
+ * Update several files in one directory with a single validated atomic write.
+ * Each value replaces the complete custom-field map for its filename.
+ */
+export async function updateCustomFieldsBatch(
+  dirPath: string,
+  updates: CustomFieldsSchema
+): Promise<void> {
+  try {
+    await invoke<void>('update_custom_fields_batch', {
+      dir_path: dirPath,
+      updates,
+    });
+  } catch (error) {
+    console.error(`Failed to update custom fields in batch at ${dirPath}:`, error);
     throw error;
   }
 }

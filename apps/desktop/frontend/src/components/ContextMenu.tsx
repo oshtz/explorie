@@ -11,6 +11,7 @@ import {
 import { useOperationQueueStore } from '../operationQueueStore';
 import { useToast } from './Toast';
 import type { Toast } from './Toast';
+import { BatchCustomFieldsDialog } from './BatchCustomFieldsDialog';
 import { basename, normalizePathForCompare } from '../utils/path';
 import { reportError } from '../utils/errorReporter';
 import type { AppInfo } from '../services/finderIntegration';
@@ -178,6 +179,7 @@ export function ContextMenu({
   const [openWithExpanded, setOpenWithExpanded] = useState(false);
   const [advancedExpanded, setAdvancedExpanded] = useState(false);
   const [position, setPosition] = useState({ x: state.x, y: state.y });
+  const [batchFieldsFiles, setBatchFieldsFiles] = useState<FileEntry[] | null>(null);
 
   useLayoutEffect(() => {
     if (!state.open || !menuRef.current) return;
@@ -318,6 +320,13 @@ export function ContextMenu({
     }
     onClose();
   }, [state.files, onBatchRename, onClose]);
+
+  const handleBatchFields = useCallback(() => {
+    if (state.files.length > 1) {
+      setBatchFieldsFiles(state.files);
+    }
+    onClose();
+  }, [state.files, onClose]);
 
   const handleCopy = useCallback(() => {
     if (state.files.length > 0) {
@@ -505,10 +514,23 @@ export function ContextMenu({
     setOpenWithExpanded((prev) => !prev);
   }, []);
 
-  if (!state.open) return null;
+  if (!state.open) {
+    if (!batchFieldsFiles) return null;
+    return (
+      <BatchCustomFieldsDialog
+        files={batchFieldsFiles}
+        onClose={() => setBatchFieldsFiles(null)}
+        onApplied={async () => {
+          await onRefresh?.();
+          setBatchFieldsFiles(null);
+        }}
+      />
+    );
+  }
 
   const hasFiles = state.files.length > 0;
   const isMultiple = state.files.length > 1;
+  const canBatchFields = isMultiple && state.files.some((file) => !file.is_dir);
   const hasClipboard = !!clipboard;
   const showPaste = !hasFiles && hasClipboard;
   const isSingleFolder = state.files.length === 1 && state.files[0].is_dir;
@@ -576,6 +598,21 @@ export function ContextMenu({
                 <Icon name="edit" />
               </span>
               Batch Rename ({state.files.length})
+            </div>
+          )}
+
+          {canBatchFields && (
+            <div
+              className={styles.contextItem}
+              role="menuitem"
+              tabIndex={-1}
+              onClick={handleBatchFields}
+              onKeyDown={(e) => e.key === 'Enter' && handleBatchFields()}
+            >
+              <span className={styles.contextIcon} aria-hidden="true">
+                <Icon name="edit" />
+              </span>
+              Edit Custom Fields ({state.files.length})
             </div>
           )}
 

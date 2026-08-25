@@ -84,6 +84,39 @@ pub struct FileEntry {
     pub has_xattrs: bool,
 }
 
+/// The value types supported by a typed custom-field declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CustomFieldType {
+    String,
+    Number,
+    Boolean,
+    StringArray,
+    Date,
+    Url,
+    Enum,
+}
+
+/// A field definition in the optional `$schema` metadata declaration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustomFieldDefinition {
+    #[serde(rename = "type")]
+    pub field_type: CustomFieldType,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub values: Vec<String>,
+}
+
+/// The typed field declarations stored under `$schema`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustomFieldsSchemaDeclaration {
+    #[serde(default)]
+    pub fields: HashMap<String, CustomFieldDefinition>,
+}
+
+pub type CustomFieldSchema = CustomFieldsSchemaDeclaration;
+
 const CUSTOM_FIELDS_CACHE_LIMIT: usize = 64;
 
 struct CustomFieldsCacheEntry {
@@ -121,6 +154,490 @@ fn invalidate_custom_fields_cache(path: &Path) {
     cache.order.retain(|cached| cached != path);
 }
 
+struct CustomFieldsDocument {
+    schema_key: Option<String>,
+    schema_value: Option<serde_json::Value>,
+    schema: Option<CustomFieldsSchemaDeclaration>,
+    entries: HashMap<String, HashMap<String, serde_json::Value>>,
+}
+
+fn metadata_error(path: &Path, message: impl Into<String>) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("Invalid {}: {}", path.display(), message.into()),
+    )
+}
+
+fn parse_custom_field_type(value: &str) -> Option<CustomFieldType> {
+    match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+        "string" => Some(CustomFieldType::String),
+        "number" => Some(CustomFieldType::Number),
+        "boolean" | "bool" => Some(CustomFieldType::Boolean),
+        "string-array" | "array" | "strings" => Some(CustomFieldType::StringArray),
+        "date" => Some(CustomFieldType::Date),
+        "url" | "uri" => Some(CustomFieldType::Url),
+        "enum" | "enumeration" => Some(CustomFieldType::Enum),
+        _ => None,
+    }
+}
+
+fn parse_enum_values(
+    object: &serde_json::Map<String, serde_json::Value>,
+    path: &Path,
+    field_name: &str,
+) -> io::Result<Vec<String>> {
+    let value = object
+        .get("values")
+        .or_else(|| object.get("options"))
+        .or_else(|| object.get("allowed"))
+        .or_else(|| object.get("enum"));
+    let Some(value) = value else {
+        return Err(metadata_error(
+            path,
+            format!("enum field `{field_name}` must declare a non-empty values array"),
+        ));
+    };
+    let Some(values) = value.as_array() else {
+        return Err(metadata_error(
+            path,
+            format!("enum field `{field_name}` values must be an array of strings"),
+        ));
+    };
+    if values.is_empty() {
+        return Err(metadata_error(
+            path,
+            format!("enum field `{field_name}` must declare at least one value"),
+        ));
+    }
+
+    values
+        .iter()
+        .map(|value| {
+            value.as_str().map(str::to_owned).ok_or_else(|| {
+                metadata_error(
+                    path,
+                    format!("enum field `{field_name}` values must be strings"),
+                )
+            })
+        })
+        .collect()
+}
+
+fn parse_custom_field_definition(
+    field_name: &str,
+    value: &serde_json::Value,
+    path: &Path,
+) -> io::Result<CustomFieldDefinition> {
+    match value {
+        serde_json::Value::String(type_name) => {
+            let field_type = parse_custom_field_type(type_name).ok_or_else(|| {
+                metadata_error(
+                    path,
+                    format!("unknown type `{type_name}` for field `{field_name}`"),
+                )
+            })?;
+            if field_type == CustomFieldType::Enum {
+                return Err(metadata_error(
+                    path,
+                    format!("enum field `{field_name}` must declare values"),
+                ));
+            }
+            Ok(CustomFieldDefinition {
+                field_type,
+                required: false,
+                values: Vec::new(),
+            })
+        }
+        serde_json::Value::Array(values) => {
+            if values.is_empty() || values.iter().any(|value| !value.is_string()) {
+                return Err(metadata_error(
+                    path,
+                    format!("enum field `{field_name}` values must be a non-empty string array"),
+                ));
+            }
+            Ok(CustomFieldDefinition {
+                field_type: CustomFieldType::Enum,
+                required: false,
+                values: values
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .collect(),
+            })
+        }
+        serde_json::Value::Object(object) => {
+            let field_type = object
+                .get("type")
+                .or_else(|| object.get("fieldType"))
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| {
+                    (object.contains_key("enum")
+                        || object.contains_key("values")
+                        || object.contains_key("options")
+                        || object.contains_key("allowed"))
+                    .then_some("enum")
+                })
+                .and_then(parse_custom_field_type)
+                .ok_or_else(|| {
+                    metadata_error(
+                        path,
+                        format!("field `{field_name}` must declare a supported type"),
+                    )
+                })?;
+            let required = match object.get("required") {
+                None => false,
+                Some(value) => value.as_bool().ok_or_else(|| {
+                    metadata_error(
+                        path,
+                        format!("field `{field_name}` required must be a boolean"),
+                    )
+                })?,
+            };
+            let values = if field_type == CustomFieldType::Enum {
+                parse_enum_values(object, path, field_name)?
+            } else {
+                Vec::new()
+            };
+
+            Ok(CustomFieldDefinition {
+                field_type,
+                required,
+                values,
+            })
+        }
+        _ => Err(metadata_error(
+            path,
+            format!("field `{field_name}` declaration must be a type or object"),
+        )),
+    }
+}
+
+fn parse_required_fields(
+    value: &serde_json::Value,
+    declarations: &mut HashMap<String, CustomFieldDefinition>,
+    path: &Path,
+) -> io::Result<()> {
+    match value {
+        serde_json::Value::Array(fields) => {
+            for field in fields {
+                let field_name = field.as_str().ok_or_else(|| {
+                    metadata_error(path, "schema required entries must be strings")
+                })?;
+                let declaration = declarations.get_mut(field_name).ok_or_else(|| {
+                    metadata_error(
+                        path,
+                        format!("required field `{field_name}` has no type declaration"),
+                    )
+                })?;
+                declaration.required = true;
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            for (field_name, required) in fields {
+                let required = required.as_bool().ok_or_else(|| {
+                    metadata_error(
+                        path,
+                        format!("required flag for field `{field_name}` must be a boolean"),
+                    )
+                })?;
+                if !required {
+                    continue;
+                }
+                let declaration = declarations.get_mut(field_name).ok_or_else(|| {
+                    metadata_error(
+                        path,
+                        format!("required field `{field_name}` has no type declaration"),
+                    )
+                })?;
+                declaration.required = true;
+            }
+        }
+        _ => {
+            return Err(metadata_error(
+                path,
+                "schema required must be an array or object",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn parse_schema_declaration(
+    value: &serde_json::Value,
+    path: &Path,
+) -> io::Result<CustomFieldsSchemaDeclaration> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| metadata_error(path, "schema declaration must be an object"))?;
+    let mut fields = HashMap::new();
+    if let Some(declarations) = object.get("fields").or_else(|| object.get("types")) {
+        if let Some(declarations) = declarations.as_object() {
+            for (field_name, definition) in declarations {
+                fields.insert(
+                    field_name.clone(),
+                    parse_custom_field_definition(field_name, definition, path)?,
+                );
+            }
+        } else if let Some(declarations) = declarations.as_array() {
+            for declaration in declarations {
+                let declaration = declaration
+                    .as_object()
+                    .ok_or_else(|| metadata_error(path, "schema fields entries must be objects"))?;
+                let field_name = declaration
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| metadata_error(path, "schema fields entries need a name"))?;
+                fields.insert(
+                    field_name.to_string(),
+                    parse_custom_field_definition(
+                        field_name,
+                        &serde_json::Value::Object(declaration.clone()),
+                        path,
+                    )?,
+                );
+            }
+        } else {
+            return Err(metadata_error(
+                path,
+                "schema fields must be an object or array",
+            ));
+        }
+    } else {
+        for (field_name, definition) in object {
+            if field_name == "required" {
+                continue;
+            }
+            fields.insert(
+                field_name.clone(),
+                parse_custom_field_definition(field_name, definition, path)?,
+            );
+        }
+    }
+
+    if let Some(required) = object.get("required") {
+        parse_required_fields(required, &mut fields, path)?;
+    }
+
+    Ok(CustomFieldsSchemaDeclaration { fields })
+}
+
+fn is_schema_marker(key: &str, value: &serde_json::Value) -> bool {
+    // `$schema` is the documented opt-in marker. Do not reserve look-alike
+    // filenames such as `schema` or `__schema`: older metadata may contain
+    // entries with those names and must continue to load unchanged.
+    key == "$schema" && value.is_object()
+}
+
+fn parse_custom_fields_document(
+    value: serde_json::Value,
+    path: &Path,
+) -> io::Result<CustomFieldsDocument> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| metadata_error(path, "metadata root must be an object"))?;
+    let mut schema_key = None;
+    let mut schema_value = None;
+    let mut schema = None;
+    let mut entries = HashMap::new();
+
+    for (key, value) in object {
+        if is_schema_marker(key, value) {
+            if schema.is_some() {
+                return Err(metadata_error(
+                    path,
+                    "metadata contains more than one schema",
+                ));
+            }
+            schema_key = Some(key.clone());
+            schema_value = Some(value.clone());
+            schema = Some(parse_schema_declaration(value, path)?);
+            continue;
+        }
+
+        let fields = value.as_object().ok_or_else(|| {
+            metadata_error(path, format!("metadata entry `{key}` must be an object"))
+        })?;
+        entries.insert(
+            key.clone(),
+            fields
+                .iter()
+                .map(|(field, value)| (field.clone(), value.clone()))
+                .collect(),
+        );
+    }
+
+    let document = CustomFieldsDocument {
+        schema_key,
+        schema_value,
+        schema,
+        entries,
+    };
+    validate_custom_fields_document(&document, path)?;
+    Ok(document)
+}
+
+fn custom_value_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+fn custom_field_type_label(field_type: CustomFieldType) -> &'static str {
+    match field_type {
+        CustomFieldType::String => "string",
+        CustomFieldType::Number => "number",
+        CustomFieldType::Boolean => "boolean",
+        CustomFieldType::StringArray => "string-array",
+        CustomFieldType::Date => "date (YYYY-MM-DD)",
+        CustomFieldType::Url => "url",
+        CustomFieldType::Enum => "enum",
+    }
+}
+
+fn is_valid_date(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return false;
+    }
+    if !bytes
+        .iter()
+        .enumerate()
+        .all(|(index, byte)| index == 4 || index == 7 || byte.is_ascii_digit())
+    {
+        return false;
+    }
+    let year = value[0..4].parse::<u32>().unwrap_or(0);
+    let month = value[5..7].parse::<u32>().unwrap_or(0);
+    let day = value[8..10].parse::<u32>().unwrap_or(0);
+    if year == 0 || !(1..=12).contains(&month) || day == 0 {
+        return false;
+    }
+    let leap_year = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_month = match month {
+        2 if leap_year => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    day <= days_in_month
+}
+
+fn is_valid_url(value: &str) -> bool {
+    if value.is_empty()
+        || value
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+    {
+        return false;
+    }
+
+    let Ok(url) = url::Url::parse(value) else {
+        return false;
+    };
+
+    // Keep this in step with the UI's `new URL(value)` plus hostname check:
+    // schemes without a host (for example `mailto:` and `file:`) are not
+    // accepted as metadata URLs, while malformed ports are rejected by the
+    // parser instead of being treated as part of the hostname.
+    !url.scheme().is_empty() && url.host_str().is_some_and(|host| !host.is_empty())
+}
+
+fn validate_custom_field_value(
+    value: &serde_json::Value,
+    definition: &CustomFieldDefinition,
+) -> Result<(), String> {
+    let valid = match definition.field_type {
+        CustomFieldType::String => value.is_string(),
+        CustomFieldType::Number => value.is_number(),
+        CustomFieldType::Boolean => value.is_boolean(),
+        CustomFieldType::StringArray => value
+            .as_array()
+            .map(|values| values.iter().all(serde_json::Value::is_string))
+            .unwrap_or(false),
+        CustomFieldType::Date => value.as_str().is_some_and(is_valid_date),
+        CustomFieldType::Url => value.as_str().is_some_and(is_valid_url),
+        CustomFieldType::Enum => value
+            .as_str()
+            .is_some_and(|value| definition.values.iter().any(|allowed| allowed == value)),
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(format!(
+            "expected {}, got {}",
+            custom_field_type_label(definition.field_type),
+            custom_value_kind(value)
+        ))
+    }
+}
+
+fn is_legacy_custom_field_value(value: &serde_json::Value) -> bool {
+    value.is_null()
+        || value.is_string()
+        || value.is_number()
+        || value.is_boolean()
+        || value
+            .as_array()
+            .map(|values| values.iter().all(serde_json::Value::is_string))
+            .unwrap_or(false)
+}
+
+fn validate_custom_fields_document(document: &CustomFieldsDocument, path: &Path) -> io::Result<()> {
+    let Some(schema) = document.schema.as_ref() else {
+        return Ok(());
+    };
+
+    for (file_name, fields) in &document.entries {
+        for (field_name, definition) in &schema.fields {
+            let Some(value) = fields.get(field_name) else {
+                if definition.required {
+                    return Err(metadata_error(
+                        path,
+                        format!("field `{file_name}.{field_name}` is required"),
+                    ));
+                }
+                continue;
+            };
+            validate_custom_field_value(value, definition).map_err(|reason| {
+                metadata_error(path, format!("field `{file_name}.{field_name}` {reason}"))
+            })?;
+        }
+        for (field_name, value) in fields {
+            if !schema.fields.contains_key(field_name) && !is_legacy_custom_field_value(value) {
+                return Err(metadata_error(
+                    path,
+                    format!(
+                        "field `{file_name}.{field_name}` expected a supported custom value, got {}",
+                        custom_value_kind(value)
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn custom_fields_document_value(document: &CustomFieldsDocument) -> serde_json::Value {
+    let mut object = serde_json::Map::new();
+    if let (Some(schema_key), Some(schema_value)) =
+        (document.schema_key.as_ref(), document.schema_value.as_ref())
+    {
+        object.insert(schema_key.clone(), schema_value.clone());
+    }
+    for (file_name, fields) in &document.entries {
+        object.insert(
+            file_name.clone(),
+            serde_json::Value::Object(fields.clone().into_iter().collect()),
+        );
+    }
+    serde_json::Value::Object(object)
+}
+
 /// Load custom fields from .explorie.json file in a directory.
 ///
 /// Invalid metadata is returned to the caller instead of being treated as an
@@ -147,13 +664,10 @@ fn load_custom_fields(
     }
 
     let content = fs::read_to_string(&explorie_json_path)?;
-    let parsed: HashMap<String, HashMap<String, serde_json::Value>> =
-        serde_json::from_str(&content).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Invalid {}: {error}", explorie_json_path.display()),
-            )
-        })?;
+    let parsed_value: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|error| metadata_error(&explorie_json_path, error.to_string()))?;
+    let document = parse_custom_fields_document(parsed_value, &explorie_json_path)?;
+    let parsed = document.entries;
 
     if let Ok(mut cache) = custom_fields_cache().write() {
         if cache.entries.len() >= CUSTOM_FIELDS_CACHE_LIMIT
@@ -212,10 +726,7 @@ fn atomic_replace(source: &Path, destination: &Path) -> io::Result<()> {
     fs::rename(source, destination)
 }
 
-fn write_custom_fields_atomic(
-    dir_path: &Path,
-    fields: &HashMap<String, HashMap<String, serde_json::Value>>,
-) -> io::Result<()> {
+fn write_custom_fields_atomic(dir_path: &Path, fields: &serde_json::Value) -> io::Result<()> {
     let destination = dir_path.join(".explorie.json");
     let temporary = dir_path.join(format!(".explorie.{}.tmp", Uuid::new_v4()));
     let bytes = serde_json::to_vec_pretty(fields)
@@ -575,7 +1086,8 @@ pub fn list_dir(path: &Path) -> io::Result<Vec<FileEntry>> {
 /// # Arguments
 ///
 /// * `dir_path` - Directory where `.explorie.json` will be created
-/// * `fields` - Map of filename -> field map
+/// * `fields` - Map of filename -> field map. An optional `$schema` entry may
+///   contain `fields` with typed declarations and `required` flags.
 ///
 /// # Example
 ///
@@ -596,10 +1108,14 @@ pub fn create_explorie_schema(
     dir_path: &Path,
     fields: HashMap<String, HashMap<String, serde_json::Value>>,
 ) -> io::Result<()> {
+    let metadata = serde_json::to_value(fields)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let metadata_path = dir_path.join(".explorie.json");
+    let document = parse_custom_fields_document(metadata, &metadata_path)?;
     let _guard = custom_fields_write_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    write_custom_fields_atomic(dir_path, &fields)
+    write_custom_fields_atomic(dir_path, &custom_fields_document_value(&document))
 }
 
 /// Update custom fields for a specific file in `.explorie.json`.
@@ -638,29 +1154,65 @@ pub fn update_custom_fields(
     file_name: &str,
     custom_fields: HashMap<String, serde_json::Value>,
 ) -> io::Result<()> {
+    update_custom_fields_batch(
+        dir_path,
+        HashMap::from([(file_name.to_string(), custom_fields)]),
+    )
+}
+
+/// Update custom fields for multiple files with one validated atomic write.
+///
+/// Every update replaces the complete field map for its file. All updates are
+/// validated against the directory's optional schema before `.explorie.json`
+/// is replaced, so a rejected item leaves every existing entry untouched.
+pub fn update_custom_fields_batch(
+    dir_path: &Path,
+    updates: HashMap<String, HashMap<String, serde_json::Value>>,
+) -> io::Result<()> {
+    if updates.is_empty() {
+        return Ok(());
+    }
+
     let explorie_json_path = dir_path.join(".explorie.json");
     let _guard = custom_fields_write_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    // Load existing schema or create empty one
-    let mut schema: HashMap<String, HashMap<String, serde_json::Value>> =
-        if explorie_json_path.exists() {
-            let content = fs::read_to_string(&explorie_json_path)?;
-            serde_json::from_str(&content).map_err(|error| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("Invalid {}: {error}", explorie_json_path.display()),
-                )
-            })?
-        } else {
-            HashMap::new()
-        };
+    let mut document = if explorie_json_path.exists() {
+        let content = fs::read_to_string(&explorie_json_path)?;
+        let metadata: serde_json::Value = serde_json::from_str(&content)
+            .map_err(|error| metadata_error(&explorie_json_path, error.to_string()))?;
+        parse_custom_fields_document(metadata, &explorie_json_path)?
+    } else {
+        CustomFieldsDocument {
+            schema_key: None,
+            schema_value: None,
+            schema: None,
+            entries: HashMap::new(),
+        }
+    };
 
-    // Update the fields for this file
-    schema.insert(file_name.to_string(), custom_fields);
+    for (file_name, custom_fields) in updates {
+        document.entries.insert(file_name, custom_fields);
+    }
+    validate_custom_fields_document(&document, &explorie_json_path)?;
 
-    write_custom_fields_atomic(dir_path, &schema)
+    write_custom_fields_atomic(dir_path, &custom_fields_document_value(&document))
+}
+
+/// Read the optional typed custom-field schema for a directory.
+pub fn get_custom_fields_schema(
+    dir_path: &Path,
+) -> io::Result<Option<CustomFieldsSchemaDeclaration>> {
+    let metadata_path = dir_path.join(".explorie.json");
+    if !metadata_path.exists() {
+        return Ok(None);
+    }
+
+    let content = fs::read_to_string(&metadata_path)?;
+    let metadata: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|error| metadata_error(&metadata_path, error.to_string()))?;
+    Ok(parse_custom_fields_document(metadata, &metadata_path)?.schema)
 }
 
 #[cfg(test)]

@@ -173,4 +173,60 @@ describe('fs utils', () => {
     );
     expect(errorSpy).toHaveBeenCalled();
   });
+
+  it('delegates a directory batch custom-field update as one native call', async () => {
+    const { updateCustomFieldsBatch } = await import('./fs');
+    invokeMock.mockResolvedValueOnce(undefined);
+
+    await updateCustomFieldsBatch('/dir', {
+      'one.txt': { state: 'done' },
+      'two.txt': { state: 'done' },
+    });
+
+    expect(invokeMock).toHaveBeenCalledWith('update_custom_fields_batch', {
+      dir_path: '/dir',
+      updates: {
+        'one.txt': { state: 'done' },
+        'two.txt': { state: 'done' },
+      },
+    });
+  });
+
+  it('passes typed schema declarations through the create command', async () => {
+    const { createExplorieSchemaBatch } = await import('./fs');
+    invokeMock.mockResolvedValueOnce(undefined);
+
+    await createExplorieSchemaBatch('/dir', {
+      $schema: {
+        fields: {
+          dueDate: { type: 'date', required: true },
+          source: { type: 'url' },
+          state: { type: 'enum', values: ['draft', 'published'] },
+        },
+      },
+    });
+
+    expect(invokeMock).toHaveBeenCalledWith('create_explorie_schema', {
+      dir_path: '/dir',
+      fields: {
+        $schema: {
+          fields: {
+            dueDate: { type: 'date', required: true },
+            source: { type: 'url' },
+            state: { type: 'enum', values: ['draft', 'published'] },
+          },
+        },
+      },
+    });
+  });
+
+  it('reads a directory custom-field schema through the native command', async () => {
+    const { getCustomFieldsSchema } = await import('./fs');
+    invokeMock.mockResolvedValueOnce({ fields: { rating: { type: 'number' } } });
+
+    await expect(getCustomFieldsSchema('/dir')).resolves.toEqual({
+      fields: { rating: { type: 'number' } },
+    });
+    expect(invokeMock).toHaveBeenCalledWith('get_custom_fields_schema', { dir_path: '/dir' });
+  });
 });

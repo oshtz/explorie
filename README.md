@@ -264,6 +264,30 @@ explorie reads optional `.explorie.json` files from folders to attach custom fie
 }
 ```
 
+Typed validation is opt-in through a `$schema` entry. Declarations may mark a
+field as `required` and accept `string`, `number`, `boolean`, `string-array`,
+`date` (`YYYY-MM-DD`), `url`, or `enum` values:
+
+```json
+{
+  "$schema": {
+    "fields": {
+      "dueDate": { "type": "date", "required": true },
+      "source": { "type": "url" },
+      "state": { "type": "enum", "values": ["draft", "published"] }
+    }
+  },
+  "report.pdf": {
+    "dueDate": "2026-08-09",
+    "source": "https://example.com/report",
+    "state": "draft"
+  }
+}
+```
+
+Files without `$schema` keep the existing loose metadata behavior. Typed
+validation is performed in the Rust core before any metadata write.
+
 The metadata stays next to your files and is not synced by explorie itself.
 
 ---

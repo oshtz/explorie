@@ -1,0 +1,75 @@
+.backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: grid;
+  place-items: center;
+  background: rgb(0 0 0 / 50%);
+}
+
+.dialog {
+  width: min(420px, calc(100vw - 32px));
+  display: grid;
+  gap: var(--padding-xs);
+  padding: var(--padding-lg);
+  color: var(--fg-primary);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-primary);
+  box-shadow: 0 16px 48px rgb(0 0 0 / 30%);
+}
+
+.dialog h2 {
+  margin: 0;
+  color: var(--fg-title);
+  font-size: calc(16px * var(--font-scale));
+}
+
+.description {
+  margin: 0 0 var(--padding-sm);
+  color: var(--fg-secondary);
+  font-size: calc(12px * var(--font-scale));
+}
+
+.label {
+  color: var(--fg-title);
+  font-size: calc(12px * var(--font-scale));
+}
+
+.dialog input,
+.dialog select {
+  width: 100%;
+  padding: 6px 8px;
+  color: var(--fg-primary);
+  background: var(--bg-primary);
+  border: 1px solid var(--border-primary);
+}
+
+.hint {
+  color: var(--fg-secondary);
+  font-size: calc(11px * var(--font-scale));
+}
+
+.error {
+  color: var(--accent-red);
+  font-size: calc(12px * var(--font-scale));
+}
+
+.actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--padding-sm);
+  margin-top: var(--padding-sm);
+}
+
+.actions button {
+  padding: 5px 10px;
+  color: var(--fg-primary);
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-primary);
+  cursor: pointer;
+}
+
+.actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}

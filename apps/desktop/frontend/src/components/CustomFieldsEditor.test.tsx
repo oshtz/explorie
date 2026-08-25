@@ -6,12 +6,14 @@ import type { FileEntry } from '../store';
 import { CustomFieldsEditor } from './CustomFieldsEditor';
 
 const mocks = vi.hoisted(() => ({
+  getCustomFieldsSchema: vi.fn(),
   updateCustomFields: vi.fn(),
   reportError: vi.fn(),
   showToast: vi.fn(),
 }));
 
 vi.mock('../utils/fs', () => ({
+  getCustomFieldsSchema: mocks.getCustomFieldsSchema,
   updateCustomFields: mocks.updateCustomFields,
 }));
 
@@ -49,6 +51,7 @@ function getFieldRow(label: string): HTMLElement {
 
 describe('CustomFieldsEditor', () => {
   beforeEach(() => {
+    mocks.getCustomFieldsSchema.mockResolvedValue(null);
     mocks.updateCustomFields.mockResolvedValue(undefined);
   });
 
@@ -175,6 +178,71 @@ describe('CustomFieldsEditor', () => {
         toast: mocks.showToast,
       })
     );
+    expect(
+      screen
+        .getAllByRole('alert')
+        .some((element) => element.textContent?.includes('metadata denied'))
+    ).toBe(true);
     expect(screen.getByText('Todo')).toBeInTheDocument();
+  });
+
+  it('renders schema-aware number input and persists a number', async () => {
+    const user = userEvent.setup();
+    render(
+      <CustomFieldsEditor
+        file={createFile({ custom: {} })}
+        schema={{ fields: { count: { type: 'number' } } }}
+      />
+    );
+
+    await user.type(screen.getByPlaceholderText('Field name'), 'count');
+    const value = screen.getByPlaceholderText('Value');
+    expect(value).toHaveAttribute('type', 'number');
+    await user.type(value, '7');
+    await user.click(screen.getByRole('button', { name: 'Add Field' }));
+
+    await waitFor(() =>
+      expect(mocks.updateCustomFields).toHaveBeenCalledWith('/Users/test', 'file.txt', {
+        count: 7,
+      })
+    );
+  });
+
+  it('renders schema-aware boolean input and persists a boolean', async () => {
+    const user = userEvent.setup();
+    render(
+      <CustomFieldsEditor
+        file={createFile({ custom: {} })}
+        schema={{ fields: { enabled: { type: 'boolean' } } }}
+      />
+    );
+
+    await user.type(screen.getByPlaceholderText('Field name'), 'enabled');
+    const value = screen.getByRole('combobox');
+    await user.selectOptions(value, 'true');
+    await user.click(screen.getByRole('button', { name: 'Add Field' }));
+
+    await waitFor(() =>
+      expect(mocks.updateCustomFields).toHaveBeenCalledWith('/Users/test', 'file.txt', {
+        enabled: true,
+      })
+    );
+  });
+
+  it('reports typed validation errors inline without writing', async () => {
+    const user = userEvent.setup();
+    render(
+      <CustomFieldsEditor
+        file={createFile({ custom: {} })}
+        schema={{ fields: { website: { type: 'url' } } }}
+      />
+    );
+
+    await user.type(screen.getByPlaceholderText('Field name'), 'website');
+    await user.type(screen.getByPlaceholderText('Value'), 'https://example.com:bad');
+    await user.click(screen.getByRole('button', { name: 'Add Field' }));
+
+    expect((await screen.findAllByRole('alert'))[0]).toHaveTextContent('website: Expected url');
+    expect(mocks.updateCustomFields).not.toHaveBeenCalled();
   });
 });

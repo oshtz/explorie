@@ -1,6 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import {
   isCustomFieldValue,
+  validateCustomFieldValue,
+  validateCustomFields,
   isKnownFieldName,
   isStatusValue,
   isPriorityValue,
@@ -8,6 +10,8 @@ import {
   isCategoryValue,
   sanitizeCustomFields,
   validateKnownFieldValue,
+  parseCustomFieldInput,
+  formatCustomFieldInput,
   getValueSuggestions,
   isColumnCandidate,
   formatFieldValue,
@@ -53,6 +57,57 @@ describe('customFieldTypes', () => {
 
     it('should return false for undefined', () => {
       expect(isCustomFieldValue(undefined)).toBe(false);
+    });
+  });
+
+  describe('typed schema validation', () => {
+    it('accepts date, URL, and enum values', () => {
+      expect(validateCustomFieldValue('2026-08-09', { type: 'date' })).toBeNull();
+      expect(validateCustomFieldValue('https://example.com/docs', { type: 'url' })).toBeNull();
+      expect(
+        validateCustomFieldValue('published', {
+          type: 'enum',
+          values: ['draft', 'published'],
+        })
+      ).toBeNull();
+    });
+
+    it('rejects malformed date, URL, and enum values with reasons', () => {
+      expect(validateCustomFieldValue('2026-02-30', { type: 'date' })).toContain('date');
+      expect(validateCustomFieldValue('0000-01-01', { type: 'date' })).toContain('date');
+      expect(validateCustomFieldValue('not a URL', { type: 'url' })).toContain('url');
+      expect(validateCustomFieldValue('https://example.com:bad', { type: 'url' })).toContain('url');
+      expect(
+        validateCustomFieldValue('https://example.com/path with space', { type: 'url' })
+      ).toContain('url');
+      expect(validateCustomFieldValue('https://example.com/%zz', { type: 'url' })).toContain('url');
+      expect(
+        validateCustomFieldValue('archived', { type: 'enum', values: ['draft', 'published'] })
+      ).toContain('enum');
+    });
+
+    it('reports required and typed field violations by name', () => {
+      expect(
+        validateCustomFields(
+          { website: 'not a URL' },
+          {
+            fields: {
+              dueDate: { type: 'date', required: true },
+              website: { type: 'url' },
+            },
+          }
+        )
+      ).toEqual({
+        dueDate: 'This field is required',
+        website: 'Expected url',
+      });
+    });
+
+    it('converts typed editor input to JSON values', () => {
+      expect(parseCustomFieldInput('4.5', { type: 'number' })).toBe(4.5);
+      expect(parseCustomFieldInput('true', { type: 'boolean' })).toBe(true);
+      expect(parseCustomFieldInput('one, two', { type: 'string-array' })).toEqual(['one', 'two']);
+      expect(formatCustomFieldInput(['one', 'two'])).toBe('one, two');
     });
   });
 

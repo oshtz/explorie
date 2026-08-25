@@ -402,6 +402,14 @@ fn open_remote_drive_helper_settings() -> Result<(), String> {
 }
 
 #[tauri::command]
+fn get_custom_fields_schema(
+    dir_path: String,
+) -> Result<Option<explorie_core::CustomFieldsSchemaDeclaration>, String> {
+    let path = Path::new(&dir_path);
+    explorie_core::get_custom_fields_schema(path).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn create_explorie_schema(
     dir_path: String,
     fields: HashMap<String, HashMap<String, Value>>,
@@ -418,6 +426,15 @@ fn update_custom_fields(
 ) -> Result<(), String> {
     let path = Path::new(&dir_path);
     explorie_core::update_custom_fields(path, &file_name, custom_fields).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn update_custom_fields_batch(
+    dir_path: String,
+    updates: HashMap<String, HashMap<String, Value>>,
+) -> Result<(), String> {
+    let path = Path::new(&dir_path);
+    explorie_core::update_custom_fields_batch(path, updates).map_err(|e| e.to_string())
 }
 
 #[derive(Serialize)]
@@ -2153,7 +2170,9 @@ fn main() {
             create_website_link,
             delete_path_permanently,
             create_explorie_schema,
+            get_custom_fields_schema,
             update_custom_fields,
+            update_custom_fields_batch,
             open_path,
             reveal_in_file_manager,
             quick_look,
