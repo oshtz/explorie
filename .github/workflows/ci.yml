@@ -93,6 +93,9 @@ jobs:
           node scripts/prepare-rclone.mjs
           node scripts/prepare-winfsp.mjs
 
+      - name: Test native integration smoke on Windows
+        run: cargo test -p explorie-desktop native_integration -- --nocapture
+
       - name: Run tests with coverage
         run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
 
@@ -147,6 +150,12 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      - name: Prepare native dependencies
+        run: node scripts/prepare-rclone.mjs
+
+      - name: Test native integration smoke on macOS
+        run: cargo test -p explorie-desktop native_integration -- --nocapture
 
       - name: Build macOS application
         run: pnpm --filter explorie-desktop exec -- tauri build --no-bundle --ci -- --locked

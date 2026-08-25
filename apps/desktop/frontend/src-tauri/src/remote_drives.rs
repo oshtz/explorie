@@ -1050,13 +1050,7 @@ mod macos {
     }
 
     pub fn status() -> String {
-        match unsafe { explorie_mount_helper_status() } {
-            0 => "not-registered",
-            1 => "enabled",
-            2 => "approval-required",
-            _ => "unavailable",
-        }
-        .to_string()
+        super::map_macos_helper_status(unsafe { explorie_mount_helper_status() }).to_string()
     }
 
     pub fn register() -> Result<String, String> {
@@ -1108,13 +1102,23 @@ mod macos {
     }
 }
 
+#[cfg(any(test, target_os = "macos"))]
+pub(crate) fn map_macos_helper_status(code: i32) -> &'static str {
+    match code {
+        0 => "not-registered",
+        1 => "enabled",
+        2 => "approval-required",
+        _ => "unavailable",
+    }
+}
+
 #[cfg(target_os = "macos")]
-fn macos_helper_status() -> Option<String> {
+pub(crate) fn macos_helper_status() -> Option<String> {
     Some(macos::status())
 }
 
 #[cfg(not(target_os = "macos"))]
-fn macos_helper_status() -> Option<String> {
+pub(crate) fn macos_helper_status() -> Option<String> {
     None
 }
 

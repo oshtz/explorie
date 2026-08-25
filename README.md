@@ -227,6 +227,7 @@ Before creating a new tag, manually verify:
 - Exercise copy, move, rename, delete/trash, undo/redo, archive, and extract flows on disposable files.
 - Reopen the app and confirm persisted settings.
 - Confirm Windows and macOS packaged-app behavior on real machines.
+- Confirm GUI-only Explorer, Finder, Quick Look, and Open With presentation on packaged apps; headless CI covers adapters only.
 - Remove or uninstall v0.1.0 before first running v0.2.6; the permanent `com.omershatz.explorie` identity intentionally starts a clean application lineage.
 - Run the Windows portable executable and install the macOS package on real machines, confirm the Windows unsigned warning is expected, and verify macOS signing/notarization plus both SHA-256 manifests.
 

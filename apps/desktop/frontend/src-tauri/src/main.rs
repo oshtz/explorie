@@ -1,6 +1,7 @@
 // Prevents a terminal window from appearing on Windows
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod native_integration;
 mod remote_drives;
 
 use explorie_core::archive::{
@@ -21,6 +22,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+use native_integration::SystemIntegrationStatus;
 use remote_drives::{
     DisconnectResult, RemoteDriveEnvironment, RemoteDriveManager, RemoteDriveProfile,
     RemoteDriveStatus,
@@ -107,13 +109,6 @@ struct TextPreview {
     truncated: bool,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SystemIntegrationStatus {
-    supported: bool,
-    enabled: bool,
-}
-
 fn launch_directory_from_args(args: impl IntoIterator<Item = OsString>) -> Option<String> {
     args.into_iter()
         .skip(1)
@@ -127,148 +122,14 @@ fn get_launch_path() -> Option<String> {
     launch_directory_from_args(std::env::args_os())
 }
 
-#[cfg(target_os = "windows")]
-mod windows_integration {
-    use std::io;
-    use std::os::windows::process::CommandExt;
-    use std::path::Path;
-    use std::process::Command;
-
-    const CREATE_NO_WINDOW: u32 = 0x08000000;
-    const MENU_KEYS: [(&str, &str); 3] = [
-        (r"HKCU\Software\Classes\Directory\shell\Explorie", "%1"),
-        (r"HKCU\Software\Classes\Drive\shell\Explorie", "%1"),
-        (
-            r"HKCU\Software\Classes\Directory\Background\shell\Explorie",
-            "%V",
-        ),
-    ];
-
-    fn reg() -> Command {
-        let mut command = Command::new("reg.exe");
-        command.creation_flags(CREATE_NO_WINDOW);
-        command
-    }
-
-    fn run(command: &mut Command) -> io::Result<()> {
-        let output = command.output()?;
-        if output.status.success() {
-            Ok(())
-        } else {
-            Err(io::Error::other(
-                String::from_utf8_lossy(&output.stderr).trim().to_string(),
-            ))
-        }
-    }
-
-    fn key_exists(key: &str) -> io::Result<bool> {
-        Ok(reg().args(["query", key]).status()?.success())
-    }
-
-    fn add_value(key: &str, name: Option<&str>, value: &str) -> io::Result<()> {
-        let mut command = reg();
-        command.args(["add", key]);
-        if let Some(name) = name {
-            command.args(["/v", name]);
-        } else {
-            command.arg("/ve");
-        }
-        run(command.args(["/d", value, "/f"]))
-    }
-
-    fn remove() -> io::Result<()> {
-        for (key, _) in MENU_KEYS {
-            if key_exists(key)? {
-                run(reg().args(["delete", key, "/f"]))?;
-            }
-        }
-        Ok(())
-    }
-
-    pub fn enabled() -> io::Result<bool> {
-        for (key, _) in MENU_KEYS {
-            if !key_exists(key)? {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-
-    pub fn set_enabled(enabled: bool) -> io::Result<()> {
-        if !enabled {
-            return remove();
-        }
-
-        let executable = std::env::current_exe()?;
-        let icon = executable.to_string_lossy();
-        for (key, path_argument) in MENU_KEYS {
-            let result = (|| {
-                add_value(key, None, "Open in Explorie")?;
-                add_value(key, Some("Icon"), &icon)?;
-                add_value(
-                    &format!(r"{key}\command"),
-                    None,
-                    &shell_command(&executable, path_argument),
-                )
-            })();
-            if let Err(error) = result {
-                let _ = remove();
-                return Err(error);
-            }
-        }
-        Ok(())
-    }
-
-    fn shell_command(executable: &Path, path_argument: &str) -> String {
-        format!(r#""{}" "{}""#, executable.display(), path_argument)
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn shell_command_quotes_executable_and_folder() {
-            assert_eq!(
-                shell_command(Path::new(r"C:\Program Files\Explorie\explorie.exe"), "%1"),
-                r#""C:\Program Files\Explorie\explorie.exe" "%1""#
-            );
-        }
-    }
-}
-
 #[tauri::command]
 fn get_system_integration_status() -> Result<SystemIntegrationStatus, String> {
-    #[cfg(target_os = "windows")]
-    {
-        windows_integration::enabled()
-            .map(|enabled| SystemIntegrationStatus {
-                supported: true,
-                enabled,
-            })
-            .map_err(|error| error.to_string())
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    Ok(SystemIntegrationStatus {
-        supported: false,
-        enabled: false,
-    })
+    native_integration::system_integration_status()
 }
 
 #[tauri::command]
 fn set_system_integration(enabled: bool) -> Result<SystemIntegrationStatus, String> {
-    #[cfg(target_os = "windows")]
-    {
-        windows_integration::set_enabled(enabled).map_err(|error| error.to_string())?;
-        get_system_integration_status()
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = enabled;
-        Err("System integration is currently available only on Windows.".to_string())
-    }
+    native_integration::set_system_integration(enabled)
 }
 
 #[tauri::command]
@@ -1098,241 +959,31 @@ fn reveal_in_file_manager(path: String) -> Result<(), String> {
     }
 }
 
-/// Open Quick Look preview for a file (macOS only)
-#[cfg(target_os = "macos")]
 #[tauri::command]
 fn quick_look(path: String) -> Result<(), String> {
-    Command::new("qlmanage")
-        .args(["-p", &path])
-        .spawn()
-        .map_err(|e| format!("Failed to open Quick Look: {}", e))?;
-    Ok(())
+    native_integration::launch_quick_look(&path)
 }
 
-#[cfg(not(target_os = "macos"))]
-#[tauri::command]
-fn quick_look(_path: String) -> Result<(), String> {
-    Err("Quick Look is only available on macOS.".to_string())
-}
-
-/// Get Finder tags for a file (macOS only)
-/// Returns a list of tag names
-#[cfg(target_os = "macos")]
 #[tauri::command]
 fn get_finder_tags(path: String) -> Result<Vec<String>, String> {
-    use std::ffi::CString;
-
-    let c_path = CString::new(path.as_bytes()).map_err(|_| "Invalid path")?;
-
-    // Get the com.apple.metadata:_kMDItemUserTags xattr
-    let attr_name = CString::new("com.apple.metadata:_kMDItemUserTags")
-        .map_err(|_| "Invalid attribute name")?;
-
-    // First, get the size of the xattr value
-    let size = unsafe {
-        libc::getxattr(
-            c_path.as_ptr(),
-            attr_name.as_ptr(),
-            std::ptr::null_mut(),
-            0,
-            0,
-            libc::XATTR_NOFOLLOW,
-        )
-    };
-
-    if size < 0 {
-        // No tags or error - return empty list
-        return Ok(Vec::new());
-    }
-
-    // Allocate buffer and read the xattr
-    let mut buffer = vec![0u8; size as usize];
-    let read_size = unsafe {
-        libc::getxattr(
-            c_path.as_ptr(),
-            attr_name.as_ptr(),
-            buffer.as_mut_ptr() as *mut libc::c_void,
-            size as usize,
-            0,
-            libc::XATTR_NOFOLLOW,
-        )
-    };
-
-    if read_size < 0 {
-        return Ok(Vec::new());
-    }
-
-    // Parse the plist data - tags are stored as a binary plist array
-    // For simplicity, we'll use the mdls command which is more reliable
-    let output = Command::new("mdls")
-        .args(["-name", "kMDItemUserTags", "-raw", &path])
-        .output()
-        .map_err(|e| e.to_string())?;
-
-    if !output.status.success() {
-        return Ok(Vec::new());
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    // Parse the output which looks like: (tag1, tag2, tag3) or (null)
-    let tags: Vec<String> = stdout
-        .trim()
-        .trim_start_matches('(')
-        .trim_end_matches(')')
-        .split(',')
-        .map(|s| s.trim().trim_matches('"').to_string())
-        .filter(|s| !s.is_empty() && s != "null")
-        .collect();
-
-    Ok(tags)
+    native_integration::get_finder_tags(&path)
 }
 
-#[cfg(not(target_os = "macos"))]
-#[tauri::command]
-fn get_finder_tags(_path: String) -> Result<Vec<String>, String> {
-    // Return empty list on non-macOS platforms
-    Ok(Vec::new())
-}
-
-/// Set Finder tags for a file (macOS only)
-#[cfg(target_os = "macos")]
 #[tauri::command]
 fn set_finder_tags(path: String, tags: Vec<String>) -> Result<(), String> {
-    // Use xattr command to set tags (more reliable than direct xattr manipulation)
-    // Tags are stored in com.apple.metadata:_kMDItemUserTags as a binary plist
-
-    // First, clear existing tags by removing the xattr
-    let _ = Command::new("xattr")
-        .args(["-d", "com.apple.metadata:_kMDItemUserTags", &path])
-        .output();
-
-    if tags.is_empty() {
-        return Ok(());
-    }
-
-    // Create a plist array string
-    let tags_plist: Vec<String> = tags
-        .iter()
-        .map(|t| {
-            format!(
-                "<string>{}</string>",
-                t.replace('&', "&amp;")
-                    .replace('<', "&lt;")
-                    .replace('>', "&gt;")
-            )
-        })
-        .collect();
-
-    let plist_content = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<array>
-{}
-</array>
-</plist>"#,
-        tags_plist.join("\n")
-    );
-
-    // Write to a temp file and use xattr to set it
-    let temp_dir = std::env::temp_dir();
-    let temp_file = temp_dir.join(format!("explorie_tags_{}.plist", std::process::id()));
-
-    std::fs::write(&temp_file, plist_content)
-        .map_err(|e| format!("Failed to write temp file: {}", e))?;
-
-    // Convert plist to binary and set as xattr
-    let output = Command::new("plutil")
-        .args(["-convert", "binary1", temp_file.to_string_lossy().as_ref()])
-        .output()
-        .map_err(|e| e.to_string())?;
-
-    if !output.status.success() {
-        let _ = std::fs::remove_file(&temp_file);
-        return Err("Failed to convert plist to binary".to_string());
-    }
-
-    // Read the binary plist
-    let binary_data =
-        std::fs::read(&temp_file).map_err(|e| format!("Failed to read binary plist: {}", e))?;
-
-    let _ = std::fs::remove_file(&temp_file);
-
-    // Set the xattr using the xattr command with hex encoding
-    use std::ffi::CString;
-    let c_path = CString::new(path.as_bytes()).map_err(|_| "Invalid path")?;
-    let attr_name = CString::new("com.apple.metadata:_kMDItemUserTags")
-        .map_err(|_| "Invalid attribute name")?;
-
-    let result = unsafe {
-        libc::setxattr(
-            c_path.as_ptr(),
-            attr_name.as_ptr(),
-            binary_data.as_ptr() as *const libc::c_void,
-            binary_data.len(),
-            0,
-            libc::XATTR_NOFOLLOW,
-        )
-    };
-
-    if result < 0 {
-        return Err(format!(
-            "Failed to set xattr: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-
-    Ok(())
-}
-
-#[cfg(not(target_os = "macos"))]
-#[tauri::command]
-fn set_finder_tags(_path: String, _tags: Vec<String>) -> Result<(), String> {
-    Err("Finder tags are only available on macOS.".to_string())
+    native_integration::set_finder_tags(&path, &tags)
 }
 
 /// Get available Finder tag colors (macOS only)
 /// Returns a mapping of color names to their index
 #[tauri::command]
 fn get_finder_tag_colors() -> Result<HashMap<String, u8>, String> {
-    let mut colors = HashMap::new();
-    colors.insert("None".to_string(), 0);
-    colors.insert("Gray".to_string(), 1);
-    colors.insert("Green".to_string(), 2);
-    colors.insert("Purple".to_string(), 3);
-    colors.insert("Blue".to_string(), 4);
-    colors.insert("Yellow".to_string(), 5);
-    colors.insert("Red".to_string(), 6);
-    colors.insert("Orange".to_string(), 7);
-    Ok(colors)
+    Ok(native_integration::finder_tag_colors())
 }
 
-/// Open a file with a specific application (macOS only)
-/// Uses the `open` command with -a flag to specify the application
-#[cfg(target_os = "macos")]
 #[tauri::command]
 fn open_with_app(path: String, app_name: String) -> Result<(), String> {
-    Command::new("open")
-        .args(["-a", &app_name, &path])
-        .spawn()
-        .map_err(|e| format!("Failed to open with {}: {}", app_name, e))?;
-    Ok(())
-}
-
-#[cfg(target_os = "windows")]
-#[tauri::command]
-fn open_with_app(path: String, _app_name: String) -> Result<(), String> {
-    Command::new("rundll32.exe")
-        .args(["shell32.dll,OpenAs_RunDLL", &path])
-        .spawn()
-        .map_err(|err| format!("Failed to open Windows Open with: {err}"))?;
-    Ok(())
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-#[tauri::command]
-fn open_with_app(_path: String, _app_name: String) -> Result<(), String> {
-    Err("Open With is unavailable on this platform.".to_string())
+    native_integration::launch_open_with(&path, &app_name)
 }
 
 #[derive(Debug, Clone, Serialize)]
