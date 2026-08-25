@@ -21,9 +21,15 @@ import { getSortableColumnProps, announceSelection } from '../utils/accessibilit
 import type { GetSelectedFilesFunction } from '../hooks/useKeyboardClipboard';
 import { useCentralFileSelection } from '../hooks/useCentralFileSelection';
 import type { DragStartHandler } from '../hooks/useDragStart';
+import { isLink, linkTypeLabel, openEntry } from '../utils/links';
+import { isLinkFollowed } from '../store/slices/fileSlice';
+import { LinkBadge } from './LinkBadge';
 
 const LazyBatchRenameDialog = React.lazy(() =>
   import('./BatchRenameDialog').then((m) => ({ default: m.BatchRenameDialog }))
+);
+const LazyEditLinkTargetDialog = React.lazy(() =>
+  import('./EditLinkTargetDialog').then((m) => ({ default: m.EditLinkTargetDialog }))
 );
 const LazyArchiveDialog = React.lazy(() =>
   import('./ArchiveDialog').then((m) => ({ default: m.ArchiveDialog }))
@@ -413,6 +419,10 @@ function FileTableInner({
   const confirmBeforeDelete = useFileStore((s) => s.confirmBeforeDelete);
   const setConfirmBeforeDelete = useFileStore((s) => s.setConfirmBeforeDelete);
 
+  // Link target editing state
+  const [editLinkTarget, setEditLinkTarget] = useState<FileEntry | null>(null);
+  const linkFollow = useFileStore((s) => s.linkFollow);
+
   React.useEffect(() => {
     let cancelled = false;
     const count = safeFiles.length;
@@ -709,6 +719,27 @@ function FileTableInner({
   const handleArchiveClose = useCallback(() => {
     setArchiveDialog({ open: false, mode: 'compress', files: [] });
   }, []);
+
+  // Link handlers
+  const refreshFiles = useCallback(async () => {
+    const res = await invoke<FileEntry[]>('list_files', {
+      path: containerPath,
+      calc_dir_size: false,
+    });
+    setFiles(withDisplayNames(res));
+  }, [containerPath, setFiles]);
+
+  const handleOpenEntry = useCallback(
+    (file: FileEntry) => {
+      void openEntry(file, {
+        follow: isLinkFollowed(linkFollow, file.path),
+        onFolderOpen,
+        onError: (message, error) =>
+          reportError(message, error, { toast: showToast, context: { path: file.path } }),
+      });
+    },
+    [linkFollow, onFolderOpen, showToast]
+  );
 
   const handleArchiveSuccess = useCallback(async () => {
     // Refresh file list after archive operation
@@ -1046,7 +1077,7 @@ function FileTableInner({
                 role="row"
                 aria-rowindex={index + 2}
                 aria-selected={isSelected}
-                aria-label={`${isDirectory(file) ? 'Folder' : 'File'}: ${fileName}${isSelected ? ', selected' : ''}`}
+                aria-label={`${isLink(file) ? linkTypeLabel(file) : isDirectory(file) ? 'Folder' : 'File'}: ${fileName}${isSelected ? ', selected' : ''}`}
                 className={`${styles.clickable} ${isSelected ? styles.selected : ''} ${isSource ? styles.dragSource : ''} ${combineTargetId === file.id && isDirectory(file) ? styles.dropTargetRow : ''}`}
                 onClick={(e) => handleRowClick(e, index, file)}
                 onContextMenu={(e) => {
@@ -1062,27 +1093,11 @@ function FileTableInner({
                   }
                   contextMenu.openForFiles(e, targetFiles, containerPath);
                 }}
-                onDoubleClick={() => {
-                  if (isDirectory(file)) onFolderOpen?.(file);
-                  else
-                    invoke('open_path', { path: file.path }).catch((err) =>
-                      reportError('Open failed', err, {
-                        toast: showToast,
-                        context: { path: file.path },
-                      })
-                    );
-                }}
+                onDoubleClick={() => handleOpenEntry(file)}
                 tabIndex={cursorIndex === index ? 0 : -1}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter') {
-                    if (isDirectory(file)) onFolderOpen?.(file);
-                    else
-                      invoke('open_path', { path: file.path }).catch((err) =>
-                        reportError('Open failed', err, {
-                          toast: showToast,
-                          context: { path: file.path },
-                        })
-                      );
+                    handleOpenEntry(file);
                   } else if (e.key === ' ') {
                     handleRowClick(e, index, file);
                   }
@@ -1100,6 +1115,7 @@ function FileTableInner({
                   <span className={styles.fileIcon} aria-hidden="true">
                     <Icon name={getFileIconName(file)} />
                   </span>
+                  <LinkBadge file={file} />
                   {editingId === file.id ? (
                     <InlineRename
                       key={`edit:${file.id}`}
@@ -1211,9 +1227,20 @@ function FileTableInner({
         }}
         onCompress={handleCompress}
         onExtract={handleExtract}
+        onEditLinkTarget={setEditLinkTarget}
         confirmBeforeDelete={confirmBeforeDelete}
         onDeleteConfirm={(files) => setDeleteConfirm({ open: true, files })}
       />
+      {editLinkTarget && (
+        <React.Suspense fallback={null}>
+          <LazyEditLinkTargetDialog
+            open
+            file={editLinkTarget}
+            onClose={() => setEditLinkTarget(null)}
+            onSuccess={refreshFiles}
+          />
+        </React.Suspense>
+      )}
       {batchRename.open && (
         <React.Suspense fallback={null}>
           <LazyBatchRenameDialog

@@ -210,6 +210,20 @@ describe('useFileStore', () => {
     expect(localStorage.getItem('explorie:sortDir')).toBe('desc');
   });
 
+  it('persists each link follow choice and restores the default when re-enabled', () => {
+    const store = useFileStore.getState();
+
+    store.setLinkFollow('C:\\Workspace\\Report-Link', false);
+    expect(useFileStore.getState().linkFollow).toEqual({ 'c:/workspace/report-link': false });
+    expect(JSON.parse(localStorage.getItem('explorie:linkFollow') || '{}')).toEqual({
+      'c:/workspace/report-link': false,
+    });
+
+    store.setLinkFollow('C:/Workspace/Report-Link', true);
+    expect(useFileStore.getState().linkFollow).toEqual({});
+    expect(JSON.parse(localStorage.getItem('explorie:linkFollow') || '{}')).toEqual({});
+  });
+
   it('toggles sort direction when sorting by the same key', () => {
     const { setSort } = useFileStore.getState();
     setSort('name');

@@ -406,6 +406,29 @@ describe('FileTable', () => {
     expect(within(archiveRow).getByLabelText('Tag: storage')).toBeInTheDocument();
   });
 
+  it('renders a link badge and resolved target in list rows', () => {
+    render(
+      <FileTable
+        droppableId="list:/root"
+        files={[
+          makeFile({
+            id: 'report-link',
+            path: '/root/links/report-link',
+            name: 'report-link',
+            is_symlink: true,
+            link_target: '../report.md',
+          }),
+        ]}
+        sortKey="name"
+        sortDir="asc"
+        onSort={vi.fn()}
+      />
+    );
+
+    expect(screen.getByRole('img', { name: 'Symbolic link' })).toBeInTheDocument();
+    expect(screen.getByText('/root/report.md')).toBeInTheDocument();
+  });
+
   it('uses keyboard-accessible buttons for sorting', () => {
     const onSort = vi.fn();
     render(

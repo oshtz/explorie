@@ -896,6 +896,31 @@ fn rename_path_impl(source_path: String, new_base_name: String) -> Result<String
 }
 
 #[tauri::command]
+fn read_link_info(path: String) -> Result<explorie_core::LinkInfo, String> {
+    let link = PathBuf::from(path);
+    if !link.is_absolute() {
+        return Err("Link path must be absolute".to_string());
+    }
+    explorie_core::read_link_info(&link).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn set_link_target(
+    remote_drives: tauri::State<'_, RemoteDriveManager>,
+    path: String,
+    target: String,
+) -> Result<(), String> {
+    let link = PathBuf::from(path);
+    if !link.is_absolute() {
+        return Err("Link path must be absolute".to_string());
+    }
+    if remote_drives.is_mount_root(&link) {
+        return Err("Refusing to edit a managed remote-drive root".to_string());
+    }
+    explorie_core::set_link_target(&link, &target).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 fn create_folder(dir_path: String, base_name: String) -> Result<String, String> {
     let directory = PathBuf::from(dir_path);
     validate_real_directory(&directory)?;
@@ -2148,6 +2173,8 @@ fn main() {
             cancel_file_operation,
             read_text_preview,
             rename_path,
+            read_link_info,
+            set_link_target,
             create_folder,
             create_note,
             create_website_link,

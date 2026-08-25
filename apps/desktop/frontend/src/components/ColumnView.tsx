@@ -4,7 +4,6 @@ import { useFileStore } from '../store';
 import styles from './ColumnView.module.css';
 import { Icon } from './Icon';
 import type { IconName } from '../icons';
-import { invoke } from '@tauri-apps/api/core';
 import type { SortKey, SortDir } from './FileTable';
 import { sortFiles } from './FileTable';
 import { createFolderIn, joinPaths, renamePath } from '../utils/fs';
@@ -17,6 +16,13 @@ import { deleteWithUndo } from '../utils/fileOperations';
 import { reportError } from '../utils/errorReporter';
 import type { GetSelectedFilesFunction } from '../hooks/useKeyboardClipboard';
 import { useVirtualRows } from '../hooks/useVirtualRows';
+import { isLink, linkTypeLabel, openEntry } from '../utils/links';
+import { isLinkFollowed } from '../store/slices/fileSlice';
+import { LinkBadge } from './LinkBadge';
+
+const LazyEditLinkTargetDialog = React.lazy(() =>
+  import('./EditLinkTargetDialog').then((m) => ({ default: m.EditLinkTargetDialog }))
+);
 
 // Column width constants
 const MIN_COLUMN_WIDTH = 180;
@@ -263,7 +269,7 @@ interface ColumnFileListProps {
   selectedIds: Set<string>;
   onSelectionChange: (ids: Set<string>, anchor: number | null) => void;
   onItemClick: (e: React.MouseEvent | React.KeyboardEvent, index: number, file: FileEntry) => void;
-  onFolderClick: (entry: FileEntry) => void;
+  onOpenEntry: (entry: FileEntry) => void;
   onContextMenu: (e: React.MouseEvent, file: FileEntry) => void;
   onHoverContainerPath?: (path: string) => void;
   onHoverFolder?: (file: FileEntry | null) => void;
@@ -282,7 +288,7 @@ function ColumnFileList({
   selectedIds,
   onSelectionChange,
   onItemClick,
-  onFolderClick,
+  onOpenEntry,
   onContextMenu,
   onHoverContainerPath,
   onHoverFolder,
@@ -418,23 +424,19 @@ function ColumnFileList({
             aria-setsize={visible.length}
             aria-posinset={index + 1}
             tabIndex={focusId === entry.id ? 0 : -1}
-            aria-label={isFolder ? `Open folder ${fileName}` : `Select file ${fileName}`}
+            aria-label={
+              isLink(entry)
+                ? `${linkTypeLabel(entry)} ${fileName}`
+                : isFolder
+                  ? `Open folder ${fileName}`
+                  : `Select file ${fileName}`
+            }
             onClick={(e) => onItemClick(e, index, entry)}
             onContextMenu={(e) => onContextMenu(e, entry)}
-            onDoubleClick={() => {
-              if (isFolder) onFolderClick(entry);
-              else
-                invoke('open_path', { path: entry.path }).catch((err) =>
-                  console.error('open_path failed', err)
-                );
-            }}
+            onDoubleClick={() => onOpenEntry(entry)}
             onKeyDown={(e) => {
               if (e.key === 'Enter') {
-                if (isFolder) onFolderClick(entry);
-                else
-                  invoke('open_path', { path: entry.path }).catch((err) =>
-                    console.error('open_path failed', err)
-                  );
+                onOpenEntry(entry);
               } else if (e.key === ' ') {
                 onItemClick(e, index, entry);
               }
@@ -453,6 +455,7 @@ function ColumnFileList({
             <span className={styles.fileIcon}>
               <Icon name={getFileIconName(entry)} />
             </span>
+            <LinkBadge file={entry} />
             {editingId === entry.id ? (
               renderEditingItem(entry, path)
             ) : (
@@ -559,6 +562,22 @@ function ColumnViewInner({
     files: FileEntry[];
     currentPath: string;
   }>({ open: false, mode: 'compress', files: [], currentPath: '' });
+
+  // Link target editing state
+  const [editLinkTarget, setEditLinkTarget] = useState<FileEntry | null>(null);
+  const linkFollow = useFileStore((s) => s.linkFollow);
+
+  const handleOpenEntry = React.useCallback(
+    (colIdx: number, entry: FileEntry) => {
+      void openEntry(entry, {
+        follow: isLinkFollowed(linkFollow, entry.path),
+        onFolderOpen: (folder) => onFolderClick(colIdx, folder),
+        onError: (message, error) =>
+          reportError(message, error, { toast: showToast, context: { path: entry.path } }),
+      });
+    },
+    [linkFollow, onFolderClick, showToast]
+  );
 
   // Column width management with persistence
   const { getColumnWidth, setColumnWidth } = useColumnWidths();
@@ -1139,7 +1158,7 @@ function ColumnViewInner({
                       onItemClick={(e, index, entry) =>
                         handleFileSelect(e, path, index, entry, visible)
                       }
-                      onFolderClick={(entry) => onFolderClick(colIdx, entry)}
+                      onOpenEntry={(entry) => handleOpenEntry(colIdx, entry)}
                       onContextMenu={(e, entry) => {
                         const clickedInSelection = sel.has(entry.id);
                         const targetFiles = clickedInSelection
@@ -1235,7 +1254,18 @@ function ColumnViewInner({
         onDeleteConfirm={(files) => setDeleteConfirm({ open: true, files })}
         onCompress={handleCompress}
         onExtract={handleExtract}
+        onEditLinkTarget={setEditLinkTarget}
       />
+      {editLinkTarget && (
+        <React.Suspense fallback={null}>
+          <LazyEditLinkTargetDialog
+            open
+            file={editLinkTarget}
+            onClose={() => setEditLinkTarget(null)}
+            onSuccess={() => setPathStackStore([...(pathStackState || [])])}
+          />
+        </React.Suspense>
+      )}
       {archiveDialog.open && (
         <React.Suspense fallback={null}>
           <LazyArchiveDialog

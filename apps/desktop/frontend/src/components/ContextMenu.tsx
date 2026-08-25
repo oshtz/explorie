@@ -13,6 +13,8 @@ import { useToast } from './Toast';
 import type { Toast } from './Toast';
 import { basename, normalizePathForCompare } from '../utils/path';
 import { reportError } from '../utils/errorReporter';
+import { isLink, linkTypeLabel, resolvedLinkTarget } from '../utils/links';
+import { isLinkFollowed } from '../store/slices/fileSlice';
 import type { AppInfo } from '../services/finderIntegration';
 import {
   revealInFileManager,
@@ -67,6 +69,8 @@ interface ContextMenuProps {
   compareTarget?: FileEntry | null;
   /** Called to set a file as comparison target */
   onSetCompareTarget?: (file: FileEntry | null) => void;
+  /** Called when the target of a symlink or junction should be edited */
+  onEditLinkTarget?: (file: FileEntry) => void;
 }
 
 // Helper to check if a file is an archive
@@ -163,6 +167,7 @@ export function ContextMenu({
   onCompare,
   compareTarget,
   onSetCompareTarget,
+  onEditLinkTarget,
 }: ContextMenuProps) {
   const menuRef = useRef<HTMLDivElement>(null);
   const clipboard = useFileStore((s) => s.clipboard);
@@ -170,6 +175,8 @@ export function ContextMenu({
   const addFavorite = useFileStore((s) => s.addFavorite);
   const removeFavorite = useFileStore((s) => s.removeFavorite);
   const favorites = useFileStore((s) => s.favorites);
+  const linkFollow = useFileStore((s) => s.linkFollow);
+  const setLinkFollow = useFileStore((s) => s.setLinkFollow);
   const menuId = useId();
   const [focusedIndex, setFocusedIndex] = useState(0);
   const [quickLookAvailable, setQuickLookAvailable] = useState(false);
@@ -505,6 +512,22 @@ export function ContextMenu({
     setOpenWithExpanded((prev) => !prev);
   }, []);
 
+  // Link handlers - single symlink or junction only
+  const handleEditLinkTarget = useCallback(() => {
+    if (state.files.length === 1 && onEditLinkTarget) {
+      onEditLinkTarget(state.files[0]);
+    }
+    onClose();
+  }, [state.files, onEditLinkTarget, onClose]);
+
+  const handleToggleFollowLink = useCallback(() => {
+    if (state.files.length === 1) {
+      const path = state.files[0].path;
+      setLinkFollow(path, !isLinkFollowed(linkFollow, path));
+    }
+    onClose();
+  }, [state.files, linkFollow, setLinkFollow, onClose]);
+
   if (!state.open) return null;
 
   const hasFiles = state.files.length > 0;
@@ -514,6 +537,9 @@ export function ContextMenu({
   const isSingleFolder = state.files.length === 1 && state.files[0].is_dir;
   const singleFolderIsFavorite = isSingleFolder && isFavorite(state.files[0]);
   const isSingleArchive = state.files.length === 1 && isArchiveFile(state.files[0]);
+  const singleLink = state.files.length === 1 && isLink(state.files[0]) ? state.files[0] : null;
+  const singleLinkFollowed = singleLink ? isLinkFollowed(linkFollow, singleLink.path) : true;
+  const singleLinkTarget = singleLink ? resolvedLinkTarget(singleLink) : null;
   const canCompress = hasFiles && onCompress;
   const canExtract = isSingleArchive && onExtract;
   const canCompare =
@@ -693,6 +719,55 @@ export function ContextMenu({
                   )}
                 </div>
               )}
+            </>
+          )}
+
+          {/* Link actions - only for a single symlink or junction */}
+          {singleLink && (
+            <>
+              <div className={styles.separator} role="separator" />
+              <div
+                className={styles.linkTarget}
+                role="note"
+                title={singleLinkTarget ?? 'The link target could not be read'}
+              >
+                <span className={styles.contextIcon} aria-hidden="true">
+                  <Icon name="link" />
+                </span>
+                <span>Target: {singleLinkTarget ?? 'unavailable'}</span>
+              </div>
+              {onEditLinkTarget && (
+                <div
+                  className={styles.contextItem}
+                  role="menuitem"
+                  tabIndex={-1}
+                  onClick={handleEditLinkTarget}
+                  onKeyDown={(e) => e.key === 'Enter' && handleEditLinkTarget()}
+                >
+                  <span className={styles.contextIcon} aria-hidden="true">
+                    <Icon name="link" />
+                  </span>
+                  Edit Link Target
+                </div>
+              )}
+              <div
+                className={styles.contextItem}
+                role="menuitemcheckbox"
+                aria-checked={singleLinkFollowed}
+                tabIndex={-1}
+                onClick={handleToggleFollowLink}
+                onKeyDown={(e) => e.key === 'Enter' && handleToggleFollowLink()}
+                title={`${linkTypeLabel(singleLink)}: ${
+                  singleLinkFollowed
+                    ? 'opening this link jumps to its target'
+                    : 'opening this link stays on the link path'
+                }`}
+              >
+                <span className={styles.contextIcon} aria-hidden="true">
+                  <Icon name={singleLinkFollowed ? 'link' : 'unlink'} />
+                </span>
+                {singleLinkFollowed ? "Don't Follow Link" : 'Follow Link'}
+              </div>
             </>
           )}
 

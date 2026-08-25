@@ -1,5 +1,45 @@
 import type { StateCreator } from 'zustand';
 import type { FileSlice, StoreState } from '../types';
+import { normalizePathForCompare } from '../../utils/path';
+
+const LINK_FOLLOW_KEY = 'explorie:linkFollow';
+
+/** Key link choices by a stable form of the path so casing/separators agree. */
+export function linkFollowKey(path: string): string {
+  const normalized = normalizePathForCompare(path);
+  // Drive and UNC paths are Windows identities; preserve case for POSIX paths
+  // because two links that differ only by case can coexist there.
+  return /^[A-Za-z]:\//.test(normalized) || normalized.startsWith('//')
+    ? normalized.toLowerCase()
+    : normalized;
+}
+
+/** Whether a link should resolve to its target. Links follow unless told not to. */
+export function isLinkFollowed(
+  linkFollow: Record<string, boolean> | undefined,
+  path: string
+): boolean {
+  return linkFollow?.[linkFollowKey(path)] ?? true;
+}
+
+function loadLinkFollow(): Record<string, boolean> {
+  try {
+    if (typeof window !== 'undefined') {
+      const raw = window.localStorage.getItem(LINK_FOLLOW_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          return Object.fromEntries(
+            Object.entries(parsed as Record<string, unknown>)
+              .filter(([, value]) => typeof value === 'boolean')
+              .map(([key, value]) => [key, value as boolean])
+          );
+        }
+      }
+    }
+  } catch {}
+  return {};
+}
 
 export const createFileSlice: StateCreator<StoreState, [], [], FileSlice> = (set) => ({
   files: [],
@@ -88,6 +128,7 @@ export const createFileSlice: StateCreator<StoreState, [], [], FileSlice> = (set
   clipboard: null,
   selectedPaths: [],
   selectionCursorPath: null,
+  linkFollow: loadLinkFollow(),
   setPathStack: (stack) => set({ pathStack: stack }),
   setEditingId: (id) => set({ editingId: id }),
   setDraftNew: (draft) => set({ draftNew: draft }),
@@ -95,6 +136,20 @@ export const createFileSlice: StateCreator<StoreState, [], [], FileSlice> = (set
   setSelectedPaths: (paths) => set({ selectedPaths: [...new Set(paths)] }),
   setSelectionCursorPath: (path) => set({ selectionCursorPath: path }),
   clearSelection: () => set({ selectedPaths: [], selectionCursorPath: null }),
+  setLinkFollow: (path, follow) =>
+    set((state) => {
+      const key = linkFollowKey(path);
+      const next = { ...state.linkFollow };
+      // Following is the default, so remembering it would only grow the map.
+      if (follow) delete next[key];
+      else next[key] = false;
+      try {
+        if (typeof window !== 'undefined') {
+          window.localStorage.setItem(LINK_FOLLOW_KEY, JSON.stringify(next));
+        }
+      } catch {}
+      return { linkFollow: next };
+    }),
   setFiles: (files) =>
     set((state) => ({
       files: typeof files === 'function' ? files(state.files) : files,

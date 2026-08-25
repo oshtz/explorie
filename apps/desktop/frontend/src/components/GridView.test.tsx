@@ -469,6 +469,24 @@ describe('GridView', () => {
     expect(screen.getByLabelText('Select file hello.txt')).toBeInTheDocument();
   });
 
+  it('renders a link badge and resolved target for linked grid entries', () => {
+    storeState.searchQuery = '';
+    const link = makeFile({
+      id: 'grid-link',
+      path: '/grid/links/report-link',
+      name: 'report-link',
+    });
+    link.is_symlink = true;
+    link.link_target = '../report.md';
+
+    render(
+      <GridView currentPath="/grid" files={[link]} onFileSelect={vi.fn()} onFolderOpen={vi.fn()} />
+    );
+
+    expect(screen.getByRole('img', { name: 'Symbolic link' })).toBeInTheDocument();
+    expect(screen.getByText('/grid/report.md')).toBeInTheDocument();
+  });
+
   it('shows image and video thumbnails and loads native executable icons on Windows', async () => {
     document.documentElement.dataset.platform = 'windows';
     mocks.invoke.mockImplementation(async (command: string) => {

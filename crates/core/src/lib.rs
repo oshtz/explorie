@@ -59,6 +59,8 @@ pub mod archive;
 pub use archive::*;
 mod file_operations;
 pub use file_operations::*;
+pub mod links;
+pub use links::{LinkInfo, LinkKind, read_link_info, set_link_target};
 
 /// Represents a file or directory entry in explorie.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -458,17 +460,12 @@ pub fn list_dir_with_sizes(path: &Path, calc_dir_size: bool) -> io::Result<Vec<F
 
             // Get symlink metadata (doesn't follow links)
             let symlink_meta = entry.path().symlink_metadata()?;
-            let is_symlink = symlink_meta.file_type().is_symlink();
 
-            // Check for Windows junction points / reparse points
-            #[cfg(windows)]
-            let is_junction = {
-                use std::os::windows::fs::MetadataExt;
-                const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-                (symlink_meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 && !is_symlink
-            };
-            #[cfg(not(windows))]
-            let is_junction = false;
+            // Windows reports junctions as symlinks, so classification needs
+            // the reparse tag rather than the file type alone.
+            let link_class = links::link_class(&entry.path(), &symlink_meta);
+            let is_symlink = link_class == Some(links::LinkClass::Symlink);
+            let is_junction = link_class == Some(links::LinkClass::Junction);
 
             // Get link target for symlinks and junctions
             let link_target = if is_symlink || is_junction {

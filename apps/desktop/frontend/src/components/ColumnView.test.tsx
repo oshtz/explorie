@@ -333,6 +333,26 @@ describe('ColumnView', () => {
     expect(screen.getByText('readme.md')).toBeInTheDocument();
   });
 
+  it('renders a link badge and resolved target for linked column entries', () => {
+    storeState.pathStack = ['/columns'];
+    const link = makeEntry('/columns/links/report-link', {
+      is_symlink: true,
+      link_target: '../report.md',
+    });
+
+    render(
+      <ColumnView
+        pathStack={storeState.pathStack}
+        columnFiles={{ '/columns': [link] } as any}
+        onFolderClick={vi.fn()}
+        onColumnBack={vi.fn()}
+      />
+    );
+
+    expect(screen.getByRole('img', { name: 'Symbolic link' })).toBeInTheDocument();
+    expect(screen.getByText('/columns/report.md')).toBeInTheDocument();
+  });
+
   it('renders only the virtualized slice of a large column', () => {
     storeState.pathStack = ['/large'];
     const files = Array.from({ length: 1000 }, (_, index) =>

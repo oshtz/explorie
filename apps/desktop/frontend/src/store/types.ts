@@ -127,6 +127,8 @@ export interface FileSlice {
   clipboard: { mode: 'copy' | 'cut'; items: FileEntry[]; sourcePath: string } | null;
   selectedPaths: string[];
   selectionCursorPath: string | null;
+  /** Per-link "follow the target" choice, keyed by link path. Absent = follow. */
+  linkFollow: Record<string, boolean>;
   setPathStack: (stack: string[]) => void;
   setFiles: (files: FileEntry[] | ((prev: FileEntry[]) => FileEntry[])) => void;
   setLoading: (loading: boolean) => void;
@@ -148,6 +150,7 @@ export interface FileSlice {
   setSelectedPaths: (paths: string[]) => void;
   setSelectionCursorPath: (path: string | null) => void;
   clearSelection: () => void;
+  setLinkFollow: (path: string, follow: boolean) => void;
 }
 
 export interface UISlice {

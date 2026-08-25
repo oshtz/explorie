@@ -170,3 +170,24 @@ fn listings_and_directory_info_do_not_follow_symlinks() {
     assert_eq!(count, 4);
     assert_eq!(size, 3);
 }
+
+#[cfg(windows)]
+#[test]
+fn listings_flag_junctions_separately_from_symlinks() {
+    let temp_dir = tempdir().expect("temp dir");
+    let root = temp_dir.path();
+    let data = root.join("data");
+    fs::create_dir(&data).unwrap();
+    fs::write(data.join("file.txt"), b"abc").unwrap();
+    explorie_core::links::create_junction(&root.join("junction"), &data).unwrap();
+
+    let entries = list_dir(root).unwrap();
+    let junction = entries
+        .iter()
+        .find(|entry| entry.path.ends_with("junction"))
+        .unwrap();
+    assert!(junction.is_junction, "junction should be flagged as one");
+    assert!(!junction.is_symlink, "a junction is not a symlink");
+    assert!(!junction.is_dir, "links must not be listed as directories");
+    assert!(junction.link_target.is_some(), "target should be reported");
+}

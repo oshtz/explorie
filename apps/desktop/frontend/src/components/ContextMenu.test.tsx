@@ -14,18 +14,22 @@ type ClipboardState = {
 type StoreState = {
   clipboard: ClipboardState;
   favorites: Array<{ path: string; name: string }>;
+  linkFollow: Record<string, boolean>;
   setClipboard: ReturnType<typeof vi.fn>;
   addFavorite: ReturnType<typeof vi.fn>;
   removeFavorite: ReturnType<typeof vi.fn>;
+  setLinkFollow: ReturnType<typeof vi.fn>;
 };
 
 const mocks = vi.hoisted(() => ({
   storeState: {
     clipboard: null,
     favorites: [],
+    linkFollow: {},
     setClipboard: vi.fn(),
     addFavorite: vi.fn(),
     removeFavorite: vi.fn(),
+    setLinkFollow: vi.fn(),
   } as StoreState,
   showToast: vi.fn(),
   deleteWithUndo: vi.fn(),
@@ -120,9 +124,11 @@ describe('ContextMenu', () => {
     document.documentElement.dataset.platform = 'web';
     mocks.storeState.clipboard = null;
     mocks.storeState.favorites = [];
+    mocks.storeState.linkFollow = {};
     mocks.storeState.setClipboard.mockReset();
     mocks.storeState.addFavorite.mockReset();
     mocks.storeState.removeFavorite.mockReset();
+    mocks.storeState.setLinkFollow.mockReset();
     mocks.showToast.mockReset();
     mocks.deleteWithUndo.mockReset();
     mocks.deleteWithUndo.mockResolvedValue(undefined);
@@ -284,6 +290,37 @@ describe('ContextMenu', () => {
 
     await user.click(screen.getByRole('menuitem', { name: /Compare Files/ }));
     expect(onCompare).toHaveBeenCalledWith([first, second]);
+  });
+
+  it('shows link actions and edits the selected link target', async () => {
+    const user = userEvent.setup();
+    const link = file('/workspace/report-link', {
+      is_symlink: true,
+      link_target: '/workspace/report.txt',
+    });
+    const onClose = vi.fn();
+    const onEditLinkTarget = vi.fn();
+
+    render(
+      <ContextMenu
+        state={menuState({ files: [link] })}
+        onClose={onClose}
+        onEditLinkTarget={onEditLinkTarget}
+      />
+    );
+
+    expect(screen.getByRole('note')).toHaveTextContent('Target: /workspace/report.txt');
+    expect(screen.getByRole('menuitem', { name: 'Edit Link Target' })).toBeInTheDocument();
+    expect(screen.getByRole('menuitemcheckbox', { name: "Don't Follow Link" })).toHaveAttribute(
+      'aria-checked',
+      'true'
+    );
+
+    await user.click(screen.getByRole('menuitem', { name: 'Edit Link Target' }));
+    expect(onEditLinkTarget).toHaveBeenCalledWith(link);
+
+    await user.click(screen.getByRole('menuitemcheckbox', { name: "Don't Follow Link" }));
+    expect(mocks.storeState.setLinkFollow).toHaveBeenCalledWith(link.path, false);
   });
 
   it('shows extract and compare-with-marked actions for supported single files', async () => {

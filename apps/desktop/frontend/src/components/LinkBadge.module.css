@@ -1,0 +1,23 @@
+.linkBadge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  min-width: 0;
+  margin-right: 2px;
+  color: var(--accent-primary);
+  opacity: 0.9;
+}
+
+.target {
+  min-width: 0;
+  max-width: 18em;
+  margin-left: 3px;
+  overflow: hidden;
+  color: var(--fg-tertiary);
+  font-family: var(--font-mono, monospace);
+  font-size: 10px;
+  font-weight: 400;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

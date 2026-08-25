@@ -39,6 +39,24 @@
   color: var(--fg-secondary);
 }
 
+.linkTarget {
+  display: flex;
+  align-items: center;
+  gap: var(--padding-md);
+  min-width: 0;
+  padding: var(--padding-sm) var(--padding-lg);
+  color: var(--fg-tertiary);
+  font-family: var(--font-mono, monospace);
+  font-size: calc(11px * var(--font-scale));
+}
+
+.linkTarget > span:last-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .separator {
   height: 1px;
   background: var(--border-primary);

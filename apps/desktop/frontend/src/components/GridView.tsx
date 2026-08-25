@@ -23,9 +23,15 @@ import { reportError } from '../utils/errorReporter';
 import type { GetSelectedFilesFunction } from '../hooks/useKeyboardClipboard';
 import { useCentralFileSelection } from '../hooks/useCentralFileSelection';
 import type { DragStartHandler } from '../hooks/useDragStart';
+import { isLink, linkTypeLabel, openEntry } from '../utils/links';
+import { isLinkFollowed } from '../store/slices/fileSlice';
+import { LinkBadge } from './LinkBadge';
 
 const LazyBatchRenameDialog = React.lazy(() =>
   import('./BatchRenameDialog').then((m) => ({ default: m.BatchRenameDialog }))
+);
+const LazyEditLinkTargetDialog = React.lazy(() =>
+  import('./EditLinkTargetDialog').then((m) => ({ default: m.EditLinkTargetDialog }))
 );
 const LazyArchiveDialog = React.lazy(() =>
   import('./ArchiveDialog').then((m) => ({ default: m.ArchiveDialog }))
@@ -411,6 +417,10 @@ function GridViewInner({
     mode: 'compress' | 'extract';
     files: FileEntry[];
   }>({ open: false, mode: 'compress', files: [] });
+
+  // Link target editing state
+  const [editLinkTarget, setEditLinkTarget] = useState<FileEntry | null>(null);
+  const linkFollow = useFileStore((s) => s.linkFollow);
 
   // Defensive: ensure files is an array
   const safeFiles = useMemo<FileEntry[]>(() => (Array.isArray(files) ? files : []), [files]);
@@ -1047,6 +1057,27 @@ function GridViewInner({
     setArchiveDialog({ open: false, mode: 'compress', files: [] });
   }, [currentPath, setFiles]);
 
+  // Link handlers
+  const refreshFiles = useCallback(async () => {
+    const res = await invoke<FileEntry[]>('list_files', {
+      path: currentPath,
+      calc_dir_size: false,
+    });
+    setFiles(withDisplayNames(res));
+  }, [currentPath, setFiles]);
+
+  const handleOpenEntry = useCallback(
+    (file: FileEntry) => {
+      void openEntry(file, {
+        follow: isLinkFollowed(linkFollow, file.path),
+        onFolderOpen,
+        onError: (message, error) =>
+          reportError(message, error, { toast: showToast, context: { path: file.path } }),
+      });
+    },
+    [linkFollow, onFolderOpen, showToast]
+  );
+
   const noMatches = safeFiles.length > 0 && sortedFiles.length === 0;
 
   return (
@@ -1159,28 +1190,18 @@ function GridViewInner({
                     role="option"
                     aria-selected={selectedIds.has(file.id)}
                     tabIndex={cursorIndex === itemIndex ? 0 : -1}
-                    aria-label={isFolder ? `Open folder ${fileName}` : `Select file ${fileName}`}
+                    aria-label={
+                      isLink(file)
+                        ? `${linkTypeLabel(file)} ${fileName}`
+                        : isFolder
+                          ? `Open folder ${fileName}`
+                          : `Select file ${fileName}`
+                    }
                     onClick={(e) => handleItemClick(e, itemIndex, file)}
-                    onDoubleClick={() => {
-                      if (isFolder) onFolderOpen?.(file);
-                      else
-                        invoke('open_path', { path: file.path }).catch((err) =>
-                          reportError('Open failed', err, {
-                            toast: showToast,
-                            context: { path: file.path },
-                          })
-                        );
-                    }}
+                    onDoubleClick={() => handleOpenEntry(file)}
                     onKeyDown={(e) => {
                       if (e.key === 'Enter') {
-                        if (isFolder) onFolderOpen?.(file);
-                        else
-                          invoke('open_path', { path: file.path }).catch((err) =>
-                            reportError('Open failed', err, {
-                              toast: showToast,
-                              context: { path: file.path },
-                            })
-                          );
+                        handleOpenEntry(file);
                       } else if (e.key === ' ') {
                         handleItemClick(e, itemIndex, file);
                       }
@@ -1224,6 +1245,7 @@ function GridViewInner({
                       />
                     ) : (
                       <span className={styles.fileName} title={fileName}>
+                        <LinkBadge file={file} />
                         {fileName}
                       </span>
                     )}
@@ -1251,7 +1273,18 @@ function GridViewInner({
         onDeleteConfirm={(files) => setDeleteConfirm({ open: true, files })}
         onCompress={handleCompress}
         onExtract={handleExtract}
+        onEditLinkTarget={setEditLinkTarget}
       />
+      {editLinkTarget && (
+        <React.Suspense fallback={null}>
+          <LazyEditLinkTargetDialog
+            open
+            file={editLinkTarget}
+            onClose={() => setEditLinkTarget(null)}
+            onSuccess={refreshFiles}
+          />
+        </React.Suspense>
+      )}
       {deleteConfirm.open && (
         <React.Suspense fallback={null}>
           <LazySecureDeleteDialog
