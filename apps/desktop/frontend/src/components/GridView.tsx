@@ -23,6 +23,7 @@ import { reportError } from '../utils/errorReporter';
 import type { GetSelectedFilesFunction } from '../hooks/useKeyboardClipboard';
 import { useCentralFileSelection } from '../hooks/useCentralFileSelection';
 import type { DragStartHandler } from '../hooks/useDragStart';
+import { DEFAULT_SHORTCUTS, matchesShortcut } from '../utils/shortcuts';
 
 const LazyBatchRenameDialog = React.lazy(() =>
   import('./BatchRenameDialog').then((m) => ({ default: m.BatchRenameDialog }))
@@ -373,6 +374,7 @@ function GridViewInner({
   const setEditingId = useFileStore((s) => s.setEditingId);
   const setDraftNew = useFileStore((s) => s.setDraftNew);
   const setFiles = useFileStore((s) => s.setFiles);
+  const shortcuts = useFileStore((s) => s.shortcuts) ?? DEFAULT_SHORTCUTS;
   const pendingSelectPathRef = useRef<string | null>(null);
 
   // runs after sorted files computed; selects/scrolls to pending path
@@ -755,27 +757,36 @@ function GridViewInner({
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLDivElement>) => {
-      if ((e.ctrlKey || e.metaKey) && (e.key === 'a' || e.key === 'A')) {
+      if (matchesShortcut(e.nativeEvent, shortcuts['selection-select-all'])) {
         e.preventDefault();
+        e.stopPropagation();
         const all = new Set(sortedFiles.map((f) => f.id));
         setSelectedIds(all);
         setAnchorIndex(sortedFiles.length ? 0 : null);
         setCursorIndex(sortedFiles.length ? 0 : null);
       } else if (e.key === 'Escape') {
+        if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+        e.preventDefault();
+        e.stopPropagation();
         setSelectedIds(new Set());
         setAnchorIndex(null);
         setCursorIndex(null);
-      } else if (e.key === 'F2') {
+      } else if (matchesShortcut(e.nativeEvent, shortcuts['edit-rename'])) {
         // rename first selected item
+        e.preventDefault();
+        e.stopPropagation();
         const firstSel = selectedIds.values().next().value as string | undefined;
         if (firstSel) {
-          e.preventDefault();
           setEditingId(firstSel);
         }
       } else if (
+        !e.altKey &&
+        !e.ctrlKey &&
+        !e.metaKey &&
         ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'].includes(e.key)
       ) {
         e.preventDefault();
+        e.stopPropagation();
         if (sortedFiles.length === 0) return;
         const perRow = columnCount;
         const current =
@@ -828,13 +839,14 @@ function GridViewInner({
       setCursorIndex,
       setSelectedIds,
       scrollIndexIntoView,
+      shortcuts,
     ]
   );
 
   // Global ESC handler to clear selection even without focus
   React.useEffect(() => {
     const onKey = (ev: KeyboardEvent) => {
-      if (ev.key === 'Escape') {
+      if (ev.key === 'Escape' && !ev.altKey && !ev.ctrlKey && !ev.metaKey && !ev.shiftKey) {
         setSelectedIds(new Set());
         setAnchorIndex(null);
         setCursorIndex(null);
@@ -1172,7 +1184,15 @@ function GridViewInner({
                         );
                     }}
                     onKeyDown={(e) => {
-                      if (e.key === 'Enter') {
+                      if (
+                        !e.altKey &&
+                        !e.ctrlKey &&
+                        !e.metaKey &&
+                        !e.shiftKey &&
+                        e.key === 'Enter'
+                      ) {
+                        e.preventDefault();
+                        e.stopPropagation();
                         if (isFolder) onFolderOpen?.(file);
                         else
                           invoke('open_path', { path: file.path }).catch((err) =>
@@ -1181,7 +1201,15 @@ function GridViewInner({
                               context: { path: file.path },
                             })
                           );
-                      } else if (e.key === ' ') {
+                      } else if (
+                        !e.altKey &&
+                        !e.ctrlKey &&
+                        !e.metaKey &&
+                        !e.shiftKey &&
+                        e.key === ' '
+                      ) {
+                        e.preventDefault();
+                        e.stopPropagation();
                         handleItemClick(e, itemIndex, file);
                       }
                     }}

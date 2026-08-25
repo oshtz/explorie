@@ -197,6 +197,7 @@ function AppContent() {
     showFolderSizes,
     sortKey,
     sortDir,
+    shortcuts,
   } = useFileStore(
     useShallow((s) => ({
       files: s.files,
@@ -213,6 +214,7 @@ function AppContent() {
       showFolderSizes: s.showFolderSizes,
       sortKey: s.sortKey,
       sortDir: s.sortDir,
+      shortcuts: s.shortcuts,
     }))
   );
 
@@ -1011,6 +1013,7 @@ function AppContent() {
     setClipboard,
     showToast,
     onRefresh: refreshVisibleViews,
+    shortcuts,
   });
 
   // Stable callbacks for child props to reduce re-renders
@@ -1225,6 +1228,7 @@ function AppContent() {
     showHidden,
     showPreviewPanel,
     showStatusBar,
+    shortcuts,
     handlers: paletteCommandHandlers,
   });
 
@@ -1332,6 +1336,7 @@ function AppContent() {
     goForward: handleGoForward,
     openQuickLook: quickLook.openSelected,
     openGoToFolder: handleGoToFolderFromPalette,
+    openSettings: handleOpenSettingsFromPalette,
     openCommandPalette: handleOpenCommandPaletteShortcut,
     toggleDebugPanel: handleToggleDebugPanelShortcut,
     addFavorite,
@@ -1344,6 +1349,7 @@ function AppContent() {
     goUp: handlePaletteGoUp,
     refresh: handleRefreshFromPalette,
     setViewMode,
+    shortcuts,
     toggleHidden: handleToggleHidden,
     activateTabOffset: handleActivateTabOffset,
     focusSearch: handleFocusSearch,
@@ -1398,9 +1404,11 @@ function AppContent() {
             tabIndex={0}
             onMouseDown={handleSidebarResizeStart}
             onKeyDown={(event) => {
+              if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
               const delta = event.key === 'ArrowLeft' ? -10 : event.key === 'ArrowRight' ? 10 : 0;
               if (!delta) return;
               event.preventDefault();
+              event.stopPropagation();
               setSidebarWidth(Math.min(480, Math.max(160, sidebarWidth + delta)));
             }}
           />
@@ -1580,10 +1588,12 @@ function AppContent() {
                     tabIndex={0}
                     onMouseDown={handlePreviewResizeStart}
                     onKeyDown={(event) => {
+                      if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
                       const delta =
                         event.key === 'ArrowLeft' ? 10 : event.key === 'ArrowRight' ? -10 : 0;
                       if (!delta) return;
                       event.preventDefault();
+                      event.stopPropagation();
                       setPreviewWidth(Math.min(720, Math.max(280, previewWidth + delta)));
                     }}
                   />
@@ -1635,6 +1645,7 @@ function AppContent() {
             files={quickLook.quickLookFiles}
             onClose={quickLook.close}
             onNavigate={quickLook.navigateTo}
+            shortcuts={shortcuts}
           />
         </ErrorBoundary>
       )}
@@ -1651,6 +1662,7 @@ function AppContent() {
         <KeyboardShortcutsOverlay
           open={shortcutsOverlayOpen}
           onClose={() => setShortcutsOverlayOpen(false)}
+          shortcuts={shortcuts}
         />
       </InlineErrorBoundary>
       {/* Workspace Manager */}

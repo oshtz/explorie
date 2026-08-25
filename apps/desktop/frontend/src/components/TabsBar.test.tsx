@@ -32,6 +32,35 @@ describe('TabsBar keyboard navigation', () => {
     expect(tabs[0].querySelector('button')).toBeNull();
   });
 
+  it('contains local tab keys and leaves modified arrows to global shortcuts', () => {
+    const onActivate = vi.fn();
+    const onClose = vi.fn();
+    const globalKeyDown = vi.fn();
+    window.addEventListener('keydown', globalKeyDown);
+    render(
+      <TabsBar
+        tabs={[
+          { id: 'one', path: '/one' },
+          { id: 'two', path: '/two' },
+        ]}
+        activeTabId="one"
+        onActivate={onActivate}
+        onClose={onClose}
+        onAdd={vi.fn()}
+      />
+    );
+
+    const tab = screen.getAllByRole('tab')[0];
+    fireEvent.keyDown(tab, { key: ' ' });
+    fireEvent.keyDown(tab, { key: 'Delete' });
+    fireEvent.keyDown(tab, { key: 'ArrowLeft', altKey: true });
+
+    expect(onActivate).toHaveBeenCalledTimes(1);
+    expect(onClose).toHaveBeenCalledWith('one');
+    expect(globalKeyDown).toHaveBeenCalledTimes(1);
+    window.removeEventListener('keydown', globalKeyDown);
+  });
+
   it('reorders tabs by drag and exposes file drops with hover-open', () => {
     vi.useFakeTimers();
     const onActivate = vi.fn();

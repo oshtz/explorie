@@ -7,6 +7,7 @@ import {
 } from '../utils/fileOperations';
 import { useOperationQueueStore } from '../operationQueueStore';
 import { reportError } from '../utils/errorReporter';
+import { DEFAULT_SHORTCUTS, matchesShortcut, type ShortcutMap } from '../utils/shortcuts';
 
 /**
  * Type for a function that returns currently selected files
@@ -24,6 +25,7 @@ interface KeyboardClipboardManagerOptions {
   clipboard: { mode: 'copy' | 'cut'; items: FileEntry[]; sourcePath: string } | null;
   showToast: ShowToastFn;
   onRefresh: () => Promise<void>;
+  shortcuts?: ShortcutMap;
 }
 
 /**
@@ -39,6 +41,7 @@ export function useKeyboardClipboardManager({
   clipboard,
   showToast,
   onRefresh,
+  shortcuts = DEFAULT_SHORTCUTS,
 }: KeyboardClipboardManagerOptions) {
   const getSelectedFilesRef = useRef<GetSelectedFilesFunction | null>(null);
 
@@ -132,38 +135,31 @@ export function useKeyboardClipboardManager({
   // Keyboard event handler
   const handleKeyDown = useCallback(
     (e: KeyboardEvent) => {
-      const ctrlOrMeta = e.ctrlKey || e.metaKey;
-
       // Don't trigger shortcuts when typing in input fields
       const target = e.target as HTMLElement;
       const isInputField =
         target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable;
       if (isInputField) return;
 
-      // Ctrl+C for copy
-      if (ctrlOrMeta && (e.key === 'c' || e.key === 'C') && !e.shiftKey && !e.altKey) {
-        if (handleCopy()) {
-          e.preventDefault();
-        }
-        return;
-      }
-
-      // Ctrl+X for cut
-      if (ctrlOrMeta && (e.key === 'x' || e.key === 'X') && !e.shiftKey && !e.altKey) {
-        if (handleCut()) {
-          e.preventDefault();
-        }
-        return;
-      }
-
-      // Ctrl+V for paste
-      if (ctrlOrMeta && (e.key === 'v' || e.key === 'V') && !e.shiftKey && !e.altKey) {
-        handlePaste();
+      if (matchesShortcut(e, shortcuts['clipboard-copy'])) {
         e.preventDefault();
+        handleCopy();
+        return;
+      }
+
+      if (matchesShortcut(e, shortcuts['clipboard-cut'])) {
+        e.preventDefault();
+        handleCut();
+        return;
+      }
+
+      if (matchesShortcut(e, shortcuts['clipboard-paste'])) {
+        e.preventDefault();
+        handlePaste();
         return;
       }
     },
-    [handleCopy, handleCut, handlePaste]
+    [handleCopy, handleCut, handlePaste, shortcuts]
   );
 
   // Attach keyboard event listener

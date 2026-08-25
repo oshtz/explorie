@@ -156,7 +156,7 @@ describe('SettingsPanel', () => {
     const navigation = screen.getByRole('navigation', { name: 'Settings sections' });
     const sectionButtons = navigation.querySelectorAll('button');
 
-    expect(sectionButtons).toHaveLength(5);
+    expect(sectionButtons).toHaveLength(6);
     expect(screen.getByRole('button', { name: 'General' })).toHaveAttribute('aria-current', 'page');
   });
 

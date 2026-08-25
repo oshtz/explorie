@@ -234,19 +234,42 @@ Before creating a new tag, manually verify:
 
 ## Keyboard Shortcuts
 
-| Shortcut     | Action                                               |
-| ------------ | ---------------------------------------------------- |
-| `Space`      | Open or close Quick Look for the selected file       |
-| `Escape`     | Close dialogs, menus, Quick Look, or command palette |
-| `Ctrl/Cmd+T` | New tab                                              |
-| `Ctrl/Cmd+W` | Close tab                                            |
-| `Ctrl/Cmd+P` | Command palette                                      |
-| `Ctrl/Cmd+F` | Focus search                                         |
-| `Ctrl/Cmd+,` | Settings                                             |
-| `Arrow keys` | Navigate file views                                  |
-| `Enter`      | Open selected item                                   |
-| `F2`         | Rename selected item                                 |
-| `Delete`     | Delete or trash selected item                        |
+| Shortcut                 | Action                                               |
+| ------------------------ | ---------------------------------------------------- |
+| `Space`                  | Open or close Quick Look for the selected file       |
+| `Escape` (fixed)         | Close dialogs, menus, Quick Look, or command palette |
+| `Ctrl/Cmd+T`             | New tab                                              |
+| `Ctrl/Cmd+W`             | Close tab                                            |
+| `Ctrl/Cmd+Shift+P`       | Command palette                                      |
+| `Ctrl/Cmd+F`             | Focus search                                         |
+| `Ctrl/Cmd+,`             | Settings                                             |
+| `Ctrl/Cmd+G`             | Go to folder                                         |
+| `Ctrl/Cmd+D`             | Add current folder to favorites                      |
+| `Ctrl/Cmd+1/2/3`         | List, grid, or column view                           |
+| `Ctrl/Cmd+H`             | Toggle hidden files                                  |
+| `Ctrl/Cmd+Tab`           | Next tab                                             |
+| `Ctrl/Cmd+Shift+Tab`     | Previous tab                                         |
+| `Alt+Left/Right`         | Navigate backward or forward                         |
+| `Backspace`              | Go up one directory                                  |
+| `F5`                     | Refresh                                              |
+| `Delete`                 | Delete or trash selected item                        |
+| `Ctrl/Cmd+A`             | Select all items                                     |
+| `Ctrl/Cmd+C` / `X` / `V` | Copy, cut, or paste selected items                   |
+| `Ctrl/Cmd+Z`             | Undo                                                 |
+| `Ctrl/Cmd+Y`             | Redo                                                 |
+| `Ctrl/Cmd+Shift+Z`       | Redo (alternate)                                     |
+| `?`                      | Show keyboard shortcuts                              |
+| `+` / `-`                | Increase or decrease grid thumbnail size             |
+| `Arrow keys` (fixed)     | Navigate file views                                  |
+| `Enter` (fixed)          | Open selected item                                   |
+| `F2`                     | Rename selected item                                 |
+| Type letters (fixed)     | Select by filename                                   |
+
+The development build also exposes `Ctrl/Cmd+Shift+D` for the debug panel. The bindings shown in
+this table that appear under Settings → Keyboard Shortcuts can be rebound there; file-view
+navigation keys (`Escape`, `Enter`, arrows, `Home`, and `End`) and type-to-select remain fixed so
+native focus and selection behavior cannot collide with global commands. Browser- and OS-reserved
+chords are rejected.
 
 ---
 

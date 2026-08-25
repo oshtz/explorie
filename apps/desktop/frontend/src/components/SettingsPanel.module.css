@@ -418,6 +418,74 @@
   resize: vertical;
 }
 
+.shortcutIntro {
+  padding: var(--padding-md) var(--padding-lg);
+  color: var(--fg-secondary);
+  font-size: calc(11px * var(--font-scale));
+  line-height: 1.45;
+}
+
+.shortcutCategory {
+  margin: 0;
+  padding: var(--padding-sm) var(--padding-lg);
+  border-top: 1px solid var(--border-primary);
+  background: var(--bg-secondary);
+  color: var(--fg-secondary);
+  font-size: calc(11px * var(--font-scale));
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.shortcutRow {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) minmax(140px, auto);
+  align-items: center;
+  gap: var(--padding-xl);
+  min-height: calc(40px * var(--ui-scale));
+  padding: var(--padding-sm) var(--padding-lg);
+  border-top: 1px solid var(--border-subtle);
+}
+
+.shortcutRow .controls {
+  justify-content: flex-end;
+}
+
+.shortcutCaptureActive {
+  border-color: var(--accent-primary) !important;
+  box-shadow: 0 0 0 1px var(--accent-primary);
+}
+
+.shortcutConflict {
+  margin: var(--padding-md) var(--padding-lg) 0;
+  padding: var(--padding-sm) var(--padding-md);
+  border: 1px solid var(--danger, #d06b6b);
+  color: var(--danger, #d06b6b);
+  font-size: calc(11px * var(--font-scale));
+}
+
+.shortcutActions {
+  display: flex;
+  justify-content: flex-end;
+  padding: var(--padding-md) var(--padding-lg);
+  border-top: 1px solid var(--border-primary);
+}
+
+.shortcutActions button {
+  min-height: calc(34px * var(--ui-scale));
+  padding: 0 var(--padding-md);
+  border: 1px solid var(--border-primary);
+  background: var(--bg-secondary);
+  color: var(--fg-primary);
+  font: inherit;
+  font-size: calc(12px * var(--font-scale));
+  cursor: pointer;
+}
+
+.shortcutActions button:hover {
+  border-color: var(--border-secondary);
+  background: var(--bg-hover);
+}
+
 @media (max-width: 860px) {
   .panel {
     width: calc(100vw - var(--padding-xl));
@@ -461,6 +529,11 @@
   }
 
   .row {
+    grid-template-columns: 1fr;
+    gap: var(--padding-sm);
+  }
+
+  .shortcutRow {
     grid-template-columns: 1fr;
     gap: var(--padding-sm);
   }

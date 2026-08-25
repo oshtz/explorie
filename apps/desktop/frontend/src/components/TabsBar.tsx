@@ -51,6 +51,8 @@ export function TabsBar({
   };
 
   const activateFromKey = (event: React.KeyboardEvent, index: number) => {
+    if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return false;
+
     let nextIndex = index;
     if (event.key === 'ArrowLeft') nextIndex = index === 0 ? tabs.length - 1 : index - 1;
     else if (event.key === 'ArrowRight') nextIndex = index === tabs.length - 1 ? 0 : index + 1;
@@ -59,6 +61,7 @@ export function TabsBar({
     else return false;
 
     event.preventDefault();
+    event.stopPropagation();
     const next = tabs[nextIndex];
     if (!next) return true;
     onActivate(next.id);
@@ -128,12 +131,15 @@ export function TabsBar({
             }}
             onKeyDown={(e) => {
               if (activateFromKey(e, index)) return;
+              if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
               if (e.key === 'Enter' || e.key === ' ') {
                 e.preventDefault();
+                e.stopPropagation();
                 onActivate(t.id);
-              } else if ((e.key === 'Delete' || e.key === 'Backspace') && tabs.length > 1) {
+              } else if (e.key === 'Delete' || e.key === 'Backspace') {
                 e.preventDefault();
-                onClose(t.id);
+                e.stopPropagation();
+                if (tabs.length > 1) onClose(t.id);
               }
             }}
             title={t.path}
@@ -148,6 +154,17 @@ export function TabsBar({
               onClick={(e) => {
                 e.stopPropagation();
                 onClose(t.id);
+              }}
+              onKeyDown={(e) => {
+                if (
+                  e.key === 'Enter' ||
+                  e.key === ' ' ||
+                  e.key === 'Delete' ||
+                  e.key === 'Backspace'
+                ) {
+                  e.stopPropagation();
+                  if (e.key === 'Delete' || e.key === 'Backspace') e.preventDefault();
+                }
               }}
               title="Close tab"
               aria-label={`Close ${titleFor(t.path)} tab`}

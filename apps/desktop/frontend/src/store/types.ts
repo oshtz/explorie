@@ -1,6 +1,9 @@
 import type { ViewMode } from '../components/ViewModeToggle';
 import type { SortKey, SortDir } from '../components/FileTable';
 import type { CustomFields } from '../utils/customFieldTypes';
+import type { ShortcutId, ShortcutMap } from '../utils/shortcuts';
+
+export type { ShortcutId, ShortcutMap } from '../utils/shortcuts';
 
 export type ThemeMode = 'dark' | 'light' | 'system';
 export type AccentColor = 'blue' | 'green' | 'purple' | 'orange' | 'pink' | 'custom';
@@ -193,6 +196,12 @@ export interface UISlice {
   applyThemeSpec: (spec: ThemeSpec) => void;
 }
 
+export interface KeyboardShortcutSlice {
+  shortcuts: ShortcutMap;
+  setShortcut: (id: ShortcutId, shortcut: string) => boolean;
+  resetShortcuts: () => void;
+}
+
 export interface FavoritesSlice {
   favorites: FavoriteItem[];
   addFavorite: (path: string, name?: string) => void;
@@ -231,4 +240,8 @@ export interface WorkspaceSlice {
   importAllWorkspaces: (jsonString: string) => number;
 }
 
-export type StoreState = FileSlice & UISlice & FavoritesSlice & WorkspaceSlice;
+export type StoreState = FileSlice &
+  UISlice &
+  KeyboardShortcutSlice &
+  FavoritesSlice &
+  WorkspaceSlice;

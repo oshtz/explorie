@@ -3,6 +3,7 @@ import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { QuickLookModal } from './QuickLookModal';
 import type { FileEntry } from '../store';
+import { DEFAULT_SHORTCUTS } from '../utils/shortcuts';
 
 vi.mock('./FilePreviewer', () => ({
   FilePreviewer: ({ file, variant }: { file: FileEntry; variant?: string }) => (
@@ -105,5 +106,30 @@ describe('QuickLookModal', () => {
       vi.advanceTimersByTime(150);
     });
     expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it('closes with the active Quick Look binding after it is rebound', () => {
+    const onClose = vi.fn();
+    const onNavigate = vi.fn();
+    const shortcuts = { ...DEFAULT_SHORTCUTS, 'view-quick-look': 'Mod+K' };
+
+    render(
+      <QuickLookModal
+        file={files[0]}
+        files={files}
+        onClose={onClose}
+        onNavigate={onNavigate}
+        shortcuts={shortcuts}
+      />
+    );
+
+    fireEvent.keyDown(window, { key: ' ', code: 'Space' });
+    expect(onClose).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(window, { key: 'k', ctrlKey: true });
+    act(() => {
+      vi.advanceTimersByTime(150);
+    });
+    expect(onClose).toHaveBeenCalledOnce();
   });
 });

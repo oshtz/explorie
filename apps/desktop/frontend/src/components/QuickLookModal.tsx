@@ -5,12 +5,14 @@ import { Icon } from './Icon';
 import styles from './QuickLookModal.module.css';
 import { formatLocalDateTime } from '../utils/date';
 import { createFocusTrap } from '../utils/accessibility';
+import { DEFAULT_SHORTCUTS, matchesShortcut, type ShortcutMap } from '../utils/shortcuts';
 
 interface QuickLookModalProps {
   file: FileEntry;
   files: FileEntry[]; // All files in current directory for navigation
   onClose: () => void;
   onNavigate: (file: FileEntry) => void;
+  shortcuts?: ShortcutMap;
 }
 
 /**
@@ -28,7 +30,13 @@ function formatFileSize(bytes: number): string {
   return `${Number(value.toFixed(value >= 10 || index === 0 ? 0 : 1))} ${units[index]}`;
 }
 
-export function QuickLookModal({ file, files, onClose, onNavigate }: QuickLookModalProps) {
+export function QuickLookModal({
+  file,
+  files,
+  onClose,
+  onNavigate,
+  shortcuts = DEFAULT_SHORTCUTS,
+}: QuickLookModalProps) {
   const [isClosing, setIsClosing] = useState(false);
   const [showInfo, setShowInfo] = useState(false);
   const backdropRef = useRef<HTMLDivElement>(null);
@@ -73,13 +81,14 @@ export function QuickLookModal({ file, files, onClose, onNavigate }: QuickLookMo
   // Handle keyboard navigation
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      if (matchesShortcut(e, shortcuts['view-quick-look'])) {
+        e.preventDefault();
+        handleClose();
+        return;
+      }
+
       switch (e.key) {
         case 'Escape':
-          e.preventDefault();
-          handleClose();
-          break;
-        case ' ':
-          // Space toggles the modal (close it)
           e.preventDefault();
           handleClose();
           break;
@@ -98,7 +107,7 @@ export function QuickLookModal({ file, files, onClose, onNavigate }: QuickLookMo
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [handleClose, navigatePrev, navigateNext]);
+  }, [handleClose, navigatePrev, navigateNext, shortcuts]);
 
   // Handle click outside
   const handleBackdropClick = useCallback(

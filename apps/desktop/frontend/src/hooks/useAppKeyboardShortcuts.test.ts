@@ -2,6 +2,7 @@ import React from 'react';
 import { cleanup, render } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { useAppKeyboardShortcuts } from './useAppKeyboardShortcuts';
+import { DEFAULT_SHORTCUTS } from '../utils/shortcuts';
 
 function ShortcutHarness(props: Partial<Parameters<typeof useAppKeyboardShortcuts>[0]>) {
   useAppKeyboardShortcuts({
@@ -70,12 +71,14 @@ describe('useAppKeyboardShortcuts', () => {
     const openQuickLook = vi.fn();
     const openGoToFolder = vi.fn();
     const addFavorite = vi.fn();
+    const addTab = vi.fn();
 
     const { getByLabelText } = render(
       React.createElement(ShortcutHarness, {
         openQuickLook,
         openGoToFolder,
         addFavorite,
+        addTab,
       })
     );
     const input = getByLabelText('editable');
@@ -83,10 +86,12 @@ describe('useAppKeyboardShortcuts', () => {
     input.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', bubbles: true }));
     input.dispatchEvent(new KeyboardEvent('keydown', { key: 'g', ctrlKey: true, bubbles: true }));
     input.dispatchEvent(new KeyboardEvent('keydown', { key: 'd', ctrlKey: true, bubbles: true }));
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 't', ctrlKey: true, bubbles: true }));
 
     expect(openQuickLook).not.toHaveBeenCalled();
     expect(openGoToFolder).not.toHaveBeenCalled();
     expect(addFavorite).not.toHaveBeenCalled();
+    expect(addTab).not.toHaveBeenCalled();
   });
 
   it('routes grid thumbnail shortcuts only in grid view', () => {
@@ -117,6 +122,7 @@ describe('useAppKeyboardShortcuts', () => {
     const activateTabOffset = vi.fn();
     const focusSearch = vi.fn();
     const typeToSelect = vi.fn();
+    const redo = vi.fn();
     render(
       React.createElement(ShortcutHarness, {
         deleteSelection,
@@ -127,6 +133,7 @@ describe('useAppKeyboardShortcuts', () => {
         activateTabOffset,
         focusSearch,
         typeToSelect,
+        redo,
       })
     );
 
@@ -137,6 +144,7 @@ describe('useAppKeyboardShortcuts', () => {
     window.dispatchEvent(new KeyboardEvent('keydown', { key: 'h', ctrlKey: true }));
     window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', ctrlKey: true }));
     window.dispatchEvent(new KeyboardEvent('keydown', { key: 'f', ctrlKey: true }));
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'z', ctrlKey: true, shiftKey: true }));
     window.dispatchEvent(new KeyboardEvent('keydown', { key: 'r' }));
 
     expect(deleteSelection).toHaveBeenCalledOnce();
@@ -146,6 +154,7 @@ describe('useAppKeyboardShortcuts', () => {
     expect(toggleHidden).toHaveBeenCalledOnce();
     expect(activateTabOffset).toHaveBeenCalledWith(1);
     expect(focusSearch).toHaveBeenCalledOnce();
+    expect(redo).toHaveBeenCalledOnce();
     expect(typeToSelect).toHaveBeenCalledWith('r');
   });
 
@@ -161,5 +170,49 @@ describe('useAppKeyboardShortcuts', () => {
 
     expect(addTab).not.toHaveBeenCalled();
     modal.remove();
+  });
+
+  it('does not dispatch an event already consumed by a local handler', () => {
+    const typeToSelect = vi.fn();
+    render(React.createElement(ShortcutHarness, { typeToSelect }));
+
+    const event = new KeyboardEvent('keydown', {
+      key: 'q',
+      cancelable: true,
+    });
+    event.preventDefault();
+    window.dispatchEvent(event);
+
+    expect(typeToSelect).not.toHaveBeenCalled();
+  });
+
+  it('dispatches a user-rebound shortcut and stops using its default key', () => {
+    const addTab = vi.fn();
+    render(
+      React.createElement(ShortcutHarness, {
+        shortcuts: { ...DEFAULT_SHORTCUTS, 'tab-new': 'Mod+K' },
+        addTab,
+      })
+    );
+
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', ctrlKey: true }));
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 't', ctrlKey: true }));
+
+    expect(addTab).toHaveBeenCalledTimes(1);
+  });
+
+  it('makes the alternate redo chord rebindable without a dispatch-time fallback', () => {
+    const redo = vi.fn();
+    render(
+      React.createElement(ShortcutHarness, {
+        shortcuts: { ...DEFAULT_SHORTCUTS, 'edit-redo-alternate': 'Mod+K' },
+        redo,
+      })
+    );
+
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'z', ctrlKey: true, shiftKey: true }));
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', ctrlKey: true }));
+
+    expect(redo).toHaveBeenCalledTimes(1);
   });
 });

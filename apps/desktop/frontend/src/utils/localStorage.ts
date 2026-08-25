@@ -19,6 +19,7 @@ import type {
   ThemeSpec,
 } from '../store/types';
 import type { RemoteDriveProfile } from './remoteDrives';
+import type { ShortcutMap } from './shortcuts';
 
 // ============================================================================
 // Type Definitions
@@ -57,6 +58,7 @@ export interface LocalStorageSchema {
   'explorie:iconSize': number;
   'explorie:reduceMotion': boolean;
   'explorie:themes': Record<string, ThemeSpec>;
+  'explorie:shortcuts': ShortcutMap;
 
   // Navigation & Tabs
   'explorie:tabs': Array<{ id: string; path: string }>;

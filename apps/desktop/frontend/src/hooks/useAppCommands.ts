@@ -2,6 +2,7 @@ import { useMemo } from 'react';
 import type { Command } from '../components/CommandPalette';
 import type { ViewMode } from '../components/ViewModeToggle';
 import type { ThemeMode } from '../store/types';
+import { DEFAULT_SHORTCUTS, formatShortcut, type ShortcutMap } from '../utils/shortcuts';
 
 interface AppCommandHandlers {
   goBack: () => void;
@@ -31,6 +32,7 @@ interface UseAppCommandsInput {
   showHidden: boolean;
   showPreviewPanel: boolean;
   showStatusBar: boolean;
+  shortcuts?: ShortcutMap;
   handlers: AppCommandHandlers;
 }
 
@@ -38,34 +40,37 @@ export function useAppCommands({
   showHidden,
   showPreviewPanel,
   showStatusBar,
+  shortcuts,
   handlers,
 }: UseAppCommandsInput): Command[] {
+  const shortcutMap = shortcuts ?? DEFAULT_SHORTCUTS;
   return useMemo<Command[]>(
     () => [
       {
         id: 'nav-back',
         name: 'Go Back',
-        shortcut: 'Alt+Left',
+        shortcut: formatShortcut(shortcutMap['nav-back']),
         category: 'navigation',
         action: handlers.goBack,
       },
       {
         id: 'nav-forward',
         name: 'Go Forward',
-        shortcut: 'Alt+Right',
+        shortcut: formatShortcut(shortcutMap['nav-forward']),
         category: 'navigation',
         action: handlers.goForward,
       },
       {
         id: 'nav-go-to-folder',
         name: 'Go to Folder...',
-        shortcut: 'Ctrl+G',
+        shortcut: formatShortcut(shortcutMap['nav-go-to-folder']),
         category: 'navigation',
         action: handlers.goToFolder,
       },
       {
         id: 'nav-up',
         name: 'Go Up One Directory',
+        shortcut: formatShortcut(shortcutMap['nav-up']),
         category: 'navigation',
         action: handlers.goUp,
       },
@@ -78,24 +83,28 @@ export function useAppCommands({
       {
         id: 'view-list',
         name: 'Switch to List View',
+        shortcut: formatShortcut(shortcutMap['view-list']),
         category: 'view',
         action: () => handlers.setViewMode('list'),
       },
       {
         id: 'view-grid',
         name: 'Switch to Grid View',
+        shortcut: formatShortcut(shortcutMap['view-grid']),
         category: 'view',
         action: () => handlers.setViewMode('grid'),
       },
       {
         id: 'view-column',
         name: 'Switch to Column View',
+        shortcut: formatShortcut(shortcutMap['view-column']),
         category: 'view',
         action: () => handlers.setViewMode('column'),
       },
       {
         id: 'view-toggle-hidden',
         name: showHidden ? 'Hide Hidden Files' : 'Show Hidden Files',
+        shortcut: formatShortcut(shortcutMap['view-toggle-hidden']),
         category: 'view',
         action: handlers.toggleHidden,
       },
@@ -114,21 +123,21 @@ export function useAppCommands({
       {
         id: 'view-refresh',
         name: 'Refresh',
-        shortcut: 'F5',
+        shortcut: formatShortcut(shortcutMap['view-refresh']),
         category: 'view',
         action: handlers.refresh,
       },
       {
         id: 'tab-new',
         name: 'New Tab',
-        shortcut: 'Ctrl+T',
+        shortcut: formatShortcut(shortcutMap['tab-new']),
         category: 'tab',
         action: handlers.addTab,
       },
       {
         id: 'tab-close',
         name: 'Close Tab',
-        shortcut: 'Ctrl+W',
+        shortcut: formatShortcut(shortcutMap['tab-close']),
         category: 'tab',
         action: handlers.closeActiveTab,
       },
@@ -141,20 +150,21 @@ export function useAppCommands({
       {
         id: 'edit-undo',
         name: 'Undo',
-        shortcut: 'Ctrl+Z',
+        shortcut: formatShortcut(shortcutMap['edit-undo']),
         category: 'file',
         action: handlers.undo,
       },
       {
         id: 'edit-redo',
         name: 'Redo',
-        shortcut: 'Ctrl+Y',
+        shortcut: formatShortcut(shortcutMap['edit-redo']),
         category: 'file',
         action: handlers.redo,
       },
       {
         id: 'settings-open',
         name: 'Open Settings',
+        shortcut: formatShortcut(shortcutMap['settings-open']),
         category: 'settings',
         action: handlers.openSettings,
       },
@@ -179,14 +189,14 @@ export function useAppCommands({
       {
         id: 'nav-add-favorite',
         name: 'Add Current Folder to Favorites',
-        shortcut: 'Ctrl+D',
+        shortcut: formatShortcut(shortcutMap['nav-add-favorite']),
         category: 'navigation',
         action: handlers.addFavorite,
       },
       {
         id: 'help-keyboard-shortcuts',
         name: 'Show Keyboard Shortcuts',
-        shortcut: '?',
+        shortcut: formatShortcut(shortcutMap['help-keyboard-shortcuts']),
         category: 'settings',
         action: handlers.showKeyboardShortcuts,
       },
@@ -203,6 +213,6 @@ export function useAppCommands({
         action: handlers.saveWorkspace,
       },
     ],
-    [handlers, showHidden, showPreviewPanel, showStatusBar]
+    [handlers, showHidden, showPreviewPanel, showStatusBar, shortcutMap]
   );
 }

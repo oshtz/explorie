@@ -612,6 +612,8 @@ describe('App Quick Look shortcut', () => {
     const sidebarSeparator = screen.getByRole('separator', { name: 'Resize sidebar' });
     fireEvent.keyDown(sidebarSeparator, { key: 'ArrowRight' });
     expect(sidebarSeparator).toHaveAttribute('aria-valuenow', '230');
+    fireEvent.keyDown(sidebarSeparator, { key: 'ArrowLeft', altKey: true });
+    expect(sidebarSeparator).toHaveAttribute('aria-valuenow', '230');
 
     fireEvent.click(await screen.findByRole('button', { name: 'Select alpha.txt' }));
     const previewSeparator = screen.getByRole('separator', { name: 'Resize preview panel' });

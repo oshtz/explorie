@@ -3,6 +3,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { KeyboardShortcutsOverlay } from './KeyboardShortcutsOverlay';
+import { DEFAULT_SHORTCUTS } from '../utils/shortcuts';
 
 function renderOverlay(
   overrides: Partial<React.ComponentProps<typeof KeyboardShortcutsOverlay>> = {}
@@ -64,6 +65,13 @@ describe('KeyboardShortcutsOverlay', () => {
 
     expect(screen.getByText('No shortcuts found')).toBeInTheDocument();
     expect(screen.queryByText('Navigation')).not.toBeInTheDocument();
+  });
+
+  it('renders the active binding instead of the shipped default', () => {
+    renderOverlay({ shortcuts: { ...DEFAULT_SHORTCUTS, 'tab-new': 'Mod+K' } });
+
+    expect(screen.getByText('Ctrl + K')).toBeInTheDocument();
+    expect(screen.queryByText('Ctrl + T')).not.toBeInTheDocument();
   });
 
   it('closes from the close button and backdrop only when the backdrop is targeted', async () => {

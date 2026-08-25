@@ -2,6 +2,7 @@ import { act, renderHook } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { FileEntry } from '../store';
 import { useOperationQueueStore } from '../operationQueueStore';
+import { DEFAULT_SHORTCUTS } from '../utils/shortcuts';
 import { useKeyboardClipboardManager } from './useKeyboardClipboard';
 
 const mocks = vi.hoisted(() => ({
@@ -221,6 +222,23 @@ describe('useKeyboardClipboardManager', () => {
 
     expect(props.showToast).not.toHaveBeenCalledWith('Cut "keyboard.txt"', { type: 'success' });
     input.remove();
+    unmount();
+  });
+
+  it('claims a rebound clipboard chord even when no item is selected', () => {
+    const { props, unmount } = renderClipboard({
+      shortcuts: { ...DEFAULT_SHORTCUTS, 'clipboard-copy': 'Q' },
+    });
+    const event = new KeyboardEvent('keydown', {
+      key: 'q',
+      bubbles: true,
+      cancelable: true,
+    });
+
+    window.dispatchEvent(event);
+
+    expect(event.defaultPrevented).toBe(true);
+    expect(props.showToast).not.toHaveBeenCalled();
     unmount();
   });
 });

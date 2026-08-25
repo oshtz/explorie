@@ -17,6 +17,7 @@ import { deleteWithUndo } from '../utils/fileOperations';
 import { reportError } from '../utils/errorReporter';
 import type { GetSelectedFilesFunction } from '../hooks/useKeyboardClipboard';
 import { useVirtualRows } from '../hooks/useVirtualRows';
+import { DEFAULT_SHORTCUTS, matchesShortcut } from '../utils/shortcuts';
 
 // Column width constants
 const MIN_COLUMN_WIDTH = 180;
@@ -140,6 +141,8 @@ function ColumnResizeHandle({ colIdx, currentWidth, onResize }: ColumnResizeHand
 
   const handleKeyDown = useCallback(
     (event: React.KeyboardEvent) => {
+      if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+
       let nextWidth: number | null = null;
       if (event.key === 'ArrowLeft') nextWidth = currentWidth - 10;
       if (event.key === 'ArrowRight') nextWidth = currentWidth + 10;
@@ -429,13 +432,17 @@ function ColumnFileList({
                 );
             }}
             onKeyDown={(e) => {
-              if (e.key === 'Enter') {
+              if (!e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey && e.key === 'Enter') {
+                e.preventDefault();
+                e.stopPropagation();
                 if (isFolder) onFolderClick(entry);
                 else
                   invoke('open_path', { path: entry.path }).catch((err) =>
                     console.error('open_path failed', err)
                   );
-              } else if (e.key === ' ') {
+              } else if (!e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey && e.key === ' ') {
+                e.preventDefault();
+                e.stopPropagation();
                 onItemClick(e, index, entry);
               }
             }}
@@ -538,6 +545,7 @@ function ColumnViewInner({
     pathStack: pathStackState,
     confirmBeforeDelete,
     uiScale,
+    shortcuts = DEFAULT_SHORTCUTS,
   } = useFileStore();
   const rowHeight = columnRowHeight(uiScale ?? 1);
   const setEditingId = useFileStore((s) => s.setEditingId);
@@ -862,8 +870,9 @@ function ColumnViewInner({
     const visible = getVisibleFiles(activePath);
     if (visible.length === 0) return;
 
-    if ((e.ctrlKey || e.metaKey) && (e.key === 'a' || e.key === 'A')) {
+    if (matchesShortcut(e.nativeEvent, shortcuts['selection-select-all'])) {
       e.preventDefault();
+      e.stopPropagation();
       const all = new Set(visible.map((f) => f.id));
       setSelectionByPath((prev) => ({
         ...prev,
@@ -871,20 +880,30 @@ function ColumnViewInner({
       }));
       setSelectionCursorPath(visible[0]?.path ?? null);
     } else if (e.key === 'Escape') {
+      if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+      e.preventDefault();
+      e.stopPropagation();
       setSelectionByPath((prev) => ({
         ...prev,
         [activePath]: { ids: new Set<string>(), anchor: null },
       }));
       setSelectionCursorPath(null);
       onFileSelect?.(null);
-    } else if (e.key === 'F2') {
+    } else if (matchesShortcut(e.nativeEvent, shortcuts['edit-rename'])) {
+      e.preventDefault();
+      e.stopPropagation();
       const firstId = Array.from(selectionByPath[activePath]?.ids || [])[0] as string | undefined;
       if (firstId) {
-        e.preventDefault();
         setEditingId(firstId);
       }
-    } else if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+    } else if (
+      !e.altKey &&
+      !e.ctrlKey &&
+      !e.metaKey &&
+      (e.key === 'ArrowUp' || e.key === 'ArrowDown')
+    ) {
       e.preventDefault();
+      e.stopPropagation();
       const sel = selectionByPath[activePath]?.ids || new Set<string>();
       const anchor = selectionByPath[activePath]?.anchor ?? null;
       const currentIndex = (() => {
@@ -921,18 +940,20 @@ function ColumnViewInner({
       setSelectionCursorPath(nextFile.path);
       onFileSelect?.(nextFile);
       scrollItemIntoView(nextIdx);
-    } else if (e.key === 'ArrowLeft') {
+    } else if (!e.altKey && !e.ctrlKey && !e.metaKey && e.key === 'ArrowLeft') {
       if (pathStack.length > 1) {
         e.preventDefault();
+        e.stopPropagation();
         onColumnBack(pathStack.length - 2);
       }
-    } else if (e.key === 'ArrowRight') {
+    } else if (!e.altKey && !e.ctrlKey && !e.metaKey && e.key === 'ArrowRight') {
       const sel = selectionByPath[activePath]?.ids || new Set<string>();
       if (sel.size === 0) return;
       const selectedId = sel.values().next().value as string | undefined;
       const entry = visible.find((f) => f.id === selectedId);
       if (entry && entry.is_dir) {
         e.preventDefault();
+        e.stopPropagation();
         // Store current selection before navigating away (ref updated immediately)
         const currentIndex = visible.findIndex((f) => f.id === selectedId);
         setSelectionByPath((prev) => ({
@@ -961,7 +982,7 @@ function ColumnViewInner({
   // Global ESC handler to clear selection even without focus
   React.useEffect(() => {
     const onKey = (ev: KeyboardEvent) => {
-      if (ev.key === 'Escape') {
+      if (ev.key === 'Escape' && !ev.altKey && !ev.ctrlKey && !ev.metaKey && !ev.shiftKey) {
         setSelectionByPath((prev) => {
           const next: typeof prev = {};
           for (const k of Object.keys(prev)) {
@@ -1113,8 +1134,16 @@ function ColumnViewInner({
                   title={path}
                   onClick={() => colIdx < pathStack.length - 1 && onColumnBack(colIdx)}
                   onKeyDown={(e) => {
-                    if ((e.key === 'Enter' || e.key === ' ') && colIdx < pathStack.length - 1) {
+                    if (
+                      !e.altKey &&
+                      !e.ctrlKey &&
+                      !e.metaKey &&
+                      !e.shiftKey &&
+                      (e.key === 'Enter' || e.key === ' ') &&
+                      colIdx < pathStack.length - 1
+                    ) {
                       e.preventDefault();
+                      e.stopPropagation();
                       onColumnBack(colIdx);
                     }
                   }}

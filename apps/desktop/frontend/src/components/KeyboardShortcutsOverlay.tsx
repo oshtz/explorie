@@ -1,6 +1,13 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import styles from './KeyboardShortcutsOverlay.module.css';
 import { createFocusTrap } from '../utils/accessibility';
+import { useFileStore } from '../store';
+import {
+  DEFAULT_SHORTCUTS,
+  formatShortcutSpaced,
+  SHORTCUT_DEFINITIONS,
+  type ShortcutMap,
+} from '../utils/shortcuts';
 
 interface Shortcut {
   keys: string;
@@ -12,15 +19,11 @@ interface ShortcutCategory {
   shortcuts: Shortcut[];
 }
 
-const SHORTCUT_CATEGORIES: ShortcutCategory[] = [
+const STATIC_SHORTCUT_CATEGORIES: ShortcutCategory[] = [
   {
     name: 'Navigation',
     shortcuts: [
-      { keys: 'Alt + Left', description: 'Go back' },
-      { keys: 'Alt + Right', description: 'Go forward' },
-      { keys: 'Ctrl + G', description: 'Go to folder' },
       { keys: 'Enter', description: 'Open selected item' },
-      { keys: 'Backspace', description: 'Go up one directory' },
       { keys: 'Arrow Keys', description: 'Navigate between files' },
       { keys: 'Home', description: 'Select first item' },
       { keys: 'End', description: 'Select last item' },
@@ -28,21 +31,11 @@ const SHORTCUT_CATEGORIES: ShortcutCategory[] = [
   },
   {
     name: 'File Operations',
-    shortcuts: [
-      { keys: 'Delete', description: 'Delete selected item' },
-      { keys: 'F2', description: 'Rename selected item' },
-      { keys: 'Ctrl + C', description: 'Copy selected items' },
-      { keys: 'Ctrl + X', description: 'Cut selected items' },
-      { keys: 'Ctrl + V', description: 'Paste items' },
-      { keys: 'Ctrl + Z', description: 'Undo last action' },
-      { keys: 'Ctrl + Y', description: 'Redo last action' },
-      { keys: 'Ctrl + D', description: 'Add to favorites' },
-    ],
+    shortcuts: [],
   },
   {
     name: 'Selection',
     shortcuts: [
-      { keys: 'Ctrl + A', description: 'Select all items' },
       { keys: 'Ctrl + Click', description: 'Toggle item selection' },
       { keys: 'Shift + Click', description: 'Select range of items' },
       { keys: 'Escape', description: 'Clear selection' },
@@ -50,48 +43,67 @@ const SHORTCUT_CATEGORIES: ShortcutCategory[] = [
     ],
   },
   {
-    name: 'View',
-    shortcuts: [
-      { keys: 'Ctrl + 1', description: 'List view' },
-      { keys: 'Ctrl + 2', description: 'Grid view' },
-      { keys: 'Ctrl + 3', description: 'Column view' },
-      { keys: 'Ctrl + H', description: 'Toggle hidden files' },
-      { keys: 'F5', description: 'Refresh' },
-      { keys: 'Space', description: 'Quick Look preview' },
-      { keys: '+', description: 'Increase thumbnail size (Grid)' },
-      { keys: '-', description: 'Decrease thumbnail size (Grid)' },
-    ],
-  },
-  {
     name: 'Tabs',
-    shortcuts: [
-      { keys: 'Ctrl + T', description: 'New tab' },
-      { keys: 'Ctrl + W', description: 'Close current tab' },
-      { keys: 'Ctrl + Tab', description: 'Next tab' },
-      { keys: 'Ctrl + Shift + Tab', description: 'Previous tab' },
-      { keys: 'Alt + Up/Down', description: 'Reorder focused Favorite' },
-    ],
-  },
-  {
-    name: 'Search & Commands',
-    shortcuts: [
-      { keys: 'Ctrl + F', description: 'Search files' },
-      { keys: 'Ctrl + Shift + P', description: 'Open command palette' },
-      { keys: '?', description: 'Show keyboard shortcuts' },
-    ],
+    shortcuts: [{ keys: 'Alt + Up/Down', description: 'Reorder focused Favorite' }],
   },
 ];
+
+const CATEGORY_NAMES: Record<string, string> = {
+  navigation: 'Navigation',
+  file: 'File Operations',
+  selection: 'Selection',
+  view: 'View',
+  tabs: 'Tabs',
+  commands: 'Search & Commands',
+};
+
+function buildShortcutCategories(shortcuts: ShortcutMap): ShortcutCategory[] {
+  const dynamic = new Map<string, Shortcut[]>();
+  for (const definition of SHORTCUT_DEFINITIONS) {
+    if (definition.developmentOnly && !import.meta.env.DEV) continue;
+    const name = CATEGORY_NAMES[definition.category];
+    const entries = dynamic.get(name) ?? [];
+    entries.push({
+      keys: formatShortcutSpaced(shortcuts[definition.id]),
+      description: definition.label,
+    });
+    dynamic.set(name, entries);
+  }
+
+  const categories: ShortcutCategory[] = [];
+  for (const name of [
+    'Navigation',
+    'File Operations',
+    'Selection',
+    'View',
+    'Tabs',
+    'Search & Commands',
+  ]) {
+    const staticEntries = STATIC_SHORTCUT_CATEGORIES.find((category) => category.name === name);
+    const dynamicEntries = dynamic.get(name) ?? [];
+    const entries = [...dynamicEntries, ...(staticEntries?.shortcuts ?? [])];
+    if (entries.length > 0) categories.push({ name, shortcuts: entries });
+  }
+  return categories;
+}
 
 interface KeyboardShortcutsOverlayProps {
   open: boolean;
   onClose: () => void;
+  shortcuts?: ShortcutMap;
 }
 
-export function KeyboardShortcutsOverlay({ open, onClose }: KeyboardShortcutsOverlayProps) {
+export function KeyboardShortcutsOverlay({
+  open,
+  onClose,
+  shortcuts,
+}: KeyboardShortcutsOverlayProps) {
   const [searchQuery, setSearchQuery] = useState('');
   const inputRef = useRef<HTMLInputElement>(null);
   const overlayRef = useRef<HTMLDivElement>(null);
   const focusTrapRef = useRef<ReturnType<typeof createFocusTrap> | null>(null);
+  const storedShortcuts = useFileStore((state) => state.shortcuts);
+  const currentShortcuts = shortcuts ?? storedShortcuts ?? DEFAULT_SHORTCUTS;
 
   useEffect(() => {
     if (!open || !overlayRef.current) return;
@@ -106,20 +118,21 @@ export function KeyboardShortcutsOverlay({ open, onClose }: KeyboardShortcutsOve
 
   // Filter shortcuts based on search query
   const filteredCategories = useMemo(() => {
-    if (!searchQuery.trim()) {
-      return SHORTCUT_CATEGORIES;
-    }
+    const categories = buildShortcutCategories(currentShortcuts);
+    if (!searchQuery.trim()) return categories;
 
     const query = searchQuery.toLowerCase();
-    return SHORTCUT_CATEGORIES.map((category) => ({
-      ...category,
-      shortcuts: category.shortcuts.filter(
-        (shortcut) =>
-          shortcut.keys.toLowerCase().includes(query) ||
-          shortcut.description.toLowerCase().includes(query)
-      ),
-    })).filter((category) => category.shortcuts.length > 0);
-  }, [searchQuery]);
+    return categories
+      .map((category) => ({
+        ...category,
+        shortcuts: category.shortcuts.filter(
+          (shortcut) =>
+            shortcut.keys.toLowerCase().includes(query) ||
+            shortcut.description.toLowerCase().includes(query)
+        ),
+      }))
+      .filter((category) => category.shortcuts.length > 0);
+  }, [currentShortcuts, searchQuery]);
 
   // Focus search input when opened
   useEffect(() => {
@@ -211,7 +224,10 @@ export function KeyboardShortcutsOverlay({ open, onClose }: KeyboardShortcutsOve
                   <h3 className={styles.categoryTitle}>{category.name}</h3>
                   <div className={styles.shortcuts}>
                     {category.shortcuts.map((shortcut) => (
-                      <div key={shortcut.keys} className={styles.shortcutItem}>
+                      <div
+                        key={`${shortcut.description}-${shortcut.keys}`}
+                        className={styles.shortcutItem}
+                      >
                         <span className={styles.description}>{shortcut.description}</span>
                         <kbd className={styles.keys}>{shortcut.keys}</kbd>
                       </div>
