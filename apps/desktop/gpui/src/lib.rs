@@ -13635,6 +13635,8 @@ impl DirectoryWindow {
             .cloned()
             .enumerate()
             .collect::<Vec<_>>();
+        let back_history_offset_y = 21.0 + back_history.len() as f32 * 16.0;
+        let forward_history_offset_y = 21.0 + forward_history.len() as f32 * 16.0;
         let back_menu = back_history
             .into_iter()
             .map(|(index, path)| {
@@ -13941,7 +13943,7 @@ impl DirectoryWindow {
                 deferred(
                     anchored()
                         .anchor(Anchor::TopLeft)
-                        .offset(point(px(0.0), px(36.0)))
+                        .offset(point(px(76.0), px(back_history_offset_y)))
                         .snap_to_window_with_margin(px(8.0))
                         .child(
                             toolbar_popover("back-history-menu", palette, back_menu)
@@ -13976,7 +13978,7 @@ impl DirectoryWindow {
                 deferred(
                     anchored()
                         .anchor(Anchor::TopLeft)
-                        .offset(point(px(0.0), px(36.0)))
+                        .offset(point(px(76.0), px(forward_history_offset_y)))
                         .snap_to_window_with_margin(px(8.0))
                         .child(
                             toolbar_popover("forward-history-menu", palette, forward_menu)
@@ -19813,7 +19815,7 @@ fn toolbar_popover(
         .debug_selector(move || id.to_string())
         .flex()
         .flex_col()
-        .min_w(px(184.0))
+        .w(px(184.0))
         .max_h(px(440.0))
         .overflow_y_scroll()
         .border_1()
@@ -21351,7 +21353,16 @@ mod tests {
         window.simulate_mouse_down(back, MouseButton::Right, gpui::Modifiers::default());
         window.simulate_mouse_up(back, MouseButton::Right, gpui::Modifiers::default());
         window.run_until_parked();
-        assert!(window.debug_bounds("back-history-menu").is_some());
+        let back_menu = window.debug_bounds("back-history-menu").unwrap();
+        let back_button = window.debug_bounds("back").unwrap();
+        assert!(
+            (f32::from(back_menu.left()) - f32::from(back_button.left())).abs() <= 1.0,
+            "back menu {back_menu:?} must align under button {back_button:?}"
+        );
+        assert!(
+            back_menu.top() >= back_button.bottom() + px(2.0),
+            "back menu {back_menu:?} must open below button {back_button:?}"
+        );
         for selector in [
             "back-history-item-0",
             "back-history-item-1",
@@ -21373,7 +21384,10 @@ mod tests {
         window.simulate_mouse_down(forward, MouseButton::Right, gpui::Modifiers::default());
         window.simulate_mouse_up(forward, MouseButton::Right, gpui::Modifiers::default());
         window.run_until_parked();
-        assert!(window.debug_bounds("forward-history-menu").is_some());
+        let forward_menu = window.debug_bounds("forward-history-menu").unwrap();
+        let forward_button = window.debug_bounds("forward").unwrap();
+        assert!((f32::from(forward_menu.left()) - f32::from(forward_button.left())).abs() <= 1.0);
+        assert!(forward_menu.top() >= forward_button.bottom() + px(2.0));
         assert!(window.debug_bounds("forward-history-item-0").is_some());
         assert!(window.debug_bounds("forward-history-item-1").is_some());
         let newest = window
