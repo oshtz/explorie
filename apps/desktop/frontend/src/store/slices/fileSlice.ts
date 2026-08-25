@@ -5,6 +5,8 @@ export const createFileSlice: StateCreator<StoreState, [], [], FileSlice> = (set
   files: [],
   loading: false,
   error: null,
+  filesystemWatcherStatus: 'idle',
+  filesystemWatcherError: null,
   showHidden: (() => {
     try {
       if (typeof window !== 'undefined') {
@@ -101,6 +103,8 @@ export const createFileSlice: StateCreator<StoreState, [], [], FileSlice> = (set
     })),
   setLoading: (loading) => set({ loading }),
   setError: (error) => set({ error }),
+  setFilesystemWatcherStatus: (status, error = null) =>
+    set({ filesystemWatcherStatus: status, filesystemWatcherError: error }),
   setShowHidden: (show) => {
     try {
       if (typeof window !== 'undefined') {

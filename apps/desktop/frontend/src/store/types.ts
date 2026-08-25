@@ -7,6 +7,7 @@ export type AccentColor = 'blue' | 'green' | 'purple' | 'orange' | 'pink' | 'cus
 export type Density = 'comfortable' | 'compact';
 export type FontChoice = 'mono' | 'system' | 'serif' | 'custom';
 export type BorderRadius = 0 | 4 | 8;
+export type FilesystemWatcherStatus = 'idle' | 'watching' | 'unavailable';
 
 export type FileModified =
   | string
@@ -112,6 +113,8 @@ export interface FileSlice {
   files: FileEntry[];
   loading: boolean;
   error: string | null;
+  filesystemWatcherStatus: FilesystemWatcherStatus;
+  filesystemWatcherError: string | null;
   showHidden: boolean;
   showSystemFiles: boolean; // Show .DS_Store, Thumbs.db, etc.
   searchQuery: string;
@@ -131,6 +134,7 @@ export interface FileSlice {
   setFiles: (files: FileEntry[] | ((prev: FileEntry[]) => FileEntry[])) => void;
   setLoading: (loading: boolean) => void;
   setError: (error: string | null) => void;
+  setFilesystemWatcherStatus: (status: FilesystemWatcherStatus, error?: string | null) => void;
   setShowHidden: (show: boolean) => void;
   setShowSystemFiles: (show: boolean) => void;
   setSearchQuery: (q: string) => void;

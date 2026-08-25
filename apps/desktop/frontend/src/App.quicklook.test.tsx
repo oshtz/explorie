@@ -5,6 +5,10 @@ import { invoke } from '@tauri-apps/api/core';
 import App from './App';
 import { useFileStore, type FileEntry } from './store';
 import type { StoreState } from './store/types';
+import {
+  FILESYSTEM_WATCH_DEBOUNCE_MS,
+  FILESYSTEM_WATCH_UNAVAILABLE_MESSAGE,
+} from './hooks/useFilesystemWatcher';
 
 const initialFileStoreState = useFileStore.getState();
 
@@ -22,6 +26,14 @@ const fsWatch = vi.hoisted(() => {
   );
   return { callbacks, unwatch, watch };
 });
+
+const remoteEvents = vi.hoisted(() => ({
+  listen: vi.fn(async () => vi.fn()),
+}));
+
+const tabsHarness = vi.hoisted(() => ({
+  activateTab: null as ((id: string) => void) | null,
+}));
 
 const sampleFiles: FileEntry[] = [
   {
@@ -75,6 +87,10 @@ vi.mock('@tauri-apps/api/core', () => ({
 vi.mock('@tauri-apps/plugin-fs', async () => ({
   ...(await vi.importActual<typeof import('@tauri-apps/plugin-fs')>('@tauri-apps/plugin-fs')),
   watch: fsWatch.watch,
+}));
+
+vi.mock('@tauri-apps/api/event', () => ({
+  listen: remoteEvents.listen,
 }));
 
 vi.mock('@tauri-apps/api/window', () => ({
@@ -145,7 +161,10 @@ vi.mock('./hooks/useTabs', async () => {
   const ReactActual = await vi.importActual<typeof import('react')>('react');
   return {
     useTabs: () => {
-      const [tabs, setTabs] = ReactActual.useState([{ id: 'tab-1', path: '/root' }]);
+      const [tabs, setTabs] = ReactActual.useState([
+        { id: 'tab-1', path: '/root' },
+        { id: 'tab-2', path: '/root' },
+      ]);
       const [activeTabId, setActiveTabId] = ReactActual.useState('tab-1');
       const tabsRef = ReactActual.useRef(tabs);
       const activeTabIdRef = ReactActual.useRef(activeTabId);
@@ -155,6 +174,9 @@ vi.mock('./hooks/useTabs', async () => {
       ReactActual.useEffect(() => {
         activeTabIdRef.current = activeTabId;
       }, [activeTabId]);
+      tabsHarness.activateTab = (id: string) => {
+        if (tabs.some((tab) => tab.id === id)) setActiveTabId(id);
+      };
       return {
         tabs,
         setTabs,
@@ -260,9 +282,33 @@ vi.mock('./components/ListView', async () => {
   };
 });
 
-vi.mock('./components/GridView', () => ({
-  GridView: () => null,
-}));
+vi.mock('./components/GridView', async () => {
+  const ReactActual = await vi.importActual<typeof import('react')>('react');
+  return {
+    GridView: ({
+      files,
+      onFileSelect,
+    }: {
+      files: FileEntry[];
+      onFileSelect?: (file: FileEntry) => void;
+    }) =>
+      ReactActual.createElement(
+        'div',
+        { 'data-testid': 'mock-grid-view' },
+        files.map((file) =>
+          ReactActual.createElement(
+            'button',
+            {
+              key: file.id,
+              type: 'button',
+              onClick: () => onFileSelect?.(file),
+            },
+            `Grid select ${file.name ?? file.path}`
+          )
+        )
+      ),
+  };
+});
 
 vi.mock('./components/ColumnView', async () => {
   const ReactActual = await vi.importActual<typeof import('react')>('react');
@@ -392,8 +438,22 @@ function resetFileStore(overrides: Partial<StoreState> = {}) {
   });
 }
 
+async function emitWatchEventAndFlush(event: { type: unknown; paths: string[]; attrs: unknown }) {
+  vi.useFakeTimers();
+  try {
+    act(() => fsWatch.callbacks[0](event));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(FILESYSTEM_WATCH_DEBOUNCE_MS);
+    });
+  } finally {
+    vi.useRealTimers();
+  }
+}
+
 function installBrowserStubs() {
   fsWatch.callbacks.length = 0;
+  remoteEvents.listen.mockClear();
+  remoteEvents.listen.mockResolvedValue(vi.fn());
   Object.defineProperty(window, 'matchMedia', {
     writable: true,
     value: vi.fn().mockImplementation((query: string) => ({
@@ -418,6 +478,7 @@ describe('App spacing variables', () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     cleanup();
   });
 
@@ -450,6 +511,7 @@ describe('App Quick Look shortcut', () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     cleanup();
   });
 
@@ -546,6 +608,94 @@ describe('App Quick Look shortcut', () => {
     await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument());
   });
 
+  it.each([
+    {
+      view: 'list' as const,
+      testId: 'mock-list-view',
+      selectPrefix: 'Select',
+      store: {} as Partial<StoreState>,
+    },
+    {
+      view: 'grid' as const,
+      testId: 'mock-grid-view',
+      selectPrefix: 'Grid select',
+      store: { viewMode: 'grid' } as Partial<StoreState>,
+    },
+    {
+      view: 'column' as const,
+      testId: 'mock-column-view',
+      selectPrefix: 'Column select',
+      store: { files: [], viewMode: 'column', pathStack: ['/root'] } as Partial<StoreState>,
+    },
+  ])(
+    'does not unmount the $view view or reset scroll on a filesystem event',
+    async ({ testId, selectPrefix, store }) => {
+      const invokeMock = vi.mocked(invoke);
+      const gamma: FileEntry = {
+        id: 'gamma',
+        path: '/root/gamma.txt',
+        name: 'gamma.txt',
+        size: 300,
+        modified: 5,
+        is_dir: false,
+        custom: {},
+      };
+      if (Object.keys(store).length > 0) resetFileStore(store);
+      render(<App />);
+
+      try {
+        const view = await screen.findByTestId(testId);
+        view.scrollTop = 72;
+        await waitFor(() => expect(fsWatch.callbacks).toHaveLength(1));
+        invokeMock.mockClear();
+
+        let resolveRefresh!: (files: FileEntry[]) => void;
+        const pendingRefresh = new Promise<FileEntry[]>((resolve) => {
+          resolveRefresh = resolve;
+        });
+        invokeMock.mockImplementation((command) => {
+          if (command === 'list_files') return pendingRefresh;
+          return Promise.resolve(null);
+        });
+
+        await emitWatchEventAndFlush({
+          type: { create: { kind: 'file' } },
+          paths: ['/root/gamma.txt'],
+          attrs: null,
+        });
+
+        await waitFor(() =>
+          expect(invokeMock).toHaveBeenCalledWith('list_files', {
+            path: '/root',
+            calc_dir_size: false,
+          })
+        );
+
+        expect(screen.queryByText('Loading files…')).not.toBeInTheDocument();
+        expect(screen.getByTestId(testId)).toBe(view);
+        expect(view.scrollTop).toBe(72);
+
+        await act(async () => {
+          resolveRefresh([...sampleFiles, gamma]);
+          await pendingRefresh;
+        });
+
+        expect(
+          await screen.findByRole('button', { name: `${selectPrefix} gamma.txt` })
+        ).toBeVisible();
+        expect(screen.queryByText('Loading files…')).not.toBeInTheDocument();
+        expect(screen.getByTestId(testId)).toBe(view);
+        expect(view.scrollTop).toBe(72);
+      } finally {
+        invokeMock.mockImplementation(async (command: string) => {
+          if (command === 'list_files') return sampleFiles;
+          if (command === 'get_dir_size') return 0;
+          return null;
+        });
+      }
+    }
+  );
+
   it('refreshes visible files after filesystem changes without reacting to reads', async () => {
     const invokeMock = vi.mocked(invoke);
     render(<App />);
@@ -575,15 +725,184 @@ describe('App Quick Look shortcut', () => {
         custom: {},
       },
     ]);
-    act(() =>
-      fsWatch.callbacks[0]({
-        type: { create: { kind: 'file' } },
-        paths: ['/root/gamma.txt'],
-        attrs: null,
-      })
-    );
+    await emitWatchEventAndFlush({
+      type: { create: { kind: 'file' } },
+      paths: ['/root/gamma.txt'],
+      attrs: null,
+    });
 
     expect(await screen.findByRole('button', { name: 'Select gamma.txt' })).toBeVisible();
+  });
+
+  it('keeps a filesystem refresh newer than an in-flight initial list load', async () => {
+    const invokeMock = vi.mocked(invoke);
+    let resolveInitialLoad!: (files: FileEntry[]) => void;
+    const initialLoad = new Promise<FileEntry[]>((resolve) => {
+      resolveInitialLoad = resolve;
+    });
+    const refreshedFiles: FileEntry[] = [
+      ...sampleFiles,
+      {
+        id: 'gamma',
+        path: '/root/gamma.txt',
+        name: 'gamma.txt',
+        size: 300,
+        modified: 5,
+        is_dir: false,
+        custom: {},
+      },
+    ];
+    resetFileStore({ files: [] });
+    invokeMock.mockReturnValueOnce(initialLoad).mockResolvedValueOnce(refreshedFiles);
+
+    render(<App />);
+    await waitFor(() => expect(fsWatch.callbacks).toHaveLength(1));
+
+    await emitWatchEventAndFlush({
+      type: { create: { kind: 'file' } },
+      paths: ['/root/gamma.txt'],
+      attrs: null,
+    });
+
+    expect(await screen.findByRole('button', { name: 'Select gamma.txt' })).toBeVisible();
+
+    await act(async () => {
+      resolveInitialLoad(sampleFiles);
+      await initialLoad;
+    });
+
+    expect(screen.getByRole('button', { name: 'Select gamma.txt' })).toBeVisible();
+  });
+
+  it('keeps a filesystem refresh newer than an in-flight initial column load', async () => {
+    const invokeMock = vi.mocked(invoke);
+    let resolveInitialLoad!: (files: FileEntry[]) => void;
+    const initialLoad = new Promise<FileEntry[]>((resolve) => {
+      resolveInitialLoad = resolve;
+    });
+    const refreshedFiles: FileEntry[] = [
+      ...sampleFiles,
+      {
+        id: 'gamma',
+        path: '/root/gamma.txt',
+        name: 'gamma.txt',
+        size: 300,
+        modified: 5,
+        is_dir: false,
+        custom: {},
+      },
+    ];
+    resetFileStore({ files: [], viewMode: 'column', pathStack: ['/', '/root'] });
+    let listCallCount = 0;
+    invokeMock.mockImplementation((command) => {
+      if (command !== 'list_files') return Promise.resolve(null);
+      listCallCount += 1;
+      if (listCallCount === 1) return initialLoad;
+      return Promise.resolve(listCallCount % 2 === 0 ? sampleFiles : refreshedFiles);
+    });
+
+    render(<App />);
+    await waitFor(() => expect(fsWatch.callbacks).toHaveLength(1));
+
+    await emitWatchEventAndFlush({
+      type: { create: { kind: 'file' } },
+      paths: ['/root/gamma.txt'],
+      attrs: null,
+    });
+
+    expect(await screen.findByRole('button', { name: 'Column select gamma.txt' })).toBeVisible();
+
+    await act(async () => {
+      resolveInitialLoad(sampleFiles);
+      await initialLoad;
+    });
+
+    expect(screen.getByRole('button', { name: 'Column select gamma.txt' })).toBeVisible();
+  });
+
+  it('does not apply an in-flight refresh after navigating to another path', async () => {
+    const invokeMock = vi.mocked(invoke);
+    let resolveRootRefresh!: (files: FileEntry[]) => void;
+    const rootRefresh = new Promise<FileEntry[]>((resolve) => {
+      resolveRootRefresh = resolve;
+    });
+    const otherFiles: FileEntry[] = [
+      {
+        id: 'other',
+        path: '/other/other.txt',
+        name: 'other.txt',
+        size: 10,
+        modified: 6,
+        is_dir: false,
+        custom: {},
+      },
+    ];
+
+    invokeMock
+      .mockResolvedValueOnce(sampleFiles)
+      .mockReturnValueOnce(rootRefresh)
+      .mockResolvedValueOnce(otherFiles);
+
+    render(<App />);
+    await screen.findByRole('button', { name: 'Select alpha.txt' });
+    await waitFor(() => expect(fsWatch.callbacks).toHaveLength(1));
+
+    await emitWatchEventAndFlush({
+      type: { create: { kind: 'file' } },
+      paths: ['/root/late.txt'],
+      attrs: null,
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Navigate elsewhere' }));
+    expect(await screen.findByRole('button', { name: 'Select other.txt' })).toBeVisible();
+
+    await act(async () => {
+      resolveRootRefresh([
+        ...sampleFiles,
+        {
+          id: 'late',
+          path: '/root/late.txt',
+          name: 'late.txt',
+          size: 30,
+          modified: 7,
+          is_dir: false,
+          custom: {},
+        },
+      ]);
+      await rootRefresh;
+    });
+
+    expect(screen.queryByRole('button', { name: 'Select late.txt' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Select other.txt' })).toBeVisible();
+  });
+
+  it('refetches list entries when activating a tab that was inactive during external changes', async () => {
+    const invokeMock = vi.mocked(invoke);
+    const refreshedFiles = [
+      ...sampleFiles,
+      {
+        id: 'gamma',
+        path: '/root/gamma.txt',
+        name: 'gamma.txt',
+        size: 300,
+        modified: 5,
+        is_dir: false,
+        custom: {},
+      },
+    ];
+    render(<App />);
+
+    await screen.findByRole('button', { name: 'Select alpha.txt' });
+    invokeMock.mockClear();
+    invokeMock.mockResolvedValueOnce(refreshedFiles);
+
+    act(() => tabsHarness.activateTab?.('tab-2'));
+
+    expect(await screen.findByRole('button', { name: 'Select gamma.txt' })).toBeVisible();
+    expect(invokeMock).toHaveBeenCalledWith('list_files', {
+      path: '/root',
+      calc_dir_size: false,
+    });
   });
 
   it('refetches cached columns when the path stack is used as a refresh signal', async () => {
@@ -602,6 +921,68 @@ describe('App Quick Look shortcut', () => {
         calc_dir_size: false,
       })
     );
+  });
+
+  it('refetches cached columns when activating a tab that was inactive during external changes', async () => {
+    const invokeMock = vi.mocked(invoke);
+    const refreshedFiles = [
+      ...sampleFiles,
+      {
+        id: 'gamma',
+        path: '/root/gamma.txt',
+        name: 'gamma.txt',
+        size: 300,
+        modified: 5,
+        is_dir: false,
+        custom: {},
+      },
+    ];
+    resetFileStore({ files: [], viewMode: 'column', pathStack: ['/root'] });
+    render(<App />);
+
+    await screen.findByRole('button', { name: 'Column select alpha.txt' });
+    invokeMock.mockClear();
+    invokeMock.mockResolvedValueOnce(refreshedFiles);
+
+    act(() => tabsHarness.activateTab?.('tab-2'));
+
+    expect(await screen.findByRole('button', { name: 'Column select gamma.txt' })).toBeVisible();
+    expect(invokeMock).toHaveBeenCalledWith('list_files', {
+      path: '/root',
+      calc_dir_size: false,
+    });
+  });
+
+  it('surfaces unavailable live updates with retry and manual refresh', async () => {
+    const invokeMock = vi.mocked(invoke);
+    fsWatch.watch.mockRejectedValueOnce(new Error('mount unavailable'));
+    render(<App />);
+
+    const status = await screen.findByTestId('filesystem-watcher-status');
+    expect(status).toHaveTextContent(FILESYSTEM_WATCH_UNAVAILABLE_MESSAGE);
+    expect(screen.getByRole('button', { name: 'Retry live updates' })).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Refresh now' })).toBeVisible();
+
+    fsWatch.watch.mockImplementationOnce(
+      async (
+        _paths: string[],
+        callback: (event: { type: unknown; paths: string[]; attrs: unknown }) => void
+      ) => {
+        fsWatch.callbacks.push(callback);
+        return fsWatch.unwatch;
+      }
+    );
+    invokeMock.mockClear();
+    fireEvent.click(screen.getByRole('button', { name: 'Retry live updates' }));
+
+    await waitFor(() => expect(fsWatch.watch).toHaveBeenCalledTimes(2));
+    await waitFor(() =>
+      expect(screen.queryByTestId('filesystem-watcher-status')).not.toBeInTheDocument()
+    );
+    expect(invokeMock).toHaveBeenCalledWith('list_files', {
+      path: '/root',
+      calc_dir_size: false,
+    });
   });
 
   it('provides keyboard-operable pane separators without application role', async () => {

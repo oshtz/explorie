@@ -1,7 +1,7 @@
 import React from 'react';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { ColumnView } from './ColumnView';
+import { ColumnView, shouldRestoreColumnScroll, type ColumnScrollRestoreKey } from './ColumnView';
 import type { FileEntry } from '../store';
 
 const mocks = vi.hoisted(() => ({
@@ -310,6 +310,44 @@ describe('ColumnView', () => {
         storeState.selectionCursorPath = path;
       }),
     };
+  });
+
+  it('keeps the current scroll position when a visible list is refreshed in place', () => {
+    const currentSelection: ColumnScrollRestoreKey = {
+      activePath: '/root',
+      selectedId: 'selected-file',
+      pathStack: ['/root'],
+    };
+
+    expect(shouldRestoreColumnScroll(null, currentSelection)).toBe(true);
+    expect(
+      shouldRestoreColumnScroll(currentSelection, {
+        ...currentSelection,
+        pathStack: ['/root'],
+      })
+    ).toBe(false);
+  });
+
+  it('restores the selected item after navigation or a selection change', () => {
+    const currentSelection: ColumnScrollRestoreKey = {
+      activePath: '/root',
+      selectedId: 'selected-file',
+      pathStack: ['/root'],
+    };
+
+    expect(
+      shouldRestoreColumnScroll(currentSelection, {
+        ...currentSelection,
+        activePath: '/root/child',
+        pathStack: ['/root', '/root/child'],
+      })
+    ).toBe(true);
+    expect(
+      shouldRestoreColumnScroll(currentSelection, {
+        ...currentSelection,
+        selectedId: 'another-file',
+      })
+    ).toBe(true);
   });
 
   it('renders columns and items for each path', () => {

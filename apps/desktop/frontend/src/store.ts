@@ -14,6 +14,7 @@ export type {
   Workspace,
   SmartFolderCriteria,
   SmartFolder,
+  FilesystemWatcherStatus,
 } from './store/types';
 
 // Re-export custom field types for convenience

@@ -256,6 +256,26 @@ const columnRowHeight = (uiScale: number) => Math.round(32 * uiScale) + 2;
 type ColumnSelection = { ids: Set<string>; anchor: number | null };
 type ColumnSelectionByPath = Record<string, ColumnSelection>;
 
+export type ColumnScrollRestoreKey = {
+  activePath: string;
+  selectedId: string;
+  pathStack: readonly string[];
+};
+
+export function shouldRestoreColumnScroll(
+  previous: ColumnScrollRestoreKey | null,
+  next: ColumnScrollRestoreKey
+): boolean {
+  if (!previous) return true;
+  if (previous.activePath !== next.activePath || previous.selectedId !== next.selectedId) {
+    return true;
+  }
+  return (
+    previous.pathStack.length !== next.pathStack.length ||
+    previous.pathStack.some((path, index) => path !== next.pathStack[index])
+  );
+}
+
 interface ColumnFileListProps {
   path: string;
   colIdx: number;
@@ -805,14 +825,21 @@ function ColumnViewInner({
 
   // Track the previous pathStack length to detect navigation direction
   const prevPathStackLengthRef = useRef(pathStack.length);
+  const previousColumnScrollKeyRef = useRef<ColumnScrollRestoreKey | null>(null);
 
   // Restore selection when navigating between columns
   React.useEffect(() => {
     const activePath = pathStack[pathStack.length - 1];
-    if (!activePath) return;
+    if (!activePath) {
+      previousColumnScrollKeyRef.current = null;
+      return;
+    }
 
     const visible = getVisibleFiles(activePath);
-    if (visible.length === 0) return;
+    if (visible.length === 0) {
+      previousColumnScrollKeyRef.current = null;
+      return;
+    }
 
     const existingSelection = selectionByPath[activePath];
     if (existingSelection && existingSelection.ids.size > 0) {
@@ -825,10 +852,24 @@ function ColumnViewInner({
       const selectedIndex = visible.findIndex((f) => f.id === selectedId);
 
       if (selectedFile && selectedIndex >= 0) {
-        // Selection is valid - update preview and scroll
+        // Selection is valid - update preview and only restore scroll when the
+        // user changed columns or selection. Filesystem refreshes replace the
+        // visible array but should leave the current vertical position alone.
         onFileSelect?.(selectedFile);
-        containerRef.current?.focus();
-        setTimeout(() => scrollItemIntoView(selectedIndex), 50);
+        const nextScrollKey: ColumnScrollRestoreKey = {
+          activePath,
+          selectedId: selectedFile.id,
+          pathStack: [...pathStack],
+        };
+        const shouldRestoreScroll = shouldRestoreColumnScroll(
+          previousColumnScrollKeyRef.current,
+          nextScrollKey
+        );
+        previousColumnScrollKeyRef.current = nextScrollKey;
+        if (shouldRestoreScroll) {
+          containerRef.current?.focus();
+          setTimeout(() => scrollItemIntoView(selectedIndex), 50);
+        }
         prevPathStackLengthRef.current = pathStack.length;
         return;
       }
@@ -844,7 +885,7 @@ function ColumnViewInner({
       onFileSelect?.(visible[0]);
     }
 
-    containerRef.current?.focus();
+    previousColumnScrollKeyRef.current = null;
     prevPathStackLengthRef.current = pathStack.length;
   }, [
     pathStack,

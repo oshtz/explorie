@@ -1,6 +1,5 @@
 import React, { useEffect, useState, useCallback, useMemo, useRef } from 'react';
 import { invoke, isTauri } from '@tauri-apps/api/core';
-import { watch } from '@tauri-apps/plugin-fs';
 import { useFileStore } from './store';
 import { ListView } from './components/ListView';
 import { ColumnView } from './components/ColumnView';
@@ -27,6 +26,10 @@ import { useAppCommands } from './hooks/useAppCommands';
 import { useAppKeyboardShortcuts } from './hooks/useAppKeyboardShortcuts';
 import { calculatePaneLayout, useAppLayoutPersistence } from './hooks/useAppLayoutPersistence';
 import { useQuickLookController } from './hooks/useQuickLookController';
+import {
+  FILESYSTEM_WATCH_UNAVAILABLE_MESSAGE,
+  useFilesystemWatcher,
+} from './hooks/useFilesystemWatcher';
 import { formatErrorMessage } from './utils/errorMessages';
 import { DragOverlay } from './components/DragOverlay';
 import { deleteWithUndo } from './utils/fileOperations';
@@ -186,6 +189,8 @@ function AppContent() {
     files,
     loading,
     error,
+    filesystemWatcherStatus,
+    filesystemWatcherError,
     viewMode,
     theme,
     pathStack,
@@ -202,6 +207,8 @@ function AppContent() {
       files: s.files,
       loading: s.loading,
       error: s.error,
+      filesystemWatcherStatus: s.filesystemWatcherStatus,
+      filesystemWatcherError: s.filesystemWatcherError,
       viewMode: s.viewMode,
       theme: s.theme,
       pathStack: s.pathStack,
@@ -220,6 +227,7 @@ function AppContent() {
   const setFiles = useFileStore((s) => s.setFiles);
   const setLoading = useFileStore((s) => s.setLoading);
   const setError = useFileStore((s) => s.setError);
+  const setFilesystemWatcherStatus = useFileStore((s) => s.setFilesystemWatcherStatus);
   const setViewMode = useFileStore((s) => s.setViewMode);
   const setTheme = useFileStore((s) => s.setTheme);
   const setPathStack = useFileStore((s) => s.setPathStack);
@@ -666,11 +674,30 @@ function AppContent() {
     root.style.setProperty('--grid-min-width', `${grid}px`);
   }, [listRowHeight, gridMinWidth, uiScale]);
 
+  // Invalidate asynchronous loads whenever the active browsing scope changes.
+  // A watcher refresh may outlive the tab/path that started it.
+  const refreshGenerationRef = useRef(0);
+  const viewRequestTokenRef = useRef(0);
+  useEffect(() => {
+    return () => {
+      refreshGenerationRef.current += 1;
+    };
+  }, []);
+  useEffect(() => {
+    refreshGenerationRef.current += 1;
+  }, [activeTabId, currentPath, viewMode, pathStack, activeSmartFolder]);
+
   // Fetch files for the current path (list/grid views)
   useEffect(() => {
     if (pathInitializing || (!currentPath && !activeSmartFolder)) return;
     if (viewMode === 'list' || viewMode === 'grid') {
       let cancelled = false;
+      const requestGeneration = refreshGenerationRef.current;
+      const requestToken = viewRequestTokenRef.current;
+      const isCurrentRequest = () =>
+        !cancelled &&
+        refreshGenerationRef.current === requestGeneration &&
+        viewRequestTokenRef.current === requestToken;
       const fetchFiles = async () => {
         setLoading(true);
         setError(null);
@@ -686,7 +713,7 @@ function AppContent() {
               calc_dir_size: false,
             });
           }
-          if (cancelled) return;
+          if (!isCurrentRequest()) return;
           setFiles(
             result.map((e) => ({
               ...e,
@@ -696,14 +723,20 @@ function AppContent() {
           if (showFolderSizes) {
             void fetchDirSizesConcurrent(
               result,
-              (sizes) => setFiles((prev) => mergeDirectorySizes(prev, sizes)),
-              () => cancelled
+              (sizes) => {
+                if (!isCurrentRequest()) return;
+                setFiles((prev) => mergeDirectorySizes(prev, sizes));
+              },
+              () => !isCurrentRequest()
             );
           }
         } catch (err: unknown) {
+          if (!isCurrentRequest()) return;
           setError(formatErrorMessage(err));
         } finally {
-          setLoading(false);
+          if (isCurrentRequest()) {
+            setLoading(false);
+          }
         }
       };
       fetchFiles();
@@ -720,6 +753,7 @@ function AppContent() {
     showFolderSizes,
     pathInitializing,
     activeSmartFolder,
+    activeTabId,
     shouldUseDevMockEntries,
   ]);
 
@@ -727,16 +761,30 @@ function AppContent() {
   const columnFilesRef = useRef(columnFiles);
   columnFilesRef.current = columnFiles;
   const previousColumnPathStackRef = useRef<string[]>([]);
+  const previousColumnScopeRef = useRef<{ tabId: string; viewMode: string } | null>(null);
 
   // Fetch new columns, or refetch all when the same stack is emitted as a refresh signal.
   useEffect(() => {
     if (pathInitializing || !currentPath) return;
+    const previousColumnScope = previousColumnScopeRef.current;
+    const columnScopeChanged =
+      previousColumnScope === null ||
+      previousColumnScope.tabId !== activeTabId ||
+      previousColumnScope.viewMode !== viewMode;
+    previousColumnScopeRef.current = { tabId: activeTabId, viewMode };
     if (viewMode === 'column') {
       let cancelled = false;
+      const requestGeneration = refreshGenerationRef.current;
+      const requestToken = viewRequestTokenRef.current;
+      const isCurrentRequest = () =>
+        !cancelled &&
+        refreshGenerationRef.current === requestGeneration &&
+        viewRequestTokenRef.current === requestToken;
       const previousPathStack = previousColumnPathStackRef.current;
       const refreshRequested =
-        previousPathStack.length === pathStack.length &&
-        previousPathStack.every((path, index) => path === pathStack[index]);
+        columnScopeChanged ||
+        (previousPathStack.length === pathStack.length &&
+          previousPathStack.every((path, index) => path === pathStack[index]));
       previousColumnPathStackRef.current = pathStack;
       const fetchAll = async () => {
         const currentColumnFiles = columnFilesRef.current;
@@ -746,6 +794,7 @@ function AppContent() {
 
         // If no new paths to fetch, just trim columnFiles to current pathStack
         if (pathsToFetch.length === 0) {
+          if (!isCurrentRequest()) return;
           setColumnFiles((prev) => {
             const trimmed: { [path: string]: FileEntry[] } = {};
             for (const p of pathStack) {
@@ -774,7 +823,7 @@ function AppContent() {
             const result = shouldUseDevMockEntries
               ? createDevMockEntries(path)
               : await invoke<FileEntry[]>('list_files', { path, calc_dir_size: false });
-            if (cancelled) return;
+            if (!isCurrentRequest()) return;
             newColumnFiles[path] = result.map((e) => ({
               ...e,
               name: e.name ?? (e.path.split(/[/\\]/).pop() || e.path),
@@ -785,26 +834,30 @@ function AppContent() {
                 fetchDirSizesConcurrent(
                   result,
                   (sizes) => {
+                    if (!isCurrentRequest()) return;
                     setColumnFiles((prev) => ({
                       ...prev,
                       [columnPath]: mergeDirectorySizes(prev[columnPath] || [], sizes),
                     }));
                   },
-                  () => cancelled
+                  () => !isCurrentRequest()
                 )
               );
             }
           }
-          if (!cancelled) {
+          if (isCurrentRequest()) {
             setColumnFiles(newColumnFiles);
             for (const startTask of sizeTasks) {
               void startTask();
             }
           }
         } catch (err: unknown) {
+          if (!isCurrentRequest()) return;
           setError(formatErrorMessage(err));
         } finally {
-          setLoading(false);
+          if (isCurrentRequest()) {
+            setLoading(false);
+          }
         }
       };
       fetchAll();
@@ -820,6 +873,7 @@ function AppContent() {
     showFolderSizes,
     pathInitializing,
     currentPath,
+    activeTabId,
     shouldUseDevMockEntries,
   ]);
 
@@ -903,6 +957,11 @@ function AppContent() {
 
   // Refresh currently visible views (list/grid or column)
   const refreshVisibleViews = useCallback(async () => {
+    const requestGeneration = refreshGenerationRef.current;
+    const requestToken = ++viewRequestTokenRef.current;
+    const isCurrentRequest = () =>
+      refreshGenerationRef.current === requestGeneration &&
+      viewRequestTokenRef.current === requestToken;
     setError(null);
     try {
       if (viewMode === 'list' || viewMode === 'grid') {
@@ -911,6 +970,7 @@ function AppContent() {
           : shouldUseDevMockEntries
             ? createDevMockEntries(currentPath)
             : await invoke<FileEntry[]>('list_files', { path: currentPath, calc_dir_size: false });
+        if (!isCurrentRequest()) return;
         setFiles(
           refreshed.map((e) => ({
             ...e,
@@ -920,8 +980,11 @@ function AppContent() {
         if (showFolderSizes) {
           void fetchDirSizesConcurrent(
             refreshed,
-            (sizes) => setFiles((prev) => mergeDirectorySizes(prev, sizes)),
-            () => false
+            (sizes) => {
+              if (!isCurrentRequest()) return;
+              setFiles((prev) => mergeDirectorySizes(prev, sizes));
+            },
+            () => !isCurrentRequest()
           );
         }
       } else {
@@ -930,24 +993,30 @@ function AppContent() {
           const res = shouldUseDevMockEntries
             ? createDevMockEntries(path)
             : await invoke<FileEntry[]>('list_files', { path, calc_dir_size: false });
+          if (!isCurrentRequest()) return;
           refreshed[path] = res;
           if (showFolderSizes) {
             void fetchDirSizesConcurrent(
               res,
               (sizes) => {
+                if (!isCurrentRequest()) return;
                 setColumnFiles((prev) => ({
                   ...prev,
                   [path]: mergeDirectorySizes(prev[path] || [], sizes),
                 }));
               },
-              () => false
+              () => !isCurrentRequest()
             );
           }
         }
+        if (!isCurrentRequest()) return;
         setColumnFiles(refreshed);
       }
     } catch (refreshError) {
+      if (!isCurrentRequest()) return;
       setError(formatErrorMessage(refreshError));
+    } finally {
+      if (isCurrentRequest()) setLoading(false);
     }
   }, [
     viewMode,
@@ -955,6 +1024,7 @@ function AppContent() {
     pathStack,
     showFolderSizes,
     setFiles,
+    setLoading,
     setError,
     activeSmartFolder,
     shouldUseDevMockEntries,
@@ -1029,34 +1099,23 @@ function AppContent() {
     refreshVisibleViewsRef.current = refreshVisibleViews;
   }, [refreshVisibleViews]);
 
-  useEffect(() => {
-    if (!tauri || pathInitializing || activeSmartFolder || !currentPath) return;
+  const visibleWatchPaths = useMemo(
+    () => (viewMode === 'column' ? pathStack : currentPath ? [currentPath] : []),
+    [viewMode, pathStack, currentPath]
+  );
 
-    const visiblePaths = viewMode === 'column' ? [...new Set(pathStack)] : [currentPath];
-    let disposed = false;
-    let stopWatching: (() => void) | undefined;
+  const { retry: retryFilesystemWatcher } = useFilesystemWatcher({
+    enabled: tauri && !pathInitializing && !activeSmartFolder && Boolean(currentPath),
+    paths: visibleWatchPaths,
+    scopeKey: `${activeTabId}:${viewMode}`,
+    onChange: () => refreshVisibleViewsRef.current(),
+    onStatusChange: ({ status, error }) => setFilesystemWatcherStatus(status, error),
+  });
 
-    void watch(
-      visiblePaths,
-      (event) => {
-        if (typeof event.type === 'object' && 'access' in event.type) return;
-        void refreshVisibleViewsRef.current();
-      },
-      { recursive: false, delayMs: 200 }
-    )
-      .then((unwatch) => {
-        if (disposed) unwatch();
-        else stopWatching = unwatch;
-      })
-      .catch((watchError) => {
-        if (!disposed) console.warn('Directory watching unavailable:', watchError);
-      });
-
-    return () => {
-      disposed = true;
-      stopWatching?.();
-    };
-  }, [activeSmartFolder, currentPath, pathInitializing, pathStack, tauri, viewMode]);
+  const handleRetryFilesystemWatcher = useCallback(() => {
+    retryFilesystemWatcher();
+    void refreshVisibleViewsRef.current();
+  }, [retryFilesystemWatcher]);
 
   const handlePaletteGoUp = useCallback(() => {
     const path = normalizePath(currentPathRef.current);
@@ -1466,6 +1525,22 @@ function AppContent() {
                       onDismiss={dismissRecovery}
                     />
                   </InlineErrorBoundary>
+                )}
+                {filesystemWatcherStatus === 'unavailable' && (
+                  <div
+                    className={styles.watcherStatus}
+                    role="alert"
+                    aria-live="polite"
+                    data-testid="filesystem-watcher-status"
+                  >
+                    <span>{filesystemWatcherError ?? FILESYSTEM_WATCH_UNAVAILABLE_MESSAGE}</span>
+                    <button type="button" onClick={handleRetryFilesystemWatcher}>
+                      Retry live updates
+                    </button>
+                    <button type="button" onClick={handleRefreshFromPalette}>
+                      Refresh now
+                    </button>
+                  </div>
                 )}
                 {waitingForInitialPath && (
                   <div className={styles.loadingMessage} role="status" aria-live="polite">
