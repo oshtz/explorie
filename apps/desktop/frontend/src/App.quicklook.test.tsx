@@ -8,19 +8,16 @@ import type { StoreState } from './store/types';
 
 const initialFileStoreState = useFileStore.getState();
 
-const fsWatch = vi.hoisted(() => {
-  const callbacks: Array<(event: { type: unknown; paths: string[]; attrs: unknown }) => void> = [];
-  const unwatch = vi.fn();
-  const watch = vi.fn(
-    async (
-      _paths: string[],
-      callback: (event: { type: unknown; paths: string[]; attrs: unknown }) => void
-    ) => {
+const nativeWatch = vi.hoisted(() => {
+  const callbacks: Array<(event: { payload: unknown }) => void> = [];
+  const unlisten = vi.fn();
+  const listen = vi.fn(
+    async (_event: string, callback: (event: { payload: unknown }) => void) => {
       callbacks.push(callback);
-      return unwatch;
+      return unlisten;
     }
   );
-  return { callbacks, unwatch, watch };
+  return { callbacks, unlisten, listen };
 });
 
 const sampleFiles: FileEntry[] = [
@@ -68,13 +65,18 @@ vi.mock('@tauri-apps/api/core', () => ({
   invoke: vi.fn(async (command: string) => {
     if (command === 'list_files') return sampleFiles;
     if (command === 'get_dir_size') return 0;
+    if (command === 'watch_paths') return 1;
+    if (command === 'unwatch_paths') return true;
     return null;
   }),
 }));
 
+vi.mock('@tauri-apps/api/event', () => ({
+  listen: nativeWatch.listen,
+}));
+
 vi.mock('@tauri-apps/plugin-fs', async () => ({
   ...(await vi.importActual<typeof import('@tauri-apps/plugin-fs')>('@tauri-apps/plugin-fs')),
-  watch: fsWatch.watch,
 }));
 
 vi.mock('@tauri-apps/api/window', () => ({
@@ -393,7 +395,7 @@ function resetFileStore(overrides: Partial<StoreState> = {}) {
 }
 
 function installBrowserStubs() {
-  fsWatch.callbacks.length = 0;
+  nativeWatch.callbacks.length = 0;
   Object.defineProperty(window, 'matchMedia', {
     writable: true,
     value: vi.fn().mockImplementation((query: string) => ({
@@ -546,19 +548,21 @@ describe('App Quick Look shortcut', () => {
     await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument());
   });
 
-  it('refreshes visible files after filesystem changes without reacting to reads', async () => {
+  it('refreshes visible files only for its native watcher registration', async () => {
     const invokeMock = vi.mocked(invoke);
     render(<App />);
 
     await screen.findByRole('button', { name: 'Select alpha.txt' });
-    await waitFor(() => expect(fsWatch.callbacks).toHaveLength(1));
+    await waitFor(() => expect(nativeWatch.callbacks).toHaveLength(1));
     invokeMock.mockClear();
 
     act(() =>
-      fsWatch.callbacks[0]({
-        type: { access: { kind: 'open', mode: 'read' } },
-        paths: ['/root/alpha.txt'],
-        attrs: null,
+      nativeWatch.callbacks[0]({
+        payload: {
+          registrationId: 999,
+          state: 'changed',
+          paths: ['/root/alpha.txt'],
+        },
       })
     );
     expect(invokeMock).not.toHaveBeenCalled();
@@ -576,10 +580,12 @@ describe('App Quick Look shortcut', () => {
       },
     ]);
     act(() =>
-      fsWatch.callbacks[0]({
-        type: { create: { kind: 'file' } },
-        paths: ['/root/gamma.txt'],
-        attrs: null,
+      nativeWatch.callbacks[0]({
+        payload: {
+          registrationId: 1,
+          state: 'changed',
+          paths: ['/root/gamma.txt'],
+        },
       })
     );
 

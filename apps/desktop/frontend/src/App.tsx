@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useCallback, useMemo, useRef } from 'react';
 import { invoke, isTauri } from '@tauri-apps/api/core';
-import { watch } from '@tauri-apps/plugin-fs';
+import { listen } from '@tauri-apps/api/event';
 import { useFileStore } from './store';
 import { ListView } from './components/ListView';
 import { ColumnView } from './components/ColumnView';
@@ -40,6 +40,13 @@ const LazySecureDeleteDialog = React.lazy(() =>
   }))
 );
 type CssVariableStyle<K extends string> = React.CSSProperties & Record<K, string>;
+
+type NativeWatcherEvent = {
+  registrationId: number;
+  state: 'changed' | 'failed' | 'stopped';
+  paths: string[];
+  error?: string | null;
+};
 
 function createDevMockEntries(basePath: string): FileEntry[] {
   const normalizedBase = basePath.replace(/\\$/, '') || '/';
@@ -1034,27 +1041,51 @@ function AppContent() {
 
     const visiblePaths = viewMode === 'column' ? [...new Set(pathStack)] : [currentPath];
     let disposed = false;
-    let stopWatching: (() => void) | undefined;
+    let registrationId: number | undefined;
+    let stopListening: (() => void) | undefined;
 
-    void watch(
-      visiblePaths,
-      (event) => {
-        if (typeof event.type === 'object' && 'access' in event.type) return;
-        void refreshVisibleViewsRef.current();
-      },
-      { recursive: false, delayMs: 200 }
-    )
-      .then((unwatch) => {
-        if (disposed) unwatch();
-        else stopWatching = unwatch;
-      })
-      .catch((watchError) => {
+    const startWatching = async () => {
+      try {
+        stopListening = await listen<NativeWatcherEvent>('filesystem-change', (event) => {
+          const payload = event.payload;
+          if (disposed || registrationId !== payload.registrationId) return;
+          if (payload.state === 'failed') {
+            console.warn('Directory watching unavailable:', payload.error ?? 'unknown error');
+          } else if (payload.state === 'changed') {
+            void refreshVisibleViewsRef.current();
+          }
+        });
+
+        if (disposed) {
+          stopListening?.();
+          stopListening = undefined;
+          return;
+        }
+
+        const id = await invoke<number>('watch_paths', { paths: visiblePaths });
+        if (disposed) {
+          await invoke('unwatch_paths', { registrationId: id });
+          stopListening?.();
+          stopListening = undefined;
+        } else {
+          registrationId = id;
+        }
+      } catch (watchError) {
         if (!disposed) console.warn('Directory watching unavailable:', watchError);
-      });
+        stopListening?.();
+        stopListening = undefined;
+      }
+    };
+
+    void startWatching();
 
     return () => {
       disposed = true;
-      stopWatching?.();
+      stopListening?.();
+      stopListening = undefined;
+      if (registrationId !== undefined) {
+        void invoke('unwatch_paths', { registrationId });
+      }
     };
   }, [activeSmartFolder, currentPath, pathInitializing, pathStack, tauri, viewMode]);
 
