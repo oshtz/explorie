@@ -51,6 +51,12 @@ struct ActiveMutations {
     exit_requested: AtomicBool,
 }
 
+#[derive(Default)]
+struct RemoteDriveExitState {
+    in_progress: AtomicBool,
+    ready_to_exit: AtomicBool,
+}
+
 impl ActiveMutations {
     fn begin(&self) {
         self.count.fetch_add(1, Ordering::Relaxed);
@@ -85,6 +91,10 @@ impl Drop for ActiveMutation {
                 .state::<RemoteDriveManager>()
                 .disconnect_all_if_clean(&self.0)
         {
+            self.0
+                .state::<RemoteDriveExitState>()
+                .ready_to_exit
+                .store(true, Ordering::Release);
             self.0.exit(0);
         }
     }
@@ -303,19 +313,25 @@ async fn get_syncthing_root(path: String) -> Option<String> {
 }
 
 #[tauri::command]
-fn get_remote_drive_environment(
+async fn get_remote_drive_environment(
     app: AppHandle,
     manager: tauri::State<'_, RemoteDriveManager>,
-) -> RemoteDriveEnvironment {
-    manager.environment(&app)
+) -> Result<RemoteDriveEnvironment, String> {
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || manager.environment(&app))
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
-fn list_rclone_remotes(
+async fn list_rclone_remotes(
     app: AppHandle,
     manager: tauri::State<'_, RemoteDriveManager>,
 ) -> Result<Vec<String>, String> {
-    manager.list_remotes(&app)
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || manager.list_remotes(&app))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -368,11 +384,20 @@ async fn force_remote_drive_shutdown(
 ) -> Result<(), String> {
     let manager = manager.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        manager.disconnect_all(&app);
+        if !manager.disconnect_all(&app) {
+            return Err(
+                "A remote drive connection is still stopping. Wait a moment, then try again."
+                    .to_string(),
+            );
+        }
+        app.state::<RemoteDriveExitState>()
+            .ready_to_exit
+            .store(true, Ordering::Release);
         app.exit(0);
+        Ok(())
     })
     .await
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -388,12 +413,24 @@ fn register_remote_drive_helper() -> Result<String, String> {
 }
 
 #[tauri::command]
-fn unregister_remote_drive_helper(
+async fn unregister_remote_drive_helper(
     app: AppHandle,
     manager: tauri::State<'_, RemoteDriveManager>,
 ) -> Result<(), String> {
-    manager.disconnect_all(&app);
-    remote_drives::unregister_macos_helper()
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if !manager.disconnect_all(&app) {
+            return Err(
+                "A remote drive connection is still stopping. Wait a moment, then try again."
+                    .to_string(),
+            );
+        }
+        let result = remote_drives::unregister_macos_helper();
+        manager.clear_shutdown_request();
+        result
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -2120,6 +2157,7 @@ fn main() {
         }))
         .manage(FileOperationJobs::default())
         .manage(ActiveMutations::default())
+        .manage(RemoteDriveExitState::default())
         .manage(RemoteDriveManager::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
@@ -2179,14 +2217,40 @@ fn main() {
 
     app.run(|app_handle, event| {
         if let tauri::RunEvent::ExitRequested { api, .. } = event {
+            if app_handle
+                .state::<RemoteDriveExitState>()
+                .ready_to_exit
+                .swap(false, Ordering::AcqRel)
+            {
+                return;
+            }
             if app_handle.state::<ActiveMutations>().request_exit() {
                 app_handle.state::<FileOperationJobs>().cancel_all();
                 api.prevent_exit();
-            } else if !app_handle
-                .state::<RemoteDriveManager>()
-                .disconnect_all_if_clean(app_handle)
+            } else if app_handle
+                .state::<RemoteDriveExitState>()
+                .in_progress
+                .swap(true, Ordering::AcqRel)
             {
                 api.prevent_exit();
+            } else {
+                api.prevent_exit();
+                let app = app_handle.clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    let clean = app
+                        .state::<RemoteDriveManager>()
+                        .disconnect_all_if_clean(&app);
+                    if clean {
+                        app.state::<RemoteDriveExitState>()
+                            .ready_to_exit
+                            .store(true, Ordering::Release);
+                        app.exit(0);
+                    } else {
+                        app.state::<RemoteDriveExitState>()
+                            .in_progress
+                            .store(false, Ordering::Release);
+                    }
+                });
             }
         }
     });

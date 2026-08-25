@@ -5,6 +5,42 @@
 
 // Common error patterns mapped to user-friendly messages
 const ERROR_PATTERNS: Array<{ pattern: RegExp; message: string; category: ErrorCategory }> = [
+  // Remote-drive setup and mount errors
+  {
+    pattern: /(no (?:rclone )?remotes|without creating a remote|no configured remotes)/i,
+    message: 'No rclone remotes are configured. Choose Configure to add one, then try again.',
+    category: 'remote_drive',
+  },
+  {
+    pattern: /(selected rclone remote is no longer configured|remote .*not configured)/i,
+    message:
+      'The selected rclone remote is no longer configured. Choose Configure to refresh the remote list, then try again.',
+    category: 'remote_drive',
+  },
+  {
+    pattern:
+      /(encrypted.*config|config.*encrypted|unable to decrypt|failed to decrypt|password required|non.?interactive.*password)/i,
+    message:
+      "rclone's encrypted configuration could not be unlocked non-interactively. Set up the existing rclone password command or RCLONE_CONFIG_PASS, then try again.",
+    category: 'remote_drive',
+  },
+  {
+    pattern: /(winfsp|windows filesystem driver)/i,
+    message: 'Install WinFsp before mounting remote drives on Windows, then try again.',
+    category: 'remote_drive',
+  },
+  {
+    pattern: /(approval-required|approve.*helper|privileged.*helper|system settings.*mount)/i,
+    message: 'Approve the Explorie Remote Drives helper in macOS System Settings, then try again.',
+    category: 'remote_drive',
+  },
+  {
+    pattern: /(rclone exited|rclone.*mount|remote[- ]drive.*(failed|error)|remote[- ]drive)/i,
+    message:
+      'Remote drive mount failed. Check the remote configuration and network connection, then try again.',
+    category: 'remote_drive',
+  },
+
   // Permission errors
   {
     pattern: /(access is denied|permission denied|eacces|eperm)/i,
@@ -145,6 +181,7 @@ export type ErrorCategory =
   | 'network'
   | 'archive'
   | 'path'
+  | 'remote_drive'
   | 'system'
   | 'unknown';
 
@@ -212,6 +249,19 @@ export function formatError(error: unknown): FormattedError {
 export function formatOperationError(operation: string, error: unknown): string {
   const formatted = formatError(error);
   return `${operation}: ${formatted.message}`;
+}
+
+/**
+ * Format an error originating from a remote-drive connection or mount.
+ * The backend normally supplies a categorized message; this fallback keeps
+ * rejected Tauri promises actionable too.
+ */
+export function formatRemoteDriveError(error: unknown): string {
+  const technical = extractErrorMessage(error);
+  if (/^remote drive mount failed:/i.test(technical.trim())) return technical;
+  const formatted = formatError(error);
+  if (formatted.category === 'remote_drive') return formatted.message;
+  return `Remote drive connection failed: ${formatted.message}. Check the remote configuration and network connection, then try again.`;
 }
 
 /**
@@ -358,6 +408,8 @@ function getSuggestion(category: ErrorCategory): string | undefined {
       return 'Free up disk space and try again';
     case 'network':
       return 'Check your network connection and try again';
+    case 'remote_drive':
+      return 'Check the remote configuration and network connection, then try again';
     case 'exists':
       return 'Rename the file or choose a different location';
     case 'name':
@@ -404,6 +456,7 @@ export default {
   formatErrorMessage,
   formatError,
   formatOperationError,
+  formatRemoteDriveError,
   formatBatchErrors,
   createOperationErrorMessage,
 };

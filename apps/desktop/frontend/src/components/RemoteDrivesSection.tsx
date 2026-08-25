@@ -5,12 +5,15 @@ import { Icon } from './Icon';
 import {
   loadRemoteDrives,
   saveRemoteDrives,
+  getRemoteDriveLifecycle,
+  getRemoteDriveStatusMessage,
   type DisconnectResult,
   type RemoteDriveEnvironment,
   type RemoteDriveExitBlocker,
   type RemoteDriveProfile,
   type RemoteDriveStatus,
 } from '../utils/remoteDrives';
+import { formatErrorMessage, formatRemoteDriveError } from '../utils/errorMessages';
 import styles from './RemoteDrivesSection.module.css';
 
 const WINDOWS_LETTERS = Array.from({ length: 23 }, (_, index) =>
@@ -18,6 +21,8 @@ const WINDOWS_LETTERS = Array.from({ length: 23 }, (_, index) =>
 );
 
 const disconnected = (id: string): RemoteDriveStatus => ({ id, state: 'disconnected' });
+const noRemotesMessage =
+  'No rclone remotes are configured. Choose Configure to add one, then try again.';
 
 export function RemoteDrivesSection({
   onSelectLocation,
@@ -32,32 +37,53 @@ export function RemoteDrivesSection({
   const [installingWinFsp, setInstallingWinFsp] = useState(false);
   const [configuringRemotes, setConfiguringRemotes] = useState(false);
   const [editing, setEditing] = useState<RemoteDriveProfile | null>(null);
+  const [connectingSince, setConnectingSince] = useState<Record<string, number>>({});
+  const [clock, setClock] = useState(() => Date.now());
   const autoStarted = useRef(false);
 
   const updateStatus = useCallback((status: RemoteDriveStatus) => {
     setStatuses((current) => ({ ...current, [status.id]: status }));
+    setConnectingSince((current) => {
+      if (status.state === 'connecting') {
+        return current[status.id] ? current : { ...current, [status.id]: Date.now() };
+      }
+      if (!(status.id in current)) return current;
+      const next = { ...current };
+      delete next[status.id];
+      return next;
+    });
   }, []);
 
   const refreshEnvironment = useCallback(async () => {
     try {
       const next = await invoke<RemoteDriveEnvironment>('get_remote_drive_environment');
       setEnvironment(next);
-      setSetupError(next.error ?? null);
+      setSetupError(next.error ? formatErrorMessage(next.error) : null);
       if (next.rcloneAvailable) {
-        setRemotes(await invoke<string[]>('list_rclone_remotes'));
+        const configuredRemotes = await invoke<string[]>('list_rclone_remotes');
+        setRemotes(configuredRemotes);
+        if (configuredRemotes.length === 0) setSetupError(noRemotesMessage);
       }
     } catch (error) {
-      setSetupError(String(error));
+      setSetupError(formatErrorMessage(error));
     }
   }, []);
 
   const connect = useCallback(
     async (profile: RemoteDriveProfile) => {
-      updateStatus({ id: profile.id, state: 'connecting' });
+      updateStatus({
+        id: profile.id,
+        state: 'connecting',
+        message: getRemoteDriveStatusMessage({ state: 'connecting' }),
+      });
       try {
         updateStatus(await invoke<RemoteDriveStatus>('connect_remote_drive', { profile }));
       } catch (error) {
-        updateStatus({ id: profile.id, state: 'error', error: String(error) });
+        updateStatus({
+          id: profile.id,
+          state: 'error',
+          error: formatRemoteDriveError(error),
+        });
       }
     },
     [updateStatus]
@@ -112,6 +138,12 @@ export function RemoteDrivesSection({
   }, [refreshEnvironment, updateStatus]);
 
   useEffect(() => {
+    if (!Object.values(statuses).some((status) => status.state === 'connecting')) return;
+    const timer = window.setInterval(() => setClock(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [statuses]);
+
+  useEffect(() => {
     if (!environment || autoStarted.current || !environment.rcloneAvailable) return;
     if (environment.platform === 'windows' && environment.winfspAvailable === false) return;
     if (environment.platform === 'macos' && environment.helperStatus !== 'enabled') return;
@@ -160,7 +192,7 @@ export function RemoteDrivesSection({
         return next;
       });
     } catch (error) {
-      updateStatus({ id: profile.id, state: 'error', error: String(error) });
+      updateStatus({ id: profile.id, state: 'error', error: formatRemoteDriveError(error) });
     }
   };
 
@@ -173,7 +205,7 @@ export function RemoteDrivesSection({
       );
       if (confirmed) await disconnect(profile, true);
     } catch (error) {
-      updateStatus({ id: profile.id, state: 'error', error: String(error) });
+      updateStatus({ id: profile.id, state: 'error', error: formatRemoteDriveError(error) });
     }
   };
 
@@ -185,7 +217,7 @@ export function RemoteDrivesSection({
         await invoke('open_remote_drive_helper_settings');
       }
     } catch (error) {
-      setSetupError(String(error));
+      setSetupError(formatErrorMessage(error));
     }
   };
 
@@ -196,7 +228,7 @@ export function RemoteDrivesSection({
       await invoke('install_winfsp');
       await refreshEnvironment();
     } catch (error) {
-      setSetupError(String(error));
+      setSetupError(formatErrorMessage(error));
     } finally {
       setInstallingWinFsp(false);
     }
@@ -230,9 +262,9 @@ export function RemoteDrivesSection({
       const next = await invoke<string[]>('list_rclone_remotes');
       setRemotes(next);
       if (next.length > 0) openEditor(undefined, next);
-      else setSetupError('rclone finished without creating a remote.');
+      else setSetupError(noRemotesMessage);
     } catch (error) {
-      setSetupError(String(error));
+      setSetupError(formatErrorMessage(error));
     } finally {
       setConfiguringRemotes(false);
     }
@@ -307,20 +339,31 @@ export function RemoteDrivesSection({
       <div className={styles.list}>
         {profiles.map((profile) => {
           const driveStatus = statuses[profile.id] ?? disconnected(profile.id);
+          const lifecycle = getRemoteDriveLifecycle(
+            driveStatus,
+            connectingSince[profile.id],
+            clock
+          );
           const canOpen = driveStatus.state === 'connected' && driveStatus.mountPath;
           return (
             <div className={styles.item} key={profile.id}>
               <button
                 type="button"
                 className={styles.drive}
-                title={driveStatus.error ?? driveStatus.mountPath ?? profile.mountTarget}
+                title={lifecycle.message}
+                aria-label={profile.name + ': ' + lifecycle.label}
                 onClick={() =>
-                  canOpen ? onSelectLocation(driveStatus.mountPath!) : void connect(profile)
+                  canOpen
+                    ? onSelectLocation(driveStatus.mountPath!)
+                    : lifecycle.state === 'connecting'
+                      ? undefined
+                      : void connect(profile)
                 }
               >
                 <Icon name="hard-drive" />
                 <span>{profile.name}</span>
-                <span className={`${styles.dot} ${styles[driveStatus.state]}`} aria-hidden="true" />
+                <small className={styles.lifecycle}>{lifecycle.label}</small>
+                <span className={styles.dot + ' ' + styles[lifecycle.state]} aria-hidden="true" />
               </button>
               <div className={styles.actions}>
                 {driveStatus.state === 'connected' && (
@@ -346,6 +389,15 @@ export function RemoteDrivesSection({
                 >
                   <Icon name="x" size={12} />
                 </button>
+              </div>
+              <div
+                className={styles.statusMessage}
+                role={
+                  lifecycle.state === 'error' || lifecycle.state === 'hung' ? 'alert' : 'status'
+                }
+                aria-live="polite"
+              >
+                {lifecycle.message}
               </div>
             </div>
           );

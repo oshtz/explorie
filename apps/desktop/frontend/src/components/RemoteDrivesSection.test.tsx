@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { RemoteDrivesSection } from './RemoteDrivesSection';
@@ -42,7 +42,10 @@ describe('RemoteDrivesSection', () => {
     });
   });
 
-  afterEach(cleanup);
+  afterEach(() => {
+    cleanup();
+    vi.useRealTimers();
+  });
 
   it('adds a sanitized profile using an available mount target', async () => {
     const user = userEvent.setup();
@@ -155,5 +158,52 @@ describe('RemoteDrivesSection', () => {
     await waitFor(() => expect(invokeMock).toHaveBeenCalledWith('configure_rclone', undefined));
     expect(await screen.findByRole('dialog', { name: 'Remote Drive' })).toBeInTheDocument();
     expect(screen.getByLabelText('rclone remote')).toHaveValue('cloud');
+  });
+
+  it('allows retrying a connection after it is classified as hung', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(10_000);
+    const profile = {
+      id: '672ce77a-b72d-4e16-a9e8-55e0ac5bc580',
+      name: 'Archive',
+      remote: 'cloud',
+      remotePath: '',
+      mountTarget: 'E:',
+    };
+    window.localStorage.setItem('explorie:remoteDrives', JSON.stringify([profile]));
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'get_remote_drive_environment') {
+        return Promise.resolve({ ...environment, rcloneAvailable: false });
+      }
+      if (command === 'get_remote_drive_statuses') {
+        return Promise.resolve([{ id: profile.id, state: 'connecting' }]);
+      }
+      if (command === 'connect_remote_drive') {
+        return Promise.resolve({
+          id: profile.id,
+          state: 'connected',
+          mountPath: 'E:\\',
+        });
+      }
+      return Promise.resolve(undefined);
+    });
+
+    render(<RemoteDrivesSection onSelectLocation={vi.fn()} />);
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    vi.setSystemTime(10_000 + 30_000);
+    await act(async () => {
+      vi.advanceTimersByTime(1_000);
+      await Promise.resolve();
+    });
+
+    const drive = screen.getByRole('button', { name: 'Archive: Still connecting' });
+    drive.click();
+    expect(invokeMock).toHaveBeenCalledWith(
+      'connect_remote_drive',
+      expect.objectContaining({ profile })
+    );
   });
 });

@@ -3,6 +3,7 @@ import {
   formatErrorMessage,
   formatError,
   formatOperationError,
+  formatRemoteDriveError,
   formatBatchErrors,
   createOperationErrorMessage,
   type FormattedError,
@@ -83,6 +84,20 @@ describe('errorMessages', () => {
       expect(formatErrorMessage('Request timed out')).toBe('The operation timed out');
     });
 
+    it('maps common remote-drive setup failures to next actions', () => {
+      expect(formatErrorMessage('no remotes found')).toContain('Choose Configure');
+      expect(formatErrorMessage('config is encrypted and password required')).toContain(
+        'non-interactively'
+      );
+      expect(formatErrorMessage('WinFsp is not installed')).toContain('Install WinFsp');
+      expect(formatErrorMessage('Approve the mount helper in System Settings')).toContain(
+        'Approve'
+      );
+      expect(formatErrorMessage('rclone exited with exit status: 1')).toContain(
+        'Check the remote configuration'
+      );
+    });
+
     it('cleans up technical messages that do not match patterns', () => {
       // Should capitalize first letter
       const result = formatErrorMessage('some random error');
@@ -133,6 +148,28 @@ describe('errorMessages', () => {
       expect(formatOperationError('Copy', 'Permission denied')).toBe(
         "Copy: Access denied - you don't have permission for this operation"
       );
+    });
+  });
+
+  describe('formatRemoteDriveError', () => {
+    it('keeps a categorized backend message actionable', () => {
+      expect(formatRemoteDriveError('no rclone remotes are configured')).toContain(
+        'Choose Configure'
+      );
+    });
+
+    it('adds remote-drive recovery guidance to an otherwise generic error', () => {
+      expect(formatRemoteDriveError('offline')).toBe(
+        'Remote drive connection failed: Offline. Check the remote configuration and network connection, then try again.'
+      );
+    });
+
+    it('preserves bounded retry evidence from the backend terminal error', () => {
+      expect(
+        formatRemoteDriveError(
+          'Remote drive mount failed: The mount failed after 3 attempts: rclone exited. Check the remote configuration and network connection, then try again.'
+        )
+      ).toContain('after 3 attempts');
     });
   });
 
