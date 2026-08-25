@@ -34,3 +34,6 @@ sha2 = "0.10"
 
 [build-dependencies]
 tauri-build = { version = "2.2.0", features = [] }
+
+[dev-dependencies]
+tauri = { version = "2.11.1", features = ["test"] }

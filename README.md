@@ -184,6 +184,8 @@ explorie does not include telemetry. Diagnostics exports are local-only and are 
 
 Remote Drives use the bundled, pinned rclone executable with the user's existing rclone configuration. Choose **Remote Drives → Configure** to open rclone's own interactive setup in a terminal; when it closes, Explorie refreshes the remote list and opens the Add Drive dialog. Explorie never stores provider credentials or OAuth tokens. Encrypted rclone configurations must be unlockable non-interactively through the user's existing rclone environment or password command. Mount processes run only while explorie is open; stable per-profile VFS caches allow interrupted uploads to resume.
 
+The credential-free CI lifecycle harness runs with `pnpm test:rust` and uses a local fake rclone child; it never reads a real rclone config or contacts a provider. The separate [Remote Drives real-machine smoke](docs/remote-drives-real-machine-smoke.md) covers WinFsp and the macOS helper on disposable hardware.
+
 ---
 
 ## Known Limitations
