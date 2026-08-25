@@ -3923,6 +3923,19 @@ impl DirectoryWindow {
         );
     }
 
+    fn adjust_grid_width(&mut self, delta: i16, cx: &mut Context<Self>) {
+        self.settings.appearance.grid_min_width =
+            (i32::from(self.settings.appearance.grid_min_width) + i32::from(delta)).clamp(120, 260)
+                as u16;
+        self.finish_settings_change(
+            format!(
+                "Grid card width: {} px",
+                self.settings.appearance.grid_min_width
+            ),
+            cx,
+        );
+    }
+
     fn cycle_font(&mut self, cx: &mut Context<Self>) {
         if self.settings.appearance.font == FontChoice::Custom {
             self.open_appearance_value_editor(AppearanceValueKind::Font, cx);
@@ -9381,6 +9394,26 @@ impl DirectoryWindow {
             || event.keystroke.modifiers.platform
         {
             return;
+        }
+        if event.keystroke.key == "backspace" {
+            self.go_up(cx);
+            cx.stop_propagation();
+            return;
+        }
+        if self.browser.view_mode() == ViewMode::Grid {
+            let key_char = event.keystroke.key_char.as_deref();
+            if matches!(event.keystroke.key.as_str(), "+" | "=")
+                || matches!(key_char, Some("+") | Some("="))
+            {
+                self.adjust_grid_width(10, cx);
+                cx.stop_propagation();
+                return;
+            }
+            if event.keystroke.key == "-" || key_char == Some("-") {
+                self.adjust_grid_width(-10, cx);
+                cx.stop_propagation();
+                return;
+            }
         }
         let Some(text) = event.keystroke.key_char.as_deref() else {
             return;
@@ -27027,6 +27060,64 @@ mod tests {
                 assert!(view.column_tasks.is_empty());
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn retained_plain_key_shortcuts_go_up_and_resize_grid(cx: &mut TestAppContext) {
+        let directory = fixture_dir();
+        let child = directory.join("child");
+        fs::create_dir(&child).unwrap();
+        let services = NativeServices::new(ResourcePaths::test(&directory));
+        let (view, cx) =
+            cx.add_window_view(|_, cx| DirectoryWindow::new(child.clone(), services, cx));
+
+        view.update(cx, |view, cx| {
+            view.set_view_mode(ViewMode::Grid, cx);
+            view.settings.appearance.grid_min_width = 250;
+
+            view.handle_type_select_key(
+                &KeyDownEvent {
+                    keystroke: Keystroke::parse("=").unwrap().with_simulated_ime(),
+                    is_held: false,
+                    prefer_character_input: false,
+                },
+                cx,
+            );
+            assert_eq!(view.settings.appearance.grid_min_width, 260);
+
+            view.handle_type_select_key(
+                &KeyDownEvent {
+                    keystroke: Keystroke::parse("=").unwrap().with_simulated_ime(),
+                    is_held: false,
+                    prefer_character_input: false,
+                },
+                cx,
+            );
+            assert_eq!(view.settings.appearance.grid_min_width, 260);
+
+            view.handle_type_select_key(
+                &KeyDownEvent {
+                    keystroke: Keystroke::parse("-").unwrap().with_simulated_ime(),
+                    is_held: false,
+                    prefer_character_input: false,
+                },
+                cx,
+            );
+            assert_eq!(view.settings.appearance.grid_min_width, 250);
+
+            view.handle_type_select_key(
+                &KeyDownEvent {
+                    keystroke: Keystroke::parse("backspace").unwrap(),
+                    is_held: false,
+                    prefer_character_input: false,
+                },
+                cx,
+            );
+            assert_eq!(view.browser.path(), directory.as_path());
+        });
+
+        cx.run_until_parked();
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[gpui::test]
