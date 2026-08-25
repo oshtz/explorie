@@ -661,7 +661,13 @@ fn typed_field_error(field: &str, message: &str) -> io::Error {
 
 fn require_enum(name: &str, value: &serde_json::Value, allowed: &[&str]) -> io::Result<()> {
     match value.as_str() {
-        Some(candidate) if allowed.contains(&candidate) => Ok(()),
+        Some(candidate)
+            if allowed
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(candidate)) =>
+        {
+            Ok(())
+        }
         _ => Err(typed_field_error(
             name,
             &format!("expected one of {}", allowed.join(", ")),
