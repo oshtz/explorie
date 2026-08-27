@@ -27883,6 +27883,8 @@ mod tests {
             Uuid::new_v4()
         ));
         fs::create_dir(&path).unwrap();
+        #[cfg(target_os = "macos")]
+        let path = path.canonicalize().unwrap();
         path
     }
 

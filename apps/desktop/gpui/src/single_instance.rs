@@ -309,6 +309,8 @@ mod tests {
             Uuid::new_v4()
         ));
         fs::create_dir(&path).unwrap();
+        #[cfg(target_os = "macos")]
+        let path = path.canonicalize().unwrap();
         path
     }
 
@@ -356,7 +358,7 @@ mod tests {
         stream
             .write_all(&serde_json::to_vec(&bad_request).unwrap())
             .unwrap();
-        stream.shutdown(Shutdown::Write).unwrap();
+        let _ = stream.shutdown(Shutdown::Write);
         assert!(requests.recv_timeout(Duration::from_millis(100)).is_err());
 
         forward_to_primary(&config_dir, Some(&missing)).unwrap();
