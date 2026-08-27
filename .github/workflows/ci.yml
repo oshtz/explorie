@@ -84,6 +84,8 @@ jobs:
           workspaces: './ -> target'
 
       - name: Test GPUI-native application on macOS
+        env:
+          TMPDIR: ${{ runner.temp }}
         run: |
           cargo test -p explorie-core -p explorie-native-services -p explorie-ffmpeg-wrapper -p explorie-cli
           cargo test -p explorie-gpui -- --test-threads=1
