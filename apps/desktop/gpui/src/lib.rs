@@ -29920,11 +29920,13 @@ mod tests {
         view.update(cx, |view, _| {
             assert_eq!(view.entry_icons.len(), 3, "text icons should deduplicate");
             assert!(view.entry_icons.len() <= ENTRY_ICON_CACHE_LIMIT);
-            #[cfg(windows)]
             assert!(
-                view.entry_icons.values().all(
-                    |icon| matches!(icon, EntryIconState::Ready(Some(path)) if path.is_file())
-                )
+                view.entry_icons.values().all(|icon| match icon {
+                    EntryIconState::Ready(Some(path)) => path.is_file(),
+                    EntryIconState::Ready(None) => true,
+                    EntryIconState::Loading => false,
+                }),
+                "icon loading should finish with a valid native artifact or fallback"
             );
         });
 
