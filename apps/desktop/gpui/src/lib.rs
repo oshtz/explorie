@@ -27888,6 +27888,15 @@ mod tests {
         path
     }
 
+    fn secondary_keystroke(keys: &str) -> Keystroke {
+        let modifier = if cfg!(target_os = "macos") {
+            "cmd"
+        } else {
+            "ctrl"
+        };
+        Keystroke::parse(&format!("{modifier}-{keys}")).unwrap()
+    }
+
     fn minimal_pdf(page_count: usize) -> Vec<u8> {
         let mut bytes = b"%PDF-1.4\n".to_vec();
         let mut objects = Vec::with_capacity(page_count + 2);
@@ -28866,23 +28875,32 @@ mod tests {
 
         window.simulate_resize(gpui::size(px(800.0), px(600.0)));
         window.run_until_parked();
-        let title_bar = window.debug_bounds("title-bar").unwrap();
-        let drag_region = window.debug_bounds("title-bar-drag-region").unwrap();
-        let app_icon = window.debug_bounds("title-bar-app-icon").unwrap();
-        assert_eq!(f32::from(title_bar.size.height), 36.0);
-        assert_eq!(title_bar.top(), px(0.0));
-        assert_eq!(drag_region.top(), title_bar.top());
-        assert_eq!(drag_region.bottom(), title_bar.bottom());
-        assert_eq!(f32::from(app_icon.size.width), 22.0);
-        assert_eq!(f32::from(app_icon.size.height), 22.0);
-        assert!(app_icon.left() >= drag_region.left());
-        assert!(app_icon.right() <= drag_region.right());
-        for selector in ["window-minimize", "window-maximize", "window-close"] {
-            let bounds = window.debug_bounds(selector).unwrap();
-            assert_eq!(f32::from(bounds.size.width), 44.0);
-            assert_eq!(bounds.top(), title_bar.top());
-            assert_eq!(bounds.bottom(), title_bar.bottom());
-        }
+        #[cfg(windows)]
+        let content_top = {
+            let title_bar = window.debug_bounds("title-bar").unwrap();
+            let drag_region = window.debug_bounds("title-bar-drag-region").unwrap();
+            let app_icon = window.debug_bounds("title-bar-app-icon").unwrap();
+            assert_eq!(f32::from(title_bar.size.height), 36.0);
+            assert_eq!(title_bar.top(), px(0.0));
+            assert_eq!(drag_region.top(), title_bar.top());
+            assert_eq!(drag_region.bottom(), title_bar.bottom());
+            assert_eq!(f32::from(app_icon.size.width), 22.0);
+            assert_eq!(f32::from(app_icon.size.height), 22.0);
+            assert!(app_icon.left() >= drag_region.left());
+            assert!(app_icon.right() <= drag_region.right());
+            for selector in ["window-minimize", "window-maximize", "window-close"] {
+                let bounds = window.debug_bounds(selector).unwrap();
+                assert_eq!(f32::from(bounds.size.width), 44.0);
+                assert_eq!(bounds.top(), title_bar.top());
+                assert_eq!(bounds.bottom(), title_bar.bottom());
+            }
+            title_bar.bottom()
+        };
+        #[cfg(not(windows))]
+        let content_top = {
+            assert!(window.debug_bounds("title-bar").is_none());
+            px(0.0)
+        };
 
         view.update(window, |view, cx| {
             view.browser.select(directory.join("alpha.txt"));
@@ -28899,7 +28917,7 @@ mod tests {
         assert_eq!(f32::from(toolbar.size.height), 72.0);
         let sidebar = window.debug_bounds("sidebar").unwrap();
         let tabs = window.debug_bounds("tabs").unwrap();
-        assert_eq!(sidebar.top(), title_bar.bottom());
+        assert_eq!(sidebar.top(), content_top);
         assert!(
             toolbar.left() >= sidebar.right(),
             "toolbar {toolbar:?} must stay inside the main area beside sidebar {sidebar:?}"
@@ -33036,7 +33054,11 @@ mod tests {
                 |_, _| view.clone().into_element(),
             );
             assert!(window.debug_bounds("context-menu-quick-look").is_some());
-            assert!(window.debug_bounds("context-menu-open-with").is_some());
+            assert!(
+                window
+                    .debug_bounds("context-menu-open-with-toggle")
+                    .is_some()
+            );
             view.update(window, |view, cx| {
                 view.execute_context_menu_action(ContextMenuAction::ToggleOpenWith, cx)
             });
@@ -33879,7 +33901,7 @@ mod tests {
         window
             .update(cx, |view, _, _| assert!(!view.settings_panel_open))
             .unwrap();
-        cx.dispatch_keystroke(*window, Keystroke::parse("ctrl-alt-k").unwrap());
+        cx.dispatch_keystroke(*window, secondary_keystroke("alt-k"));
         window
             .update(cx, |view, _, _| assert!(view.settings_panel_open))
             .unwrap();
@@ -33889,7 +33911,7 @@ mod tests {
                 view.open_shortcut_editor("settings-open", cx);
                 view.handle_shortcut_editor_key(
                     &KeyDownEvent {
-                        keystroke: Keystroke::parse("ctrl-c").unwrap(),
+                        keystroke: secondary_keystroke("c"),
                         is_held: false,
                         prefer_character_input: false,
                     },
@@ -33903,7 +33925,7 @@ mod tests {
                 );
                 view.handle_shortcut_editor_key(
                     &KeyDownEvent {
-                        keystroke: Keystroke::parse("ctrl-alt-j").unwrap(),
+                        keystroke: secondary_keystroke("alt-j"),
                         is_held: false,
                         prefer_character_input: false,
                     },
@@ -33923,11 +33945,11 @@ mod tests {
             })
             .unwrap();
 
-        cx.dispatch_keystroke(*window, Keystroke::parse("ctrl-alt-k").unwrap());
+        cx.dispatch_keystroke(*window, secondary_keystroke("alt-k"));
         window
             .update(cx, |view, _, _| assert!(!view.settings_panel_open))
             .unwrap();
-        cx.dispatch_keystroke(*window, Keystroke::parse("ctrl-alt-j").unwrap());
+        cx.dispatch_keystroke(*window, secondary_keystroke("alt-j"));
         window
             .update(cx, |view, _, _| assert!(view.settings_panel_open))
             .unwrap();
@@ -33958,7 +33980,7 @@ mod tests {
             })
             .unwrap()
         });
-        cx.dispatch_keystroke(*restarted_window, Keystroke::parse("ctrl-alt-j").unwrap());
+        cx.dispatch_keystroke(*restarted_window, secondary_keystroke("alt-j"));
         restarted_window
             .update(cx, |view, _, _| {
                 assert!(view.settings_panel_open);
@@ -34262,7 +34284,11 @@ mod tests {
         window.simulate_resize(gpui::size(px(800.0), px(600.0)));
         window.run_until_parked();
 
-        window.simulate_keystrokes("ctrl-g");
+        window.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-g"
+        } else {
+            "ctrl-g"
+        });
         window.run_until_parked();
         let backdrop = window.debug_bounds("go-to-folder-backdrop").unwrap();
         let dialog = window.debug_bounds("go-to-folder-dialog").unwrap();
