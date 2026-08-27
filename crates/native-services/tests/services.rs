@@ -266,6 +266,8 @@ fn archive_preview_and_platform_services_use_background_tasks() {
             archive_path: result.output_path,
             output_dir: extracted.clone(),
             password: None,
+            allow_extended_limits: false,
+            operation_id: "extract-test".into(),
         })
         .wait()
         .unwrap();

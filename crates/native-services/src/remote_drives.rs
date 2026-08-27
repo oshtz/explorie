@@ -16,8 +16,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+use crate::process::{ProcessError, ProcessOutput, run_with_timeout};
+
 const READY_TIMEOUT: Duration = Duration::from_secs(15);
 const RC_TIMEOUT: Duration = Duration::from_secs(5);
+const RCLONE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const RCLONE_LIST_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_RCLONE_OUTPUT: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1145,10 +1150,11 @@ fn find_rclone(resources: &ResourcePaths) -> Option<PathBuf> {
 }
 
 fn rclone_version(rclone: &Path) -> ServiceResult<String> {
-    let output = Command::new(rclone)
-        .arg("version")
-        .output()
-        .map_err(ServiceError::from)?;
+    let output = run_rclone_command(
+        rclone_command(rclone).arg("version"),
+        RCLONE_PROBE_TIMEOUT,
+        "rclone version check",
+    )?;
     if !output.status.success() {
         return Err(ServiceError::new(
             ErrorCode::RemoteUnavailable,
@@ -1173,13 +1179,14 @@ fn ensure_rclone_capabilities(rclone: &Path) -> ServiceResult<()> {
     } else {
         &["mount", "--help"]
     };
-    let status = Command::new(rclone)
-        .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(ServiceError::from)?;
-    status.success().then_some(()).ok_or_else(|| {
+    let output = run_with_timeout(
+        rclone_command(rclone).args(args),
+        RCLONE_PROBE_TIMEOUT,
+        0,
+        0,
+    )
+    .map_err(|error| remote_process_error("rclone capability check", error))?;
+    output.status.success().then_some(()).ok_or_else(|| {
         ServiceError::new(
             ErrorCode::RemoteUnavailable,
             "rclone 1.65 or newer with mount support is required.",
@@ -1188,10 +1195,11 @@ fn ensure_rclone_capabilities(rclone: &Path) -> ServiceResult<()> {
 }
 
 fn list_remotes_with_command(rclone: &Path) -> ServiceResult<Vec<String>> {
-    let output = Command::new(rclone)
-        .args(["listremotes", "--ask-password=false"])
-        .output()
-        .map_err(|error| remote_io("list rclone remotes", error))?;
+    let output = run_rclone_command(
+        rclone_command(rclone).args(["listremotes", "--ask-password=false"]),
+        RCLONE_LIST_TIMEOUT,
+        "list rclone remotes",
+    )?;
     if !output.status.success() {
         return Err(remote_command_error(
             "rclone could not read its configuration",
@@ -1280,7 +1288,7 @@ fn configure_rclone_with_system(rclone: &Path, _resources: &ResourcePaths) -> Se
 fn start_mount_with_system(
     request: &RemoteMountRequest,
 ) -> ServiceResult<Box<dyn RemoteDriveProcess>> {
-    let mut command = Command::new(&request.rclone);
+    let mut command = rclone_command(&request.rclone);
     let remote = remote_spec(&request.profile);
     let rc_addr = rc_bind_address(&request.rc_url)?;
 
@@ -1355,6 +1363,42 @@ fn rc_bind_address(rc_url: &str) -> ServiceResult<&str> {
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+fn rclone_command(rclone: &Path) -> Command {
+    let mut command = Command::new(rclone);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
+fn run_rclone_command(
+    command: &mut Command,
+    timeout: Duration,
+    action: &str,
+) -> ServiceResult<ProcessOutput> {
+    let output = run_with_timeout(command, timeout, MAX_RCLONE_OUTPUT, MAX_RCLONE_OUTPUT)
+        .map_err(|error| remote_process_error(action, error))?;
+    if output.stdout_truncated || output.stderr_truncated {
+        return Err(ServiceError::new(
+            ErrorCode::RemoteUnavailable,
+            format!("{action} returned more output than Explorie can safely process"),
+        ));
+    }
+    Ok(output)
+}
+
+fn remote_process_error(action: &str, error: ProcessError) -> ServiceError {
+    match error {
+        ProcessError::Io(error) => remote_io(action, error),
+        ProcessError::TimedOut => {
+            ServiceError::new(ErrorCode::RemoteUnavailable, format!("{action} timed out"))
+                .retryable(true)
+        }
+    }
+}
 
 #[cfg(windows)]
 fn winfsp_available() -> Option<bool> {
@@ -1535,29 +1579,16 @@ fn rc_call(
 }
 
 fn remote_control_with_system(request: &RemoteControlRequest) -> ServiceResult<Value> {
-    let mut child = Command::new(&request.rclone)
-        .args(["rc", "--url"])
-        .arg(&request.rc_url)
-        .arg(&request.endpoint)
-        .env("RCLONE_RC_USER", &request.rc_user)
-        .env("RCLONE_RC_PASS", &request.rc_pass)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(ServiceError::from)?;
-    let started = Instant::now();
-    while child.try_wait().map_err(ServiceError::from)?.is_none() {
-        if started.elapsed() >= RC_TIMEOUT {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(ServiceError::new(
-                ErrorCode::RemoteUnavailable,
-                format!("rclone remote-control call timed out after {RC_TIMEOUT:?}"),
-            ));
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-    let output = child.wait_with_output().map_err(ServiceError::from)?;
+    let output = run_rclone_command(
+        rclone_command(&request.rclone)
+            .args(["rc", "--url"])
+            .arg(&request.rc_url)
+            .arg(&request.endpoint)
+            .env("RCLONE_RC_USER", &request.rc_user)
+            .env("RCLONE_RC_PASS", &request.rc_pass),
+        RC_TIMEOUT,
+        "rclone remote-control call",
+    )?;
     if !output.status.success() {
         return Err(remote_command_error(
             "rclone remote-control call failed",

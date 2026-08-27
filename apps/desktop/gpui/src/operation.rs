@@ -1,9 +1,10 @@
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use explorie_native_services::{
     FileOperationEvent, FileOperationProgress, FileOperationRequest, FileOperationResult,
-    FileOperationState,
+    FileOperationState, FileTreeSnapshot,
 };
 
 const OPERATION_HISTORY_LIMIT: usize = 50;
@@ -240,6 +241,7 @@ pub enum UndoAction {
     Copy {
         request: FileOperationRequest,
         targets: Vec<PathBuf>,
+        snapshots: Vec<FileTreeSnapshot>,
     },
     Move {
         request: FileOperationRequest,
@@ -258,11 +260,99 @@ pub enum UndoAction {
     },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PathFingerprint {
+    kind: u8,
+    len: u64,
+    modified_ns: Option<u128>,
+    platform_id: Option<(u64, u64)>,
+}
+
+#[derive(Clone, Debug)]
+struct ExpectedPathState {
+    path: PathBuf,
+    fingerprint: Option<PathFingerprint>,
+}
+
+fn path_fingerprint(path: &Path) -> Option<PathFingerprint> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    let kind = if metadata.file_type().is_symlink() {
+        2
+    } else if metadata.is_dir() {
+        1
+    } else {
+        0
+    };
+    let modified_ns = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos());
+    #[cfg(unix)]
+    let platform_id = {
+        use std::os::unix::fs::MetadataExt;
+        Some((metadata.dev(), metadata.ino()))
+    };
+    #[cfg(windows)]
+    let platform_id = {
+        use std::os::windows::fs::MetadataExt;
+        Some((
+            metadata.creation_time(),
+            u64::from(metadata.file_attributes()),
+        ))
+    };
+    #[cfg(not(any(unix, windows)))]
+    let platform_id = None;
+    Some(PathFingerprint {
+        kind,
+        len: metadata.len(),
+        modified_ns,
+        platform_id,
+    })
+}
+
+fn expected_path(path: PathBuf) -> ExpectedPathState {
+    ExpectedPathState {
+        fingerprint: path_fingerprint(&path),
+        path,
+    }
+}
+
+fn undo_paths(action: &UndoAction) -> Vec<PathBuf> {
+    match action {
+        UndoAction::Copy { targets, .. } => targets.clone(),
+        UndoAction::Move { pairs, .. } => pairs.iter().map(|(_, target)| target.clone()).collect(),
+        UndoAction::Create { path, .. } => vec![path.clone()],
+        UndoAction::Rename { after, .. } => vec![after.clone()],
+        UndoAction::BatchRename { pairs } => pairs.iter().map(|(_, after)| after.clone()).collect(),
+    }
+}
+
+fn redo_paths(action: &UndoAction) -> Vec<PathBuf> {
+    match action {
+        UndoAction::Copy {
+            request, targets, ..
+        } => request
+            .sources
+            .iter()
+            .cloned()
+            .chain(targets.iter().cloned())
+            .collect(),
+        UndoAction::Move { pairs, .. } | UndoAction::BatchRename { pairs } => pairs
+            .iter()
+            .flat_map(|(before, after)| [before.clone(), after.clone()])
+            .collect(),
+        UndoAction::Create { path, .. } => vec![path.clone()],
+        UndoAction::Rename { before, after } => vec![before.clone(), after.clone()],
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct UndoRecord {
     description: String,
     created_at: SystemTime,
     bytes: usize,
+    expected_paths: Vec<ExpectedPathState>,
     pub action: UndoAction,
 }
 
@@ -281,6 +371,7 @@ impl UndoRecord {
                 UndoAction::Copy {
                     request,
                     targets: result.targets,
+                    snapshots: result.target_snapshots,
                 },
             ),
             explorie_native_services::FileOperationKind::Move
@@ -334,12 +425,40 @@ impl UndoRecord {
             description,
             created_at: SystemTime::now(),
             bytes,
+            expected_paths: undo_paths(&action).into_iter().map(expected_path).collect(),
             action,
         }
     }
 
     pub fn description(&self) -> &str {
         &self.description
+    }
+
+    pub fn validate_expected_paths(&self) -> Result<(), String> {
+        for expected in &self.expected_paths {
+            let actual = path_fingerprint(&expected.path);
+            if actual != expected.fingerprint {
+                return Err(format!(
+                    "{} changed after the operation; refusing to modify it",
+                    expected.path.display()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn capture_undo_paths(&mut self) {
+        self.expected_paths = undo_paths(&self.action)
+            .into_iter()
+            .map(expected_path)
+            .collect();
+    }
+
+    pub fn capture_redo_paths(&mut self) {
+        self.expected_paths = redo_paths(&self.action)
+            .into_iter()
+            .map(expected_path)
+            .collect();
     }
 
     fn expired_at(&self, now: SystemTime, timeout: Duration) -> bool {
@@ -448,10 +567,18 @@ impl UndoLedger {
 fn action_path_bytes(action: &UndoAction) -> usize {
     let path_bytes = |path: &PathBuf| path.as_os_str().to_string_lossy().len();
     match action {
-        UndoAction::Copy { request, targets } => {
+        UndoAction::Copy {
+            request,
+            targets,
+            snapshots,
+        } => {
             request.sources.iter().map(&path_bytes).sum::<usize>()
                 + request.destination.as_ref().map_or(0, &path_bytes)
                 + targets.iter().map(path_bytes).sum::<usize>()
+                + snapshots
+                    .iter()
+                    .map(FileTreeSnapshot::estimated_bytes)
+                    .sum::<usize>()
         }
         UndoAction::Move { request, pairs } => {
             request.sources.iter().map(&path_bytes).sum::<usize>()
@@ -531,6 +658,7 @@ mod tests {
                 processed_entries: 4,
                 processed_bytes: 20,
                 targets: vec![PathBuf::from("destination/source")],
+                target_snapshots: Vec::new(),
             }),
             retryable_sources: Vec::new(),
             error: None,
@@ -559,6 +687,7 @@ mod tests {
                 processed_entries: 1,
                 processed_bytes: 4,
                 targets: vec![PathBuf::from("destination/source")],
+                target_snapshots: Vec::new(),
             }),
             retryable_sources: Vec::new(),
             error: None,
@@ -578,6 +707,7 @@ mod tests {
                     processed_entries: 1,
                     processed_bytes: 4,
                     targets: vec![PathBuf::from("destination/source")],
+                    target_snapshots: Vec::new(),
                 },
             )
             .is_none()
@@ -640,6 +770,7 @@ mod tests {
                 processed_entries: 1,
                 processed_bytes: 1,
                 targets: vec![PathBuf::from("destination/source")],
+                target_snapshots: Vec::new(),
             }),
             retryable_sources: Vec::new(),
             error: None,
@@ -669,6 +800,7 @@ mod tests {
                 processed_entries: 1,
                 processed_bytes: 5,
                 targets: vec![PathBuf::from("destination/first")],
+                target_snapshots: Vec::new(),
             }),
             retryable_sources: vec![PathBuf::from("second")],
             error: Some(ServiceError::new(ErrorCode::Conflict, "destination exists")),
@@ -680,7 +812,9 @@ mod tests {
             .take_undo_record("batch")
             .expect("completed prefix undo");
         match undo.action {
-            UndoAction::Copy { request, targets } => {
+            UndoAction::Copy {
+                request, targets, ..
+            } => {
                 assert_eq!(request.sources, vec![PathBuf::from("first")]);
                 assert_eq!(targets, vec![PathBuf::from("destination/first")]);
             }
@@ -705,6 +839,7 @@ mod tests {
                 processed_entries: 0,
                 processed_bytes: 0,
                 targets: Vec::new(),
+                target_snapshots: Vec::new(),
             }),
             retryable_sources: vec![PathBuf::from("source")],
             error: Some(ServiceError::new(ErrorCode::Io, "trash failed")),

@@ -1,10 +1,12 @@
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     mpsc,
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -14,23 +16,25 @@ use explorie_core::{FileEntry, FileOperationProgress};
 use explorie_native_services::listing::{ListRequest, launch_directory_from_args};
 use explorie_native_services::{
     AppInfo, ArchiveFormat, ArchiveInfo, ArchiveProgressEvent, AudioStatus, BatchRenameItem,
-    BlockingTask, CombineMode, CompressRequest, CompressionLevel, ConflictPolicy, ErrorCode,
-    ExtractRequest, FileOperationEvent, FileOperationKind, FileOperationRequest,
-    FileOperationResult, HelperStatus, ImageMetadata, NativeServices, PermanentDeleteResult,
-    RemoteDriveEnvironment, RemoteDriveExitBlocker, RemoteDriveProfile, RemoteDriveState,
-    RemoteDriveStatus, SearchCriteria, SearchResult, SearchType, ServiceError, ServiceEvent,
-    ServiceResult, SystemLocations, TextHighlightKind, TextPreview, VideoFrame, VideoStatus,
-    WatcherEvent, WatcherState, format_exif_date, is_image_metadata_path,
-    validate_remote_drive_profile,
+    BlockingTask, CombineMode, CompressRequest, CompressionLevel, ConflictPolicy,
+    DetectedPreviewKind, DiskInfo, DownloadedUpdate, ErrorCode, ExtractRequest, FileOperationEvent,
+    FileOperationKind, FileOperationRequest, FileOperationResult, HelperStatus, ImageMetadata,
+    NativeServices, PermanentDeleteResult, PreviewDetection, RemoteDriveEnvironment,
+    RemoteDriveExitBlocker, RemoteDriveProfile, RemoteDriveState, RemoteDriveStatus,
+    SearchCriteria, SearchProgressEvent, SearchResult, SearchType, ServiceError, ServiceEvent,
+    ServiceResult, SystemIntegrationStatus, SystemLocations, TextHighlightKind, TextPreview,
+    UpdateInfo, VideoFrame, VideoStatus, WatcherEvent, WatcherState, format_exif_date,
+    is_image_metadata_path, validate_remote_drive_profile,
 };
 #[cfg(target_os = "windows")]
 use gpui::WindowControlArea;
 use gpui::{
-    AccessibleAction, Anchor, AnyElement, App, AssetSource, ClipboardItem, Context, ElementId,
-    FocusHandle, Focusable, FontWeight, HighlightStyle, KeyDownEvent, MouseButton, ObjectFit,
-    PathPromptOptions, Render, RenderImage, Rgba, Role, ScrollHandle, ScrollStrategy, SharedString,
-    StyledImage, StyledText, Task, UniformListScrollHandle, Window, WindowAppearance, anchored,
-    deferred, div, img, point, prelude::*, px, rgb, svg, uniform_list,
+    AccessibleAction, AnyElement, App, AssetSource, Bounds, ClipboardItem, Context, ElementId,
+    Entity, ExternalPaths, FocusHandle, Focusable, FontWeight, HighlightStyle, KeyDownEvent,
+    ListAlignment, ListState, MouseButton, ObjectFit, Orientation, PathPromptOptions, Pixels,
+    Render, RenderImage, Rgba, Role, ScrollHandle, ScrollStrategy, SharedString, StyledImage,
+    StyledText, Task, TitlebarOptions, UniformListScrollHandle, Window, WindowAppearance,
+    WindowBounds, WindowOptions, deferred, div, img, list, prelude::*, px, rgb, svg, uniform_list,
 };
 
 mod batch_rename;
@@ -40,6 +44,7 @@ mod command;
 mod custom_fields;
 mod diagnostics;
 mod error_reports;
+mod native_text_input;
 mod operation;
 mod operation_recovery;
 mod preview_panel;
@@ -60,6 +65,7 @@ use command::{CommandContext, CommandId, CommandSpec, all_commands, filtered_com
 use custom_fields::{CustomFieldInput, CustomFieldsEditor, FIELD_SUGGESTIONS, display_value};
 use diagnostics::{DiagnosticsSnapshot, create_diagnostics_json};
 use error_reports::ErrorReportLog;
+use native_text_input::{NativeTextInput, NativeTextInputAppearance, NativeTextInputEvent};
 use operation::{
     ClipboardKind, ClipboardState, CreatedKind, OperationQueue, OperationStatus, UndoAction,
     UndoLedger, UndoRecord,
@@ -71,7 +77,10 @@ use preview_panel::{
 };
 use prompt::{MutationPrompt, MutationPromptKind};
 pub use recovery::RecoveryMarker;
-use session::{SessionState, SessionStore, TabId};
+use session::{
+    SessionState, SessionStore, SessionWindowPlacement, SharedSessionState, TabId,
+    WindowSessionRegistry,
+};
 use settings::{
     AccentColor, AppSettings, AppearanceSettings, Density, FontChoice, SettingsStore, ThemeMode,
     ThemeSpec, validate_theme_map, validate_theme_name,
@@ -110,6 +119,8 @@ gpui::actions!(
         ColumnRight,
         FocusSearch,
         ToggleFolderSizes,
+        NewWindow,
+        MoveTabToNewWindow,
         NewTab,
         CloseTab,
         NextTab,
@@ -197,6 +208,11 @@ pub struct ExplorieAssets;
 impl AssetSource for ExplorieAssets {
     fn load(&self, path: &str) -> gpui::Result<Option<Cow<'static, [u8]>>> {
         let bytes: Option<&'static [u8]> = match path {
+            "icons/icon.png" => Some(include_bytes!("../../native-assets/icons/icon.png")),
+            "icons/titlebar-icon.png" => Some(include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/titlebar-icon.png"
+            ))),
             "icons/app-face.svg" => Some(include_bytes!("../assets/icons/app-face.svg")),
             "icons/arrow-left.svg" => Some(include_bytes!("../assets/icons/arrow-left.svg")),
             "icons/arrow-right.svg" => Some(include_bytes!("../assets/icons/arrow-right.svg")),
@@ -204,8 +220,12 @@ impl AssetSource for ExplorieAssets {
             "icons/bookmark.svg" => Some(include_bytes!("../assets/icons/bookmark.svg")),
             "icons/check.svg" => Some(include_bytes!("../assets/icons/check.svg")),
             "icons/close.svg" => Some(include_bytes!("../assets/icons/close.svg")),
+            "icons/copy.svg" => Some(include_bytes!("../assets/icons/copy.svg")),
+            "icons/cut.svg" => Some(include_bytes!("../assets/icons/cut.svg")),
+            "icons/edit.svg" => Some(include_bytes!("../assets/icons/edit.svg")),
             "icons/eye-closed.svg" => Some(include_bytes!("../assets/icons/eye-closed.svg")),
             "icons/eye.svg" => Some(include_bytes!("../assets/icons/eye.svg")),
+            "icons/extract.svg" => Some(include_bytes!("../assets/icons/extract.svg")),
             "icons/file.svg" => Some(include_bytes!("../assets/icons/file.svg")),
             "icons/folder.svg" => Some(include_bytes!("../assets/icons/folder.svg")),
             "icons/frame.svg" => Some(include_bytes!("../assets/icons/frame.svg")),
@@ -216,6 +236,8 @@ impl AssetSource for ExplorieAssets {
             "icons/moon.svg" => Some(include_bytes!("../assets/icons/moon.svg")),
             "icons/minus.svg" => Some(include_bytes!("../assets/icons/minus.svg")),
             "icons/more-vertical.svg" => Some(include_bytes!("../assets/icons/more-vertical.svg")),
+            "icons/archive.svg" => Some(include_bytes!("../assets/icons/archive.svg")),
+            "icons/paste.svg" => Some(include_bytes!("../assets/icons/paste.svg")),
             "icons/plus.svg" => Some(include_bytes!("../assets/icons/plus.svg")),
             "icons/redo.svg" => Some(include_bytes!("../assets/icons/redo.svg")),
             "icons/reload.svg" => Some(include_bytes!("../assets/icons/reload.svg")),
@@ -224,6 +246,7 @@ impl AssetSource for ExplorieAssets {
             "icons/sliders.svg" => Some(include_bytes!("../assets/icons/sliders.svg")),
             "icons/sort.svg" => Some(include_bytes!("../assets/icons/sort.svg")),
             "icons/sun.svg" => Some(include_bytes!("../assets/icons/sun.svg")),
+            "icons/trash.svg" => Some(include_bytes!("../assets/icons/trash.svg")),
             "icons/undo.svg" => Some(include_bytes!("../assets/icons/undo.svg")),
             "icons/view-col.svg" => Some(include_bytes!("../assets/icons/view-col.svg")),
             _ => None,
@@ -236,6 +259,8 @@ impl AssetSource for ExplorieAssets {
             return Ok(Vec::new());
         }
         Ok([
+            "icon.png",
+            "titlebar-icon.png",
             "app-face.svg",
             "arrow-left.svg",
             "arrow-right.svg",
@@ -243,8 +268,12 @@ impl AssetSource for ExplorieAssets {
             "bookmark.svg",
             "check.svg",
             "close.svg",
+            "copy.svg",
+            "cut.svg",
+            "edit.svg",
             "eye-closed.svg",
             "eye.svg",
+            "extract.svg",
             "file.svg",
             "folder.svg",
             "frame.svg",
@@ -255,6 +284,8 @@ impl AssetSource for ExplorieAssets {
             "moon.svg",
             "minus.svg",
             "more-vertical.svg",
+            "archive.svg",
+            "paste.svg",
             "plus.svg",
             "redo.svg",
             "reload.svg",
@@ -263,6 +294,7 @@ impl AssetSource for ExplorieAssets {
             "sliders.svg",
             "sort.svg",
             "sun.svg",
+            "trash.svg",
             "undo.svg",
             "view-col.svg",
         ]
@@ -275,9 +307,13 @@ impl AssetSource for ExplorieAssets {
 const ENTRY_ICON_CACHE_LIMIT: usize = 256;
 const ENTRY_THUMBNAIL_CACHE_LIMIT: usize = 128;
 const ENTRY_THUMBNAIL_MAX_CONCURRENT: usize = 4;
-const GRID_MARQUEE_THRESHOLD: f32 = 5.0;
-const GRID_MARQUEE_EDGE_ZONE: f32 = 40.0;
-const GRID_MARQUEE_SCROLL_STEP: f32 = 10.0;
+const SELECTION_MARQUEE_THRESHOLD: f32 = 5.0;
+const SELECTION_MARQUEE_EDGE_ZONE: f32 = 40.0;
+const SELECTION_MARQUEE_SCROLL_STEP: f32 = 10.0;
+const SELECTION_MARQUEE_GUTTER: f32 = 16.0;
+const DEFAULT_COLUMN_VIEW_WIDTH: f32 = 280.0;
+const MIN_COLUMN_VIEW_WIDTH: f32 = 180.0;
+const MAX_COLUMN_VIEW_WIDTH: f32 = 640.0;
 const GRID_HORIZONTAL_PADDING: f32 = 8.0;
 const FILE_DRAG_EDGE_ZONE: f32 = 36.0;
 const FILE_DRAG_SCROLL_STEP: f32 = 16.0;
@@ -383,6 +419,31 @@ fn entry_supports_grid_thumbnail(entry: &FileEntry) -> bool {
             | "gif"
             | "bmp"
             | "webp"
+            | "svg"
+            | "svgz"
+            | "avif"
+            | "jxl"
+            | "jpegxl"
+            | "tif"
+            | "tiff"
+            | "ico"
+            | "tga"
+            | "dds"
+            | "hdr"
+            | "pnm"
+            | "pbm"
+            | "pgm"
+            | "ppm"
+            | "pam"
+            | "qoi"
+            | "dng"
+            | "cr2"
+            | "cr3"
+            | "nef"
+            | "arw"
+            | "orf"
+            | "rw2"
+            | "raf"
             | "mp4"
             | "webm"
             | "m4v"
@@ -396,6 +457,9 @@ fn entry_supports_grid_thumbnail(entry: &FileEntry) -> bool {
             | "mpeg"
             | "mpg"
             | "3gp"
+            | "ogv"
+            | "ts"
+            | "vob"
     )
 }
 
@@ -449,26 +513,34 @@ impl GridRect {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum MarqueeLayout {
+    List { row_height: f32 },
+    Grid(GridLayoutMetrics),
+    Column { index: usize, row_height: f32 },
+}
+
 #[derive(Clone, Debug)]
-struct GridMarquee {
+struct SelectionMarquee {
     start_window: GridPoint,
     start_content: GridPoint,
     current_content: GridPoint,
     activated: bool,
     additive: bool,
-    metrics: GridLayoutMetrics,
-    accumulated: BTreeSet<PathBuf>,
+    layout: MarqueeLayout,
+    initial_selection: BTreeSet<PathBuf>,
+    paths: Vec<PathBuf>,
 }
 
-impl GridMarquee {
+impl SelectionMarquee {
     fn content_rect(&self) -> GridRect {
         GridRect::between(self.start_content, self.current_content)
     }
 
     fn update(&mut self, window: GridPoint, content: GridPoint) {
         self.current_content = content;
-        self.activated |= (window.x - self.start_window.x).abs() >= GRID_MARQUEE_THRESHOLD
-            || (window.y - self.start_window.y).abs() >= GRID_MARQUEE_THRESHOLD;
+        self.activated |= (window.x - self.start_window.x).abs() >= SELECTION_MARQUEE_THRESHOLD
+            || (window.y - self.start_window.y).abs() >= SELECTION_MARQUEE_THRESHOLD;
     }
 }
 
@@ -495,11 +567,30 @@ fn grid_marquee_hit_indices(
         .collect()
 }
 
-fn grid_marquee_scroll_delta(pointer_y: f32, viewport_height: f32) -> f32 {
-    if pointer_y < GRID_MARQUEE_EDGE_ZONE {
-        GRID_MARQUEE_SCROLL_STEP
-    } else if pointer_y > viewport_height - GRID_MARQUEE_EDGE_ZONE {
-        -GRID_MARQUEE_SCROLL_STEP
+fn row_marquee_hit_indices(
+    marquee: GridRect,
+    item_count: usize,
+    row_height: f32,
+    viewport_width: f32,
+) -> Vec<usize> {
+    (0..item_count)
+        .filter(|index| {
+            let top = *index as f32 * row_height;
+            marquee.intersects(GridRect {
+                left: 0.0,
+                top,
+                right: viewport_width,
+                bottom: top + row_height,
+            })
+        })
+        .collect()
+}
+
+fn selection_marquee_scroll_delta(pointer_y: f32, viewport_height: f32) -> f32 {
+    if pointer_y < SELECTION_MARQUEE_EDGE_ZONE {
+        SELECTION_MARQUEE_SCROLL_STEP
+    } else if pointer_y > viewport_height - SELECTION_MARQUEE_EDGE_ZONE {
+        -SELECTION_MARQUEE_SCROLL_STEP
     } else {
         0.0
     }
@@ -533,6 +624,7 @@ struct FileDragItem {
 struct FileDrag {
     items: Vec<FileDragItem>,
     position: gpui::Point<gpui::Pixels>,
+    native_export_attempted: Arc<AtomicBool>,
 }
 
 impl FileDrag {
@@ -547,6 +639,7 @@ impl FileDrag {
                 })
                 .collect(),
             position: gpui::Point::default(),
+            native_export_attempted: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -764,6 +857,10 @@ fn on_off(value: bool) -> &'static str {
 #[derive(Clone, Copy)]
 struct UiPalette {
     dark: bool,
+    density: Density,
+    scale: f32,
+    radius: f32,
+    icon_size: f32,
     window: Rgba,
     topbar: Rgba,
     panel: Rgba,
@@ -800,10 +897,18 @@ impl UiPalette {
                 parse_hex_color(&settings.appearance.accent_custom).unwrap_or_else(|| rgb(0x7cc7ff))
             }
         };
+        let density = settings.appearance.density;
+        let scale = settings.appearance.ui_scale;
+        let radius = f32::from(settings.appearance.border_radius);
+        let icon_size = f32::from(settings.appearance.icon_size);
         if settings.appearance.high_contrast {
             let window = if dark { rgb(0x000000) } else { rgb(0xffffff) };
             return Self {
                 dark,
+                density,
+                scale,
+                radius,
+                icon_size,
                 window,
                 topbar: if dark { rgb(0x050505) } else { rgb(0xfafafa) },
                 panel: if dark { rgb(0x0a0a0a) } else { rgb(0xf5f5f5) },
@@ -825,6 +930,10 @@ impl UiPalette {
         if dark {
             Self {
                 dark,
+                density,
+                scale,
+                radius,
+                icon_size,
                 window: rgb(0x0f0f0f),
                 topbar: rgb(0x111111),
                 panel: rgb(0x151515),
@@ -842,6 +951,10 @@ impl UiPalette {
         } else {
             Self {
                 dark,
+                density,
+                scale,
+                radius,
+                icon_size,
                 window: rgb(0xf6f6f6),
                 topbar: rgb(0xf3f3f3),
                 panel: rgb(0xefefef),
@@ -880,6 +993,63 @@ fn adaptive_hover(color: Rgba) -> Rgba {
         rgb(0x000000)
     };
     color.blend(with_alpha(contrast, 0.08))
+}
+
+fn contrasting_text(color: Rgba) -> Rgba {
+    let luminance = 0.2126 * color.r + 0.7152 * color.g + 0.0722 * color.b;
+    if luminance > 0.56 {
+        rgb(0x171717)
+    } else {
+        rgb(0xffffff)
+    }
+}
+
+struct AppTooltip {
+    text: SharedString,
+    palette: UiPalette,
+}
+
+impl Render for AppTooltip {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .max_w(px(320.0 * self.palette.scale))
+            .px_2()
+            .py_1()
+            .rounded(px(self.palette.radius.min(6.0)))
+            .border_1()
+            .border_color(self.palette.border)
+            .bg(self.palette.panel)
+            .text_xs()
+            .text_color(self.palette.text)
+            .child(self.text.clone())
+    }
+}
+
+fn app_tooltip(text: impl Into<SharedString>, palette: UiPalette, cx: &mut App) -> gpui::AnyView {
+    let text = text.into();
+    cx.new(|_| AppTooltip { text, palette }).into()
+}
+
+fn control_tooltip_text(label: &str) -> String {
+    let shortcut = match label {
+        "Close settings" | "Close preview" | "Close Quick Look" => Some("Esc"),
+        _ => None,
+    };
+    shortcut.map_or_else(
+        || label.to_string(),
+        |shortcut| format!("{label}  •  {shortcut}"),
+    )
+}
+
+fn shortcut_tooltip_text(
+    label: &str,
+    overrides: &BTreeMap<String, String>,
+    shortcut_id: &str,
+) -> String {
+    binding_for(overrides, shortcut_id).map_or_else(
+        || label.to_string(),
+        |binding| format!("{label}  •  {}", display_binding(&binding)),
+    )
 }
 
 fn syntax_highlights(
@@ -926,6 +1096,173 @@ fn syntax_highlights(
         .collect()
 }
 
+fn syntax_highlights_for_line(
+    highlights: &[(std::ops::Range<usize>, HighlightStyle)],
+    line_start: usize,
+    line_end: usize,
+) -> Vec<(std::ops::Range<usize>, HighlightStyle)> {
+    highlights
+        .iter()
+        .filter_map(|(range, style)| {
+            let start = range.start.max(line_start);
+            let end = range.end.min(line_end);
+            (start < end).then_some((start - line_start..end - line_start, *style))
+        })
+        .collect()
+}
+
+fn find_highlights_for_line(
+    line: &str,
+    line_start: usize,
+    regex: Option<&regex::Regex>,
+    active_match: Option<&std::ops::Range<usize>>,
+    palette: UiPalette,
+) -> Vec<(std::ops::Range<usize>, HighlightStyle)> {
+    let Some(regex) = regex else {
+        return Vec::new();
+    };
+    regex
+        .find_iter(line)
+        .map(|found| {
+            let absolute = line_start + found.start()..line_start + found.end();
+            let active = active_match == Some(&absolute);
+            (
+                found.start()..found.end(),
+                HighlightStyle {
+                    background_color: Some(
+                        with_alpha(palette.accent, if active { 0.78 } else { 0.34 }).into(),
+                    ),
+                    font_weight: Some(if active {
+                        FontWeight::BOLD
+                    } else {
+                        FontWeight::MEDIUM
+                    }),
+                    ..Default::default()
+                },
+            )
+        })
+        .collect()
+}
+
+fn merge_text_highlight_layers(
+    mut base: Vec<(std::ops::Range<usize>, HighlightStyle)>,
+    mut overlay: Vec<(std::ops::Range<usize>, HighlightStyle)>,
+) -> Vec<(std::ops::Range<usize>, HighlightStyle)> {
+    base.retain(|(range, _)| range.start < range.end);
+    overlay.retain(|(range, _)| range.start < range.end);
+    base.sort_by_key(|(range, _)| (range.start, range.end));
+    overlay.sort_by_key(|(range, _)| (range.start, range.end));
+
+    let mut boundaries = Vec::with_capacity((base.len() + overlay.len()) * 2);
+    for (range, _) in base.iter().chain(&overlay) {
+        boundaries.push(range.start);
+        boundaries.push(range.end);
+    }
+    boundaries.sort_unstable();
+    boundaries.dedup();
+
+    let mut merged = Vec::<(std::ops::Range<usize>, HighlightStyle)>::new();
+    let mut base_index = 0;
+    let mut overlay_index = 0;
+    for boundary in boundaries.windows(2) {
+        let start = boundary[0];
+        let end = boundary[1];
+        while base
+            .get(base_index)
+            .is_some_and(|(range, _)| range.end <= start)
+        {
+            base_index += 1;
+        }
+        while overlay
+            .get(overlay_index)
+            .is_some_and(|(range, _)| range.end <= start)
+        {
+            overlay_index += 1;
+        }
+        let base_style = base.get(base_index).and_then(|(range, style)| {
+            (range.start <= start && range.end >= end).then_some(*style)
+        });
+        let overlay_style = overlay.get(overlay_index).and_then(|(range, style)| {
+            (range.start <= start && range.end >= end).then_some(*style)
+        });
+        let style = match (base_style, overlay_style) {
+            (None, None) => continue,
+            (Some(style), None) | (None, Some(style)) => style,
+            (Some(base), Some(overlay)) => HighlightStyle {
+                color: overlay.color.or(base.color),
+                font_weight: overlay.font_weight.or(base.font_weight),
+                font_style: overlay.font_style.or(base.font_style),
+                background_color: overlay.background_color.or(base.background_color),
+                underline: overlay.underline.or(base.underline),
+                strikethrough: overlay.strikethrough.or(base.strikethrough),
+                fade_out: overlay.fade_out.or(base.fade_out),
+            },
+        };
+        if let Some((range, previous)) = merged.last_mut()
+            && range.end == start
+            && *previous == style
+        {
+            range.end = end;
+        } else {
+            merged.push((start..end, style));
+        }
+    }
+    merged
+}
+
+fn text_find_regex(query: &str) -> Option<regex::Regex> {
+    let query = query.trim();
+    if query.is_empty() {
+        return None;
+    }
+    regex::RegexBuilder::new(&regex::escape(query))
+        .case_insensitive(true)
+        .unicode(true)
+        .build()
+        .ok()
+}
+
+fn text_preview_line_element(
+    line_index: usize,
+    line: &str,
+    highlights: Vec<(std::ops::Range<usize>, HighlightStyle)>,
+    show_line_numbers: bool,
+    gutter_width: f32,
+    wrapped: bool,
+    palette: UiPalette,
+) -> AnyElement {
+    let styled_line = StyledText::new(if line.is_empty() {
+        "\u{00a0}".to_string()
+    } else {
+        line.to_string()
+    })
+    .with_highlights(highlights);
+    div()
+        .flex()
+        .items_start()
+        .min_w_full()
+        .when(show_line_numbers, |row| {
+            row.child(
+                div()
+                    .flex_none()
+                    .w(px(gutter_width))
+                    .pr_3()
+                    .text_right()
+                    .text_color(palette.tertiary)
+                    .child((line_index + 1).to_string()),
+            )
+        })
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .when(wrapped, |line| line.whitespace_normal())
+                .when(!wrapped, |line| line.whitespace_nowrap())
+                .child(styled_line),
+        )
+        .into_any_element()
+}
+
 fn format_audio_time(milliseconds: u64) -> String {
     let total_seconds = milliseconds / 1_000;
     let hours = total_seconds / 3_600;
@@ -935,6 +1272,67 @@ fn format_audio_time(milliseconds: u64) -> String {
         format!("{hours}:{minutes:02}:{seconds:02}")
     } else {
         format!("{minutes}:{seconds:02}")
+    }
+}
+
+fn slider_fraction(bounds: Bounds<Pixels>, position_x: Pixels) -> f32 {
+    let width = f32::from(bounds.size.width);
+    if width <= 0.0 {
+        return 0.0;
+    }
+    ((f32::from(position_x) - f32::from(bounds.left())) / width).clamp(0.0, 1.0)
+}
+
+fn media_slider_track(value: f32, palette: UiPalette) -> gpui::Div {
+    let value = value.clamp(0.0, 1.0);
+    let thumb_size = 10.0 * palette.scale;
+    div()
+        .relative()
+        .w_full()
+        .h(px(thumb_size))
+        .child(
+            div()
+                .absolute()
+                .left_0()
+                .right_0()
+                .top(px((thumb_size - 4.0 * palette.scale) / 2.0))
+                .h(px(4.0 * palette.scale))
+                .rounded_full()
+                .overflow_hidden()
+                .bg(palette.border)
+                .child(div().h_full().w(gpui::relative(value)).bg(palette.accent)),
+        )
+        .child(
+            div()
+                .absolute()
+                .left(gpui::relative(value))
+                .top_0()
+                .ml(px(-thumb_size / 2.0))
+                .size(px(thumb_size))
+                .rounded_full()
+                .border_1()
+                .border_color(palette.surface)
+                .bg(palette.accent)
+                .shadow_sm(),
+        )
+}
+
+fn monospace_font_family() -> &'static str {
+    if cfg!(windows) {
+        "Consolas"
+    } else if cfg!(target_os = "macos") {
+        "Menlo"
+    } else {
+        "monospace"
+    }
+}
+
+fn unknown_preview_detection() -> PreviewDetection {
+    PreviewDetection {
+        kind: DetectedPreviewKind::Unknown,
+        description: "Unknown file".to_string(),
+        mime_type: Some("application/octet-stream".to_string()),
+        byte_sample: None,
     }
 }
 
@@ -971,6 +1369,22 @@ fn font_family(settings: &AppSettings) -> String {
 
 pub fn parse_startup_path(args: impl IntoIterator<Item = OsString>) -> Option<PathBuf> {
     launch_directory_from_args(args)
+}
+
+fn apply_smart_folder_browser_state(browser: &mut SessionState, criteria: &SearchCriteria) {
+    browser.set_view_mode(ViewMode::List);
+    browser.set_search_query(
+        criteria
+            .name_pattern
+            .clone()
+            .filter(|_| !criteria.name_regex)
+            .unwrap_or_default(),
+    );
+    browser.set_filter(match criteria.type_filter {
+        SearchType::All => EntryFilter::All,
+        SearchType::Files => EntryFilter::Files,
+        SearchType::Folders => EntryFilter::Folders,
+    });
 }
 
 #[derive(Debug)]
@@ -1016,17 +1430,6 @@ pub enum SearchEvent {
         generation: u64,
         error: ServiceError,
     },
-}
-
-async fn search_task(
-    services: NativeServices,
-    generation: u64,
-    criteria: SearchCriteria,
-) -> SearchEvent {
-    match services.search.search(criteria).await {
-        Ok(result) => SearchEvent::Completed { generation, result },
-        Err(error) => SearchEvent::Failed { generation, error },
-    }
 }
 
 async fn permanently_delete_items(
@@ -1093,12 +1496,31 @@ fn valid_leaf_name(name: &str) -> bool {
         })
 }
 
+fn finish_awaited_recovery(store: &Option<OperationRecoveryStore>, ids: &[String]) {
+    if let Some(store) = store.as_ref() {
+        let _ = store.remove(ids);
+    }
+}
+
 async fn await_file_operation(
     services: NativeServices,
     request: FileOperationRequest,
+    recovery_store: Option<OperationRecoveryStore>,
 ) -> ServiceResult<FileOperationResult> {
+    let recovery_ids = recovery_store
+        .as_ref()
+        .map_or_else(|| Ok(Vec::new()), |store| store.record(&request))
+        .map_err(ServiceError::from)?;
     let subscription = services.subscribe_async();
-    let job_id = services.mutations.start_file_operation(request)?;
+    let job_id = match services.mutations.start_file_operation(request) {
+        Ok(job_id) => job_id,
+        Err(error) => {
+            if let Some(store) = recovery_store.as_ref() {
+                let _ = store.remove(&recovery_ids);
+            }
+            return Err(error);
+        }
+    };
     loop {
         let ServiceEvent::FileOperation(event) = subscription.next().await else {
             continue;
@@ -1109,6 +1531,7 @@ async fn await_file_operation(
         match event.state {
             explorie_native_services::FileOperationState::Running => {}
             explorie_native_services::FileOperationState::Completed => {
+                finish_awaited_recovery(&recovery_store, &recovery_ids);
                 return event.result.ok_or_else(|| {
                     ServiceError::new(
                         ErrorCode::Internal,
@@ -1117,11 +1540,13 @@ async fn await_file_operation(
                 });
             }
             explorie_native_services::FileOperationState::Cancelled => {
+                finish_awaited_recovery(&recovery_store, &recovery_ids);
                 return Err(event.error.unwrap_or_else(|| {
                     ServiceError::new(ErrorCode::Cancelled, "File operation cancelled")
                 }));
             }
             explorie_native_services::FileOperationState::Failed => {
+                finish_awaited_recovery(&recovery_store, &recovery_ids);
                 return Err(event.error.unwrap_or_else(|| {
                     ServiceError::new(ErrorCode::Internal, "File operation failed")
                 }));
@@ -1132,7 +1557,14 @@ async fn await_file_operation(
 
 #[cfg(test)]
 async fn undo_action(action: UndoAction, services: NativeServices) -> ServiceResult<UndoAction> {
-    undo_action_with_progress(action, services, Arc::new(AtomicBool::new(false)), |_| {}).await
+    undo_action_with_progress(
+        action,
+        services,
+        None,
+        Arc::new(AtomicBool::new(false)),
+        |_| {},
+    )
+    .await
 }
 
 fn undo_action_item_count(action: &UndoAction) -> usize {
@@ -1150,14 +1582,27 @@ fn undo_cancelled_error() -> ServiceError {
 async fn await_undo_file_operation(
     services: NativeServices,
     request: FileOperationRequest,
+    recovery_store: Option<OperationRecoveryStore>,
     cancellation: &AtomicBool,
     on_update: &mut impl FnMut(UndoProgressUpdate),
 ) -> ServiceResult<FileOperationResult> {
     if cancellation.load(Ordering::Acquire) {
         return Err(undo_cancelled_error());
     }
+    let recovery_ids = recovery_store
+        .as_ref()
+        .map_or_else(|| Ok(Vec::new()), |store| store.record(&request))
+        .map_err(ServiceError::from)?;
     let subscription = services.subscribe_async();
-    let job_id = services.mutations.start_file_operation(request)?;
+    let job_id = match services.mutations.start_file_operation(request) {
+        Ok(job_id) => job_id,
+        Err(error) => {
+            if let Some(store) = recovery_store.as_ref() {
+                let _ = store.remove(&recovery_ids);
+            }
+            return Err(error);
+        }
+    };
     on_update(UndoProgressUpdate::Started(job_id.clone()));
     if cancellation.load(Ordering::Acquire) {
         services.mutations.cancel_file_operation(&job_id);
@@ -1179,6 +1624,7 @@ async fn await_undo_file_operation(
                 }
             }
             explorie_native_services::FileOperationState::Completed => {
+                finish_awaited_recovery(&recovery_store, &recovery_ids);
                 return event.result.ok_or_else(|| {
                     ServiceError::new(
                         ErrorCode::Internal,
@@ -1187,9 +1633,11 @@ async fn await_undo_file_operation(
                 });
             }
             explorie_native_services::FileOperationState::Cancelled => {
+                finish_awaited_recovery(&recovery_store, &recovery_ids);
                 return Err(event.error.unwrap_or_else(undo_cancelled_error));
             }
             explorie_native_services::FileOperationState::Failed => {
+                finish_awaited_recovery(&recovery_store, &recovery_ids);
                 return Err(event.error.unwrap_or_else(|| {
                     ServiceError::new(ErrorCode::Internal, "Undo file operation failed")
                 }));
@@ -1201,18 +1649,42 @@ async fn await_undo_file_operation(
 async fn undo_action_with_progress(
     action: UndoAction,
     services: NativeServices,
+    recovery_store: Option<OperationRecoveryStore>,
     cancellation: Arc<AtomicBool>,
     mut on_update: impl FnMut(UndoProgressUpdate),
 ) -> ServiceResult<UndoAction> {
     match action {
-        UndoAction::Copy { request, targets } => {
-            for target in &targets {
+        UndoAction::Copy {
+            request,
+            targets,
+            snapshots,
+        } => {
+            if targets.len() != snapshots.len() {
+                return Err(ServiceError::new(
+                    ErrorCode::Internal,
+                    "Copy undo is missing its safety snapshot",
+                ));
+            }
+            for (target, snapshot) in targets.iter().zip(&snapshots) {
                 if cancellation.load(Ordering::Acquire) {
                     return Err(undo_cancelled_error());
                 }
                 if !services.mutations.path_exists(target.clone()).await? {
                     on_update(UndoProgressUpdate::ItemCompleted);
                     continue;
+                }
+                if !services
+                    .mutations
+                    .path_matches_snapshot(target.clone(), snapshot.clone())
+                    .await?
+                {
+                    return Err(ServiceError::new(
+                        ErrorCode::Conflict,
+                        format!(
+                            "{} changed after it was copied; refusing to move it to Trash",
+                            target.display()
+                        ),
+                    ));
                 }
                 await_undo_file_operation(
                     services.clone(),
@@ -1222,13 +1694,18 @@ async fn undo_action_with_progress(
                         destination: None,
                         conflict_policy: ConflictPolicy::Error,
                     },
+                    recovery_store.clone(),
                     &cancellation,
                     &mut on_update,
                 )
                 .await?;
                 on_update(UndoProgressUpdate::ItemCompleted);
             }
-            Ok(UndoAction::Copy { request, targets })
+            Ok(UndoAction::Copy {
+                request,
+                targets,
+                snapshots,
+            })
         }
         UndoAction::Move { request, pairs } => {
             for (source, target) in &pairs {
@@ -1262,6 +1739,7 @@ async fn undo_action_with_progress(
                         destination: Some(parent),
                         conflict_policy: ConflictPolicy::Error,
                     },
+                    recovery_store.clone(),
                     &cancellation,
                     &mut on_update,
                 )
@@ -1283,6 +1761,7 @@ async fn undo_action_with_progress(
                         destination: None,
                         conflict_policy: ConflictPolicy::Error,
                     },
+                    recovery_store.clone(),
                     &cancellation,
                     &mut on_update,
                 )
@@ -1339,17 +1818,24 @@ async fn undo_action_with_progress(
     }
 }
 
-async fn redo_action(action: UndoAction, services: NativeServices) -> ServiceResult<UndoAction> {
+async fn redo_action(
+    action: UndoAction,
+    services: NativeServices,
+    recovery_store: Option<OperationRecoveryStore>,
+) -> ServiceResult<UndoAction> {
     match action {
         UndoAction::Copy { request, .. } => {
-            let result = await_file_operation(services, request.clone()).await?;
+            let result =
+                await_file_operation(services, request.clone(), recovery_store.clone()).await?;
             Ok(UndoAction::Copy {
                 request,
                 targets: result.targets,
+                snapshots: result.target_snapshots,
             })
         }
         UndoAction::Move { request, .. } => {
-            let result = await_file_operation(services, request.clone()).await?;
+            let result =
+                await_file_operation(services, request.clone(), recovery_store.clone()).await?;
             if result.targets.len() != request.sources.len() {
                 return Err(ServiceError::new(
                     ErrorCode::Internal,
@@ -1624,6 +2110,80 @@ enum SettingsTab {
     About,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SettingsSelector {
+    Accent,
+    Font,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SettingsConfirmation {
+    ResetSettings,
+    ResetShortcut(String),
+    ResetAllShortcuts,
+    ClearPreviewCache,
+    DeleteTheme(String),
+    RemoveCustomField(String),
+    InstallUpdate(UpdateInfo),
+    DiscardDraft(PendingDraftAction),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum UpdateStatus {
+    Idle,
+    Checking,
+    UpToDate,
+    Available(UpdateInfo),
+    Downloading(UpdateInfo),
+    Ready(DownloadedUpdate),
+    Installing,
+    Failed(String),
+}
+
+#[derive(Clone)]
+enum UpdateAction {
+    Check,
+    Download(UpdateInfo),
+    Install(DownloadedUpdate),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingDraftAction {
+    CloseControlSurface,
+    OpenControlSurface(ControlSurface),
+    ToggleToolbarMenu(ToolbarMenu),
+    OpenSettings,
+    CloseSettings,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SettingsSlider {
+    UiScale,
+    ListRowHeight,
+    GridWidth,
+    IconSize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TextInputTarget {
+    Search,
+    ControlQuery,
+    GoToFolder,
+    Breadcrumb,
+    MutationPrompt,
+    AppearanceValue,
+    NamedTheme,
+    PreviewFind,
+    CustomField,
+    FinderTag,
+}
+
+#[derive(Clone, Debug)]
+enum ColumnSelectionTarget {
+    First,
+    Path(PathBuf),
+}
+
 impl SettingsTab {
     const ALL: [Self; 6] = [
         Self::General,
@@ -1702,10 +2262,44 @@ struct GoToFolderState {
     generation: u64,
 }
 
+#[derive(Clone, Debug)]
+struct BreadcrumbEditor {
+    input: String,
+    replace_on_type: bool,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct SidebarResize {
     start_x: f32,
     start_width: f32,
+}
+
+#[derive(Clone, Debug)]
+struct ListColumnResize {
+    key: String,
+    start_x: f32,
+    start_width: f32,
+}
+
+#[derive(Clone, Debug)]
+struct ColumnViewResize {
+    path: PathBuf,
+    start_x: f32,
+    start_width: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum MediaSliderKind {
+    AudioSeek,
+    AudioVolume,
+    VideoSeek,
+    VideoVolume,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MediaSliderDrag {
+    kind: MediaSliderKind,
+    bounds: Bounds<Pixels>,
 }
 
 impl AppearanceValueEditor {
@@ -1824,33 +2418,35 @@ impl ContextMenuAction {
         }
     }
 
-    fn icon(&self) -> &'static str {
+    fn icon_name(&self) -> &'static str {
         match self {
-            Self::Open => "↗",
-            Self::Preview | Self::QuickLook => "◉",
-            Self::Rename | Self::BatchRename => "✎",
-            Self::Copy => "⧉",
-            Self::Cut => "✂",
-            Self::Trash => "⌫",
-            Self::Reveal => "▣",
-            Self::OpenWithChooser | Self::ToggleOpenWith | Self::OpenWithApp(_) => "↗",
-            Self::ToggleFavorite => "★",
-            Self::Compress | Self::InspectArchive => "▤",
-            Self::ExtractArchive => "⇲",
-            Self::Paste => "⎘",
+            Self::Open => "arrow-right",
+            Self::Preview | Self::QuickLook => "eye",
+            Self::Rename | Self::BatchRename => "edit",
+            Self::Copy => "copy",
+            Self::Cut => "cut",
+            Self::Trash => "trash",
+            Self::Reveal => "folder",
+            Self::OpenWithChooser | Self::ToggleOpenWith | Self::OpenWithApp(_) => "arrow-right",
+            Self::ToggleFavorite => "bookmark",
+            Self::Compress | Self::InspectArchive => "archive",
+            Self::ExtractArchive => "extract",
+            Self::Paste => "paste",
         }
     }
 
-    fn shortcut(&self) -> &'static str {
-        match self {
-            Self::Open => "Enter",
-            Self::Preview => "Space",
-            Self::Rename | Self::BatchRename => "F2",
-            Self::Copy => "Ctrl+C",
-            Self::Cut => "Ctrl+X",
-            Self::Trash => "Del",
-            _ => "",
-        }
+    fn shortcut(&self, overrides: &BTreeMap<String, String>) -> Option<String> {
+        let binding = match self {
+            Self::Open => Some("enter".to_string()),
+            Self::Preview => Some("space".to_string()),
+            Self::Rename | Self::BatchRename => binding_for(overrides, "file-rename"),
+            Self::Copy => binding_for(overrides, "file-copy"),
+            Self::Cut => binding_for(overrides, "file-cut"),
+            Self::Trash => binding_for(overrides, "file-trash"),
+            Self::Paste => binding_for(overrides, "file-paste"),
+            _ => None,
+        }?;
+        Some(display_binding(&binding))
     }
 
     fn selector(&self) -> String {
@@ -1879,6 +2475,7 @@ impl ContextMenuAction {
 
 #[derive(Clone, Debug)]
 struct FileContextMenu {
+    focus_handle: FocusHandle,
     position: gpui::Point<gpui::Pixels>,
     paths: Vec<PathBuf>,
     entries: Vec<FileEntry>,
@@ -1901,6 +2498,390 @@ struct PersistenceStores {
     workspaces: Option<WorkspaceStore>,
     operation_recovery: Option<OperationRecoveryStore>,
     interrupted_operations: Vec<InterruptedOperation>,
+    window_lifetime: Option<WindowLifetime>,
+}
+
+#[derive(Clone)]
+struct SharedApplicationState {
+    settings: AppSettings,
+    workspaces: WorkspaceState,
+    session: SharedSessionState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SharedOperationSummary {
+    id: String,
+    owner_window_id: String,
+    label: String,
+    item_count: usize,
+    destination: Option<PathBuf>,
+    status: OperationStatus,
+    processed_entries: u64,
+    total_entries: u64,
+    processed_bytes: u64,
+    total_bytes: u64,
+    current_path: Option<PathBuf>,
+    error: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct WindowRuntime {
+    registry: WindowSessionRegistry,
+    live_windows: Arc<AtomicUsize>,
+    quitting: Arc<AtomicBool>,
+    shared_state: Arc<Mutex<Option<SharedApplicationState>>>,
+    shared_state_revision: Arc<AtomicU64>,
+    operations: Arc<Mutex<Vec<SharedOperationSummary>>>,
+    operations_revision: Arc<AtomicU64>,
+    settings_store: Arc<Mutex<Option<Arc<SettingsStore>>>>,
+    workspace_store: Arc<Mutex<Option<Arc<WorkspaceStore>>>>,
+}
+
+impl WindowRuntime {
+    pub fn open(config_dir: &Path) -> (Self, Vec<String>) {
+        let (registry, session_ids) = WindowSessionRegistry::open(config_dir);
+        (
+            Self {
+                registry,
+                live_windows: Arc::new(AtomicUsize::new(0)),
+                quitting: Arc::new(AtomicBool::new(false)),
+                shared_state: Arc::new(Mutex::new(None)),
+                shared_state_revision: Arc::new(AtomicU64::new(0)),
+                operations: Arc::new(Mutex::new(Vec::new())),
+                operations_revision: Arc::new(AtomicU64::new(0)),
+                settings_store: Arc::new(Mutex::new(None)),
+                workspace_store: Arc::new(Mutex::new(None)),
+            },
+            session_ids,
+        )
+    }
+
+    pub fn mark_quitting(&self) {
+        self.quitting.store(true, Ordering::Release);
+    }
+
+    fn next_session_id(&self) -> String {
+        uuid::Uuid::new_v4().to_string()
+    }
+
+    fn register(&self, id: &str) -> std::io::Result<()> {
+        if id != "primary" {
+            self.registry.add(id.to_string())?;
+        }
+        Ok(())
+    }
+
+    fn lifetime(&self, id: String) -> WindowLifetime {
+        self.live_windows.fetch_add(1, Ordering::AcqRel);
+        WindowLifetime {
+            runtime: self.clone(),
+            id,
+        }
+    }
+
+    fn is_last_window(&self) -> bool {
+        self.live_windows.load(Ordering::Acquire) <= 1
+    }
+
+    fn share_settings_store(&self, store: SettingsStore) -> Arc<SettingsStore> {
+        let mut shared = self
+            .settings_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(shared.get_or_insert_with(|| Arc::new(store)))
+    }
+
+    fn share_workspace_store(&self, store: WorkspaceStore) -> Arc<WorkspaceStore> {
+        let mut shared = self
+            .workspace_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(shared.get_or_insert_with(|| Arc::new(store)))
+    }
+
+    fn adopt_or_snapshot(
+        &self,
+        settings: AppSettings,
+        workspaces: WorkspaceState,
+        session: SharedSessionState,
+    ) -> (SharedApplicationState, u64) {
+        let mut state = self
+            .shared_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let snapshot = state
+            .get_or_insert_with(|| SharedApplicationState {
+                settings,
+                workspaces,
+                session,
+            })
+            .clone();
+        let revision = if self.shared_state_revision.load(Ordering::Acquire) == 0 {
+            self.shared_state_revision.store(1, Ordering::Release);
+            1
+        } else {
+            self.shared_state_revision.load(Ordering::Acquire)
+        };
+        (snapshot, revision)
+    }
+
+    fn publish_settings(&self, mut settings: AppSettings) -> AppSettings {
+        let mut state = self
+            .shared_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(current) = state.as_mut() else {
+            return settings;
+        };
+        // Folder view and window geometry belong to an individual window/tab.
+        settings.window_placement = current.settings.window_placement;
+        settings.view.view_mode = current.settings.view.view_mode;
+        settings.view.sort_key = current.settings.view.sort_key.clone();
+        settings.view.sort_direction = current.settings.view.sort_direction;
+        settings.view.show_preview_panel = current.settings.view.show_preview_panel;
+        settings.appearance.grid_min_width = current.settings.appearance.grid_min_width;
+        if current.settings != settings {
+            current.settings = settings;
+            self.shared_state_revision.fetch_add(1, Ordering::AcqRel);
+        }
+        current.settings.clone()
+    }
+
+    fn mutate_workspaces<R>(
+        &self,
+        mutation: impl FnOnce(&mut WorkspaceState) -> R,
+    ) -> (R, WorkspaceState) {
+        let mut state = self
+            .shared_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = state
+            .as_mut()
+            .expect("window runtime state is initialized before mutations");
+        let before = current.workspaces.clone();
+        let result = mutation(&mut current.workspaces);
+        if current.workspaces != before {
+            self.shared_state_revision.fetch_add(1, Ordering::AcqRel);
+        }
+        (result, current.workspaces.clone())
+    }
+
+    fn mutate_session<R>(
+        &self,
+        mutation: impl FnOnce(&mut SharedSessionState) -> R,
+    ) -> (R, SharedSessionState) {
+        let mut state = self
+            .shared_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = state
+            .as_mut()
+            .expect("window runtime state is initialized before mutations");
+        let before = current.session.clone();
+        let result = mutation(&mut current.session);
+        if current.session != before {
+            self.shared_state_revision.fetch_add(1, Ordering::AcqRel);
+        }
+        (result, current.session.clone())
+    }
+
+    fn snapshot_after(&self, revision: u64) -> Option<(SharedApplicationState, u64)> {
+        let current_revision = self.shared_state_revision.load(Ordering::Acquire);
+        if current_revision <= revision {
+            return None;
+        }
+        self.shared_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .map(|state| (state, current_revision))
+    }
+
+    fn track_operation(&self, owner_window_id: String, id: String, request: &FileOperationRequest) {
+        let mut operations = self
+            .operations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        operations.retain(|operation| operation.id != id);
+        operations.push(SharedOperationSummary {
+            id,
+            owner_window_id,
+            label: file_operation_label(request.kind).to_string(),
+            item_count: request.sources.len(),
+            destination: request.destination.clone(),
+            status: OperationStatus::Running,
+            processed_entries: 0,
+            total_entries: 0,
+            processed_bytes: 0,
+            total_bytes: 0,
+            current_path: None,
+            error: None,
+        });
+        Self::trim_operation_summaries(&mut operations);
+        self.operations_revision.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn track_background_operation(
+        &self,
+        owner_window_id: String,
+        id: String,
+        label: impl Into<String>,
+        item_count: usize,
+        destination: Option<PathBuf>,
+    ) {
+        let mut operations = self
+            .operations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        operations.retain(|operation| operation.id != id);
+        operations.push(SharedOperationSummary {
+            id,
+            owner_window_id,
+            label: label.into(),
+            item_count,
+            destination,
+            status: OperationStatus::Running,
+            processed_entries: 0,
+            total_entries: 0,
+            processed_bytes: 0,
+            total_bytes: 0,
+            current_path: None,
+            error: None,
+        });
+        Self::trim_operation_summaries(&mut operations);
+        self.operations_revision.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn trim_operation_summaries(operations: &mut Vec<SharedOperationSummary>) {
+        while operations.len() > 50 {
+            let Some(index) = operations
+                .iter()
+                .position(|operation| operation.status != OperationStatus::Running)
+            else {
+                break;
+            };
+            operations.remove(index);
+        }
+    }
+
+    fn apply_archive_progress(&self, progress: &ArchiveProgressEvent) {
+        let mut operations = self
+            .operations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(operation) = operations
+            .iter_mut()
+            .find(|operation| operation.id == progress.operation_id)
+        else {
+            return;
+        };
+        operation.processed_bytes = progress.processed_bytes;
+        operation.total_bytes = progress.total_bytes;
+        operation.current_path = Some(PathBuf::from(&progress.current_path));
+        self.operations_revision.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn finish_background_operation(
+        &self,
+        id: &str,
+        status: OperationStatus,
+        error: Option<String>,
+    ) {
+        let mut operations = self
+            .operations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(operation) = operations.iter_mut().find(|operation| operation.id == id) else {
+            return;
+        };
+        operation.status = status;
+        operation.error = error;
+        self.operations_revision.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn apply_operation_event(&self, event: &FileOperationEvent) {
+        let mut operations = self
+            .operations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(operation) = operations
+            .iter_mut()
+            .find(|operation| operation.id == event.job_id)
+        else {
+            return;
+        };
+        operation.status = match event.state {
+            explorie_native_services::FileOperationState::Running => OperationStatus::Running,
+            explorie_native_services::FileOperationState::Completed => OperationStatus::Completed,
+            explorie_native_services::FileOperationState::Cancelled => OperationStatus::Cancelled,
+            explorie_native_services::FileOperationState::Failed => OperationStatus::Failed,
+        };
+        if let Some(progress) = &event.progress {
+            operation.processed_entries = progress.processed_entries;
+            operation.total_entries = progress.total_entries;
+            operation.processed_bytes = progress.processed_bytes;
+            operation.total_bytes = progress.total_bytes;
+            operation.current_path.clone_from(&progress.current_path);
+        }
+        operation.error = event.error.as_ref().map(ToString::to_string);
+        self.operations_revision.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn operations_revision(&self) -> u64 {
+        self.operations_revision.load(Ordering::Acquire)
+    }
+
+    fn operation_summaries(&self) -> Vec<SharedOperationSummary> {
+        self.operations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn clear_owner_finished_operations(&self, owner_window_id: &str) {
+        let mut operations = self
+            .operations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before = operations.len();
+        operations.retain(|operation| {
+            operation.owner_window_id != owner_window_id
+                || operation.status == OperationStatus::Running
+        });
+        if operations.len() != before {
+            self.operations_revision.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn remove_owner_finished_operation(&self, owner_window_id: &str, id: &str) {
+        let mut operations = self
+            .operations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before = operations.len();
+        operations.retain(|operation| {
+            operation.id != id
+                || operation.owner_window_id != owner_window_id
+                || operation.status == OperationStatus::Running
+        });
+        if operations.len() != before {
+            self.operations_revision.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+}
+
+struct WindowLifetime {
+    runtime: WindowRuntime,
+    id: String,
+}
+
+impl Drop for WindowLifetime {
+    fn drop(&mut self) {
+        self.runtime.live_windows.fetch_sub(1, Ordering::AcqRel);
+        if self.id != "primary" && !self.runtime.quitting.load(Ordering::Acquire) {
+            let _ = self.runtime.registry.remove(&self.id);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1945,30 +2926,79 @@ struct BlockedRemoteDisconnect {
     errored_files: u64,
 }
 
+#[derive(Clone, Debug)]
+struct TextPreviewUiState {
+    wrap_override: Option<bool>,
+    find: String,
+    find_match: usize,
+    unwrapped_scroll: UniformListScrollHandle,
+    wrapped_list: ListState,
+}
+
+impl Default for TextPreviewUiState {
+    fn default() -> Self {
+        Self {
+            wrap_override: None,
+            find: String::new(),
+            find_match: 0,
+            unwrapped_scroll: UniformListScrollHandle::new(),
+            wrapped_list: ListState::new(0, ListAlignment::Top, px(400.0)),
+        }
+    }
+}
+
+impl TextPreviewUiState {
+    fn reset(&mut self) {
+        self.wrap_override = None;
+        self.find.clear();
+        self.find_match = 0;
+        self.unwrapped_scroll
+            .0
+            .borrow()
+            .base_handle
+            .set_offset(gpui::point(px(0.0), px(0.0)));
+        self.wrapped_list.reset(0);
+    }
+}
+
 pub struct DirectoryWindow {
     browser: SessionState,
     services: NativeServices,
+    window_lifetime: Option<WindowLifetime>,
     state: ListingState,
     listing_task: Option<Task<()>>,
     search_task: Option<Task<()>>,
     locations_task: Option<Task<()>>,
+    disk_info_task: Option<Task<()>>,
+    syncthing_task: Option<Task<()>>,
     watcher_task: Option<Task<()>>,
     column_tasks: Vec<Task<()>>,
-    integration_task: Option<Task<()>>,
+    integration_tasks: Vec<Task<()>>,
+    integration_generation: u64,
+    system_integration_task: Option<Task<()>>,
     service_event_task: Option<Task<()>>,
-    single_instance_task: Option<Task<()>>,
+    shared_state_task: Option<Task<()>>,
+    shared_state_revision: u64,
+    operations_revision: u64,
+    single_instance_tasks: Vec<Task<()>>,
     request_generation: u64,
+    disk_info_generation: u64,
+    syncthing_generation: u64,
     search_generation: u64,
+    search_request_id: Option<String>,
+    search_progress: Option<SearchProgressEvent>,
     watcher_generation: u64,
     column_generation: u64,
     reset_scroll_on_result: bool,
+    pending_scroll_restore: Option<usize>,
     focus_handle: FocusHandle,
     scroll_handle: UniformListScrollHandle,
     column_scroll_handles: Vec<UniformListScrollHandle>,
     column_strip_scroll: ScrollHandle,
     column_scroll_to_leaf_attempts: u8,
     columns: ColumnState,
-    column_selection: Option<PathBuf>,
+    column_selection: BTreeSet<PathBuf>,
+    pending_column_selection: Option<ColumnSelectionTarget>,
     status_message: Option<String>,
     watch_status: WatchStatus,
     search_active: bool,
@@ -1977,19 +3007,21 @@ pub struct DirectoryWindow {
     calculate_folder_sizes: bool,
     session_store: Option<SessionStore>,
     settings: AppSettings,
-    settings_store: Option<SettingsStore>,
+    settings_store: Option<Arc<SettingsStore>>,
     workspaces: WorkspaceState,
-    workspace_store: Option<WorkspaceStore>,
+    workspace_store: Option<Arc<WorkspaceStore>>,
     workspace_editing: Option<String>,
     workspace_delete_confirmation: Option<String>,
     smart_folder_editor: Option<SmartFolderDraft>,
     sidebar_width: f32,
     sidebar_collapsed: bool,
     sidebar_resize: Option<SidebarResize>,
+    list_column_resize: Option<ListColumnResize>,
+    column_view_resize: Option<ColumnViewResize>,
     sidebar_resize_focus: FocusHandle,
     listing_viewport_width: f32,
     grid_columns: usize,
-    grid_marquee: Option<GridMarquee>,
+    selection_marquee: Option<SelectionMarquee>,
     file_drag_sources: BTreeSet<PathBuf>,
     file_drag_hover_target: Option<FileDragHoverTarget>,
     file_drag_hover_task: Option<Task<()>>,
@@ -2006,6 +3038,10 @@ pub struct DirectoryWindow {
     remote_exit_blocker: Option<RemoteDriveExitBlocker>,
     remote_tasks: Vec<Task<()>>,
     remote_poll_task: Option<Task<()>>,
+    remote_close_task: Option<Task<()>>,
+    remote_close_pending: bool,
+    remote_disable_pending: bool,
+    remote_environment_generation: u64,
     remote_poll_generation: u64,
     remote_auto_connect_started: bool,
     remote_auto_connect_active: Option<String>,
@@ -2016,13 +3052,28 @@ pub struct DirectoryWindow {
     mutation_exit_waiting: bool,
     settings_panel_open: bool,
     settings_tab: SettingsTab,
+    settings_selector: Option<SettingsSelector>,
+    settings_confirmation: Option<SettingsConfirmation>,
+    settings_confirmation_cancel_focus: FocusHandle,
+    settings_confirmation_confirm_focus: FocusHandle,
+    settings_confirmation_return_focus: Option<FocusHandle>,
+    settings_confirmation_focus_pending: bool,
     control_surface: ControlSurface,
     toolbar_menu: ToolbarMenu,
+    overlay_return_focus: Option<FocusHandle>,
+    overlay_focus_pending: bool,
+    overlay_restore_pending: bool,
     control_query: String,
     control_selected: usize,
+    native_text_input: Option<Entity<NativeTextInput>>,
+    native_text_input_target: Option<TextInputTarget>,
+    native_text_input_focus_pending: bool,
     previous_session_unclean: bool,
     recovery_notice: bool,
     toast: Option<ToastNotice>,
+    toast_queue: VecDeque<ToastNotice>,
+    toast_task: Option<Task<()>>,
+    toast_generation: u64,
     error_reports: ErrorReportLog,
     context_menu: Option<FileContextMenu>,
     context_menu_task: Option<Task<()>>,
@@ -2030,6 +3081,15 @@ pub struct DirectoryWindow {
     palette: UiPalette,
     system_locations: Option<SystemLocations>,
     locations_error: Option<String>,
+    system_integration_status: Option<SystemIntegrationStatus>,
+    system_integration_error: Option<String>,
+    system_integration_pending: bool,
+    update_status: UpdateStatus,
+    update_task: Option<Task<()>>,
+    disk_info: Option<DiskInfo>,
+    disk_info_path: Option<PathBuf>,
+    syncthing_root: Option<PathBuf>,
+    syncthing_path: Option<PathBuf>,
     operations: OperationQueue,
     operation_panel_minimized: bool,
     operation_panel_hidden: bool,
@@ -2044,6 +3104,7 @@ pub struct DirectoryWindow {
     named_theme_editor: Option<NamedThemeEditor>,
     shortcut_editor: Option<ShortcutEditor>,
     go_to_folder: Option<GoToFolderState>,
+    breadcrumb_editor: Option<BreadcrumbEditor>,
     go_to_folder_task: Option<Task<()>>,
     folder_picker_active: bool,
     folder_picker_error: Option<String>,
@@ -2052,14 +3113,21 @@ pub struct DirectoryWindow {
     mutation_in_progress: bool,
     undo_progress: Option<UndoProgressState>,
     archive_progress: Option<ArchiveProgressEvent>,
+    archive_creation_id: Option<String>,
+    archive_extraction_id: Option<String>,
     archive_inspection: Option<(PathBuf, ArchiveInfo)>,
     archive_inspection_loading: bool,
     preview_state: PreviewState,
+    pending_preview_refresh: Option<PathBuf>,
     quick_look_open: bool,
     quick_look_info_open: bool,
     preview_tab: PreviewTab,
     preview_generation: u64,
     preview_task: Option<Task<()>>,
+    preview_cache_task: Option<Task<()>>,
+    preview_prefetch_tasks: Vec<Task<()>>,
+    preview_detection: Option<PreviewDetection>,
+    text_preview: TextPreviewUiState,
     audio_status: Option<AudioStatus>,
     audio_tick_task: Option<Task<()>>,
     audio_autoplay_after_load: bool,
@@ -2067,6 +3135,7 @@ pub struct DirectoryWindow {
     video_frame: Option<Arc<RenderImage>>,
     video_frame_position_ms: Option<u64>,
     video_tick_task: Option<Task<()>>,
+    media_slider_drag: Option<MediaSliderDrag>,
     pdf_zoom_percent: u16,
     pdf_fit: bool,
     custom_fields_editor: Option<CustomFieldsEditor>,
@@ -2099,7 +3168,9 @@ pub struct DirectoryWindow {
 impl DirectoryWindow {
     pub fn install_shortcut_bindings(&self, cx: &mut Context<Self>) {
         cx.clear_key_bindings();
-        cx.bind_keys(application_key_bindings(&self.settings.shortcut_bindings));
+        let mut bindings = application_key_bindings(&self.settings.shortcut_bindings);
+        bindings.extend(native_text_input::key_bindings());
+        cx.bind_keys(bindings);
     }
 
     pub fn new(path: PathBuf, services: NativeServices, cx: &mut Context<Self>) -> Self {
@@ -2112,6 +3183,7 @@ impl DirectoryWindow {
                 workspaces: None,
                 operation_recovery: None,
                 interrupted_operations: Vec::new(),
+                window_lifetime: None,
             },
             AppSettings::default(),
             WorkspaceState::empty(),
@@ -2126,7 +3198,33 @@ impl DirectoryWindow {
         services: NativeServices,
         cx: &mut Context<Self>,
     ) -> Self {
-        let session_path = services.resources().config_dir.join("session-v1.json");
+        Self::restore_window_session(
+            path,
+            startup_path_is_explicit,
+            services,
+            None,
+            "primary".to_string(),
+            cx,
+        )
+    }
+
+    pub fn restore_window_session(
+        path: PathBuf,
+        startup_path_is_explicit: bool,
+        services: NativeServices,
+        runtime: Option<WindowRuntime>,
+        session_id: String,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let session_path = runtime.as_ref().map_or_else(
+            || services.resources().config_dir.join("session-v1.json"),
+            |runtime| {
+                runtime
+                    .registry
+                    .session_path(&services.resources().config_dir, &session_id)
+            },
+        );
+        let window_lifetime = runtime.map(|runtime| runtime.lifetime(session_id));
         let (store, mut session, warning) = SessionStore::open(session_path, path.clone());
         let (settings_store, settings, settings_warning) =
             SettingsStore::open(&services.resources().config_dir);
@@ -2149,9 +3247,31 @@ impl DirectoryWindow {
             settings.view.sort_direction,
             settings.view.view_mode,
         );
-        if startup_path_is_explicit && session.path() != path && session.navigate(path) {
-            session.record_current_path();
-            let _ = store.save(&session);
+        if let Some(criteria) = session
+            .active_smart_folder()
+            .map(|folder| folder.criteria().clone())
+        {
+            apply_smart_folder_browser_state(&mut session, &criteria);
+        }
+        if startup_path_is_explicit {
+            let path_changed = session.path() != path && session.navigate(path);
+            let smart_folder_cleared = session.active_smart_folder().is_some();
+            if smart_folder_cleared {
+                session.clear_active_smart_folder();
+            }
+            session.apply_browser_preferences(
+                settings.view.show_hidden,
+                settings.view.show_system_files,
+                settings.view.filter_mode,
+                settings.view.sort_key.clone(),
+                settings.view.sort_direction,
+                settings.view.view_mode,
+            );
+            session.clear_search();
+            if path_changed || smart_folder_cleared {
+                session.record_current_path();
+                let _ = store.save(&session);
+            }
         }
         Self::from_session(
             session,
@@ -2162,6 +3282,7 @@ impl DirectoryWindow {
                 workspaces: Some(workspace_store),
                 operation_recovery,
                 interrupted_operations,
+                window_lifetime,
             },
             settings,
             workspaces,
@@ -2174,46 +3295,130 @@ impl DirectoryWindow {
     }
 
     fn from_session(
-        browser: SessionState,
-        services: NativeServices,
-        stores: PersistenceStores,
-        settings: AppSettings,
-        workspaces: WorkspaceState,
+        mut browser: SessionState,
+        mut services: NativeServices,
+        mut stores: PersistenceStores,
+        mut settings: AppSettings,
+        mut workspaces: WorkspaceState,
         warning: Option<String>,
         cx: &mut Context<Self>,
     ) -> Self {
         #[cfg(test)]
         cx.background_executor().allow_parking();
 
+        services = services.fork_window_scope();
+
+        let mut shared_state_revision = 0;
+        if let Some(runtime) = stores
+            .window_lifetime
+            .as_ref()
+            .map(|lifetime| &lifetime.runtime)
+        {
+            let local_window_placement = settings.window_placement;
+            let (shared, revision) = runtime.adopt_or_snapshot(
+                settings.clone(),
+                workspaces.clone(),
+                browser.shared_state(),
+            );
+            settings = shared.settings;
+            settings.window_placement = local_window_placement;
+            workspaces = shared.workspaces;
+            browser.apply_shared_state(shared.session);
+            shared_state_revision = revision;
+        }
+        let runtime = stores
+            .window_lifetime
+            .as_ref()
+            .map(|lifetime| lifetime.runtime.clone());
+        let settings_store = stores.settings.take().map(|store| match runtime.as_ref() {
+            Some(runtime) => runtime.share_settings_store(store),
+            None => Arc::new(store),
+        });
+        let workspace_store = stores
+            .workspaces
+            .take()
+            .map(|store| match runtime.as_ref() {
+                Some(runtime) => runtime.share_workspace_store(store),
+                None => Arc::new(store),
+            });
+
+        let pending_scroll_restore = if browser.has_current_folder_view_state() {
+            let (scroll_index, grid_min_width, show_preview_panel) = browser.folder_ui_state();
+            settings.view.view_mode = browser.view_mode();
+            settings.view.sort_key = browser.sort_key();
+            settings.view.sort_direction = browser.sort_direction();
+            settings.appearance.grid_min_width = grid_min_width.clamp(120, 260);
+            settings.view.show_preview_panel = show_preview_panel;
+            Some(scroll_index)
+        } else {
+            browser.sync_folder_ui_state(
+                0,
+                settings.appearance.grid_min_width,
+                settings.view.show_preview_panel,
+            );
+            Some(0)
+        };
         let columns = ColumnState::new(browser.path());
         let undo_timeout =
             Duration::from_secs(u64::from(settings.behavior.undo_timeout_minutes) * 60);
         let palette = UiPalette::for_settings(&settings, WindowAppearance::Dark);
         let sidebar_width = settings.view.sidebar_width;
+        let remembered_window = browser.window_placement().map_or(
+            WorkspaceWindowState {
+                width: settings.window_placement.width,
+                height: settings.window_placement.height,
+                x: settings.window_placement.x,
+                y: settings.window_placement.y,
+            },
+            |placement| WorkspaceWindowState {
+                width: placement.width,
+                height: placement.height,
+                x: placement.x,
+                y: placement.y,
+            },
+        );
+        let has_remembered_window = remembered_window.width.is_some()
+            || remembered_window.height.is_some()
+            || remembered_window.x.is_some()
+            || remembered_window.y.is_some();
         Self {
             browser,
             services,
+            window_lifetime: stores.window_lifetime,
             state: ListingState::Loading,
             listing_task: None,
             search_task: None,
             locations_task: None,
+            disk_info_task: None,
+            syncthing_task: None,
             watcher_task: None,
             column_tasks: Vec::new(),
-            integration_task: None,
+            integration_tasks: Vec::new(),
+            integration_generation: 0,
+            system_integration_task: None,
             service_event_task: None,
-            single_instance_task: None,
+            shared_state_task: None,
+            shared_state_revision,
+            operations_revision: 0,
+            single_instance_tasks: Vec::new(),
             request_generation: 0,
+            disk_info_generation: 0,
+            syncthing_generation: 0,
             search_generation: 0,
+            search_request_id: None,
+            search_progress: None,
             watcher_generation: 0,
             column_generation: 0,
             reset_scroll_on_result: false,
+            pending_scroll_restore,
             focus_handle: cx.focus_handle(),
             scroll_handle: UniformListScrollHandle::new(),
             column_scroll_handles: Vec::new(),
             column_strip_scroll: ScrollHandle::new(),
             column_scroll_to_leaf_attempts: 0,
             columns,
-            column_selection: None,
+            column_selection: BTreeSet::new(),
+            pending_column_selection: None,
             status_message: warning,
             watch_status: WatchStatus::Starting,
             search_active: false,
@@ -2222,25 +3427,27 @@ impl DirectoryWindow {
             calculate_folder_sizes: settings.view.show_folder_sizes,
             session_store: stores.session,
             settings,
-            settings_store: stores.settings,
+            settings_store,
             workspaces,
-            workspace_store: stores.workspaces,
+            workspace_store,
             workspace_editing: None,
             workspace_delete_confirmation: None,
             smart_folder_editor: None,
             sidebar_width,
             sidebar_collapsed: false,
             sidebar_resize: None,
+            list_column_resize: None,
+            column_view_resize: None,
             sidebar_resize_focus: cx.focus_handle(),
             listing_viewport_width: DEFAULT_WINDOW_WIDTH - sidebar_width,
             grid_columns: 1,
-            grid_marquee: None,
+            selection_marquee: None,
             file_drag_sources: BTreeSet::new(),
             file_drag_hover_target: None,
             file_drag_hover_task: None,
             favorite_focus_handles: Vec::new(),
-            last_window_bounds: WorkspaceWindowState::default(),
-            pending_workspace_bounds: None,
+            last_window_bounds: remembered_window,
+            pending_workspace_bounds: has_remembered_window.then_some(remembered_window),
             remote_environment: None,
             remote_available: Vec::new(),
             remote_statuses: BTreeMap::new(),
@@ -2251,6 +3458,10 @@ impl DirectoryWindow {
             remote_exit_blocker: None,
             remote_tasks: Vec::new(),
             remote_poll_task: None,
+            remote_close_task: None,
+            remote_close_pending: false,
+            remote_disable_pending: false,
+            remote_environment_generation: 0,
             remote_poll_generation: 0,
             remote_auto_connect_started: false,
             remote_auto_connect_active: None,
@@ -2261,13 +3472,28 @@ impl DirectoryWindow {
             mutation_exit_waiting: false,
             settings_panel_open: false,
             settings_tab: SettingsTab::default(),
+            settings_selector: None,
+            settings_confirmation: None,
+            settings_confirmation_cancel_focus: cx.focus_handle(),
+            settings_confirmation_confirm_focus: cx.focus_handle(),
+            settings_confirmation_return_focus: None,
+            settings_confirmation_focus_pending: false,
             control_surface: ControlSurface::Closed,
             toolbar_menu: ToolbarMenu::Closed,
+            overlay_return_focus: None,
+            overlay_focus_pending: false,
+            overlay_restore_pending: false,
             control_query: String::new(),
             control_selected: 0,
+            native_text_input: None,
+            native_text_input_target: None,
+            native_text_input_focus_pending: false,
             previous_session_unclean: false,
             recovery_notice: !stores.interrupted_operations.is_empty(),
             toast: None,
+            toast_queue: VecDeque::new(),
+            toast_task: None,
+            toast_generation: 0,
             error_reports: ErrorReportLog::default(),
             context_menu: None,
             context_menu_task: None,
@@ -2275,6 +3501,15 @@ impl DirectoryWindow {
             palette,
             system_locations: None,
             locations_error: None,
+            system_integration_status: None,
+            system_integration_error: None,
+            system_integration_pending: false,
+            update_status: UpdateStatus::Idle,
+            update_task: None,
+            disk_info: None,
+            disk_info_path: None,
+            syncthing_root: None,
+            syncthing_path: None,
             operations: OperationQueue::default(),
             operation_panel_minimized: false,
             operation_panel_hidden: false,
@@ -2289,6 +3524,7 @@ impl DirectoryWindow {
             named_theme_editor: None,
             shortcut_editor: None,
             go_to_folder: None,
+            breadcrumb_editor: None,
             go_to_folder_task: None,
             folder_picker_active: false,
             folder_picker_error: None,
@@ -2297,14 +3533,21 @@ impl DirectoryWindow {
             mutation_in_progress: false,
             undo_progress: None,
             archive_progress: None,
+            archive_creation_id: None,
+            archive_extraction_id: None,
             archive_inspection: None,
             archive_inspection_loading: false,
             preview_state: PreviewState::Closed,
+            pending_preview_refresh: None,
             quick_look_open: false,
             quick_look_info_open: false,
             preview_tab: PreviewTab::Preview,
             preview_generation: 0,
             preview_task: None,
+            preview_cache_task: None,
+            preview_prefetch_tasks: Vec::new(),
+            preview_detection: None,
+            text_preview: TextPreviewUiState::default(),
             audio_status: None,
             audio_tick_task: None,
             audio_autoplay_after_load: false,
@@ -2312,6 +3555,7 @@ impl DirectoryWindow {
             video_frame: None,
             video_frame_position_ms: None,
             video_tick_task: None,
+            media_slider_drag: None,
             pdf_zoom_percent: 100,
             pdf_fit: true,
             custom_fields_editor: None,
@@ -2343,6 +3587,11 @@ impl DirectoryWindow {
     }
 
     fn persist_session(&mut self) {
+        self.sync_active_tab_view_state();
+        self.save_session_snapshot();
+    }
+
+    fn save_session_snapshot(&mut self) {
         let error = self
             .session_store
             .as_ref()
@@ -2353,15 +3602,94 @@ impl DirectoryWindow {
         }
     }
 
+    fn mutate_shared_session<R>(
+        &mut self,
+        mutation: impl FnOnce(&mut SharedSessionState) -> R,
+    ) -> R {
+        let (result, state) = if let Some(runtime) = self
+            .window_lifetime
+            .as_ref()
+            .map(|lifetime| lifetime.runtime.clone())
+        {
+            runtime.mutate_session(mutation)
+        } else {
+            let mut state = self.browser.shared_state();
+            let result = mutation(&mut state);
+            (result, state)
+        };
+        self.browser.apply_shared_state(state);
+        result
+    }
+
+    fn sync_active_tab_view_state(&mut self) {
+        let offset = (-f32::from(self.scroll_handle.0.borrow().base_handle.offset().y)).max(0.0);
+        let item_height = match self.browser.view_mode() {
+            ViewMode::List => f32::from(self.settings.appearance.list_row_height).max(1.0),
+            ViewMode::Grid => grid_layout_metrics(
+                self.listing_viewport_width,
+                self.settings.appearance.grid_min_width,
+                self.settings.appearance.density,
+                self.settings.appearance.ui_scale,
+            )
+            .row_height
+            .max(1.0),
+            ViewMode::Column => 1.0,
+        };
+        let scroll_index = if self.browser.view_mode() == ViewMode::Column {
+            0
+        } else {
+            (offset / item_height).floor() as usize
+        };
+        self.browser.sync_folder_ui_state(
+            scroll_index,
+            self.settings.appearance.grid_min_width,
+            self.settings.view.show_preview_panel,
+        );
+    }
+
+    fn apply_active_tab_view_state(&mut self) {
+        let (scroll_index, grid_min_width, show_preview_panel) = self.browser.folder_ui_state();
+        self.settings.view.view_mode = self.browser.view_mode();
+        self.settings.view.sort_key = self.browser.sort_key();
+        self.settings.view.sort_direction = self.browser.sort_direction();
+        self.settings.appearance.grid_min_width = grid_min_width.clamp(120, 260);
+        self.settings.view.show_preview_panel = show_preview_panel;
+        self.pending_scroll_restore = Some(scroll_index);
+    }
+
     fn persist_settings(&mut self) {
+        let persisted_settings = if let Some(runtime) = self
+            .window_lifetime
+            .as_ref()
+            .map(|lifetime| &lifetime.runtime)
+        {
+            runtime.publish_settings(self.settings.clone())
+        } else {
+            self.settings.clone()
+        };
         let error = self
             .settings_store
             .as_ref()
-            .and_then(|store| store.save(&self.settings).err());
+            .and_then(|store| store.save(&persisted_settings).err());
         if let Some(error) = error {
             self.record_error("Settings save failed", &error);
             self.status_message = Some(format!("Unable to save settings: {error}"));
         }
+    }
+
+    fn persist_window_placement(&mut self) {
+        self.settings.window_placement.width = self.last_window_bounds.width;
+        self.settings.window_placement.height = self.last_window_bounds.height;
+        self.settings.window_placement.x = self.last_window_bounds.x;
+        self.settings.window_placement.y = self.last_window_bounds.y;
+        self.browser.set_window_placement(SessionWindowPlacement {
+            width: self.last_window_bounds.width,
+            height: self.last_window_bounds.height,
+            x: self.last_window_bounds.x,
+            y: self.last_window_bounds.y,
+        });
+        self.persist_settings();
+        self.persist_session();
     }
 
     fn persist_workspaces(&mut self) {
@@ -2373,6 +3701,22 @@ impl DirectoryWindow {
             self.record_error("Workspace save failed", &error);
             self.status_message = Some(format!("Unable to save workspaces: {error}"));
         }
+    }
+
+    fn mutate_workspaces<R>(&mut self, mutation: impl FnOnce(&mut WorkspaceState) -> R) -> R {
+        let (result, state) = if let Some(runtime) = self
+            .window_lifetime
+            .as_ref()
+            .map(|lifetime| lifetime.runtime.clone())
+        {
+            runtime.mutate_workspaces(mutation)
+        } else {
+            let mut state = self.workspaces.clone();
+            let result = mutation(&mut state);
+            (result, state)
+        };
+        self.workspaces = state;
+        result
     }
 
     fn workspace_snapshot(&self) -> WorkspaceSnapshot {
@@ -2405,10 +3749,8 @@ impl DirectoryWindow {
 
     fn save_workspace(&mut self, cx: &mut Context<Self>) {
         let name = self.control_query.clone();
-        match self
-            .workspaces
-            .save_current(&name, self.workspace_snapshot())
-        {
+        let snapshot = self.workspace_snapshot();
+        match self.mutate_workspaces(|workspaces| workspaces.save_current(&name, snapshot)) {
             Ok(_) => {
                 self.persist_workspaces();
                 self.control_query.clear();
@@ -2425,6 +3767,7 @@ impl DirectoryWindow {
         self.control_query.clone_from(&workspace.name);
         self.workspace_editing = Some(id);
         self.workspace_delete_confirmation = None;
+        self.sync_native_text_input(self.control_query.clone(), cx);
         cx.notify();
     }
 
@@ -2432,7 +3775,8 @@ impl DirectoryWindow {
         let Some(id) = self.workspace_editing.clone() else {
             return;
         };
-        match self.workspaces.rename(&id, &self.control_query) {
+        let name = self.control_query.clone();
+        match self.mutate_workspaces(|workspaces| workspaces.rename(&id, &name)) {
             Ok(()) => {
                 self.workspace_editing = None;
                 self.control_query.clear();
@@ -2450,7 +3794,7 @@ impl DirectoryWindow {
     }
 
     fn confirm_workspace_delete(&mut self, id: String, cx: &mut Context<Self>) {
-        if self.workspaces.delete(&id) {
+        if self.mutate_workspaces(|workspaces| workspaces.delete(&id)) {
             self.persist_workspaces();
             self.workspace_delete_confirmation = None;
             self.show_toast("Workspace deleted", ToastKind::Success, cx);
@@ -2499,7 +3843,7 @@ impl DirectoryWindow {
         self.apply_global_browser_preferences();
         self.columns.reset(self.browser.path());
         self.close_preview(cx);
-        self.workspaces.mark_loaded(&id);
+        self.mutate_workspaces(|workspaces| workspaces.mark_loaded(&id));
         self.persist_session();
         self.persist_settings();
         self.persist_workspaces();
@@ -2537,7 +3881,7 @@ impl DirectoryWindow {
             self.show_toast("Clipboard does not contain text", ToastKind::Warning, cx);
             return;
         };
-        match self.workspaces.import_json(&json) {
+        match self.mutate_workspaces(|workspaces| workspaces.import_json(&json)) {
             Ok(count) => {
                 self.persist_workspaces();
                 self.show_toast(
@@ -2612,6 +3956,27 @@ impl DirectoryWindow {
         self.remote_poll_task = None;
     }
 
+    fn push_remote_task(&mut self, task: Task<()>) {
+        self.remote_tasks.retain(|task| !task.is_ready());
+        self.remote_tasks.push(task);
+    }
+
+    fn push_mutation_task(&mut self, task: Task<()>) {
+        self.mutation_tasks.retain(|task| !task.is_ready());
+        self.mutation_tasks.push(task);
+    }
+
+    fn push_integration_task(&mut self, task: Task<()>) {
+        self.integration_tasks.retain(|task| !task.is_ready());
+        self.integration_tasks.push(task);
+    }
+
+    fn begin_integration_action(&mut self, status: String) -> u64 {
+        self.integration_generation = self.integration_generation.wrapping_add(1);
+        self.status_message = Some(status);
+        self.integration_generation
+    }
+
     fn apply_polled_remote_statuses(
         &mut self,
         statuses: Vec<RemoteDriveStatus>,
@@ -2671,9 +4036,11 @@ impl DirectoryWindow {
     }
 
     fn refresh_remote_environment(&mut self, cx: &mut Context<Self>) {
+        self.remote_environment_generation = self.remote_environment_generation.wrapping_add(1);
+        let generation = self.remote_environment_generation;
         let remotes = self.services.remotes.clone();
         self.remote_setup_error = None;
-        self.remote_tasks.push(cx.spawn(async move |this, cx| {
+        self.push_remote_task(cx.spawn(async move |this, cx| {
             let environment = remotes.environment().await;
             let (available, statuses) = match &environment {
                 Ok(environment) if environment.rclone_available => {
@@ -2684,6 +4051,9 @@ impl DirectoryWindow {
                 _ => (Ok(Vec::new()), remotes.statuses_task().await),
             };
             let _ = this.update(cx, |view, cx| {
+                if view.remote_environment_generation != generation {
+                    return;
+                }
                 match environment {
                     Ok(environment) => {
                         view.remote_setup_error = environment
@@ -2837,7 +4207,7 @@ impl DirectoryWindow {
             .insert(id.clone(), RemoteRetryState::connecting(1));
         let remotes = self.services.remotes.clone();
         let executor = cx.background_executor().clone();
-        self.remote_tasks.push(cx.spawn(async move |this, cx| {
+        self.push_remote_task(cx.spawn(async move |this, cx| {
             for attempt in 1..=REMOTE_CONNECT_MAX_ATTEMPTS {
                 match remotes.connect(profile.clone()).await {
                     Ok(status) => {
@@ -2956,7 +4326,7 @@ impl DirectoryWindow {
         self.cancel_remote_connect_attempt(&id);
         let remotes = self.services.remotes.clone();
         self.remote_blocked_disconnect = None;
-        self.remote_tasks.push(cx.spawn(async move |this, cx| {
+        self.push_remote_task(cx.spawn(async move |this, cx| {
             let result = remotes.disconnect(id.clone(), force).await;
             let _ = this.update(cx, |view, cx| {
                 match result {
@@ -2994,7 +4364,7 @@ impl DirectoryWindow {
     fn confirm_remote_profile_delete(&mut self, id: String, cx: &mut Context<Self>) {
         self.cancel_remote_connect_attempt(&id);
         let remotes = self.services.remotes.clone();
-        self.remote_tasks.push(cx.spawn(async move |this, cx| {
+        self.push_remote_task(cx.spawn(async move |this, cx| {
             let result = remotes.disconnect(id.clone(), false).await;
             let _ = this.update(cx, |view, cx| {
                 match result {
@@ -3051,6 +4421,7 @@ impl DirectoryWindow {
             field: RemoteEditorField::Name,
         });
         self.remote_delete_confirmation = None;
+        self.sync_native_text_input(self.control_query.clone(), cx);
         cx.notify();
     }
 
@@ -3136,6 +4507,7 @@ impl DirectoryWindow {
             editor.field = next;
             self.control_query = Self::remote_editor_value(&editor).to_string();
             self.remote_editor = Some(editor);
+            self.sync_native_text_input(self.control_query.clone(), cx);
             cx.notify();
             return;
         }
@@ -3188,7 +4560,7 @@ impl DirectoryWindow {
 
     fn configure_remote_backend(&mut self, cx: &mut Context<Self>) {
         let remotes = self.services.remotes.clone();
-        self.remote_tasks.push(cx.spawn(async move |this, cx| {
+        self.push_remote_task(cx.spawn(async move |this, cx| {
             let result = remotes.configure().await;
             let available = if result.is_ok() {
                 remotes.list_remotes().await
@@ -3221,7 +4593,7 @@ impl DirectoryWindow {
             .remote_environment
             .as_ref()
             .map(|environment| environment.platform.clone());
-        self.remote_tasks.push(cx.spawn(async move |this, cx| {
+        self.push_remote_task(cx.spawn(async move |this, cx| {
             let result = if platform.as_deref() == Some("windows") {
                 remotes.install_winfsp().await.map(|_| None)
             } else {
@@ -3234,7 +4606,7 @@ impl DirectoryWindow {
                             "Approve the Explorie mount helper in System Settings".to_string(),
                         );
                         let remotes = view.services.remotes.clone();
-                        view.remote_tasks.push(cx.spawn(async move |_, _| {
+                        view.push_remote_task(cx.spawn(async move |_, _| {
                             let _ = remotes.open_helper_settings().await;
                         }));
                     }
@@ -3252,7 +4624,7 @@ impl DirectoryWindow {
     fn force_disconnect_all_remotes(&mut self, cx: &mut Context<Self>) {
         self.cancel_all_remote_connect_attempts();
         let remotes = self.services.remotes.clone();
-        self.remote_tasks.push(cx.spawn(async move |this, cx| {
+        self.push_remote_task(cx.spawn(async move |this, cx| {
             let result = remotes.disconnect_all().await;
             let _ = this.update(cx, |view, cx| {
                 match result {
@@ -3350,6 +4722,65 @@ impl DirectoryWindow {
         ordered
     }
 
+    fn overlay_is_active(&self) -> bool {
+        self.settings_panel_open
+            || self.control_surface != ControlSurface::Closed
+            || self.toolbar_menu != ToolbarMenu::Closed
+            || self.context_menu.is_some()
+            || self.settings_confirmation.is_some()
+            || self.go_to_folder.is_some()
+            || self.mutation_prompt.is_some()
+            || self.quick_look_open
+            || !self.file_conflict_prompts.is_empty()
+            || self.mutation_exit_waiting
+    }
+
+    fn begin_overlay_focus(&mut self) {
+        if !self.overlay_is_active() {
+            self.overlay_focus_pending = true;
+            self.overlay_restore_pending = false;
+        }
+    }
+
+    fn finish_overlay_focus_if_inactive(&mut self) {
+        if !self.overlay_is_active() && self.overlay_return_focus.is_some() {
+            self.overlay_restore_pending = true;
+            self.overlay_focus_pending = false;
+        }
+    }
+
+    fn capture_overlay_focus(&mut self, window: &Window, cx: &App) {
+        if self.overlay_is_active() && self.overlay_return_focus.is_none() {
+            self.overlay_return_focus = window.focused(cx);
+            self.overlay_focus_pending = true;
+            self.overlay_restore_pending = false;
+        }
+    }
+
+    fn sync_overlay_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.overlay_is_active() && self.overlay_focus_pending {
+            if self.overlay_return_focus.is_none() {
+                self.overlay_return_focus = window.focused(cx);
+            }
+            self.overlay_focus_pending = false;
+            if let Some(menu) = self.context_menu.as_ref() {
+                let focus = menu.focus_handle.clone();
+                window.defer(cx, move |window, cx| window.focus(&focus, cx));
+            } else if self.native_text_input_target.is_none() {
+                window.defer(cx, |window, cx| window.focus_next(cx));
+            }
+        } else if !self.overlay_is_active()
+            && (self.overlay_restore_pending || self.overlay_return_focus.is_some())
+        {
+            self.overlay_restore_pending = false;
+            let focus = self
+                .overlay_return_focus
+                .take()
+                .unwrap_or_else(|| self.focus_handle.clone());
+            window.defer(cx, move |window, cx| window.focus(&focus, cx));
+        }
+    }
+
     fn open_control_surface(&mut self, surface: ControlSurface, cx: &mut Context<Self>) {
         if self.mutation_prompt.is_some() {
             self.show_toast(
@@ -3359,6 +4790,20 @@ impl DirectoryWindow {
             );
             return;
         }
+        if (self.control_surface != surface && self.has_control_draft())
+            || (self.settings_panel_open && self.has_settings_draft())
+        {
+            self.request_settings_confirmation(
+                SettingsConfirmation::DiscardDraft(PendingDraftAction::OpenControlSurface(surface)),
+                cx,
+            );
+            return;
+        }
+        self.open_control_surface_unchecked(surface, cx);
+    }
+
+    fn open_control_surface_unchecked(&mut self, surface: ControlSurface, cx: &mut Context<Self>) {
+        self.begin_overlay_focus();
         self.control_surface = surface;
         self.toolbar_menu = ToolbarMenu::Closed;
         self.control_query.clear();
@@ -3378,6 +4823,10 @@ impl DirectoryWindow {
         if surface != ControlSurface::BatchRename {
             self.batch_rename = None;
         }
+        self.appearance_value_editor = None;
+        self.named_theme_editor = None;
+        self.shortcut_editor = None;
+        self.settings_selector = None;
         self.settings_panel_open = false;
         self.search_active = false;
         cx.notify();
@@ -3392,6 +4841,17 @@ impl DirectoryWindow {
     }
 
     fn close_control_surface(&mut self, cx: &mut Context<Self>) {
+        if self.has_control_draft() {
+            self.request_settings_confirmation(
+                SettingsConfirmation::DiscardDraft(PendingDraftAction::CloseControlSurface),
+                cx,
+            );
+            return;
+        }
+        self.close_control_surface_unchecked(cx);
+    }
+
+    fn close_control_surface_unchecked(&mut self, cx: &mut Context<Self>) {
         if self.control_surface != ControlSurface::Closed {
             self.control_surface = ControlSurface::Closed;
             self.control_query.clear();
@@ -3403,6 +4863,8 @@ impl DirectoryWindow {
             self.remote_delete_confirmation = None;
             self.remote_blocked_disconnect = None;
             self.batch_rename = None;
+            self.deactivate_native_text_input();
+            self.finish_overlay_focus_if_inactive();
             cx.notify();
         }
     }
@@ -3416,6 +4878,18 @@ impl DirectoryWindow {
             );
             return;
         }
+        if self.control_surface != ControlSurface::Closed && self.has_control_draft() {
+            self.request_settings_confirmation(
+                SettingsConfirmation::DiscardDraft(PendingDraftAction::ToggleToolbarMenu(menu)),
+                cx,
+            );
+            return;
+        }
+        self.toggle_toolbar_menu_unchecked(menu, cx);
+    }
+
+    fn toggle_toolbar_menu_unchecked(&mut self, menu: ToolbarMenu, cx: &mut Context<Self>) {
+        self.begin_overlay_focus();
         self.toolbar_menu = if self.toolbar_menu == menu {
             ToolbarMenu::Closed
         } else {
@@ -3429,12 +4903,14 @@ impl DirectoryWindow {
             self.search_active = false;
             self.context_menu = None;
         }
+        self.finish_overlay_focus_if_inactive();
         cx.notify();
     }
 
     fn close_toolbar_menu(&mut self, cx: &mut Context<Self>) {
         if self.toolbar_menu != ToolbarMenu::Closed {
             self.toolbar_menu = ToolbarMenu::Closed;
+            self.finish_overlay_focus_if_inactive();
             cx.notify();
         }
     }
@@ -3476,6 +4952,8 @@ impl DirectoryWindow {
             CommandId::ToggleHidden => self.toggle_hidden(cx),
             CommandId::TogglePreview => self.toggle_preview_panel(cx),
             CommandId::ToggleStatus => self.toggle_status_bar(cx),
+            CommandId::NewWindow => self.open_new_window(false, cx),
+            CommandId::MoveTabToNewWindow => self.open_new_window(true, cx),
             CommandId::NewTab => self.new_tab(cx),
             CommandId::CloseTab => self.close_active_tab(cx),
             CommandId::NewFolder => self.prompt_new_folder(cx),
@@ -3487,6 +4965,7 @@ impl DirectoryWindow {
             CommandId::Undo => self.undo(cx),
             CommandId::Redo => self.redo(cx),
             CommandId::OpenSettings => {
+                self.begin_overlay_focus();
                 self.settings_panel_open = true;
                 cx.notify();
             }
@@ -3527,15 +5006,73 @@ impl DirectoryWindow {
     }
 
     fn show_toast(&mut self, message: impl Into<String>, kind: ToastKind, cx: &mut Context<Self>) {
-        self.toast = Some(ToastNotice {
+        let notice = ToastNotice {
             message: message.into(),
             kind,
-        });
+        };
+        if self.toast.as_ref() == Some(&notice) {
+            self.schedule_toast_dismiss(kind, cx);
+            cx.notify();
+            return;
+        }
+        if notice.kind == ToastKind::Warning
+            && self
+                .toast
+                .as_ref()
+                .is_some_and(|toast| toast.kind == ToastKind::Success)
+        {
+            self.toast = Some(notice);
+            self.schedule_toast_dismiss(ToastKind::Warning, cx);
+            cx.notify();
+            return;
+        }
+        if self.toast.is_some() {
+            if !self.toast_queue.contains(&notice) {
+                self.toast_queue.push_back(notice);
+                self.toast_queue.truncate(4);
+            }
+        } else {
+            self.toast = Some(notice);
+            self.schedule_toast_dismiss(kind, cx);
+        }
         cx.notify();
+    }
+
+    fn schedule_toast_dismiss(&mut self, kind: ToastKind, cx: &mut Context<Self>) {
+        self.toast_generation = self.toast_generation.wrapping_add(1);
+        let generation = self.toast_generation;
+        let duration = match kind {
+            ToastKind::Success => Duration::from_secs(4),
+            ToastKind::Warning => Duration::from_secs(9),
+        };
+        let executor = cx.background_executor().clone();
+        self.toast_task = Some(cx.spawn(async move |this, cx| {
+            executor.timer(duration).await;
+            let _ = this.update(cx, |view, cx| {
+                if view.toast_generation == generation {
+                    view.dismiss_toast(cx);
+                }
+            });
+        }));
+    }
+
+    fn pause_toast_dismissal(&mut self, paused: bool, cx: &mut Context<Self>) {
+        if paused {
+            self.toast_generation = self.toast_generation.wrapping_add(1);
+            self.toast_task = None;
+        } else if let Some(kind) = self.toast.as_ref().map(|toast| toast.kind) {
+            self.schedule_toast_dismiss(kind, cx);
+        }
     }
 
     fn dismiss_toast(&mut self, cx: &mut Context<Self>) {
         if self.toast.take().is_some() {
+            self.toast_generation = self.toast_generation.wrapping_add(1);
+            self.toast_task = None;
+            self.toast = self.toast_queue.pop_front();
+            if let Some(kind) = self.toast.as_ref().map(|toast| toast.kind) {
+                self.schedule_toast_dismiss(kind, cx);
+            }
             cx.notify();
         }
     }
@@ -3647,7 +5184,7 @@ impl DirectoryWindow {
         let now = SystemTime::now();
         DiagnosticsSnapshot {
             item_count: self.browser.visible_entries().len(),
-            selected_count: self.browser.selection_count(),
+            selected_count: self.effective_selection_count(),
             tab_count: self.browser.tabs().len(),
             favorite_count: self.browser.favorites().len(),
             smart_folder_count: self.browser.smart_folders().len(),
@@ -3659,7 +5196,7 @@ impl DirectoryWindow {
             preview_open: !matches!(self.preview_state, PreviewState::Closed),
             show_status_bar: self.settings.view.show_status_bar,
             operation_count: self.operations.operations().len(),
-            active_operation_count: self.operations.active_count(),
+            active_operation_count: self.process_active_operation_count(),
             retry_available: self.operations.latest_retryable_id().is_some(),
             undo_available: self.undo_ledger.can_undo(now),
             redo_available: self.undo_ledger.can_redo(),
@@ -3748,24 +5285,402 @@ impl DirectoryWindow {
         self.show_toast("Cleared in-memory error reports", ToastKind::Success, cx);
     }
 
-    fn toggle_settings_panel(&mut self, cx: &mut Context<Self>) {
-        self.settings_panel_open = !self.settings_panel_open;
-        self.toolbar_menu = ToolbarMenu::Closed;
-        if !self.settings_panel_open {
-            self.appearance_value_editor = None;
-            self.named_theme_editor = None;
-            self.shortcut_editor = None;
+    fn activate_native_text_input(
+        &mut self,
+        target: TextInputTarget,
+        content: impl Into<String>,
+        placeholder: &'static str,
+        label: &'static str,
+        cx: &mut Context<Self>,
+    ) {
+        let colors = [
+            self.palette.surface,
+            self.palette.border,
+            self.palette.text,
+            self.palette.tertiary,
+            self.palette.accent,
+        ];
+        let scale = self.settings.appearance.ui_scale;
+        let appearance = NativeTextInputAppearance { colors, scale };
+        let input = cx.new(|cx| NativeTextInput::new(content, placeholder, label, appearance, cx));
+        cx.subscribe(&input, |this, _, event, cx| match event {
+            NativeTextInputEvent::Changed(value) => {
+                this.apply_native_text_input_change(value.clone(), cx)
+            }
+        })
+        .detach();
+        self.native_text_input = Some(input);
+        self.native_text_input_target = Some(target);
+        self.native_text_input_focus_pending = true;
+        cx.notify();
+    }
+
+    fn deactivate_native_text_input(&mut self) {
+        self.native_text_input = None;
+        self.native_text_input_target = None;
+        self.native_text_input_focus_pending = false;
+    }
+
+    fn sync_native_text_input(&mut self, value: impl Into<String>, cx: &mut Context<Self>) {
+        let Some(input) = self.native_text_input.as_ref() else {
+            return;
+        };
+        let value = value.into();
+        if input.read(cx).content() != value {
+            input.update(cx, |input, cx| input.set_content(value, cx));
         }
+    }
+
+    fn apply_native_text_input_change(&mut self, value: String, cx: &mut Context<Self>) {
+        match self.native_text_input_target {
+            Some(TextInputTarget::Search) => {
+                self.browser.set_search_query(value);
+                self.search_active = true;
+            }
+            Some(TextInputTarget::ControlQuery) => match self.control_surface {
+                ControlSurface::SmartFolders => self.update_smart_folder_query(value, cx),
+                ControlSurface::BatchRename => {
+                    self.control_query.clone_from(&value);
+                    if let Some(editor) = self.batch_rename.as_mut() {
+                        editor.set_active_value(value);
+                    }
+                }
+                _ => {
+                    self.control_query = value;
+                    self.control_selected = 0;
+                }
+            },
+            Some(TextInputTarget::GoToFolder) => {
+                if let Some(dialog) = self.go_to_folder.as_mut() {
+                    dialog.input = value;
+                    dialog.replace_on_type = false;
+                    dialog.error = None;
+                }
+                self.schedule_go_to_folder_suggestions(cx);
+            }
+            Some(TextInputTarget::Breadcrumb) => {
+                if let Some(editor) = self.breadcrumb_editor.as_mut() {
+                    editor.input = value;
+                    editor.replace_on_type = false;
+                }
+            }
+            Some(TextInputTarget::MutationPrompt) => {
+                if let Some(prompt) = self.mutation_prompt.as_mut() {
+                    prompt.input = value;
+                    prompt.replace_on_type = false;
+                    prompt.error = None;
+                }
+            }
+            Some(TextInputTarget::AppearanceValue) => {
+                if let Some(editor) = self.appearance_value_editor.as_mut() {
+                    editor.input = value;
+                    editor.error = None;
+                }
+            }
+            Some(TextInputTarget::NamedTheme) => {
+                if let Some(editor) = self.named_theme_editor.as_mut() {
+                    editor.input = value;
+                    editor.error = None;
+                }
+            }
+            Some(TextInputTarget::PreviewFind) => {
+                self.text_preview.find = value;
+                self.text_preview.find_match = 0;
+                self.scroll_to_current_text_preview_match();
+            }
+            Some(TextInputTarget::CustomField) => {
+                if let Some(editor) = self.custom_fields_editor.as_mut() {
+                    editor.set_active_value(value);
+                }
+            }
+            Some(TextInputTarget::FinderTag) => {
+                if let Some(editor) = self.finder_tags_state.editor.as_mut() {
+                    editor.input = value.chars().take(80).collect();
+                    editor.error = None;
+                }
+            }
+            None => return,
+        }
+        cx.notify();
+    }
+
+    fn native_text_input_element(&self, target: TextInputTarget) -> Option<AnyElement> {
+        (self.native_text_input_target == Some(target))
+            .then(|| self.native_text_input.clone())
+            .flatten()
+            .map(IntoElement::into_any_element)
+    }
+
+    fn text_preview_match_count(&self) -> usize {
+        let Some(regex) = text_find_regex(&self.text_preview.find) else {
+            return 0;
+        };
+        let PreviewState::Ready {
+            content: PreviewContent::Text(preview),
+            ..
+        } = &self.preview_state
+        else {
+            return 0;
+        };
+        regex.find_iter(&preview.text).count()
+    }
+
+    fn open_text_preview_find(&mut self, cx: &mut Context<Self>) {
+        self.activate_native_text_input(
+            TextInputTarget::PreviewFind,
+            self.text_preview.find.clone(),
+            "Find in preview…",
+            "Find in text preview",
+            cx,
+        );
+    }
+
+    fn advance_text_preview_match(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let count = self.text_preview_match_count();
+        if count == 0 {
+            self.text_preview.find_match = 0;
+        } else {
+            self.text_preview.find_match =
+                (self.text_preview.find_match as isize + delta).rem_euclid(count as isize) as usize;
+        }
+        self.scroll_to_current_text_preview_match();
+        cx.notify();
+    }
+
+    fn scroll_to_current_text_preview_match(&self) {
+        let Some(regex) = text_find_regex(&self.text_preview.find) else {
+            return;
+        };
+        let PreviewState::Ready {
+            content: PreviewContent::Text(preview),
+            ..
+        } = &self.preview_state
+        else {
+            return;
+        };
+        let Some(found) = regex
+            .find_iter(&preview.text)
+            .nth(self.text_preview.find_match)
+        else {
+            return;
+        };
+        let line = preview.text.as_bytes()[..found.start()]
+            .iter()
+            .filter(|byte| **byte == b'\n')
+            .count();
+        let wrapped = self.text_preview.wrap_override.unwrap_or(preview.wrapped);
+        if wrapped {
+            self.text_preview.wrapped_list.scroll_to_reveal_item(line);
+        } else {
+            self.text_preview
+                .unwrapped_scroll
+                .scroll_to_item(line, ScrollStrategy::Center);
+        }
+    }
+
+    fn copy_text_preview(&mut self, cx: &mut Context<Self>) {
+        if let PreviewState::Ready {
+            content: PreviewContent::Text(preview),
+            ..
+        } = &self.preview_state
+        {
+            cx.write_to_clipboard(ClipboardItem::new_string(preview.text.clone()));
+            self.show_toast("Preview text copied", ToastKind::Success, cx);
+        }
+    }
+
+    fn toggle_text_preview_wrap(&mut self, default_wrapped: bool, cx: &mut Context<Self>) {
+        let wrapped = !self.text_preview.wrap_override.unwrap_or(default_wrapped);
+        self.text_preview.wrap_override = Some(wrapped);
+        self.text_preview.wrapped_list.remeasure();
+        self.scroll_to_current_text_preview_match();
+        cx.notify();
+    }
+
+    fn ensure_native_text_input(&mut self, cx: &mut Context<Self>) {
+        let control_input_needed = match self.control_surface {
+            ControlSurface::CommandPalette
+            | ControlSurface::Shortcuts
+            | ControlSurface::Workspaces => true,
+            ControlSurface::SmartFolders => self.smart_folder_editor.is_some(),
+            ControlSurface::RemoteDrives => self.remote_editor.is_some(),
+            ControlSurface::BatchRename => self.batch_rename.as_ref().is_some_and(|editor| {
+                !matches!(editor.mode, BatchRenameMode::Case | BatchRenameMode::Number)
+            }),
+            ControlSurface::Closed | ControlSurface::Diagnostics => false,
+        };
+        let desired = if let Some(editor) = self.appearance_value_editor.as_ref() {
+            Some((
+                TextInputTarget::AppearanceValue,
+                editor.input.clone(),
+                editor.hint(),
+                editor.title(),
+                false,
+                false,
+            ))
+        } else if let Some(editor) = self.named_theme_editor.as_ref() {
+            Some((
+                TextInputTarget::NamedTheme,
+                editor.input.clone(),
+                "Theme name",
+                "Theme name",
+                false,
+                false,
+            ))
+        } else if let Some(dialog) = self.go_to_folder.as_ref() {
+            Some((
+                TextInputTarget::GoToFolder,
+                dialog.input.clone(),
+                "Enter folder path…",
+                "Folder path",
+                false,
+                dialog.replace_on_type,
+            ))
+        } else if let Some(editor) = self.breadcrumb_editor.as_ref() {
+            Some((
+                TextInputTarget::Breadcrumb,
+                editor.input.clone(),
+                "Enter folder path…",
+                "Folder path",
+                false,
+                editor.replace_on_type,
+            ))
+        } else if let Some(prompt) = self
+            .mutation_prompt
+            .as_ref()
+            .filter(|prompt| !matches!(prompt.kind, MutationPromptKind::Trash { .. }))
+        {
+            let masked = matches!(
+                prompt.kind,
+                MutationPromptKind::ArchivePassword { .. }
+                    | MutationPromptKind::ExtractPassword { .. }
+            );
+            Some((
+                TextInputTarget::MutationPrompt,
+                prompt.input.clone(),
+                if masked { "No password" } else { "Type here" },
+                prompt.title(),
+                masked,
+                prompt.replace_on_type,
+            ))
+        } else if let Some(value) = self.custom_fields_editor.as_ref().and_then(|editor| {
+            editor
+                .draft
+                .as_ref()
+                .map(|_| editor.active_value().to_string())
+        }) {
+            Some((
+                TextInputTarget::CustomField,
+                value,
+                "Type a value…",
+                "Custom field value",
+                false,
+                false,
+            ))
+        } else if let Some(editor) = self.finder_tags_state.editor.as_ref() {
+            Some((
+                TextInputTarget::FinderTag,
+                editor.input.clone(),
+                "Tag name…",
+                "Finder tag name",
+                false,
+                false,
+            ))
+        } else if self.search_active {
+            Some((
+                TextInputTarget::Search,
+                self.browser.search_query().to_string(),
+                "Search current folder…",
+                "Search current folder",
+                false,
+                false,
+            ))
+        } else if control_input_needed {
+            Some((
+                TextInputTarget::ControlQuery,
+                self.control_query.clone(),
+                "Type to filter…",
+                "Filter or edit value",
+                false,
+                false,
+            ))
+        } else {
+            None
+        };
+
+        if let Some((target, content, placeholder, label, masked, replace_on_type)) = desired {
+            let target_changed = self.native_text_input_target != Some(target);
+            if target_changed {
+                self.activate_native_text_input(target, content.clone(), placeholder, label, cx);
+            }
+            if let Some(input) = self.native_text_input.as_ref() {
+                let colors = [
+                    self.palette.surface,
+                    self.palette.border,
+                    self.palette.text,
+                    self.palette.tertiary,
+                    self.palette.accent,
+                ];
+                let scale = self.settings.appearance.ui_scale;
+                input.update(cx, |input, cx| {
+                    input.reconfigure(
+                        content,
+                        placeholder,
+                        label,
+                        masked,
+                        NativeTextInputAppearance { colors, scale },
+                        cx,
+                    );
+                    if target_changed && replace_on_type {
+                        input.select_all_content(cx);
+                    }
+                });
+            }
+        } else if self.native_text_input_target != Some(TextInputTarget::PreviewFind) {
+            self.deactivate_native_text_input();
+        }
+    }
+
+    fn toggle_settings_panel(&mut self, cx: &mut Context<Self>) {
+        if self.settings_panel_open {
+            self.close_settings_panel(cx);
+            return;
+        }
+        if self.has_control_draft() {
+            self.request_settings_confirmation(
+                SettingsConfirmation::DiscardDraft(PendingDraftAction::OpenSettings),
+                cx,
+            );
+            return;
+        }
+        self.begin_overlay_focus();
+        self.settings_panel_open = true;
+        self.toolbar_menu = ToolbarMenu::Closed;
         self.search_active = false;
         cx.notify();
     }
 
     fn close_settings_panel(&mut self, cx: &mut Context<Self>) {
+        if self.has_settings_draft() {
+            self.request_settings_confirmation(
+                SettingsConfirmation::DiscardDraft(PendingDraftAction::CloseSettings),
+                cx,
+            );
+            return;
+        }
+        self.close_settings_panel_unchecked(cx);
+    }
+
+    fn close_settings_panel_unchecked(&mut self, cx: &mut Context<Self>) {
         if self.settings_panel_open {
             self.settings_panel_open = false;
             self.appearance_value_editor = None;
             self.named_theme_editor = None;
             self.shortcut_editor = None;
+            self.settings_selector = None;
+            self.settings_confirmation = None;
+            self.deactivate_native_text_input();
+            self.finish_overlay_focus_if_inactive();
             cx.notify();
         }
     }
@@ -3787,6 +5702,103 @@ impl DirectoryWindow {
         self.close_preview(cx);
         self.refresh(cx);
         self.finish_settings_change("Settings restored to defaults", cx);
+    }
+
+    fn request_settings_confirmation(
+        &mut self,
+        confirmation: SettingsConfirmation,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings_confirmation = Some(confirmation);
+        self.settings_selector = None;
+        self.settings_confirmation_focus_pending = true;
+        cx.notify();
+    }
+
+    fn restore_settings_confirmation_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let focus = self
+            .settings_confirmation_return_focus
+            .take()
+            .unwrap_or_else(|| self.focus_handle.clone());
+        window.focus(&focus, cx);
+        self.settings_confirmation_focus_pending = false;
+    }
+
+    fn cancel_settings_confirmation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings_confirmation.take().is_some() {
+            self.restore_settings_confirmation_focus(window, cx);
+            cx.notify();
+        }
+    }
+
+    fn confirm_settings_confirmation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(confirmation) = self.settings_confirmation.take() else {
+            return;
+        };
+        if matches!(&confirmation, SettingsConfirmation::DiscardDraft(_)) {
+            self.settings_confirmation_return_focus = Some(self.focus_handle.clone());
+        }
+        match confirmation {
+            SettingsConfirmation::ResetSettings => self.reset_settings(cx),
+            SettingsConfirmation::ResetShortcut(command_id) => self.reset_shortcut(&command_id, cx),
+            SettingsConfirmation::ResetAllShortcuts => self.reset_all_shortcuts(cx),
+            SettingsConfirmation::ClearPreviewCache => self.clear_preview_cache(cx),
+            SettingsConfirmation::DeleteTheme(name) => self.delete_named_theme(&name, cx),
+            SettingsConfirmation::RemoveCustomField(name) => self.remove_custom_field(&name, cx),
+            SettingsConfirmation::InstallUpdate(update) => self.start_update_download(update, cx),
+            SettingsConfirmation::DiscardDraft(action) => {
+                self.discard_draft_and_continue(action, cx)
+            }
+        }
+        self.restore_settings_confirmation_focus(window, cx);
+    }
+
+    fn has_control_draft(&self) -> bool {
+        self.workspace_editing.is_some()
+            || self.smart_folder_editor.is_some()
+            || self.remote_editor.is_some()
+            || self.batch_rename.is_some()
+    }
+
+    fn has_settings_draft(&self) -> bool {
+        self.appearance_value_editor.as_ref().is_some_and(|editor| {
+            let saved = match editor.kind {
+                AppearanceValueKind::Accent => &self.settings.appearance.accent_custom,
+                AppearanceValueKind::Font => &self.settings.appearance.font_custom,
+            };
+            editor.input != *saved
+        }) || self
+            .named_theme_editor
+            .as_ref()
+            .is_some_and(|editor| !editor.input.trim().is_empty())
+            || self.shortcut_editor.as_ref().is_some_and(|editor| {
+                binding_for(&self.settings.shortcut_bindings, &editor.command_id)
+                    .is_some_and(|saved| saved != editor.binding)
+            })
+    }
+
+    fn discard_draft_and_continue(&mut self, action: PendingDraftAction, cx: &mut Context<Self>) {
+        match action {
+            PendingDraftAction::CloseControlSurface => {
+                self.close_control_surface_unchecked(cx);
+            }
+            PendingDraftAction::OpenControlSurface(surface) => {
+                self.open_control_surface_unchecked(surface, cx);
+            }
+            PendingDraftAction::ToggleToolbarMenu(menu) => {
+                self.close_control_surface_unchecked(cx);
+                self.toggle_toolbar_menu_unchecked(menu, cx);
+            }
+            PendingDraftAction::OpenSettings => {
+                self.close_control_surface_unchecked(cx);
+                self.begin_overlay_focus();
+                self.settings_panel_open = true;
+                self.toolbar_menu = ToolbarMenu::Closed;
+                self.search_active = false;
+                cx.notify();
+            }
+            PendingDraftAction::CloseSettings => self.close_settings_panel_unchecked(cx),
+        }
     }
 
     fn begin_sidebar_resize(
@@ -3851,12 +5863,352 @@ impl DirectoryWindow {
         cx.stop_propagation();
     }
 
+    fn begin_list_column_resize(
+        &mut self,
+        key: String,
+        width: f32,
+        event: &gpui::MouseDownEvent,
+        cx: &mut Context<Self>,
+    ) {
+        self.list_column_resize = Some(ListColumnResize {
+            key,
+            start_x: f32::from(event.position.x),
+            start_width: width,
+        });
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn set_list_column_width(
+        &mut self,
+        key: String,
+        width: f32,
+        persist: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let width = width.clamp(56.0, 360.0).round() as u16;
+        self.browser.set_column_width(key, width);
+        if persist {
+            self.persist_session();
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn update_list_column_resize(&mut self, event: &gpui::MouseMoveEvent, cx: &mut Context<Self>) {
+        if !event.dragging() {
+            return;
+        }
+        let Some(resize) = self.list_column_resize.clone() else {
+            return;
+        };
+        let delta = f32::from(event.position.x) - resize.start_x;
+        self.set_list_column_width(resize.key, resize.start_width + delta, false, cx);
+    }
+
+    fn finish_list_column_resize(&mut self, cx: &mut Context<Self>) {
+        if self.list_column_resize.take().is_some() {
+            self.persist_session();
+            cx.notify();
+        }
+    }
+
+    fn begin_column_view_resize(
+        &mut self,
+        path: PathBuf,
+        width: f32,
+        event: &gpui::MouseDownEvent,
+        cx: &mut Context<Self>,
+    ) {
+        self.column_view_resize = Some(ColumnViewResize {
+            path,
+            start_x: f32::from(event.position.x),
+            start_width: width,
+        });
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn set_column_view_width(
+        &mut self,
+        path: PathBuf,
+        width: f32,
+        persist: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let width = width
+            .clamp(MIN_COLUMN_VIEW_WIDTH, MAX_COLUMN_VIEW_WIDTH)
+            .round() as u16;
+        self.browser.set_column_view_width(path, width);
+        if persist {
+            self.persist_session();
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn update_column_view_resize(&mut self, event: &gpui::MouseMoveEvent, cx: &mut Context<Self>) {
+        if !event.dragging() {
+            return;
+        }
+        let Some(resize) = self.column_view_resize.clone() else {
+            return;
+        };
+        let delta = f32::from(event.position.x) - resize.start_x;
+        self.set_column_view_width(resize.path, resize.start_width + delta, false, cx);
+    }
+
+    fn finish_column_view_resize(&mut self, cx: &mut Context<Self>) {
+        if self.column_view_resize.take().is_some() {
+            self.persist_session();
+            cx.notify();
+        }
+    }
+
     fn cycle_theme(&mut self, cx: &mut Context<Self>) {
         self.settings.appearance.theme = self.settings.appearance.theme.next();
         self.finish_settings_change(
             format!("Theme: {}", self.settings.appearance.theme.label()),
             cx,
         );
+    }
+
+    fn set_density(&mut self, density: Density, cx: &mut Context<Self>) {
+        if self.settings.appearance.density != density {
+            self.settings.appearance.density = density;
+            self.finish_settings_change(format!("Density: {}", density.label()), cx);
+        }
+    }
+
+    fn set_border_radius(&mut self, radius: u8, cx: &mut Context<Self>) {
+        let radius = match radius {
+            0 | 4 | 8 => radius,
+            _ => return,
+        };
+        if self.settings.appearance.border_radius != radius {
+            self.settings.appearance.border_radius = radius;
+            self.finish_settings_change(format!("Border radius: {radius} px"), cx);
+        }
+    }
+
+    fn set_undo_timeout(&mut self, minutes: u32, cx: &mut Context<Self>) {
+        if !matches!(minutes, 1 | 5 | 15 | 30 | 60) {
+            return;
+        }
+        self.settings.behavior.undo_timeout_minutes = minutes;
+        self.undo_ledger
+            .set_timeout(Duration::from_secs(u64::from(minutes) * 60));
+        self.finish_settings_change(format!("Undo timeout: {minutes} minute(s)"), cx);
+    }
+
+    fn set_accent_choice(&mut self, accent: AccentColor, cx: &mut Context<Self>) {
+        self.settings_selector = None;
+        if accent == AccentColor::Custom {
+            self.open_appearance_value_editor(AppearanceValueKind::Accent, cx);
+        } else {
+            self.settings.appearance.accent = accent;
+            self.finish_settings_change(format!("Accent: {}", accent.label()), cx);
+        }
+    }
+
+    fn set_font_choice(&mut self, font: FontChoice, cx: &mut Context<Self>) {
+        self.settings_selector = None;
+        if font == FontChoice::Custom {
+            self.open_appearance_value_editor(AppearanceValueKind::Font, cx);
+        } else {
+            self.settings.appearance.font = font;
+            self.finish_settings_change(format!("Font: {}", font.label()), cx);
+        }
+    }
+
+    fn settings_slider_values(kind: SettingsSlider) -> &'static [f32] {
+        match kind {
+            SettingsSlider::UiScale => &[0.9, 1.0, 1.1, 1.25, 1.4],
+            SettingsSlider::ListRowHeight => &[26.0, 30.0, 34.0, 40.0, 46.0, 52.0],
+            SettingsSlider::GridWidth => &[
+                120.0, 130.0, 140.0, 150.0, 160.0, 170.0, 180.0, 190.0, 200.0, 210.0, 220.0, 230.0,
+                240.0, 250.0, 260.0,
+            ],
+            SettingsSlider::IconSize => &[10.0, 12.0, 14.0, 16.0, 18.0, 20.0, 22.0, 24.0],
+        }
+    }
+
+    fn settings_slider_value(&self, kind: SettingsSlider) -> f32 {
+        match kind {
+            SettingsSlider::UiScale => self.settings.appearance.ui_scale,
+            SettingsSlider::ListRowHeight => f32::from(self.settings.appearance.list_row_height),
+            SettingsSlider::GridWidth => f32::from(self.settings.appearance.grid_min_width),
+            SettingsSlider::IconSize => f32::from(self.settings.appearance.icon_size),
+        }
+    }
+
+    fn set_settings_slider_index(
+        &mut self,
+        kind: SettingsSlider,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(value) = Self::settings_slider_values(kind).get(index).copied() else {
+            return;
+        };
+        match kind {
+            SettingsSlider::UiScale => {
+                self.settings.appearance.ui_scale = value;
+                self.finish_settings_change(format!("UI scale: {value:.2}×"), cx);
+            }
+            SettingsSlider::ListRowHeight => {
+                self.settings.appearance.list_row_height = value as u16;
+                self.finish_settings_change(format!("List row height: {value:.0} px"), cx);
+            }
+            SettingsSlider::GridWidth => self.set_grid_width(value as u16, cx),
+            SettingsSlider::IconSize => {
+                self.settings.appearance.icon_size = value as u8;
+                self.finish_settings_change(format!("Icon size: {value:.0} px"), cx);
+            }
+        }
+    }
+
+    fn adjust_settings_slider(
+        &mut self,
+        kind: SettingsSlider,
+        delta: isize,
+        cx: &mut Context<Self>,
+    ) {
+        let values = Self::settings_slider_values(kind);
+        let current = self.settings_slider_value(kind);
+        let index = values
+            .iter()
+            .position(|value| (*value - current).abs() < f32::EPSILON)
+            .unwrap_or(0);
+        let next = (index as isize + delta).clamp(0, values.len() as isize - 1) as usize;
+        self.set_settings_slider_index(kind, next, cx);
+    }
+
+    fn handle_settings_slider_key(
+        &mut self,
+        kind: SettingsSlider,
+        event: &KeyDownEvent,
+        cx: &mut Context<Self>,
+    ) {
+        match event.keystroke.key.as_str() {
+            "left" | "down" => self.adjust_settings_slider(kind, -1, cx),
+            "right" | "up" => self.adjust_settings_slider(kind, 1, cx),
+            "home" => self.set_settings_slider_index(kind, 0, cx),
+            "end" => self.set_settings_slider_index(
+                kind,
+                Self::settings_slider_values(kind).len() - 1,
+                cx,
+            ),
+            _ => return,
+        }
+        cx.stop_propagation();
+    }
+
+    fn render_settings_slider(
+        &mut self,
+        kind: SettingsSlider,
+        id: &'static str,
+        label: &'static str,
+        description: &'static str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let palette = self.palette;
+        let values = Self::settings_slider_values(kind);
+        let current = self.settings_slider_value(kind);
+        let current_index = values
+            .iter()
+            .position(|value| (*value - current).abs() < f32::EPSILON)
+            .unwrap_or(0);
+        let display = match kind {
+            SettingsSlider::UiScale => format!("{current:.2}×"),
+            _ => format!("{current:.0} px"),
+        };
+        let steps = values
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                let filled = index <= current_index;
+                let selected = index == current_index;
+                div()
+                    .id((id, index))
+                    .flex_1()
+                    .h_full()
+                    .items_center()
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .w_full()
+                            .h(px(if selected { 12.0 } else { 4.0 } * palette.scale))
+                            .rounded_full()
+                            .bg(if filled {
+                                palette.accent
+                            } else {
+                                palette.border
+                            }),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_settings_slider_index(kind, index, cx)
+                    }))
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+        let increment_view = cx.entity().downgrade();
+        let decrement_view = increment_view.clone();
+        settings_field_row(label, description, self.palette)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .w_full()
+                    .max_w(px(280.0 * palette.scale))
+                    .child(
+                        div()
+                            .id(id)
+                            .role(Role::Slider)
+                            .aria_label(label)
+                            .aria_numeric_value(f64::from(current))
+                            .aria_min_numeric_value(f64::from(values[0]))
+                            .aria_max_numeric_value(f64::from(values[values.len() - 1]))
+                            .focusable()
+                            .tab_stop(true)
+                            .on_a11y_action(AccessibleAction::Increment, move |_, _, cx| {
+                                increment_view
+                                    .update(cx, |this, cx| this.adjust_settings_slider(kind, 1, cx))
+                                    .ok();
+                            })
+                            .on_a11y_action(AccessibleAction::Decrement, move |_, _, cx| {
+                                decrement_view
+                                    .update(cx, |this, cx| {
+                                        this.adjust_settings_slider(kind, -1, cx)
+                                    })
+                                    .ok();
+                            })
+                            .on_key_down(cx.listener(move |this, event, _, cx| {
+                                this.handle_settings_slider_key(kind, event, cx)
+                            }))
+                            .flex()
+                            .items_center()
+                            .gap(px(2.0))
+                            .h(px(28.0 * palette.scale))
+                            .flex_1()
+                            .px_2()
+                            .rounded(px(palette.radius))
+                            .border_1()
+                            .border_color(palette.border)
+                            .focus(move |slider| slider.border_color(palette.accent))
+                            .children(steps),
+                    )
+                    .child(
+                        div()
+                            .w(px(56.0 * palette.scale))
+                            .text_right()
+                            .text_xs()
+                            .text_color(self.palette.muted)
+                            .child(display),
+                    ),
+            )
+            .into_any_element()
     }
 
     fn cycle_accent(&mut self, cx: &mut Context<Self>) {
@@ -3921,12 +6273,17 @@ impl DirectoryWindow {
             ),
             cx,
         );
+        self.persist_session();
     }
 
     fn adjust_grid_width(&mut self, delta: i16, cx: &mut Context<Self>) {
-        self.settings.appearance.grid_min_width =
-            (i32::from(self.settings.appearance.grid_min_width) + i32::from(delta)).clamp(120, 260)
-                as u16;
+        let width = (i32::from(self.settings.appearance.grid_min_width) + i32::from(delta))
+            .clamp(120, 260) as u16;
+        self.set_grid_width(width, cx);
+    }
+
+    fn set_grid_width(&mut self, width: u16, cx: &mut Context<Self>) {
+        self.settings.appearance.grid_min_width = width.clamp(120, 260);
         self.finish_settings_change(
             format!(
                 "Grid card width: {} px",
@@ -3934,6 +6291,18 @@ impl DirectoryWindow {
             ),
             cx,
         );
+        self.persist_session();
+    }
+
+    fn handle_grid_width_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        match event.keystroke.key.as_str() {
+            "left" | "down" => self.adjust_grid_width(-10, cx),
+            "right" | "up" => self.adjust_grid_width(10, cx),
+            "home" => self.set_grid_width(120, cx),
+            "end" => self.set_grid_width(260, cx),
+            _ => return,
+        }
+        cx.stop_propagation();
     }
 
     fn cycle_font(&mut self, cx: &mut Context<Self>) {
@@ -3958,6 +6327,7 @@ impl DirectoryWindow {
             AppearanceValueKind::Accent => self.settings.appearance.accent_custom.clone(),
             AppearanceValueKind::Font => self.settings.appearance.font_custom.clone(),
         };
+        self.begin_overlay_focus();
         self.settings_panel_open = true;
         self.search_active = false;
         self.named_theme_editor = None;
@@ -4061,6 +6431,7 @@ impl DirectoryWindow {
     }
 
     fn open_named_theme_editor(&mut self, cx: &mut Context<Self>) {
+        self.begin_overlay_focus();
         self.settings_panel_open = true;
         self.search_active = false;
         self.appearance_value_editor = None;
@@ -4074,6 +6445,7 @@ impl DirectoryWindow {
             self.show_toast("Shortcut command no longer exists", ToastKind::Warning, cx);
             return;
         };
+        self.begin_overlay_focus();
         self.settings_panel_open = true;
         self.search_active = false;
         self.appearance_value_editor = None;
@@ -4421,6 +6793,7 @@ impl DirectoryWindow {
         }
         let state = on_off(self.settings.view.show_preview_panel);
         self.finish_settings_change(format!("Pinned preview: {state}"), cx);
+        self.persist_session();
     }
 
     fn toggle_confirm_delete(&mut self, cx: &mut Context<Self>) {
@@ -4453,17 +6826,53 @@ impl DirectoryWindow {
     }
 
     fn toggle_remote_drives(&mut self, cx: &mut Context<Self>) {
-        self.settings.behavior.remote_drives_enabled =
-            !self.settings.behavior.remote_drives_enabled;
-        let state = on_off(self.settings.behavior.remote_drives_enabled);
-        self.finish_settings_change(format!("Remote drives: {state}"), cx);
-        if self.settings.behavior.remote_drives_enabled {
+        if self.remote_disable_pending {
+            return;
+        }
+        if !self.settings.behavior.remote_drives_enabled {
+            self.settings.behavior.remote_drives_enabled = true;
+            self.finish_settings_change("Remote drives: On", cx);
             self.remote_auto_connect_started = false;
             self.start_remote_drives(cx);
-        } else {
-            self.cancel_all_remote_connect_attempts();
-            self.stop_remote_status_polling();
+            return;
         }
+
+        self.cancel_all_remote_connect_attempts();
+        self.stop_remote_status_polling();
+        self.remote_disable_pending = true;
+        self.status_message = Some("Disconnecting remote drives safely…".to_string());
+        let task = self.services.remotes.disconnect_all_if_clean_task();
+        self.push_remote_task(cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |view, cx| {
+                view.remote_disable_pending = false;
+                match result {
+                    Ok(true) => {
+                        view.settings.behavior.remote_drives_enabled = false;
+                        view.remote_statuses.clear();
+                        view.remote_retries.clear();
+                        view.finish_settings_change("Remote drives: Off", cx);
+                    }
+                    Ok(false) => {
+                        view.start_remote_status_polling(cx);
+                        view.status_message = Some(
+                            "Remote drives remain enabled until pending uploads or errors are resolved"
+                                .to_string(),
+                        );
+                        cx.notify();
+                    }
+                    Err(error) => {
+                        view.start_remote_status_polling(cx);
+                        view.record_error("Remote disconnect failed", error.to_string());
+                        view.status_message = Some(format!(
+                            "Remote drives remain enabled: {error}"
+                        ));
+                        cx.notify();
+                    }
+                }
+            });
+        }));
+        cx.notify();
     }
 
     fn toggle_reduce_motion(&mut self, cx: &mut Context<Self>) {
@@ -4479,6 +6888,8 @@ impl DirectoryWindow {
     }
 
     pub fn start_listing(&mut self, cx: &mut Context<Self>) {
+        self.start_disk_info(cx);
+        self.start_syncthing_root(cx);
         if let Some(criteria) = self
             .browser
             .active_smart_folder()
@@ -4499,48 +6910,49 @@ impl DirectoryWindow {
         cx: &mut Context<Self>,
     ) {
         let executor = cx.background_executor().clone();
-        self.single_instance_task = Some(cx.spawn_in(window, async move |this, cx| {
-            loop {
-                executor.timer(Duration::from_millis(50)).await;
-                let mut pending = Vec::new();
-                let mut disconnected = false;
+        self.single_instance_tasks
+            .push(cx.spawn_in(window, async move |this, cx| {
                 loop {
-                    match requests.try_recv() {
-                        Ok(request) => pending.push(request),
-                        Err(mpsc::TryRecvError::Empty) => break,
-                        Err(mpsc::TryRecvError::Disconnected) => {
-                            disconnected = true;
-                            break;
+                    executor.timer(Duration::from_millis(50)).await;
+                    let mut pending = Vec::new();
+                    let mut disconnected = false;
+                    loop {
+                        match requests.try_recv() {
+                            Ok(request) => pending.push(request),
+                            Err(mpsc::TryRecvError::Empty) => break,
+                            Err(mpsc::TryRecvError::Disconnected) => {
+                                disconnected = true;
+                                break;
+                            }
                         }
                     }
-                }
 
-                for request in pending {
-                    if cx
-                        .update_root(|_, window, app| {
-                            let focus = this.update(app, |view, cx| {
-                                if let Some(path) = request.path {
-                                    view.navigate_to(path, cx);
+                    for request in pending {
+                        if cx
+                            .update_root(|_, window, app| {
+                                let focus = this.update(app, |view, cx| {
+                                    if let Some(path) = request.path {
+                                        view.navigate_to(path, cx);
+                                    }
+                                    view.focus_handle.clone()
+                                });
+                                if let Ok(focus) = focus {
+                                    window.activate_window();
+                                    window.focus(&focus, app);
+                                    app.activate(true);
                                 }
-                                view.focus_handle.clone()
-                            });
-                            if let Ok(focus) = focus {
-                                window.activate_window();
-                                window.focus(&focus, app);
-                                app.activate(true);
-                            }
-                        })
-                        .is_err()
-                    {
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+
+                    if disconnected {
                         return;
                     }
                 }
-
-                if disconnected {
-                    return;
-                }
-            }
-        }));
+            }));
     }
 
     fn start_listing_with_scroll_reset(&mut self, reset_scroll: bool, cx: &mut Context<Self>) {
@@ -4558,13 +6970,13 @@ impl DirectoryWindow {
         self.listing_task = Some(cx.spawn(async move |this, cx| {
             let event = list_directory_task(services, generation, request).await;
             let _ = this.update(cx, |view, cx| {
-                view.apply_event(event);
+                view.apply_event(event, cx);
                 cx.notify();
             });
         }));
     }
 
-    fn apply_event(&mut self, event: DirectoryEvent) {
+    fn apply_event(&mut self, event: DirectoryEvent, cx: &mut Context<Self>) {
         match event {
             DirectoryEvent::Listed {
                 generation,
@@ -4576,8 +6988,13 @@ impl DirectoryWindow {
                 if self.reset_scroll_on_result {
                     self.scroll_handle
                         .scroll_to_item_strict(0, ScrollStrategy::Top);
+                    self.pending_scroll_restore = None;
+                } else if let Some(index) = self.pending_scroll_restore.take() {
+                    self.scroll_handle
+                        .scroll_to_item_strict(index, ScrollStrategy::Top);
                 }
                 self.reset_scroll_on_result = false;
+                self.finish_pending_preview_refresh(cx);
             }
             DirectoryEvent::Failed {
                 generation,
@@ -4609,27 +7026,91 @@ impl DirectoryWindow {
         }));
     }
 
+    fn start_disk_info(&mut self, cx: &mut Context<Self>) {
+        let path = self.browser.path().to_path_buf();
+        self.disk_info_generation = self.disk_info_generation.wrapping_add(1);
+        let generation = self.disk_info_generation;
+        self.disk_info_path = Some(path.clone());
+        self.disk_info = None;
+        let task = self.services.listing.disk_info(path.clone());
+        self.disk_info_task = Some(cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |view, cx| {
+                if generation == view.disk_info_generation && view.browser.path() == path {
+                    view.disk_info = result.ok();
+                    cx.notify();
+                }
+            });
+        }));
+    }
+
+    fn start_syncthing_root(&mut self, cx: &mut Context<Self>) {
+        let path = self.browser.path().to_path_buf();
+        if self.syncthing_path.as_deref() == Some(path.as_path()) {
+            return;
+        }
+        self.syncthing_generation = self.syncthing_generation.wrapping_add(1);
+        let generation = self.syncthing_generation;
+        self.syncthing_path = Some(path.clone());
+        self.syncthing_root = None;
+        let task = self.services.listing.syncthing_root(path.clone());
+        self.syncthing_task = Some(cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |view, cx| {
+                if generation == view.syncthing_generation && view.browser.path() == path {
+                    match result {
+                        Ok(root) => view.syncthing_root = root,
+                        Err(error) => {
+                            view.syncthing_path = None;
+                            view.syncthing_root = None;
+                            view.record_error("Syncthing detection failed", error.to_string());
+                        }
+                    }
+                    cx.notify();
+                }
+            });
+        }));
+    }
+
     fn start_smart_search(&mut self, criteria: SearchCriteria, cx: &mut Context<Self>) {
+        self.services.search.cancel();
         self.search_generation = self.search_generation.wrapping_add(1);
         let generation = self.search_generation;
-        let services = self.services.clone();
+        let request_id = format!(
+            "{}-{generation}",
+            self.window_lifetime
+                .as_ref()
+                .map_or("window", |lifetime| lifetime.id.as_str())
+        );
+        let task = self
+            .services
+            .search
+            .search_with_progress(criteria, request_id.clone());
+        self.search_request_id = Some(request_id);
+        self.search_progress = None;
+        self.browser.replace_entries(Vec::new());
         self.state = ListingState::Loading;
-        self.status_message = Some("Searching indexed local files…".to_string());
+        self.status_message = Some("Indexing local files… • Esc to stop".to_string());
         self.search_task = Some(cx.spawn(async move |this, cx| {
-            let event = search_task(services, generation, criteria).await;
+            let event = match task.await {
+                Ok(result) => SearchEvent::Completed { generation, result },
+                Err(error) => SearchEvent::Failed { generation, error },
+            };
             let _ = this.update(cx, |view, cx| {
-                view.apply_search_event(event);
+                view.apply_search_event(event, cx);
                 cx.notify();
             });
         }));
     }
 
-    fn apply_search_event(&mut self, event: SearchEvent) {
+    fn apply_search_event(&mut self, event: SearchEvent, cx: &mut Context<Self>) {
         match event {
             SearchEvent::Completed { generation, result }
                 if generation == self.search_generation
                     && self.browser.active_smart_folder().is_some() =>
             {
+                self.search_task = None;
+                self.search_request_id = None;
                 let count = result.entries.len();
                 let index_status = if result.reused_index {
                     "cached index".to_string()
@@ -4640,13 +7121,30 @@ impl DirectoryWindow {
                 };
                 self.browser.replace_entries(result.entries);
                 self.state = ListingState::Ready;
-                self.status_message =
-                    Some(format!("{count} smart-folder results • {index_status}"));
+                let result_status = if result.truncated {
+                    format!("{count}+ smart-folder results (showing first {count})")
+                } else {
+                    format!("{count} smart-folder results")
+                };
+                self.status_message = Some(format!("{result_status} • {index_status}"));
+                self.search_progress = None;
+                self.finish_pending_preview_refresh(cx);
             }
             SearchEvent::Failed { generation, error }
                 if generation == self.search_generation
                     && self.browser.active_smart_folder().is_some() =>
             {
+                self.search_task = None;
+                self.search_request_id = None;
+                self.search_progress = None;
+                if error.code == ErrorCode::Cancelled {
+                    self.state = ListingState::Ready;
+                    self.status_message = Some(format!(
+                        "Search stopped • {} partial result(s)",
+                        self.browser.visible_entries().len()
+                    ));
+                    return;
+                }
                 self.record_error("Smart-folder search failed", error.to_string());
                 self.state = ListingState::Failed(error.to_string());
                 self.status_message = Some(format!("Smart-folder search failed: {error}"));
@@ -4655,12 +7153,84 @@ impl DirectoryWindow {
         }
     }
 
+    fn apply_search_progress(&mut self, progress: SearchProgressEvent, cx: &mut Context<Self>) {
+        if self.search_request_id.as_deref() != Some(progress.request_id.as_str())
+            || self.browser.active_smart_folder().is_none()
+        {
+            return;
+        }
+        if !progress.entries.is_empty() {
+            self.browser
+                .append_progressive_entries(progress.entries.clone());
+            self.state = ListingState::Ready;
+        }
+        let path = progress
+            .current_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| progress.current_path.display().to_string());
+        self.status_message = Some(match progress.phase.as_str() {
+            "indexing" => format!(
+                "Indexing {path} • {} paths • Esc to stop",
+                progress.indexed_entries
+            ),
+            "content" => format!(
+                "Reading content in {path} • {} paths • Esc to stop",
+                progress.indexed_entries
+            ),
+            _ => format!(
+                "Searching {path} • {} result(s) • Esc to stop",
+                progress.matched_entries
+            ),
+        });
+        self.search_progress = Some(progress);
+        cx.notify();
+    }
+
+    fn cancel_smart_search(&mut self, cx: &mut Context<Self>) {
+        if self.search_task.is_none() {
+            return;
+        }
+        self.services.search.cancel();
+        self.search_generation = self.search_generation.wrapping_add(1);
+        self.search_task = None;
+        self.search_request_id = None;
+        self.search_progress = None;
+        self.state = ListingState::Ready;
+        self.status_message = Some(format!(
+            "Search stopped • {} partial result(s)",
+            self.browser.visible_entries().len()
+        ));
+        cx.notify();
+    }
+
+    fn rebuild_search_index(&mut self, cx: &mut Context<Self>) {
+        let active_criteria = self
+            .browser
+            .active_smart_folder()
+            .map(|folder| folder.criteria().clone());
+        if self.search_task.is_some() {
+            self.cancel_smart_search(cx);
+        }
+        self.services.search.clear();
+        if let Some(criteria) = active_criteria {
+            self.start_smart_search(criteria, cx);
+            self.show_toast("Rebuilding the search index", ToastKind::Success, cx);
+        } else {
+            self.show_toast(
+                "Search index cleared; the next search will rebuild it",
+                ToastKind::Success,
+                cx,
+            );
+        }
+    }
+
     fn start_column_listings(&mut self, reset_stack: bool, cx: &mut Context<Self>) {
         self.column_generation = self.column_generation.wrapping_add(1);
         let generation = self.column_generation;
         if reset_stack {
             self.columns.reset(self.browser.path());
-            self.column_selection = None;
+            self.column_selection.clear();
         } else {
             self.columns.begin_refresh();
         }
@@ -4688,14 +7258,14 @@ impl DirectoryWindow {
             self.column_tasks.push(cx.spawn(async move |this, cx| {
                 let event = list_directory_task(services, generation, request).await;
                 let _ = this.update(cx, |view, cx| {
-                    view.apply_column_event(event);
+                    view.apply_column_event(event, cx);
                     cx.notify();
                 });
             }));
         }
     }
 
-    fn apply_column_event(&mut self, event: DirectoryEvent) {
+    fn apply_column_event(&mut self, event: DirectoryEvent, cx: &mut Context<Self>) {
         match event {
             DirectoryEvent::Listed {
                 generation,
@@ -4706,6 +7276,39 @@ impl DirectoryWindow {
                 if self.columns.apply_listed(&request.path, entries.clone()) && is_active {
                     self.browser.replace_entries(entries);
                     self.state = ListingState::Ready;
+                    if let Some(target) = self.pending_column_selection.take() {
+                        let requested = match target {
+                            ColumnSelectionTarget::First => self
+                                .browser
+                                .visible_entries()
+                                .first()
+                                .map(|entry| entry.path.clone()),
+                            ColumnSelectionTarget::Path(path) => self
+                                .browser
+                                .visible_entries()
+                                .iter()
+                                .any(|entry| entry.path == path)
+                                .then_some(path)
+                                .or_else(|| {
+                                    self.browser
+                                        .visible_entries()
+                                        .first()
+                                        .map(|entry| entry.path.clone())
+                                }),
+                        };
+                        if let Some(path) = requested {
+                            let index = self
+                                .browser
+                                .visible_entries()
+                                .iter()
+                                .position(|entry| entry.path == path)
+                                .unwrap_or(0);
+                            self.browser.select(path.clone());
+                            self.set_column_selection(path);
+                            self.reveal_selected(index);
+                        }
+                    }
+                    self.finish_pending_preview_refresh(cx);
                 }
             }
             DirectoryEvent::Failed {
@@ -4717,6 +7320,7 @@ impl DirectoryWindow {
                 let message = error.to_string();
                 self.record_error("Column listing failed", &message);
                 if self.columns.apply_failed(&request.path, message.clone()) && is_active {
+                    self.pending_column_selection = None;
                     self.state = ListingState::Failed(message);
                 }
             }
@@ -4742,10 +7346,11 @@ impl DirectoryWindow {
         if self.browser.view_mode() == view_mode {
             return;
         }
-        self.grid_marquee = None;
+        self.selection_marquee = None;
+        self.browser.set_view_mode(view_mode);
         self.settings.view.view_mode = view_mode;
-        self.apply_global_browser_preferences();
         self.persist_settings();
+        self.persist_session();
         match view_mode {
             ViewMode::List | ViewMode::Grid => {
                 self.column_generation = self.column_generation.wrapping_add(1);
@@ -4800,8 +7405,8 @@ impl DirectoryWindow {
         self.browser.set_sort(key);
         self.settings.view.sort_key = self.browser.sort_key();
         self.settings.view.sort_direction = self.browser.sort_direction();
-        self.apply_global_browser_preferences();
         self.persist_settings();
+        self.persist_session();
         cx.notify();
     }
 
@@ -4880,6 +7485,7 @@ impl DirectoryWindow {
         ) {
             WatcherDisposition::Refresh => {
                 self.watch_status = WatchStatus::Watching;
+                self.invalidate_changed_preview(&event.paths);
                 self.services.search.invalidate(&event.paths);
                 self.refresh(cx);
                 cx.notify();
@@ -4891,6 +7497,46 @@ impl DirectoryWindow {
                 false
             }
             WatcherDisposition::Ignore => false,
+        }
+    }
+
+    fn invalidate_changed_preview(&mut self, changed_paths: &[PathBuf]) {
+        let affects = |candidate: &Path| {
+            changed_paths
+                .iter()
+                .any(|changed| candidate == changed || candidate.starts_with(changed))
+        };
+        if let Some(path) = self.preview_state.path().filter(|path| affects(path)) {
+            self.pending_preview_refresh = Some(path.to_path_buf());
+        }
+        self.entry_thumbnails.retain(|key, _| !affects(&key.path));
+        self.entry_thumbnail_order.retain(|key| !affects(&key.path));
+        self.entry_thumbnail_queue
+            .retain(|request| !affects(&request.path));
+        self.entry_icons
+            .retain(|key, _| !matches!(key, EntryIconKey::Source { path, .. } if affects(path)));
+        self.entry_icon_order
+            .retain(|key| !matches!(key, EntryIconKey::Source { path, .. } if affects(path)));
+        self.entry_icon_queue
+            .retain(|request| !affects(&request.path));
+    }
+
+    fn finish_pending_preview_refresh(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.pending_preview_refresh.take() else {
+            return;
+        };
+        if self.preview_state.path() != Some(path.as_path()) {
+            return;
+        }
+        let remains_visible = self
+            .browser
+            .visible_entries()
+            .iter()
+            .any(|entry| entry.path == path && !entry.is_dir);
+        if remains_visible {
+            self.start_preview(path, cx);
+        } else {
+            self.close_preview(cx);
         }
     }
 
@@ -4910,23 +7556,94 @@ impl DirectoryWindow {
 
     fn path_did_change(&mut self, cx: &mut Context<Self>) {
         self.close_context_menu(cx);
+        self.close_preview(cx);
+        self.breadcrumb_editor = None;
+        let leaving_smart_folder = self.browser.active_smart_folder().is_some();
         self.browser.clear_active_smart_folder();
+        if leaving_smart_folder {
+            self.apply_global_browser_preferences();
+            self.browser.clear_search();
+            self.search_active = false;
+        }
+        self.apply_active_tab_view_state();
+        self.services.search.cancel();
         self.search_generation = self.search_generation.wrapping_add(1);
         self.search_task = None;
-        self.browser.record_current_path();
-        self.persist_session();
+        self.search_request_id = None;
+        self.search_progress = None;
+        let path = self.browser.path().to_path_buf();
+        self.mutate_shared_session(|session| session.record_current_path(path));
+        self.save_session_snapshot();
+        self.start_disk_info(cx);
+        self.start_syncthing_root(cx);
         if self.browser.view_mode() == ViewMode::Column {
             self.state = ListingState::Loading;
             self.start_column_listings(true, cx);
         } else {
-            self.start_listing_with_scroll_reset(true, cx);
+            self.start_listing_with_scroll_reset(false, cx);
         }
         self.start_watching(cx);
     }
 
+    fn prepare_column_selection(&mut self, origin: &Path, target: &Path) {
+        if self.browser.view_mode() != ViewMode::Column {
+            return;
+        }
+        let selection = if target.starts_with(origin) {
+            ColumnSelectionTarget::First
+        } else if origin.starts_with(target) {
+            origin
+                .ancestors()
+                .find(|ancestor| ancestor.parent() == Some(target))
+                .map(Path::to_path_buf)
+                .map(ColumnSelectionTarget::Path)
+                .unwrap_or(ColumnSelectionTarget::First)
+        } else {
+            ColumnSelectionTarget::First
+        };
+        self.pending_column_selection = Some(selection);
+    }
+
     fn navigate_to(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.sync_active_tab_view_state();
+        let origin = self.browser.path().to_path_buf();
         if self.browser.navigate(path) {
+            let target = self.browser.path().to_path_buf();
+            self.prepare_column_selection(&origin, &target);
             self.path_did_change(cx);
+        }
+    }
+
+    fn begin_breadcrumb_edit(&mut self, cx: &mut Context<Self>) {
+        self.toolbar_menu = ToolbarMenu::Closed;
+        self.search_active = false;
+        self.breadcrumb_editor = Some(BreadcrumbEditor {
+            input: self.browser.path().to_string_lossy().into_owned(),
+            replace_on_type: true,
+        });
+        cx.notify();
+    }
+
+    fn cancel_breadcrumb_edit(&mut self, cx: &mut Context<Self>) {
+        if self.breadcrumb_editor.take().is_some() {
+            self.deactivate_native_text_input();
+            cx.notify();
+        }
+    }
+
+    fn submit_breadcrumb_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(input) = self
+            .breadcrumb_editor
+            .take()
+            .map(|editor| editor.input.trim().to_string())
+        else {
+            return;
+        };
+        self.deactivate_native_text_input();
+        if !input.is_empty() && Path::new(&input) != self.browser.path() {
+            self.navigate_to(PathBuf::from(input), cx);
+        } else {
+            cx.notify();
         }
     }
 
@@ -5140,7 +7857,9 @@ impl DirectoryWindow {
                 view.go_to_folder_task = None;
                 match result {
                     Ok(path) => {
-                        view.browser.record_go_to_folder(path.clone());
+                        view.mutate_shared_session(|session| {
+                            session.record_go_to_folder(path.clone())
+                        });
                         view.persist_session();
                         view.go_to_folder = None;
                         view.navigate_to(path, cx);
@@ -5161,28 +7880,44 @@ impl DirectoryWindow {
 
     fn go_back(&mut self, cx: &mut Context<Self>) {
         self.close_toolbar_menu(cx);
+        self.sync_active_tab_view_state();
+        let origin = self.browser.path().to_path_buf();
         if self.browser.go_back() {
+            let target = self.browser.path().to_path_buf();
+            self.prepare_column_selection(&origin, &target);
             self.path_did_change(cx);
         }
     }
 
     fn go_forward(&mut self, cx: &mut Context<Self>) {
         self.close_toolbar_menu(cx);
+        self.sync_active_tab_view_state();
+        let origin = self.browser.path().to_path_buf();
         if self.browser.go_forward() {
+            let target = self.browser.path().to_path_buf();
+            self.prepare_column_selection(&origin, &target);
             self.path_did_change(cx);
         }
     }
 
     fn go_to_back_history(&mut self, index: usize, cx: &mut Context<Self>) {
         self.close_toolbar_menu(cx);
+        self.sync_active_tab_view_state();
+        let origin = self.browser.path().to_path_buf();
         if self.browser.go_to_back_history(index) {
+            let target = self.browser.path().to_path_buf();
+            self.prepare_column_selection(&origin, &target);
             self.path_did_change(cx);
         }
     }
 
     fn go_to_forward_history(&mut self, index: usize, cx: &mut Context<Self>) {
         self.close_toolbar_menu(cx);
+        self.sync_active_tab_view_state();
+        let origin = self.browser.path().to_path_buf();
         if self.browser.go_to_forward_history(index) {
+            let target = self.browser.path().to_path_buf();
+            self.prepare_column_selection(&origin, &target);
             self.path_did_change(cx);
         }
     }
@@ -5195,18 +7930,24 @@ impl DirectoryWindow {
 
     fn go_up(&mut self, cx: &mut Context<Self>) {
         self.close_toolbar_menu(cx);
+        self.sync_active_tab_view_state();
+        let origin = self.browser.path().to_path_buf();
         if self.browser.go_up() {
+            let target = self.browser.path().to_path_buf();
+            self.prepare_column_selection(&origin, &target);
             self.path_did_change(cx);
         }
     }
 
     fn new_tab(&mut self, cx: &mut Context<Self>) {
+        self.sync_active_tab_view_state();
         self.browser.new_tab();
         self.search_active = false;
         self.path_did_change(cx);
     }
 
     fn activate_tab(&mut self, id: TabId, cx: &mut Context<Self>) {
+        self.sync_active_tab_view_state();
         if self.browser.activate(id) {
             self.search_active = false;
             self.path_did_change(cx);
@@ -5215,6 +7956,9 @@ impl DirectoryWindow {
 
     fn close_tab(&mut self, id: TabId, cx: &mut Context<Self>) {
         let was_active = self.browser.active_tab_id() == id;
+        if was_active {
+            self.sync_active_tab_view_state();
+        }
         if self.browser.close(id) {
             if was_active {
                 self.search_active = false;
@@ -5232,6 +7976,7 @@ impl DirectoryWindow {
     }
 
     fn activate_tab_offset(&mut self, offset: isize, cx: &mut Context<Self>) {
+        self.sync_active_tab_view_state();
         if self.browser.activate_offset(offset) {
             self.search_active = false;
             self.path_did_change(cx);
@@ -5245,16 +7990,121 @@ impl DirectoryWindow {
         }
     }
 
+    fn open_new_window(&mut self, move_active_tab: bool, cx: &mut Context<Self>) {
+        let Some(runtime) = self
+            .window_lifetime
+            .as_ref()
+            .map(|lifetime| lifetime.runtime.clone())
+        else {
+            self.show_toast(
+                "New windows are unavailable in this runtime",
+                ToastKind::Warning,
+                cx,
+            );
+            return;
+        };
+        let session_id = runtime.next_session_id();
+        if let Err(error) = runtime.register(&session_id) {
+            self.show_toast(
+                format!("Unable to register new window: {error}"),
+                ToastKind::Warning,
+                cx,
+            );
+            return;
+        }
+        self.sync_active_tab_view_state();
+        self.save_session_snapshot();
+        let path = self.browser.path().to_path_buf();
+        let session_path = runtime
+            .registry
+            .session_path(&self.services.resources().config_dir, &session_id);
+        let (session_store, _, _) = SessionStore::open(session_path, path.clone());
+        if let Err(error) = session_store.save(&self.browser.active_tab_window_session()) {
+            let _ = runtime.registry.remove(&session_id);
+            self.show_toast(
+                format!("Unable to save new window session: {error}"),
+                ToastKind::Warning,
+                cx,
+            );
+            return;
+        }
+        session_store.flush();
+        let services = self.services.clone();
+        let fallback_bounds = Bounds::centered(
+            None,
+            gpui::size(px(DEFAULT_WINDOW_WIDTH), px(DEFAULT_WINDOW_HEIGHT)),
+            cx,
+        );
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(fallback_bounds)),
+            window_min_size: Some(gpui::size(px(MIN_WINDOW_WIDTH), px(MIN_WINDOW_HEIGHT))),
+            titlebar: Some(TitlebarOptions {
+                title: Some(APP_NAME.into()),
+                appears_transparent: cfg!(target_os = "windows"),
+                traffic_light_position: None,
+            }),
+            is_resizable: true,
+            app_id: Some(APP_IDENTIFIER.to_string()),
+            ..Default::default()
+        };
+        let runtime_for_window = runtime.clone();
+        let session_id_for_window = session_id.clone();
+        let opened = cx.open_window(options, move |window, cx| {
+            window.set_window_title(APP_NAME);
+            let view = cx.new(|cx| {
+                let mut view = DirectoryWindow::restore_window_session(
+                    path,
+                    true,
+                    services,
+                    Some(runtime_for_window),
+                    session_id_for_window,
+                    cx,
+                );
+                view.install_shortcut_bindings(cx);
+                view.start_listing(cx);
+                view.start_watching(cx);
+                view.start_system_locations(cx);
+                view.start_service_events(cx);
+                view.start_preview_helpers(cx);
+                view.start_system_integration_status(cx);
+                view.start_remote_drives(cx);
+                view
+            });
+            let close_view = view.clone();
+            window.on_window_should_close(cx, move |_, cx| {
+                close_view.update(cx, |view, cx| view.request_window_close(cx))
+            });
+            window.focus(&view.focus_handle(cx), cx);
+            view
+        });
+        match opened {
+            Ok(_) => {
+                if move_active_tab && self.browser.tabs().len() > 1 {
+                    self.close_active_tab(cx);
+                }
+                cx.activate(true);
+            }
+            Err(error) => {
+                let _ = runtime.registry.remove(&session_id);
+                self.show_toast(
+                    format!("Unable to open new window: {error}"),
+                    ToastKind::Warning,
+                    cx,
+                );
+            }
+        }
+    }
+
     fn toggle_current_favorite(&mut self, cx: &mut Context<Self>) {
         let path = self.browser.path().to_path_buf();
-        self.browser.toggle_favorite(path);
+        self.mutate_shared_session(|session| session.toggle_favorite(path));
         self.persist_session();
         cx.notify();
     }
 
     fn file_drag_for_entry(&self, entry: &FileEntry) -> FileDrag {
-        let entries = if self.browser.is_selected(&entry.path) {
-            let selected = self.browser.selected_entries();
+        let entries = if self.is_effectively_selected(&entry.path) {
+            let selected = self.effective_selected_entries();
             if selected.is_empty() {
                 vec![entry.clone()]
             } else {
@@ -5272,6 +8122,69 @@ impl DirectoryWindow {
             self.file_drag_sources = sources;
             cx.notify();
         }
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    fn maybe_start_external_file_drag(
+        &mut self,
+        drag: &FileDrag,
+        position: gpui::Point<gpui::Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let viewport = window.viewport_size();
+        let x = f32::from(position.x);
+        let y = f32::from(position.y);
+        let width = f32::from(viewport.width);
+        let height = f32::from(viewport.height);
+        if x > 1.0 && y > 1.0 && x < width - 1.0 && y < height - 1.0 {
+            return;
+        }
+        if drag
+            .native_export_attempted
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        let paths = drag
+            .items
+            .iter()
+            .map(|item| item.path.clone())
+            .collect::<Vec<_>>();
+        let preview = drag::Image::Raw(
+            include_bytes!(concat!(env!("OUT_DIR"), "/titlebar-icon.png")).to_vec(),
+        );
+        if let Err(error) = drag::start_drag(
+            window,
+            drag::DragItem::Files(paths),
+            preview,
+            |_, _| {},
+            drag::Options::default(),
+        ) {
+            drag.native_export_attempted.store(false, Ordering::Release);
+            self.show_toast(
+                format!("Unable to start system drag: {error}"),
+                ToastKind::Warning,
+                cx,
+            );
+        } else {
+            self.file_drag_hover_target = None;
+            self.file_drag_hover_task = None;
+            self.file_drag_sources.clear();
+            cx.notify();
+        }
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    fn maybe_start_external_file_drag(
+        &mut self,
+        _drag: &FileDrag,
+        _position: gpui::Point<gpui::Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
     }
 
     fn start_file_drag_hover(&mut self, target: FileDragHoverTarget, cx: &mut Context<Self>) {
@@ -5395,14 +8308,60 @@ impl DirectoryWindow {
         self.finish_file_drag(cx);
     }
 
-    fn drop_files_to_favorites(&mut self, drag: &FileDrag, cx: &mut Context<Self>) {
-        let mut added = 0usize;
-        for item in drag.items.iter().filter(|item| item.is_dir) {
-            if !self.browser.is_favorite(&item.path) {
-                self.browser.toggle_favorite(item.path.clone());
-                added += 1;
-            }
+    fn drop_external_paths_to(
+        &mut self,
+        paths: &ExternalPaths,
+        target: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let target_key = comparable_drop_path(&target);
+        let sources = paths
+            .paths()
+            .iter()
+            .filter(|path| path.exists())
+            .filter(|path| {
+                path.parent()
+                    .is_none_or(|parent| comparable_drop_path(parent) != target_key)
+            })
+            .filter(|path| {
+                let source = comparable_drop_path(path);
+                !path.is_dir()
+                    || (target_key != source && !target_key.starts_with(&format!("{source}/")))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if sources.is_empty() {
+            self.show_toast(
+                "Nothing can be copied to this folder",
+                ToastKind::Warning,
+                cx,
+            );
+            return;
         }
+        self.start_file_operation(
+            FileOperationRequest {
+                kind: FileOperationKind::Copy,
+                sources,
+                destination: Some(target),
+                conflict_policy: self.conflict_policy,
+            },
+            cx,
+        );
+    }
+
+    fn drop_files_to_favorites(&mut self, drag: &FileDrag, cx: &mut Context<Self>) {
+        let paths = drag
+            .items
+            .iter()
+            .filter(|item| item.is_dir)
+            .map(|item| item.path.clone())
+            .collect::<Vec<_>>();
+        let added = self.mutate_shared_session(|session| {
+            paths
+                .into_iter()
+                .filter(|path| session.add_favorite(path.clone()))
+                .count()
+        });
         if added > 0 {
             self.persist_session();
             self.show_toast(
@@ -5423,6 +8382,38 @@ impl DirectoryWindow {
         self.finish_file_drag(cx);
     }
 
+    fn drop_external_paths_to_favorites(&mut self, paths: &ExternalPaths, cx: &mut Context<Self>) {
+        let paths = paths
+            .paths()
+            .iter()
+            .filter(|path| path.is_dir())
+            .cloned()
+            .collect::<Vec<_>>();
+        let added = self.mutate_shared_session(|session| {
+            paths
+                .into_iter()
+                .filter(|path| session.add_favorite(path.clone()))
+                .count()
+        });
+        if added > 0 {
+            self.persist_session();
+            self.show_toast(
+                format!(
+                    "Added {added} folder{} to Favorites",
+                    if added == 1 { "" } else { "s" }
+                ),
+                ToastKind::Success,
+                cx,
+            );
+        } else {
+            self.show_toast(
+                "Only new folders can be added to Favorites",
+                ToastKind::Warning,
+                cx,
+            );
+        }
+    }
+
     fn reorder_favorite_to(
         &mut self,
         path: &Path,
@@ -5430,7 +8421,8 @@ impl DirectoryWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.browser.reorder_favorite(path, target_index) {
+        let path = path.to_path_buf();
+        if self.mutate_shared_session(|session| session.reorder_favorite(&path, target_index)) {
             self.persist_session();
             if let Some(handle) = self.favorite_focus_handles.get(target_index) {
                 window.focus(handle, cx);
@@ -5500,6 +8492,9 @@ impl DirectoryWindow {
         };
         let draft = SmartFolderDraft::new(id, name, criteria);
         self.open_control_surface(ControlSurface::SmartFolders, cx);
+        if self.control_surface != ControlSurface::SmartFolders {
+            return;
+        }
         self.control_query = draft.value(draft.field).to_string();
         self.smart_folder_editor = Some(draft);
         cx.notify();
@@ -5510,11 +8505,15 @@ impl DirectoryWindow {
     }
 
     fn select_smart_folder_field(&mut self, field: SmartFolderField, cx: &mut Context<Self>) {
-        let Some(editor) = &mut self.smart_folder_editor else {
-            return;
+        let value = {
+            let Some(editor) = &mut self.smart_folder_editor else {
+                return;
+            };
+            editor.field = field;
+            editor.value(field).to_string()
         };
-        editor.field = field;
-        self.control_query = editor.value(field).to_string();
+        self.control_query = value;
+        self.sync_native_text_input(self.control_query.clone(), cx);
         cx.notify();
     }
 
@@ -5563,21 +8562,22 @@ impl DirectoryWindow {
                 .is_some_and(|folder| folder.id() == id)
         });
         let message = if let Some(id) = editor.id {
-            if !self
-                .browser
-                .update_smart_folder(id, name.clone(), criteria.clone())
-            {
+            if !self.mutate_shared_session(|session| {
+                session.update_smart_folder(id, name.clone(), criteria.clone())
+            }) {
                 self.show_toast("Smart folder no longer exists", ToastKind::Warning, cx);
                 return;
             }
             format!("Smart folder updated: {name}")
         } else {
-            self.browser
-                .save_smart_folder(name.clone(), criteria.clone());
+            self.mutate_shared_session(|session| {
+                session.save_smart_folder(name.clone(), criteria.clone())
+            });
             format!("Smart folder saved: {name}")
         };
         self.persist_session();
-        self.close_control_surface(cx);
+        self.smart_folder_editor = None;
+        self.close_control_surface_unchecked(cx);
         self.show_toast(message, ToastKind::Success, cx);
         if was_active {
             self.start_smart_search(criteria, cx);
@@ -5620,23 +8620,12 @@ impl DirectoryWindow {
         else {
             return;
         };
+        self.close_preview(cx);
         self.request_generation = self.request_generation.wrapping_add(1);
         self.listing_task = None;
         self.column_generation = self.column_generation.wrapping_add(1);
         self.column_tasks.clear();
-        self.browser.set_view_mode(ViewMode::List);
-        self.browser.set_search_query(
-            criteria
-                .name_pattern
-                .clone()
-                .filter(|_| !criteria.name_regex)
-                .unwrap_or_default(),
-        );
-        self.browser.set_filter(match criteria.type_filter {
-            SearchType::All => EntryFilter::All,
-            SearchType::Files => EntryFilter::Files,
-            SearchType::Folders => EntryFilter::Folders,
-        });
+        apply_smart_folder_browser_state(&mut self.browser, &criteria);
         self.persist_session();
         self.start_smart_search(criteria, cx);
         self.start_watching(cx);
@@ -5650,9 +8639,13 @@ impl DirectoryWindow {
             .browser
             .active_smart_folder()
             .is_some_and(|folder| folder.id() == id);
-        if self.browser.delete_smart_folder(id) {
+        if self.mutate_shared_session(|session| session.delete_smart_folder(id)) {
             self.persist_session();
             if was_active {
+                self.close_preview(cx);
+                self.apply_global_browser_preferences();
+                self.browser.clear_search();
+                self.search_active = false;
                 self.start_listing(cx);
                 self.start_watching(cx);
             }
@@ -5667,29 +8660,34 @@ impl DirectoryWindow {
         }
 
         let task = self.services.integration.open(path.clone());
-        self.status_message = Some(format!("Opening {}…", path.display()));
-        self.integration_task = Some(cx.spawn(async move |this, cx| {
+        let generation = self.begin_integration_action(format!("Opening {}…", path.display()));
+        let task = cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |view, cx| {
-                view.status_message = match result {
+                let status = match result {
                     Ok(()) => None,
                     Err(error) => {
                         view.record_error("Open failed", error.to_string());
                         Some(format!("Unable to open {}: {error}", path.display()))
                     }
                 };
+                if view.integration_generation == generation {
+                    view.status_message = status;
+                }
                 cx.notify();
             });
-        }));
+        });
+        self.push_integration_task(task);
     }
 
     fn open_selected(&mut self, cx: &mut Context<Self>) {
-        if let Some(entry) = self.browser.selected_entry().cloned() {
+        if let Some(entry) = self.effective_selected_entry() {
             self.open_entry(entry.path, entry.is_dir, cx);
         }
     }
 
     pub fn start_service_events(&mut self, cx: &mut Context<Self>) {
+        self.start_shared_state_sync(cx);
         let subscription = self.services.subscribe_async();
         self.service_event_task = Some(cx.spawn(async move |this, cx| {
             loop {
@@ -5701,8 +8699,117 @@ impl DirectoryWindow {
         }));
     }
 
+    fn start_shared_state_sync(&mut self, cx: &mut Context<Self>) {
+        if self.shared_state_task.is_some() || self.window_lifetime.is_none() {
+            return;
+        }
+        let executor = cx.background_executor().clone();
+        self.shared_state_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                executor.timer(Duration::from_millis(100)).await;
+                if this
+                    .update(cx, |view, cx| {
+                        view.pull_shared_state(cx);
+                        view.pull_shared_operations(cx);
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }));
+    }
+
+    fn pull_shared_state(&mut self, cx: &mut Context<Self>) {
+        let Some((shared, revision)) = self
+            .window_lifetime
+            .as_ref()
+            .and_then(|lifetime| lifetime.runtime.snapshot_after(self.shared_state_revision))
+        else {
+            return;
+        };
+        self.shared_state_revision = revision;
+
+        let local_window_placement = self.settings.window_placement;
+        let local_view_mode = self.settings.view.view_mode;
+        let local_sort_key = self.settings.view.sort_key.clone();
+        let local_sort_direction = self.settings.view.sort_direction;
+        let local_preview_panel = self.settings.view.show_preview_panel;
+        let local_grid_width = self.settings.appearance.grid_min_width;
+        let settings_changed = self.settings != shared.settings;
+        self.settings = shared.settings;
+        self.settings.window_placement = local_window_placement;
+        self.settings.view.view_mode = local_view_mode;
+        self.settings.view.sort_key = local_sort_key;
+        self.settings.view.sort_direction = local_sort_direction;
+        self.settings.view.show_preview_panel = local_preview_panel;
+        self.settings.appearance.grid_min_width = local_grid_width;
+        self.workspaces = shared.workspaces;
+        self.browser.apply_shared_state(shared.session);
+        self.browser.apply_common_preferences(
+            self.settings.view.show_hidden,
+            self.settings.view.show_system_files,
+            self.settings.view.filter_mode,
+        );
+        self.calculate_folder_sizes = self.settings.view.show_folder_sizes;
+        if self.sidebar_resize.is_none() {
+            self.sidebar_width = self.settings.view.sidebar_width;
+        }
+        self.undo_ledger.set_timeout(Duration::from_secs(
+            u64::from(self.settings.behavior.undo_timeout_minutes) * 60,
+        ));
+        if settings_changed {
+            self.install_shortcut_bindings(cx);
+        }
+        if let Some(store) = &self.session_store {
+            let _ = store.save(&self.browser);
+        }
+        cx.notify();
+    }
+
+    fn pull_shared_operations(&mut self, cx: &mut Context<Self>) {
+        let Some(revision) = self
+            .window_lifetime
+            .as_ref()
+            .map(|lifetime| lifetime.runtime.operations_revision())
+        else {
+            return;
+        };
+        if revision == self.operations_revision {
+            return;
+        }
+        self.operations_revision = revision;
+        if self
+            .foreign_operation_summaries()
+            .iter()
+            .any(|operation| operation.status == OperationStatus::Running)
+        {
+            self.operation_panel_hidden = false;
+        }
+        cx.notify();
+    }
+
     pub fn request_window_close(&mut self, cx: &mut Context<Self>) -> bool {
+        self.persist_window_placement();
+        let secondary_window = self
+            .window_lifetime
+            .as_ref()
+            .is_some_and(|lifetime| !lifetime.runtime.is_last_window());
+        if secondary_window
+            && (self.operations.active_count() > 0
+                || self.mutation_in_progress
+                || self.undo_progress.is_some())
+        {
+            self.status_message =
+                Some("Finish or cancel this window's filesystem work before closing".to_string());
+            cx.notify();
+            return false;
+        }
+        if secondary_window {
+            return true;
+        }
         if self.services.mutations.request_exit() {
+            self.begin_overlay_focus();
             self.mutation_exit_waiting = true;
             self.status_message = Some(format!(
                 "Waiting for {} native mutation(s) before closing",
@@ -5711,14 +8818,49 @@ impl DirectoryWindow {
             cx.notify();
             return false;
         }
-        if !self.services.remotes.disconnect_all_if_clean() {
-            return false;
+        self.start_remote_close_check(cx);
+        false
+    }
+
+    fn start_remote_close_check(&mut self, cx: &mut Context<Self>) {
+        if self.remote_close_pending {
+            return;
         }
-        true
+        self.remote_close_pending = true;
+        self.status_message = Some("Checking remote drives before closing…".to_string());
+        let task = self.services.remotes.disconnect_all_if_clean_task();
+        self.remote_close_task = Some(cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |view, cx| {
+                view.remote_close_pending = false;
+                view.remote_close_task = None;
+                match result {
+                    Ok(true) => {
+                        view.mutation_exit_waiting = false;
+                        cx.quit();
+                    }
+                    Ok(false) => {
+                        view.status_message = Some(
+                            "Remote drive activity must be resolved before closing".to_string(),
+                        );
+                        cx.notify();
+                    }
+                    Err(error) => {
+                        view.record_error("Remote shutdown check failed", error.to_string());
+                        view.status_message = Some(format!(
+                            "Unable to check remote drives before closing: {error}"
+                        ));
+                        cx.notify();
+                    }
+                }
+            });
+        }));
+        cx.notify();
     }
 
     fn keep_app_open(&mut self, cx: &mut Context<Self>) {
         self.mutation_exit_waiting = false;
+        self.finish_overlay_focus_if_inactive();
         self.status_message =
             Some("Close request cancelled; filesystem work continues".to_string());
         cx.notify();
@@ -5738,16 +8880,26 @@ impl DirectoryWindow {
         if !self.mutation_exit_waiting || self.services.mutations.request_exit() {
             return;
         }
-        if self.services.remotes.disconnect_all_if_clean() {
-            self.mutation_exit_waiting = false;
-            cx.quit();
-        }
+        self.mutation_exit_waiting = false;
+        self.finish_overlay_focus_if_inactive();
+        self.start_remote_close_check(cx);
     }
 
     fn apply_service_event(&mut self, event: ServiceEvent, cx: &mut Context<Self>) {
         match event {
             ServiceEvent::FileOperation(event) => self.apply_file_operation_event(event, cx),
             ServiceEvent::ArchiveProgress(progress) => {
+                if let Some(lifetime) = self.window_lifetime.as_ref() {
+                    lifetime.runtime.apply_archive_progress(&progress);
+                    let owns_operation = self.archive_creation_id.as_deref()
+                        == Some(progress.operation_id.as_str())
+                        || self.archive_extraction_id.as_deref()
+                            == Some(progress.operation_id.as_str());
+                    if !owns_operation {
+                        cx.notify();
+                        return;
+                    }
+                }
                 self.status_message = Some(if progress.total_bytes > 0 {
                     format!(
                         "Archiving {} • {} / {}",
@@ -5761,6 +8913,7 @@ impl DirectoryWindow {
                 self.archive_progress = Some(progress);
                 cx.notify();
             }
+            ServiceEvent::SearchProgress(progress) => self.apply_search_progress(progress, cx),
             ServiceEvent::RemoteDriveStatus(status) => {
                 let new_error = status.error.as_ref().filter(|error| {
                     self.remote_statuses
@@ -5780,7 +8933,15 @@ impl DirectoryWindow {
                     blocker.pending_uploads, blocker.errored_files
                 ));
                 self.remote_exit_blocker = Some(blocker);
-                self.open_control_surface(ControlSurface::RemoteDrives, cx);
+                if self.has_control_draft() || self.has_settings_draft() {
+                    self.show_toast(
+                        "Remote-drive shutdown needs attention; finish the current draft first",
+                        ToastKind::Warning,
+                        cx,
+                    );
+                } else {
+                    self.open_control_surface(ControlSurface::RemoteDrives, cx);
+                }
             }
             ServiceEvent::MutationIdle => self.finish_waiting_exit(cx),
             ServiceEvent::HelperStatus(_) | ServiceEvent::Watcher(_) => {}
@@ -5788,6 +8949,19 @@ impl DirectoryWindow {
     }
 
     fn apply_file_operation_event(&mut self, event: FileOperationEvent, cx: &mut Context<Self>) {
+        if let Some(runtime) = self
+            .window_lifetime
+            .as_ref()
+            .map(|lifetime| &lifetime.runtime)
+        {
+            runtime.apply_operation_event(&event);
+        }
+        if matches!(
+            event.state,
+            explorie_native_services::FileOperationState::Running
+        ) {
+            self.operation_panel_hidden = false;
+        }
         let failed_error = matches!(
             event.state,
             explorie_native_services::FileOperationState::Failed
@@ -5812,6 +8986,7 @@ impl DirectoryWindow {
             .is_some_and(|error| error.code == ErrorCode::Conflict);
         let job_id = event.job_id.clone();
         if !self.operations.apply(event) {
+            cx.notify();
             return;
         }
         if let Some(error) = failed_error {
@@ -5904,12 +9079,14 @@ impl DirectoryWindow {
     }
 
     fn finish_operation_recovery(&mut self, job_id: &str) -> std::io::Result<()> {
-        let Some(ids) = self.operation_recovery_jobs.remove(job_id) else {
+        let Some(ids) = self.operation_recovery_jobs.get(job_id).cloned() else {
             return Ok(());
         };
         self.operation_recovery_store
             .as_mut()
-            .map_or_else(|| Ok(()), |store| store.remove(&ids))
+            .map_or_else(|| Ok(()), |store| store.remove(&ids))?;
+        self.operation_recovery_jobs.remove(job_id);
+        Ok(())
     }
 
     fn start_file_operation(&mut self, request: FileOperationRequest, cx: &mut Context<Self>) {
@@ -5962,6 +9139,11 @@ impl DirectoryWindow {
             .start_file_operation(request.clone())
         {
             Ok(id) => {
+                if let Some(lifetime) = self.window_lifetime.as_ref() {
+                    lifetime
+                        .runtime
+                        .track_operation(lifetime.id.clone(), id.clone(), &request);
+                }
                 self.operations.track(id.clone(), request);
                 self.operation_panel_hidden = false;
                 self.operation_panel_minimized = false;
@@ -5994,7 +9176,7 @@ impl DirectoryWindow {
     }
 
     fn set_clipboard(&mut self, kind: ClipboardKind, cx: &mut Context<Self>) {
-        let paths = self.browser.selected_paths();
+        let paths = self.effective_selected_paths();
         self.set_clipboard_paths(kind, paths, cx);
     }
 
@@ -6041,7 +9223,7 @@ impl DirectoryWindow {
     }
 
     fn trash_selected(&mut self, cx: &mut Context<Self>) {
-        let paths = self.browser.selected_paths();
+        let paths = self.effective_selected_paths();
         self.trash_paths(paths, cx);
     }
 
@@ -6115,7 +9297,7 @@ impl DirectoryWindow {
     }
 
     fn prompt_create_archive(&mut self, cx: &mut Context<Self>) {
-        let sources = self.browser.selected_paths();
+        let sources = self.effective_selected_paths();
         self.prompt_create_archive_from_paths(sources, cx);
     }
 
@@ -6154,7 +9336,7 @@ impl DirectoryWindow {
     }
 
     fn prompt_extract_archive(&mut self, cx: &mut Context<Self>) {
-        let entries = self.browser.selected_entries();
+        let entries = self.effective_selected_entries();
         if entries.len() != 1 || entries[0].is_dir {
             self.status_message = Some("Select exactly one archive file to extract".to_string());
             cx.notify();
@@ -6181,7 +9363,7 @@ impl DirectoryWindow {
     }
 
     fn inspect_selected_archive(&mut self, cx: &mut Context<Self>) {
-        let entries = self.browser.selected_entries();
+        let entries = self.effective_selected_entries();
         if entries.len() != 1 || entries[0].is_dir {
             self.status_message = Some("Select exactly one archive file to inspect".to_string());
             cx.notify();
@@ -6194,7 +9376,7 @@ impl DirectoryWindow {
         let task = self.services.archives.list(archive_path.clone());
         self.archive_inspection_loading = true;
         self.status_message = Some("Reading archive directory…".to_string());
-        self.mutation_tasks.push(cx.spawn(async move |this, cx| {
+        self.push_mutation_task(cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |view, cx| {
                 view.archive_inspection_loading = false;
@@ -6248,7 +9430,7 @@ impl DirectoryWindow {
     }
 
     fn selected_preview_path(&mut self, cx: &mut Context<Self>) -> Option<PathBuf> {
-        let entries = self.browser.selected_entries();
+        let entries = self.effective_selected_entries();
         if entries.len() != 1 || entries[0].is_dir {
             self.status_message = Some("Select exactly one file to preview".to_string());
             cx.notify();
@@ -6299,17 +9481,25 @@ impl DirectoryWindow {
         {
             self.reveal_selected(index);
         }
-        self.column_selection = Some(target.clone());
+        self.set_column_selection(target.clone());
         self.start_preview(target, cx);
     }
 
     fn start_preview(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        let route = preview_panel::route(&path, self.settings.behavior.preview_executable_scripts);
-        let autoplay_audio = route == PreviewRoute::Audio && self.audio_autoplay_after_load;
+        self.services.previews.cancel_artifact();
+        if self.native_text_input_target == Some(TextInputTarget::PreviewFind) {
+            self.deactivate_native_text_input();
+        }
+        self.text_preview.reset();
+        let hinted_route =
+            preview_panel::route(&path, self.settings.behavior.preview_executable_scripts);
+        let autoplay_audio = self.audio_autoplay_after_load;
         self.audio_autoplay_after_load = false;
         self.pdf_zoom_percent = 100;
         self.pdf_fit = true;
         self.stop_media_preview();
+        self.preview_detection = None;
+        self.preview_prefetch_tasks.clear();
         let editor_matches = self
             .custom_fields_editor
             .as_ref()
@@ -6320,7 +9510,7 @@ impl DirectoryWindow {
                 .visible_entries()
                 .iter()
                 .find(|entry| entry.path == path)
-                .map(CustomFieldsEditor::new);
+                .map(|entry| CustomFieldsEditor::new(entry));
             if self.custom_fields_editor.is_none() && self.preview_tab == PreviewTab::CustomFields {
                 self.preview_tab = PreviewTab::Preview;
             }
@@ -6329,10 +9519,60 @@ impl DirectoryWindow {
         let generation = self.preview_generation;
         self.start_photo_metadata(path.clone(), generation, cx);
         self.start_finder_tags(path.clone(), cx);
+        if hinted_route == PreviewRoute::BlockedScript {
+            self.load_preview_route(path, hinted_route, None, false, generation, cx);
+            return;
+        }
+        self.preview_state = PreviewState::Loading { path: path.clone() };
+        let task = self.services.previews.detect(path.clone());
+        self.preview_task = Some(cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |view, cx| {
+                if view.preview_generation != generation {
+                    return;
+                }
+                let detection = match result {
+                    Ok(detection) => detection,
+                    Err(error) => {
+                        view.preview_state = PreviewState::Failed { path, error };
+                        cx.notify();
+                        return;
+                    }
+                };
+                let route = preview_panel::route_with_detection(
+                    &path,
+                    view.settings.behavior.preview_executable_scripts,
+                    &detection,
+                );
+                view.preview_detection = Some(detection.clone());
+                view.load_preview_route(
+                    path.clone(),
+                    route,
+                    Some(detection),
+                    autoplay_audio,
+                    generation,
+                    cx,
+                );
+                view.prefetch_adjacent_previews(&path, cx);
+            });
+        }));
+        cx.notify();
+    }
+
+    fn load_preview_route(
+        &mut self,
+        path: PathBuf,
+        route: PreviewRoute,
+        detection: Option<PreviewDetection>,
+        autoplay_audio: bool,
+        generation: u64,
+        cx: &mut Context<Self>,
+    ) {
         match route {
             PreviewRoute::Audio => {
                 self.preview_state = PreviewState::Loading { path: path.clone() };
                 let task = self.services.audio.load(path.clone());
+                let fallback = detection.clone();
                 self.preview_task = Some(cx.spawn(async move |this, cx| {
                     let result = task.await;
                     let _ = this.update(cx, |view, cx| {
@@ -6353,7 +9593,14 @@ impl DirectoryWindow {
                                 view.start_audio_status_poll(generation, cx);
                             }
                             Err(error) => {
-                                view.preview_state = PreviewState::Failed { path, error };
+                                view.preview_state = PreviewState::Ready {
+                                    path,
+                                    content: PreviewContent::Fallback {
+                                        detection: fallback
+                                            .unwrap_or_else(unknown_preview_detection),
+                                        error: Some(error),
+                                    },
+                                };
                             }
                         }
                         cx.notify();
@@ -6363,6 +9610,7 @@ impl DirectoryWindow {
             PreviewRoute::Video => {
                 self.preview_state = PreviewState::Loading { path: path.clone() };
                 let task = self.services.video.load(path.clone());
+                let fallback = detection.clone();
                 self.preview_task = Some(cx.spawn(async move |this, cx| {
                     let result = task.await;
                     let _ = this.update(cx, |view, cx| {
@@ -6380,7 +9628,14 @@ impl DirectoryWindow {
                                 view.start_video_status_poll(generation, cx);
                             }
                             Err(error) => {
-                                view.preview_state = PreviewState::Failed { path, error };
+                                view.preview_state = PreviewState::Ready {
+                                    path,
+                                    content: PreviewContent::Fallback {
+                                        detection: fallback
+                                            .unwrap_or_else(unknown_preview_detection),
+                                        error: Some(error),
+                                    },
+                                };
                             }
                         }
                         cx.notify();
@@ -6414,7 +9669,10 @@ impl DirectoryWindow {
             PreviewRoute::External => {
                 self.preview_state = PreviewState::Ready {
                     path,
-                    content: PreviewContent::External,
+                    content: PreviewContent::Fallback {
+                        detection: detection.unwrap_or_else(unknown_preview_detection),
+                        error: None,
+                    },
                 };
                 self.preview_task = None;
             }
@@ -6424,6 +9682,7 @@ impl DirectoryWindow {
                     .services
                     .previews
                     .read_text(path.clone(), preview_panel::text_preview_bytes());
+                let fallback = detection.clone();
                 self.preview_task = Some(cx.spawn(async move |this, cx| {
                     let result = task.await;
                     let _ = this.update(cx, |view, cx| {
@@ -6435,7 +9694,13 @@ impl DirectoryWindow {
                                 path,
                                 content: PreviewContent::Text(preview),
                             },
-                            Err(error) => PreviewState::Failed { path, error },
+                            Err(error) => PreviewState::Ready {
+                                path,
+                                content: PreviewContent::Fallback {
+                                    detection: fallback.unwrap_or_else(unknown_preview_detection),
+                                    error: Some(error),
+                                },
+                            },
                         };
                         cx.notify();
                     });
@@ -6445,6 +9710,7 @@ impl DirectoryWindow {
                 self.preview_state = PreviewState::Loading { path: path.clone() };
                 let task = self.services.previews.artifact(path.clone());
                 let previews = self.services.previews.clone();
+                let fallback = detection.clone();
                 self.preview_task = Some(cx.spawn(async move |this, cx| {
                     let result = match task.await {
                         Ok(artifact) if artifact.kind == "image" => {
@@ -6466,7 +9732,13 @@ impl DirectoryWindow {
                         }
                         view.preview_state = match result {
                             Ok(content) => PreviewState::Ready { path, content },
-                            Err(error) => PreviewState::Failed { path, error },
+                            Err(error) => PreviewState::Ready {
+                                path,
+                                content: PreviewContent::Fallback {
+                                    detection: fallback.unwrap_or_else(unknown_preview_detection),
+                                    error: Some(error),
+                                },
+                            },
                         };
                         cx.notify();
                     });
@@ -6474,6 +9746,25 @@ impl DirectoryWindow {
             }
         }
         cx.notify();
+    }
+
+    fn prefetch_adjacent_previews(&mut self, path: &Path, cx: &mut Context<Self>) {
+        self.preview_prefetch_tasks.clear();
+        let (_, _, previous, next) = self.preview_navigation(path);
+        for adjacent in [previous, next].into_iter().flatten() {
+            let extension = adjacent
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if extension == "pdf" {
+                let task = self.services.previews.pdf_page(adjacent, 0);
+                self.preview_prefetch_tasks
+                    .push(cx.spawn(async move |_, _| {
+                        let _ = task.await;
+                    }));
+            }
+        }
     }
 
     fn retry_preview(&mut self, cx: &mut Context<Self>) {
@@ -6509,9 +9800,15 @@ impl DirectoryWindow {
                         path: original_path,
                         content: PreviewContent::Pdf { page, tool },
                     },
-                    Err(error) => PreviewState::Failed {
+                    Err(error) => PreviewState::Ready {
                         path: original_path,
-                        error,
+                        content: PreviewContent::Fallback {
+                            detection: view
+                                .preview_detection
+                                .clone()
+                                .unwrap_or_else(unknown_preview_detection),
+                            error: Some(error),
+                        },
                     },
                 };
                 cx.notify();
@@ -6748,45 +10045,20 @@ impl DirectoryWindow {
         cx.notify();
     }
 
-    fn handle_finder_tag_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
-        match event.keystroke.key.as_str() {
-            "escape" => self.cancel_add_finder_tag(cx),
-            "enter" => self.submit_finder_tag(cx),
-            "left" => self.cycle_finder_tag_color(-1, cx),
-            "right" => self.cycle_finder_tag_color(1, cx),
-            "backspace" => {
-                if let Some(editor) = self.finder_tags_state.editor.as_mut() {
-                    editor.input.pop();
-                    editor.error = None;
-                    cx.notify();
-                }
-            }
-            _ if !event.keystroke.modifiers.control
-                && !event.keystroke.modifiers.alt
-                && !event.keystroke.modifiers.platform =>
-            {
-                if let Some(text) = event.keystroke.key_char.as_deref()
-                    && !text.chars().any(char::is_control)
-                    && let Some(editor) = self.finder_tags_state.editor.as_mut()
-                    && editor.input.chars().count() + text.chars().count() <= 80
-                {
-                    editor.input.push_str(text);
-                    editor.error = None;
-                    cx.notify();
-                }
-            }
-            _ => {}
-        }
-        cx.stop_propagation();
-    }
-
     fn close_preview(&mut self, cx: &mut Context<Self>) {
+        self.services.previews.cancel_artifact();
+        if self.native_text_input_target == Some(TextInputTarget::PreviewFind) {
+            self.deactivate_native_text_input();
+        }
+        self.text_preview.reset();
         self.quick_look_open = false;
         self.quick_look_info_open = false;
         self.audio_autoplay_after_load = false;
         self.stop_media_preview();
         self.preview_generation = self.preview_generation.wrapping_add(1);
         self.preview_task = None;
+        self.preview_prefetch_tasks.clear();
+        self.preview_detection = None;
         self.preview_state = PreviewState::Closed;
         self.preview_tab = PreviewTab::Preview;
         self.custom_fields_editor = None;
@@ -6836,13 +10108,16 @@ impl DirectoryWindow {
         {
             return;
         }
-        let entries = self.browser.selected_entries();
+        let entries = self.effective_selected_entries();
         if entries.len() == 1 && !entries[0].is_dir {
             self.start_preview(entries[0].path.clone(), cx);
         } else {
+            self.services.previews.cancel_artifact();
             self.stop_media_preview();
             self.preview_generation = self.preview_generation.wrapping_add(1);
             self.preview_task = None;
+            self.preview_prefetch_tasks.clear();
+            self.preview_detection = None;
             self.preview_state = PreviewState::Closed;
             self.preview_tab = PreviewTab::Preview;
             self.custom_fields_editor = None;
@@ -6857,6 +10132,11 @@ impl DirectoryWindow {
     }
 
     fn clear_preview_cache(&mut self, cx: &mut Context<Self>) {
+        if self.preview_cache_task.is_some() {
+            self.status_message = Some("Preview cache is already being cleared".to_string());
+            cx.notify();
+            return;
+        }
         let clear_generation = self.preview_generation;
         let cleared_path = preview_panel::cache_backed_preview_path(
             &self.preview_state,
@@ -6865,9 +10145,10 @@ impl DirectoryWindow {
         .map(Path::to_path_buf);
         let task = self.services.previews.clear_cache();
         self.status_message = Some("Clearing preview cache…".to_string());
-        self.preview_task = Some(cx.spawn(async move |this, cx| {
+        self.preview_cache_task = Some(cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |view, cx| {
+                view.preview_cache_task = None;
                 match result {
                     Ok(()) => {
                         view.entry_icons.clear();
@@ -6917,6 +10198,226 @@ impl DirectoryWindow {
                     Err(error) => {
                         view.status_message =
                             Some(format!("Unable to inspect preview helpers: {error}"));
+                    }
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    pub fn start_system_integration_status(&mut self, cx: &mut Context<Self>) {
+        if self.system_integration_pending {
+            return;
+        }
+        self.system_integration_pending = true;
+        self.system_integration_error = None;
+        let task = self.services.integration.status();
+        self.system_integration_task = Some(cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |view, cx| {
+                view.system_integration_pending = false;
+                match result {
+                    Ok(status) => view.system_integration_status = Some(status),
+                    Err(error) => {
+                        view.system_integration_error = Some(error.to_string());
+                    }
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    fn toggle_system_integration(&mut self, cx: &mut Context<Self>) {
+        if self.system_integration_pending {
+            return;
+        }
+        let Some(status) = self.system_integration_status.as_ref() else {
+            self.start_system_integration_status(cx);
+            return;
+        };
+        if !status.supported {
+            self.show_toast(
+                "Automatic folder opening is available on Windows and macOS",
+                ToastKind::Warning,
+                cx,
+            );
+            return;
+        }
+
+        let enabled = !status.enabled;
+        self.system_integration_pending = true;
+        self.system_integration_error = None;
+        let task = self.services.integration.set_status(enabled);
+        self.system_integration_task = Some(cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |view, cx| {
+                view.system_integration_pending = false;
+                match result {
+                    Ok(status) => {
+                        view.system_integration_status = Some(status);
+                        view.show_toast(
+                            if enabled {
+                                "Folders now open in Explorie"
+                            } else if cfg!(target_os = "macos") {
+                                "Restored the previous macOS folder handler"
+                            } else {
+                                "Restored the previous Windows folder handler"
+                            },
+                            ToastKind::Success,
+                            cx,
+                        );
+                    }
+                    Err(error) => {
+                        view.system_integration_error = Some(error.to_string());
+                        view.record_error("System integration failed", error.to_string());
+                        view.show_toast(
+                            format!("Unable to update folder handling: {error}"),
+                            ToastKind::Warning,
+                            cx,
+                        );
+                    }
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    pub fn start_update_check(&mut self, manual: bool, cx: &mut Context<Self>) {
+        if matches!(
+            self.update_status,
+            UpdateStatus::Checking | UpdateStatus::Downloading(_) | UpdateStatus::Installing
+        ) {
+            return;
+        }
+        self.update_status = UpdateStatus::Checking;
+        let task = self.services.updater.check();
+        self.update_task = Some(cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |view, cx| {
+                view.update_task = None;
+                match result {
+                    Ok(Some(update)) => {
+                        view.update_status = UpdateStatus::Available(update.clone());
+                        if !view.overlay_is_active() {
+                            view.begin_overlay_focus();
+                            view.request_settings_confirmation(
+                                SettingsConfirmation::InstallUpdate(update),
+                                cx,
+                            );
+                        } else {
+                            view.show_toast(
+                                "A new Explorie update is available",
+                                ToastKind::Success,
+                                cx,
+                            );
+                        }
+                    }
+                    Ok(None) => {
+                        view.update_status = UpdateStatus::UpToDate;
+                        if manual {
+                            view.show_toast("Explorie is up to date", ToastKind::Success, cx);
+                        }
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        view.update_status = UpdateStatus::Failed(message.clone());
+                        view.record_error("Update check failed", &message);
+                        if manual {
+                            view.show_toast(
+                                format!("Unable to check for updates: {message}"),
+                                ToastKind::Warning,
+                                cx,
+                            );
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    fn start_update_download(&mut self, update: UpdateInfo, cx: &mut Context<Self>) {
+        if matches!(
+            self.update_status,
+            UpdateStatus::Downloading(_) | UpdateStatus::Installing
+        ) {
+            return;
+        }
+        self.update_status = UpdateStatus::Downloading(update.clone());
+        self.status_message = Some(format!("Downloading Explorie {}…", update.version));
+        let task = self.services.updater.download(update.clone());
+        self.update_task = Some(cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |view, cx| {
+                view.update_task = None;
+                match result {
+                    Ok(downloaded) => view.start_prepared_update(downloaded, cx),
+                    Err(error) => {
+                        let message = error.to_string();
+                        view.update_status = UpdateStatus::Failed(message.clone());
+                        view.record_error("Update download failed", &message);
+                        view.show_toast(
+                            format!("Unable to prepare the update: {message}"),
+                            ToastKind::Warning,
+                            cx,
+                        );
+                    }
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    fn start_prepared_update(&mut self, update: DownloadedUpdate, cx: &mut Context<Self>) {
+        if self.services.mutations.active_count() > 0
+            || self.operations.active_count() > 0
+            || self.mutation_in_progress
+            || self.undo_progress.is_some()
+        {
+            self.update_status = UpdateStatus::Ready(update);
+            self.show_toast(
+                "Update downloaded; finish filesystem operations before installing",
+                ToastKind::Warning,
+                cx,
+            );
+            return;
+        }
+
+        self.update_status = UpdateStatus::Installing;
+        self.status_message = Some("Preparing to restart into the Explorie update…".to_string());
+        let disconnect = self.services.remotes.disconnect_all_if_clean_task();
+        let updater = self.services.updater.clone();
+        self.update_task = Some(cx.spawn(async move |this, cx| {
+            let result = match disconnect.await {
+                Ok(true) => updater.launch(update.clone()).await,
+                Ok(false) => Err(ServiceError::new(
+                    ErrorCode::Busy,
+                    "Remote drive activity must finish before installing the update",
+                )
+                .retryable(true)),
+                Err(error) => Err(error),
+            };
+            let _ = this.update(cx, |view, cx| {
+                view.update_task = None;
+                match result {
+                    Ok(()) => {
+                        view.persist_window_placement();
+                        cx.quit();
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        view.update_status = UpdateStatus::Ready(update);
+                        view.record_error("Update launch failed", &message);
+                        view.show_toast(
+                            format!("Unable to install the update: {message}"),
+                            ToastKind::Warning,
+                            cx,
+                        );
                     }
                 }
                 cx.notify();
@@ -7041,6 +10542,17 @@ impl DirectoryWindow {
         cx.notify();
     }
 
+    fn handle_audio_seek_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        match event.keystroke.key.as_str() {
+            "left" | "down" => self.skip_audio(-5_000, cx),
+            "right" | "up" => self.skip_audio(5_000, cx),
+            "home" => self.seek_audio_fraction(0.0, cx),
+            "end" => self.seek_audio_fraction(1.0, cx),
+            _ => return,
+        }
+        cx.stop_propagation();
+    }
+
     fn skip_audio(&mut self, delta_ms: i64, cx: &mut Context<Self>) {
         let Some(status) = &self.audio_status else {
             return;
@@ -7058,6 +10570,37 @@ impl DirectoryWindow {
             return;
         };
         match self.services.audio.set_volume(status.volume + delta) {
+            Ok(status) => self.audio_status = Some(status),
+            Err(error) => self.status_message = Some(format!("Unable to set volume: {error}")),
+        }
+        cx.notify();
+    }
+
+    fn set_audio_volume(&mut self, volume: f32, cx: &mut Context<Self>) {
+        match self.services.audio.set_volume(volume.clamp(0.0, 1.0)) {
+            Ok(status) => self.audio_status = Some(status),
+            Err(error) => self.status_message = Some(format!("Unable to set volume: {error}")),
+        }
+        cx.notify();
+    }
+
+    fn handle_audio_volume_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        match event.keystroke.key.as_str() {
+            "left" | "down" => self.adjust_audio_volume(-0.1, cx),
+            "right" | "up" => self.adjust_audio_volume(0.1, cx),
+            "home" => self.set_audio_volume(0.0, cx),
+            "end" => self.set_audio_volume(1.0, cx),
+            _ => return,
+        }
+        cx.stop_propagation();
+    }
+
+    fn toggle_audio_mute(&mut self, cx: &mut Context<Self>) {
+        let Some(status) = &self.audio_status else {
+            return;
+        };
+        let volume = if status.volume <= 0.01 { 0.8 } else { 0.0 };
+        match self.services.audio.set_volume(volume) {
             Ok(status) => self.audio_status = Some(status),
             Err(error) => self.status_message = Some(format!("Unable to set volume: {error}")),
         }
@@ -7188,6 +10731,17 @@ impl DirectoryWindow {
         self.run_video_control(self.services.video.seek(target), "seek", cx);
     }
 
+    fn handle_video_seek_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        match event.keystroke.key.as_str() {
+            "left" | "down" => self.skip_video(-5_000, cx),
+            "right" | "up" => self.skip_video(5_000, cx),
+            "home" => self.seek_video_fraction(0.0, cx),
+            "end" => self.seek_video_fraction(1.0, cx),
+            _ => return,
+        }
+        cx.stop_propagation();
+    }
+
     fn skip_video(&mut self, delta_ms: i64, cx: &mut Context<Self>) {
         let Some(status) = &self.video_status else {
             return;
@@ -7205,6 +10759,75 @@ impl DirectoryWindow {
             Err(error) => self.status_message = Some(format!("Unable to set volume: {error}")),
         }
         cx.notify();
+    }
+
+    fn set_video_volume(&mut self, volume: f32, cx: &mut Context<Self>) {
+        match self.services.video.set_volume(volume.clamp(0.0, 1.0)) {
+            Ok(status) => self.video_status = Some(status),
+            Err(error) => self.status_message = Some(format!("Unable to set volume: {error}")),
+        }
+        cx.notify();
+    }
+
+    fn handle_video_volume_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        match event.keystroke.key.as_str() {
+            "left" | "down" => self.adjust_video_volume(-0.1, cx),
+            "right" | "up" => self.adjust_video_volume(0.1, cx),
+            "home" => self.set_video_volume(0.0, cx),
+            "end" => self.set_video_volume(1.0, cx),
+            _ => return,
+        }
+        cx.stop_propagation();
+    }
+
+    fn toggle_video_mute(&mut self, cx: &mut Context<Self>) {
+        let Some(status) = &self.video_status else {
+            return;
+        };
+        let volume = if status.volume <= 0.01 { 0.8 } else { 0.0 };
+        match self.services.video.set_volume(volume) {
+            Ok(status) => self.video_status = Some(status),
+            Err(error) => self.status_message = Some(format!("Unable to set volume: {error}")),
+        }
+        cx.notify();
+    }
+
+    fn update_media_slider_value(
+        &mut self,
+        kind: MediaSliderKind,
+        bounds: Bounds<Pixels>,
+        position_x: Pixels,
+        cx: &mut Context<Self>,
+    ) {
+        let fraction = slider_fraction(bounds, position_x);
+        match kind {
+            MediaSliderKind::AudioSeek => self.seek_audio_fraction(fraction, cx),
+            MediaSliderKind::AudioVolume => self.set_audio_volume(fraction, cx),
+            MediaSliderKind::VideoSeek => self.seek_video_fraction(fraction, cx),
+            MediaSliderKind::VideoVolume => self.set_video_volume(fraction, cx),
+        }
+    }
+
+    fn start_media_slider_drag(
+        &mut self,
+        kind: MediaSliderKind,
+        bounds: Bounds<Pixels>,
+        position_x: Pixels,
+        cx: &mut Context<Self>,
+    ) {
+        self.media_slider_drag = Some(MediaSliderDrag { kind, bounds });
+        self.update_media_slider_value(kind, bounds, position_x, cx);
+    }
+
+    fn update_media_slider_drag(&mut self, event: &gpui::MouseMoveEvent, cx: &mut Context<Self>) {
+        let Some(drag) = self.media_slider_drag else {
+            return;
+        };
+        self.update_media_slider_value(drag.kind, drag.bounds, event.position.x, cx);
+    }
+
+    fn finish_media_slider_drag(&mut self) {
+        self.media_slider_drag = None;
     }
 
     fn begin_add_custom_field(&mut self, cx: &mut Context<Self>) {
@@ -7235,6 +10858,18 @@ impl DirectoryWindow {
     fn toggle_custom_field_input(&mut self, cx: &mut Context<Self>) {
         if let Some(editor) = &mut self.custom_fields_editor {
             editor.toggle_input();
+            let value = editor.active_value().to_string();
+            self.sync_native_text_input(value, cx);
+            cx.notify();
+        }
+    }
+
+    fn select_custom_field_input(&mut self, input: CustomFieldInput, cx: &mut Context<Self>) {
+        if let Some(editor) = &mut self.custom_fields_editor {
+            editor.set_active_input(input);
+            let value = editor.active_value().to_string();
+            self.sync_native_text_input(value, cx);
+            self.native_text_input_focus_pending = true;
             cx.notify();
         }
     }
@@ -7265,6 +10900,19 @@ impl DirectoryWindow {
         self.persist_custom_fields(
             editor.fields_without(name),
             format!("Removed custom field {name}"),
+            cx,
+        );
+    }
+
+    fn request_remove_custom_field(&mut self, name: &str, cx: &mut Context<Self>) {
+        let Some(editor) = &self.custom_fields_editor else {
+            return;
+        };
+        if editor.pending || !editor.fields.contains_key(name) {
+            return;
+        }
+        self.request_settings_confirmation(
+            SettingsConfirmation::RemoveCustomField(name.to_string()),
             cx,
         );
     }
@@ -7306,7 +10954,7 @@ impl DirectoryWindow {
             .services
             .metadata
             .update_fields(parent, file_name, fields.clone());
-        self.mutation_tasks.push(cx.spawn(async move |this, cx| {
+        self.push_mutation_task(cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |view, cx| {
                 let matches = view
@@ -7350,20 +10998,24 @@ impl DirectoryWindow {
 
     fn reveal_item(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let task = self.services.integration.reveal(path.clone());
-        self.status_message = Some(format!("Revealing {}…", path.display()));
-        self.integration_task = Some(cx.spawn(async move |this, cx| {
+        let generation = self.begin_integration_action(format!("Revealing {}…", path.display()));
+        let task = cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |view, cx| {
-                view.status_message = Some(match result {
+                let status = Some(match result {
                     Ok(()) => format!("Revealed {}", path.display()),
                     Err(error) => {
                         view.record_error("Reveal failed", error.to_string());
                         format!("Unable to reveal {}: {error}", path.display())
                     }
                 });
+                if view.integration_generation == generation {
+                    view.status_message = status;
+                }
                 cx.notify();
             });
-        }));
+        });
+        self.push_integration_task(task);
         cx.notify();
     }
 
@@ -7376,11 +11028,12 @@ impl DirectoryWindow {
 
     fn open_item_with(&mut self, path: PathBuf, app_name: String, cx: &mut Context<Self>) {
         let task = self.services.integration.open_with(path.clone(), app_name);
-        self.status_message = Some(format!("Opening {} with another app…", path.display()));
-        self.integration_task = Some(cx.spawn(async move |this, cx| {
+        let generation =
+            self.begin_integration_action(format!("Opening {} with another app…", path.display()));
+        let task = cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |view, cx| {
-                view.status_message = match result {
+                let status = match result {
                     Ok(()) => None,
                     Err(error) => {
                         view.record_error("Open With failed", error.to_string());
@@ -7390,9 +11043,13 @@ impl DirectoryWindow {
                         ))
                     }
                 };
+                if view.integration_generation == generation {
+                    view.status_message = status;
+                }
                 cx.notify();
             });
-        }));
+        });
+        self.push_integration_task(task);
         cx.notify();
     }
 
@@ -7405,20 +11062,25 @@ impl DirectoryWindow {
 
     fn quick_look_item(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let task = self.services.integration.quick_look(path.clone());
-        self.status_message = Some(format!("Opening Quick Look for {}…", path.display()));
-        self.integration_task = Some(cx.spawn(async move |this, cx| {
+        let generation =
+            self.begin_integration_action(format!("Opening Quick Look for {}…", path.display()));
+        let task = cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |view, cx| {
-                view.status_message = match result {
+                let status = match result {
                     Ok(()) => None,
                     Err(error) => {
                         view.record_error("Quick Look failed", error.to_string());
                         Some(format!("Unable to Quick Look {}: {error}", path.display()))
                     }
                 };
+                if view.integration_generation == generation {
+                    view.status_message = status;
+                }
                 cx.notify();
             });
-        }));
+        });
+        self.push_integration_task(task);
         cx.notify();
     }
 
@@ -7525,24 +11187,12 @@ impl DirectoryWindow {
             cx.notify();
             return;
         };
-        match self
-            .services
-            .mutations
-            .start_file_operation(request.clone())
-        {
-            Ok(id) => {
-                let count = request.sources.len();
-                self.operations.mark_retry_started(previous_id);
-                self.file_conflict_prompts
-                    .retain(|prompt| prompt.job_id != previous_id);
-                self.operations.track(id, request);
-                self.operation_panel_hidden = false;
-                self.operation_panel_minimized = false;
-                self.status_message = Some(format!("Retrying {count} unresolved item(s)"));
-            }
-            Err(error) => {
-                self.status_message = Some(format!("Unable to retry operation: {error}"));
-            }
+        let count = request.sources.len();
+        if self.try_start_file_operation(request, cx).is_some() {
+            self.operations.mark_retry_started(previous_id);
+            self.file_conflict_prompts
+                .retain(|prompt| prompt.job_id != previous_id);
+            self.status_message = Some(format!("Retrying {count} unresolved item(s)"));
         }
         cx.notify();
     }
@@ -7643,12 +11293,47 @@ impl DirectoryWindow {
 
     fn clear_completed_operations(&mut self, cx: &mut Context<Self>) {
         self.operations.clear_completed();
+        if let Some(lifetime) = self.window_lifetime.as_ref() {
+            lifetime
+                .runtime
+                .clear_owner_finished_operations(&lifetime.id);
+        }
         cx.notify();
     }
 
     fn remove_finished_operation(&mut self, id: &str, cx: &mut Context<Self>) {
         self.operations.remove_finished(id);
+        if let Some(lifetime) = self.window_lifetime.as_ref() {
+            lifetime
+                .runtime
+                .remove_owner_finished_operation(&lifetime.id, id);
+        }
         cx.notify();
+    }
+
+    fn foreign_operation_summaries(&self) -> Vec<SharedOperationSummary> {
+        let Some(lifetime) = self.window_lifetime.as_ref() else {
+            return Vec::new();
+        };
+        lifetime
+            .runtime
+            .operation_summaries()
+            .into_iter()
+            .filter(|operation| operation.owner_window_id != lifetime.id)
+            .collect()
+    }
+
+    fn process_active_operation_count(&self) -> usize {
+        self.operations.active_count()
+            + usize::from(
+                self.archive_creation_id.is_some() || self.archive_extraction_id.is_some(),
+            )
+            + usize::from(self.undo_progress.is_some())
+            + self
+                .foreign_operation_summaries()
+                .iter()
+                .filter(|operation| operation.status == OperationStatus::Running)
+                .count()
     }
 
     fn toggle_operation_panel_minimized(&mut self, cx: &mut Context<Self>) {
@@ -7656,10 +11341,23 @@ impl DirectoryWindow {
         cx.notify();
     }
 
+    fn open_operation_panel(&mut self, cx: &mut Context<Self>) {
+        self.operation_panel_hidden = false;
+        self.operation_panel_minimized = false;
+        cx.notify();
+    }
+
     fn close_operation_panel(&mut self, cx: &mut Context<Self>) {
+        let foreign_active = self
+            .foreign_operation_summaries()
+            .iter()
+            .any(|operation| operation.status == OperationStatus::Running);
         if self.operations.active_count() == 0
+            && !foreign_active
             && self.undo_progress.is_none()
             && self.archive_progress.is_none()
+            && self.archive_creation_id.is_none()
+            && self.archive_extraction_id.is_none()
         {
             self.operation_panel_hidden = true;
         }
@@ -7734,10 +11432,17 @@ impl DirectoryWindow {
             cx.notify();
             return;
         };
+        if let Err(error) = record.validate_expected_paths() {
+            self.undo_ledger.finish_undo(record, false);
+            self.status_message = Some(format!("Undo blocked: {error}"));
+            cx.notify();
+            return;
+        }
         let description = record.description().to_string();
         let total_items = undo_action_item_count(&record.action);
         let cancellation = Arc::new(AtomicBool::new(false));
         let services = self.services.clone();
+        let recovery_store = self.operation_recovery_store.clone();
         self.undo_progress = Some(UndoProgressState {
             description: description.clone(),
             completed_items: 0,
@@ -7749,10 +11454,11 @@ impl DirectoryWindow {
             cancelling: false,
         });
         self.status_message = Some(format!("Undoing {description}…"));
-        self.mutation_tasks.push(cx.spawn(async move |this, cx| {
+        self.push_mutation_task(cx.spawn(async move |this, cx| {
             let result = undo_action_with_progress(
                 record.action.clone(),
                 services,
+                recovery_store,
                 cancellation,
                 |update| {
                     let _ = this.update(cx, |view, cx| view.apply_undo_progress_update(update, cx));
@@ -7764,6 +11470,7 @@ impl DirectoryWindow {
                 match result {
                     Ok(action) => {
                         record.action = action;
+                        record.capture_redo_paths();
                         view.undo_ledger.finish_undo(record, true);
                         view.refresh(cx);
                         view.status_message = Some(format!("Undid {description}"));
@@ -7806,15 +11513,23 @@ impl DirectoryWindow {
             cx.notify();
             return;
         };
+        if let Err(error) = record.validate_expected_paths() {
+            self.undo_ledger.finish_redo(record, false);
+            self.status_message = Some(format!("Redo blocked: {error}"));
+            cx.notify();
+            return;
+        }
         let description = record.description().to_string();
         let services = self.services.clone();
+        let recovery_store = self.operation_recovery_store.clone();
         self.status_message = Some(format!("Redoing {description}…"));
-        self.mutation_tasks.push(cx.spawn(async move |this, cx| {
-            let result = redo_action(record.action.clone(), services).await;
+        self.push_mutation_task(cx.spawn(async move |this, cx| {
+            let result = redo_action(record.action.clone(), services, recovery_store).await;
             let _ = this.update(cx, |view, cx| {
                 match result {
                     Ok(action) => {
                         record.action = action;
+                        record.capture_undo_paths();
                         view.undo_ledger.finish_redo(record, true);
                         view.refresh(cx);
                         view.status_message = Some(format!("Redid {description}"));
@@ -7859,7 +11574,7 @@ impl DirectoryWindow {
     }
 
     fn prompt_rename_selected(&mut self, cx: &mut Context<Self>) {
-        let paths = self.browser.selected_paths();
+        let paths = self.effective_selected_paths();
         if paths.len() > 1 {
             self.open_batch_rename(cx);
             return;
@@ -7887,7 +11602,7 @@ impl DirectoryWindow {
     }
 
     fn open_batch_rename(&mut self, cx: &mut Context<Self>) {
-        let entries = self.browser.selected_entries();
+        let entries = self.effective_selected_entries();
         self.open_batch_rename_entries(entries, cx);
     }
 
@@ -7908,8 +11623,11 @@ impl DirectoryWindow {
             );
             return;
         }
-        self.batch_rename = Some(BatchRenameEditor::new(&entries));
         self.open_control_surface(ControlSurface::BatchRename, cx);
+        if self.control_surface != ControlSurface::BatchRename {
+            return;
+        }
+        self.batch_rename = Some(BatchRenameEditor::new(&entries));
     }
 
     fn sync_batch_rename_query(&mut self) {
@@ -7923,8 +11641,9 @@ impl DirectoryWindow {
         if let Some(editor) = &mut self.batch_rename {
             editor.set_mode(mode);
             self.control_query = editor.active_value().to_string();
-            cx.notify();
         }
+        self.sync_native_text_input(self.control_query.clone(), cx);
+        cx.notify();
     }
 
     fn toggle_batch_rename_field(&mut self, cx: &mut Context<Self>) {
@@ -7934,8 +11653,9 @@ impl DirectoryWindow {
         {
             editor.toggle_field();
             self.control_query = editor.active_value().to_string();
-            cx.notify();
         }
+        self.sync_native_text_input(self.control_query.clone(), cx);
+        cx.notify();
     }
 
     fn cycle_batch_rename_position(&mut self, cx: &mut Context<Self>) {
@@ -8009,7 +11729,7 @@ impl DirectoryWindow {
         let task = self.services.mutations.batch_rename(request);
         self.mutation_in_progress = true;
         self.status_message = Some(format!("Renaming {count} items…"));
-        self.mutation_tasks.push(cx.spawn(async move |this, cx| {
+        self.push_mutation_task(cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |view, cx| {
                 view.mutation_in_progress = false;
@@ -8101,6 +11821,7 @@ impl DirectoryWindow {
                 MutationPromptKind::ExtractPassword {
                     archive_path: archive_path.clone(),
                     output_dir: self.browser.path().join(name),
+                    allow_extended_limits: false,
                 },
                 String::new(),
             ));
@@ -8127,30 +11848,50 @@ impl DirectoryWindow {
                 cx.notify();
                 return;
             }
+            let operation_id = format!(
+                "gpui-archive-{}",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            );
             let request = CompressRequest {
                 paths: sources.clone(),
                 output_path: output_path.clone(),
                 format: *format,
                 compression_level: *compression_level,
                 password: (!prompt.input.is_empty()).then(|| prompt.input.clone()),
-                operation_id: format!(
-                    "gpui-archive-{}",
-                    SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_nanos()
-                ),
+                operation_id: operation_id.clone(),
             };
+            let runtime = self.window_lifetime.as_ref().map(|lifetime| {
+                lifetime.runtime.track_background_operation(
+                    lifetime.id.clone(),
+                    operation_id.clone(),
+                    "Create archive",
+                    sources.len(),
+                    Some(output_path.clone()),
+                );
+                lifetime.runtime.clone()
+            });
             let task = self.services.archives.compress(request);
             let retry_prompt = prompt.clone();
             self.mutation_in_progress = true;
             self.archive_progress = None;
+            self.archive_creation_id = Some(operation_id.clone());
             self.status_message = Some("Creating archive…".to_string());
-            self.mutation_tasks.push(cx.spawn(async move |this, cx| {
+            self.push_mutation_task(cx.spawn(async move |this, cx| {
                 let result = task.await;
+                if let Some(runtime) = runtime.as_ref() {
+                    let (status, error) = match &result {
+                        Ok(_) => (OperationStatus::Completed, None),
+                        Err(error) => (OperationStatus::Failed, Some(error.to_string())),
+                    };
+                    runtime.finish_background_operation(&operation_id, status, error);
+                }
                 let _ = this.update(cx, |view, cx| {
                     view.mutation_in_progress = false;
                     view.archive_progress = None;
+                    view.archive_creation_id = None;
                     match result {
                         Ok(result) => {
                             view.refresh(cx);
@@ -8178,22 +11919,48 @@ impl DirectoryWindow {
         if let MutationPromptKind::ExtractPassword {
             archive_path,
             output_dir,
+            allow_extended_limits,
         } = &prompt.kind
         {
+            let operation_id = uuid::Uuid::new_v4().to_string();
+            let runtime = self.window_lifetime.as_ref().map(|lifetime| {
+                lifetime.runtime.track_background_operation(
+                    lifetime.id.clone(),
+                    operation_id.clone(),
+                    "Extract archive",
+                    1,
+                    Some(output_dir.clone()),
+                );
+                lifetime.runtime.clone()
+            });
             let task = self.services.archives.extract(ExtractRequest {
                 archive_path: archive_path.clone(),
                 output_dir: output_dir.clone(),
                 password: (!prompt.input.is_empty()).then(|| prompt.input.clone()),
+                allow_extended_limits: *allow_extended_limits,
+                operation_id: operation_id.clone(),
             });
             let retry_prompt = prompt.clone();
             self.mutation_in_progress = true;
             self.archive_progress = None;
+            self.archive_extraction_id = Some(operation_id.clone());
             self.status_message = Some("Extracting archive…".to_string());
-            self.mutation_tasks.push(cx.spawn(async move |this, cx| {
+            self.push_mutation_task(cx.spawn(async move |this, cx| {
                 let result = task.await;
+                if let Some(runtime) = runtime.as_ref() {
+                    let (status, error) = match &result {
+                        Ok(_) => (OperationStatus::Completed, None),
+                        Err(error) if error.code == ErrorCode::Cancelled => {
+                            (OperationStatus::Cancelled, None)
+                        }
+                        Err(error) => (OperationStatus::Failed, Some(error.to_string())),
+                    };
+                    runtime.finish_background_operation(&operation_id, status, error);
+                }
                 let _ = this.update(cx, |view, cx| {
                     view.mutation_in_progress = false;
                     view.archive_progress = None;
+                    view.archive_extraction_id = None;
                     match result {
                         Ok(result) => {
                             view.refresh(cx);
@@ -8204,10 +11971,30 @@ impl DirectoryWindow {
                             ));
                         }
                         Err(error) => {
+                            if error.code == ErrorCode::Cancelled {
+                                view.status_message =
+                                    Some("Archive extraction cancelled".to_string());
+                                cx.notify();
+                                return;
+                            }
                             view.record_error("Archive extraction failed", error.to_string());
-                            let message = format!("Archive extraction failed: {error}");
+                            let message = if error.retryable {
+                                format!(
+                                    "{error}. Press Enter again to approve extended extraction limits"
+                                )
+                            } else {
+                                format!("Archive extraction failed: {error}")
+                            };
                             view.status_message = Some(message.clone());
                             let mut retry_prompt = retry_prompt;
+                            if error.retryable
+                                && let MutationPromptKind::ExtractPassword {
+                                    allow_extended_limits,
+                                    ..
+                                } = &mut retry_prompt.kind
+                            {
+                                *allow_extended_limits = true;
+                            }
                             retry_prompt.error = Some(message);
                             view.mutation_prompt = Some(retry_prompt);
                         }
@@ -8232,7 +12019,7 @@ impl DirectoryWindow {
             let services = self.services.clone();
             self.mutation_in_progress = true;
             self.status_message = Some(format!("Permanently deleting {count} item(s)…"));
-            self.mutation_tasks.push(cx.spawn(async move |this, cx| {
+            self.push_mutation_task(cx.spawn(async move |this, cx| {
                 let result = permanently_delete_items(services, items).await;
                 let _ = this.update(cx, |view, cx| {
                     view.mutation_in_progress = false;
@@ -8312,7 +12099,7 @@ impl DirectoryWindow {
         };
         self.mutation_in_progress = true;
         self.status_message = Some("Applying native filesystem change…".to_string());
-        self.mutation_tasks.push(cx.spawn(async move |this, cx| {
+        self.push_mutation_task(cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |view, cx| {
                 view.mutation_in_progress = false;
@@ -8369,6 +12156,13 @@ impl DirectoryWindow {
             });
         }));
         cx.notify();
+    }
+
+    fn cancel_mutation_prompt(&mut self, cx: &mut Context<Self>) {
+        if self.mutation_prompt.take().is_some() {
+            self.deactivate_native_text_input();
+            cx.notify();
+        }
     }
 
     fn select_next(&mut self, cx: &mut Context<Self>) {
@@ -8433,7 +12227,7 @@ impl DirectoryWindow {
     ) {
         if let Some(index) = selected {
             self.reveal_selected(index);
-            self.column_selection = self.browser.selected_path().map(PathBuf::from);
+            self.sync_column_selection_from_browser();
             if extend
                 || !matches!(self.preview_state, PreviewState::Closed)
                 || self.settings.view.show_preview_panel
@@ -8514,11 +12308,25 @@ impl DirectoryWindow {
         position: gpui::Point<gpui::Pixels>,
         cx: &mut Context<Self>,
     ) {
-        if !self.browser.is_selected(&path) {
-            self.browser.select(path.clone());
+        if !self.is_effectively_selected(&path) {
+            if self.browser.view_mode() == ViewMode::Column {
+                self.set_column_selection(path.clone());
+                if self
+                    .browser
+                    .visible_entries()
+                    .iter()
+                    .any(|entry| entry.path == path)
+                {
+                    self.browser.select(path.clone());
+                } else {
+                    self.browser.clear_selection();
+                }
+            } else {
+                self.browser.select(path.clone());
+            }
             self.sync_pinned_preview(cx);
         }
-        let entries = self.browser.selected_entries();
+        let entries = self.effective_selected_entries();
         if entries.is_empty() {
             return;
         }
@@ -8539,7 +12347,9 @@ impl DirectoryWindow {
         let path = first.path.clone();
         self.context_menu_generation = self.context_menu_generation.wrapping_add(1);
         let generation = self.context_menu_generation;
+        self.begin_overlay_focus();
         self.context_menu = Some(FileContextMenu {
+            focus_handle: cx.focus_handle(),
             position,
             paths: paths.clone(),
             entries,
@@ -8548,6 +12358,7 @@ impl DirectoryWindow {
             open_with_apps: Vec::new(),
             open_with_expanded: false,
         });
+        self.overlay_focus_pending = true;
         self.context_menu_task = None;
 
         if cfg!(target_os = "macos") && paths.len() == 1 && !is_dir {
@@ -8585,7 +12396,9 @@ impl DirectoryWindow {
         self.browser.clear_selection();
         self.context_menu_generation = self.context_menu_generation.wrapping_add(1);
         self.context_menu_task = None;
+        self.begin_overlay_focus();
         self.context_menu = Some(FileContextMenu {
+            focus_handle: cx.focus_handle(),
             position,
             paths: Vec::new(),
             entries: Vec::new(),
@@ -8594,6 +12407,7 @@ impl DirectoryWindow {
             open_with_apps: Vec::new(),
             open_with_expanded: false,
         });
+        self.overlay_focus_pending = true;
         cx.notify();
     }
 
@@ -8601,6 +12415,7 @@ impl DirectoryWindow {
         if self.context_menu.take().is_some() {
             self.context_menu_generation = self.context_menu_generation.wrapping_add(1);
             self.context_menu_task = None;
+            self.finish_overlay_focus_if_inactive();
             cx.notify();
         }
     }
@@ -8670,7 +12485,7 @@ impl DirectoryWindow {
             }
             ContextMenuAction::ToggleFavorite => {
                 if let Some(path) = target {
-                    self.browser.toggle_favorite(path);
+                    self.mutate_shared_session(|session| session.toggle_favorite(path));
                     self.persist_session();
                     cx.notify();
                 }
@@ -8695,9 +12510,32 @@ impl DirectoryWindow {
 
     fn handle_context_menu_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let actions = self.context_menu_actions();
+        let mut handled = true;
         match event.keystroke.key.as_str() {
             "escape" => self.close_context_menu(cx),
+            "home" => {
+                if let Some(menu) = self.context_menu.as_mut() {
+                    menu.focused = 0;
+                    cx.notify();
+                }
+            }
+            "end" => {
+                if let Some(menu) = self.context_menu.as_mut() {
+                    menu.focused = actions.len().saturating_sub(1);
+                    cx.notify();
+                }
+            }
             "up" => {
+                let Some(menu) = self.context_menu.as_mut() else {
+                    return;
+                };
+                menu.focused = menu
+                    .focused
+                    .checked_sub(1)
+                    .unwrap_or(actions.len().saturating_sub(1));
+                cx.notify();
+            }
+            "tab" if event.keystroke.modifiers.shift => {
                 let Some(menu) = self.context_menu.as_mut() else {
                     return;
                 };
@@ -8714,6 +12552,25 @@ impl DirectoryWindow {
                 menu.focused = (menu.focused + 1) % actions.len().max(1);
                 cx.notify();
             }
+            "right" => {
+                let Some(menu) = self.context_menu.as_ref() else {
+                    return;
+                };
+                if !menu.open_with_expanded
+                    && actions.get(menu.focused).map(|(action, _)| action)
+                        == Some(&ContextMenuAction::ToggleOpenWith)
+                {
+                    self.execute_context_menu_action(ContextMenuAction::ToggleOpenWith, cx);
+                }
+            }
+            "left" => {
+                let Some(menu) = self.context_menu.as_ref() else {
+                    return;
+                };
+                if menu.open_with_expanded {
+                    self.execute_context_menu_action(ContextMenuAction::ToggleOpenWith, cx);
+                }
+            }
             "enter" => {
                 let focused = self
                     .context_menu
@@ -8724,9 +12581,95 @@ impl DirectoryWindow {
                     self.execute_context_menu_action(action, cx);
                 }
             }
-            _ => {}
+            key if key.chars().count() == 1
+                && !event.keystroke.modifiers.control
+                && !event.keystroke.modifiers.alt
+                && !event.keystroke.modifiers.platform =>
+            {
+                let Some(menu) = self.context_menu.as_ref() else {
+                    return;
+                };
+                let start = (menu.focused + 1) % actions.len().max(1);
+                let expanded = menu.open_with_expanded;
+                let count = menu.paths.len().max(1);
+                let favorite = menu
+                    .paths
+                    .first()
+                    .is_some_and(|path| self.browser.is_favorite(path));
+                let needle = key.to_lowercase();
+                if let Some(index) = (0..actions.len())
+                    .map(|offset| (start + offset) % actions.len())
+                    .find(|index| {
+                        actions[*index]
+                            .0
+                            .label(count, favorite, expanded)
+                            .to_lowercase()
+                            .starts_with(&needle)
+                    })
+                    && let Some(menu) = self.context_menu.as_mut()
+                {
+                    menu.focused = index;
+                    cx.notify();
+                }
+            }
+            _ => handled = false,
         }
-        cx.stop_propagation();
+        if handled {
+            cx.stop_propagation();
+        }
+    }
+
+    fn set_column_selection(&mut self, path: PathBuf) {
+        self.column_selection.clear();
+        self.column_selection.insert(path);
+    }
+
+    fn sync_column_selection_from_browser(&mut self) {
+        self.column_selection = self.browser.selected_paths().into_iter().collect();
+    }
+
+    fn effective_selected_entries(&self) -> Vec<FileEntry> {
+        if self.browser.view_mode() != ViewMode::Column || self.column_selection.is_empty() {
+            return self.browser.selected_entries();
+        }
+        self.columns
+            .columns()
+            .iter()
+            .flat_map(|column| column.visible_entries(&self.browser))
+            .filter(|entry| self.column_selection.contains(&entry.path))
+            .collect()
+    }
+
+    fn effective_selected_paths(&self) -> Vec<PathBuf> {
+        self.effective_selected_entries()
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect()
+    }
+
+    fn effective_selected_entry(&self) -> Option<FileEntry> {
+        if self.browser.view_mode() != ViewMode::Column || self.column_selection.is_empty() {
+            return self.browser.selected_entry().cloned();
+        }
+        let mut entries = self.effective_selected_entries().into_iter();
+        let entry = entries.next()?;
+        entries.next().is_none().then_some(entry)
+    }
+
+    fn effective_selection_count(&self) -> usize {
+        if self.browser.view_mode() == ViewMode::Column && !self.column_selection.is_empty() {
+            self.column_selection.len()
+        } else {
+            self.browser.selection_count()
+        }
+    }
+
+    fn is_effectively_selected(&self, path: &Path) -> bool {
+        if self.browser.view_mode() == ViewMode::Column && !self.column_selection.is_empty() {
+            self.column_selection.contains(path)
+        } else {
+            self.browser.is_selected(path)
+        }
     }
 
     fn select_from_pointer(
@@ -8746,8 +12689,19 @@ impl DirectoryWindow {
         self.sync_pinned_preview(cx);
     }
 
-    fn grid_viewport(&self) -> Option<(GridRect, f32)> {
-        let scroll_handle = self.scroll_handle.0.borrow().base_handle.clone();
+    fn marquee_viewport(&self, layout: MarqueeLayout) -> Option<(GridRect, f32, ScrollHandle)> {
+        let scroll_handle = match layout {
+            MarqueeLayout::List { .. } | MarqueeLayout::Grid(_) => {
+                self.scroll_handle.0.borrow().base_handle.clone()
+            }
+            MarqueeLayout::Column { index, .. } => self
+                .column_scroll_handles
+                .get(index)?
+                .0
+                .borrow()
+                .base_handle
+                .clone(),
+        };
         let bounds = scroll_handle.bounds();
         let width = f32::from(bounds.size.width);
         let height = f32::from(bounds.size.height);
@@ -8762,7 +12716,31 @@ impl DirectoryWindow {
                 bottom: f32::from(bounds.origin.y) + height,
             },
             -f32::from(scroll_handle.offset().y),
+            scroll_handle,
         ))
+    }
+
+    fn marquee_paths(&self, layout: MarqueeLayout) -> Vec<PathBuf> {
+        match layout {
+            MarqueeLayout::List { .. } | MarqueeLayout::Grid(_) => self
+                .browser
+                .visible_entries()
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect(),
+            MarqueeLayout::Column { index, .. } => self
+                .columns
+                .columns()
+                .get(index)
+                .map(|column| {
+                    column
+                        .visible_entries(&self.browser)
+                        .into_iter()
+                        .map(|entry| entry.path)
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
     }
 
     fn auto_scroll_file_drag_handle(handle: &ScrollHandle, event: &gpui::DragMoveEvent<FileDrag>) {
@@ -8795,13 +12773,14 @@ impl DirectoryWindow {
         }
     }
 
-    fn begin_grid_marquee(
+    fn begin_selection_marquee(
         &mut self,
+        layout: MarqueeLayout,
         event: &gpui::MouseDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some((viewport, scroll_top)) = self.grid_viewport() else {
+        let Some((viewport, scroll_top, _)) = self.marquee_viewport(layout) else {
             return;
         };
         window.focus(&self.focus_handle, cx);
@@ -8814,38 +12793,37 @@ impl DirectoryWindow {
             y: window_point.y - viewport.top + scroll_top,
         };
         let additive = event.modifiers.control || event.modifiers.platform;
-        let metrics = grid_layout_metrics(
-            self.listing_viewport_width,
-            self.settings.appearance.grid_min_width,
-            self.settings.appearance.density,
-            self.settings.appearance.ui_scale,
-        );
-        self.grid_marquee = Some(GridMarquee {
+        self.selection_marquee = Some(SelectionMarquee {
             start_window: window_point,
             start_content: content_point,
             current_content: content_point,
             activated: false,
             additive,
-            metrics,
-            accumulated: if additive {
-                self.browser.selected_paths().into_iter().collect()
+            layout,
+            initial_selection: if additive {
+                self.effective_selected_paths().into_iter().collect()
             } else {
                 BTreeSet::new()
             },
+            paths: self.marquee_paths(layout),
         });
         cx.notify();
     }
 
-    fn update_grid_marquee(&mut self, event: &gpui::MouseMoveEvent, cx: &mut Context<Self>) {
-        if !event.dragging() || self.grid_marquee.is_none() {
+    fn update_selection_marquee(&mut self, event: &gpui::MouseMoveEvent, cx: &mut Context<Self>) {
+        if !event.dragging() || self.selection_marquee.is_none() {
             return;
         }
-        let Some((viewport, _)) = self.grid_viewport() else {
+        let layout = self
+            .selection_marquee
+            .as_ref()
+            .expect("checked above")
+            .layout;
+        let Some((viewport, _, scroll_handle)) = self.marquee_viewport(layout) else {
             return;
         };
         let pointer_y = f32::from(event.position.y) - viewport.top;
-        let scroll_delta = grid_marquee_scroll_delta(pointer_y, viewport.height());
-        let scroll_handle = self.scroll_handle.0.borrow().base_handle.clone();
+        let scroll_delta = selection_marquee_scroll_delta(pointer_y, viewport.height());
         if scroll_delta != 0.0 {
             let offset = scroll_handle.offset();
             let max_offset = f32::from(scroll_handle.max_offset().y);
@@ -8863,33 +12841,36 @@ impl DirectoryWindow {
             x: window_point.x - viewport.left,
             y: window_point.y - viewport.top + scroll_top,
         };
-        let metrics = grid_layout_metrics(
-            self.listing_viewport_width,
-            self.settings.appearance.grid_min_width,
-            self.settings.appearance.density,
-            self.settings.appearance.ui_scale,
-        );
-        let item_count = self.browser.visible_entries().len();
         let selection = {
-            let marquee = self.grid_marquee.as_mut().expect("checked above");
+            let marquee = self.selection_marquee.as_mut().expect("checked above");
             marquee.update(window_point, content_point);
             if !marquee.activated {
                 None
             } else {
-                let hits = grid_marquee_hit_indices(marquee.content_rect(), item_count, metrics);
-                let paths = hits.into_iter().filter_map(|index| {
-                    self.browser
-                        .visible_entries()
-                        .get(index)
-                        .map(|entry| entry.path.clone())
-                });
+                let hits = match marquee.layout {
+                    MarqueeLayout::Grid(metrics) => grid_marquee_hit_indices(
+                        marquee.content_rect(),
+                        marquee.paths.len(),
+                        metrics,
+                    ),
+                    MarqueeLayout::List { row_height }
+                    | MarqueeLayout::Column { row_height, .. } => row_marquee_hit_indices(
+                        marquee.content_rect(),
+                        marquee.paths.len(),
+                        row_height,
+                        viewport.width(),
+                    ),
+                };
+                let paths = hits
+                    .into_iter()
+                    .filter_map(|index| marquee.paths.get(index).cloned());
                 if marquee.additive {
-                    marquee.accumulated.extend(paths);
                     Some(
                         marquee
-                            .accumulated
+                            .initial_selection
                             .iter()
                             .cloned()
+                            .chain(paths)
                             .collect::<Vec<PathBuf>>(),
                     )
                 } else {
@@ -8898,33 +12879,45 @@ impl DirectoryWindow {
             }
         };
         if let Some(selection) = selection {
-            self.browser.replace_selection(selection);
+            if let MarqueeLayout::Column { index, .. } = layout {
+                self.column_selection = selection.iter().cloned().collect();
+                if index + 1 == self.columns.columns().len() {
+                    self.browser.replace_selection(selection);
+                } else {
+                    self.browser.clear_selection();
+                }
+            } else {
+                self.browser.replace_selection(selection);
+            }
         }
         cx.notify();
     }
 
-    fn finish_grid_marquee(&mut self, cx: &mut Context<Self>) {
-        let Some(marquee) = self.grid_marquee.take() else {
+    fn finish_selection_marquee(&mut self, cx: &mut Context<Self>) {
+        let Some(marquee) = self.selection_marquee.take() else {
             return;
         };
         if !marquee.activated {
             self.browser.clear_selection();
+            if matches!(marquee.layout, MarqueeLayout::Column { .. }) {
+                self.column_selection.clear();
+            }
         }
         self.sync_pinned_preview(cx);
     }
 
-    fn cancel_grid_marquee(&mut self, cx: &mut Context<Self>) {
-        if self.grid_marquee.take().is_some() {
+    fn cancel_selection_marquee(&mut self, cx: &mut Context<Self>) {
+        if self.selection_marquee.take().is_some() {
             cx.notify();
         }
     }
 
-    fn grid_marquee_overlay_rect(&self) -> Option<GridRect> {
+    fn selection_marquee_overlay_rect(&self, layout: MarqueeLayout) -> Option<GridRect> {
         let marquee = self
-            .grid_marquee
+            .selection_marquee
             .as_ref()
-            .filter(|marquee| marquee.activated)?;
-        let (viewport, scroll_top) = self.grid_viewport()?;
+            .filter(|marquee| marquee.activated && marquee.layout == layout)?;
+        let (viewport, scroll_top, _) = self.marquee_viewport(layout)?;
         let content = marquee.content_rect();
         let viewport_rect = GridRect {
             left: content.left.clamp(0.0, viewport.width()),
@@ -8933,6 +12926,21 @@ impl DirectoryWindow {
             bottom: (content.bottom - scroll_top).clamp(0.0, viewport.height()),
         };
         (viewport_rect.width() > 0.0 && viewport_rect.height() > 0.0).then_some(viewport_rect)
+    }
+
+    fn render_selection_marquee_overlay(&self, rect: GridRect) -> AnyElement {
+        div()
+            .id("selection-marquee-overlay")
+            .debug_selector(|| "selection-marquee-overlay".to_string())
+            .absolute()
+            .left(px(rect.left))
+            .top(px(rect.top))
+            .w(px(rect.width()))
+            .h(px(rect.height()))
+            .border_1()
+            .border_color(self.palette.accent)
+            .bg(with_alpha(self.palette.accent, 0.15))
+            .into_any_element()
     }
 
     fn reveal_selected(&self, entry_index: usize) {
@@ -8972,7 +12980,7 @@ impl DirectoryWindow {
         match self.browser.view_mode() {
             ViewMode::Grid => self.select_by_offset(1, false, cx),
             ViewMode::Column => {
-                if let Some(entry) = self.browser.selected_entry().cloned()
+                if let Some(entry) = self.effective_selected_entry()
                     && entry.is_dir
                 {
                     self.navigate_to(entry.path, cx);
@@ -8985,17 +12993,55 @@ impl DirectoryWindow {
     fn handle_search_key(
         &mut self,
         event: &KeyDownEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.native_text_input_target.is_some()
+            && !matches!(
+                event.keystroke.key.as_str(),
+                "enter" | "escape" | "up" | "down" | "tab"
+            )
+        {
+            return;
+        }
         if self.quick_look_open {
+            let is_audio = matches!(
+                self.preview_state,
+                PreviewState::Ready {
+                    content: PreviewContent::Audio,
+                    ..
+                }
+            );
+            let is_video = matches!(
+                self.preview_state,
+                PreviewState::Ready {
+                    content: PreviewContent::Video,
+                    ..
+                }
+            );
             match event.keystroke.key.as_str() {
                 "escape" | "space" => self.close_quick_look(cx),
                 "left" | "up" => self.navigate_preview(-1, cx),
                 "right" | "down" => self.navigate_preview(1, cx),
+                "k" if is_audio => self.toggle_audio_playback(cx),
+                "j" if is_audio => self.skip_audio(-10_000, cx),
+                "l" if is_audio => self.skip_audio(10_000, cx),
+                "m" if is_audio => self.toggle_audio_mute(cx),
+                "home" if is_audio => self.seek_audio_fraction(0.0, cx),
+                "end" if is_audio => self.seek_audio_fraction(1.0, cx),
+                "k" if is_video => self.toggle_video_playback(cx),
+                "j" if is_video => self.skip_video(-10_000, cx),
+                "l" if is_video => self.skip_video(10_000, cx),
+                "m" if is_video => self.toggle_video_mute(cx),
+                "home" if is_video => self.seek_video_fraction(0.0, cx),
+                "end" if is_video => self.seek_video_fraction(1.0, cx),
                 _ => {}
             }
             cx.stop_propagation();
+            return;
+        }
+        if self.breadcrumb_editor.is_some() {
+            self.handle_breadcrumb_editor_key(event, cx);
             return;
         }
         if self.go_to_folder.is_some() {
@@ -9012,6 +13058,28 @@ impl DirectoryWindow {
         }
         if self.appearance_value_editor.is_some() {
             self.handle_appearance_value_key(event, cx);
+            return;
+        }
+        if self.native_text_input_target == Some(TextInputTarget::FinderTag) {
+            match event.keystroke.key.as_str() {
+                "enter" => self.submit_finder_tag(cx),
+                "escape" => self.cancel_add_finder_tag(cx),
+                _ => {}
+            }
+            cx.stop_propagation();
+            return;
+        }
+        if self.native_text_input_target == Some(TextInputTarget::PreviewFind) {
+            match event.keystroke.key.as_str() {
+                "enter" => self.advance_text_preview_match(1, cx),
+                "escape" => {
+                    self.text_preview.find.clear();
+                    self.deactivate_native_text_input();
+                    cx.notify();
+                }
+                _ => {}
+            }
+            cx.stop_propagation();
             return;
         }
         if self.undo_progress.is_some() && event.keystroke.key == "escape" {
@@ -9031,9 +13099,30 @@ impl DirectoryWindow {
             cx.stop_propagation();
             return;
         }
+        if self.settings_panel_open {
+            match event.keystroke.key.as_str() {
+                "escape" => self.close_settings_panel(cx),
+                "tab" if event.keystroke.modifiers.shift => window.focus_prev(cx),
+                "tab" => window.focus_next(cx),
+                _ => {}
+            }
+            cx.stop_propagation();
+            return;
+        }
         if self.toolbar_menu != ToolbarMenu::Closed {
-            if event.keystroke.key == "escape" {
-                self.close_toolbar_menu(cx);
+            match event.keystroke.key.as_str() {
+                "escape" => self.close_toolbar_menu(cx),
+                "down" => window.focus_next(cx),
+                "up" => window.focus_prev(cx),
+                "tab" if event.keystroke.modifiers.shift => window.focus_prev(cx),
+                "tab" => window.focus_next(cx),
+                "home" => {
+                    if let Some(trigger) = self.overlay_return_focus.as_ref() {
+                        window.focus(trigger, cx);
+                        window.focus_next(cx);
+                    }
+                }
+                _ => {}
             }
             cx.stop_propagation();
             return;
@@ -9055,10 +13144,6 @@ impl DirectoryWindow {
             self.handle_custom_field_key(event, cx);
             return;
         }
-        if self.preview_tab == PreviewTab::Metadata && self.finder_tags_state.editor.is_some() {
-            self.handle_finder_tag_key(event, cx);
-            return;
-        }
         if self.context_menu.is_some() {
             self.handle_context_menu_key(event, cx);
             return;
@@ -9077,11 +13162,15 @@ impl DirectoryWindow {
             "escape" => {
                 self.browser.clear_search();
                 self.search_active = false;
+                self.deactivate_native_text_input();
+                window.focus(&self.focus_handle, cx);
                 cx.stop_propagation();
                 cx.notify();
             }
             "enter" => {
                 self.search_active = false;
+                self.deactivate_native_text_input();
+                window.focus(&self.focus_handle, cx);
                 cx.stop_propagation();
                 cx.notify();
             }
@@ -9099,6 +13188,48 @@ impl DirectoryWindow {
             }
             _ => {}
         }
+    }
+
+    fn handle_breadcrumb_editor_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        match event.keystroke.key.as_str() {
+            "escape" => self.cancel_breadcrumb_edit(cx),
+            "enter" => self.submit_breadcrumb_edit(cx),
+            "backspace" => {
+                if let Some(editor) = self.breadcrumb_editor.as_mut() {
+                    if editor.replace_on_type {
+                        editor.input.clear();
+                        editor.replace_on_type = false;
+                    } else {
+                        editor.input.pop();
+                    }
+                }
+                cx.notify();
+            }
+            "a" if event.keystroke.modifiers.control || event.keystroke.modifiers.platform => {
+                if let Some(editor) = self.breadcrumb_editor.as_mut() {
+                    editor.replace_on_type = true;
+                }
+                cx.notify();
+            }
+            _ if !event.keystroke.modifiers.control
+                && !event.keystroke.modifiers.alt
+                && !event.keystroke.modifiers.platform =>
+            {
+                if let Some(text) = event.keystroke.key_char.as_deref()
+                    && !text.chars().any(char::is_control)
+                    && let Some(editor) = self.breadcrumb_editor.as_mut()
+                {
+                    if editor.replace_on_type {
+                        editor.input.clear();
+                        editor.replace_on_type = false;
+                    }
+                    editor.input.push_str(text);
+                    cx.notify();
+                }
+            }
+            _ => {}
+        }
+        cx.stop_propagation();
     }
 
     fn handle_go_to_folder_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
@@ -9358,9 +13489,8 @@ impl DirectoryWindow {
                 cx.notify();
             }
             "escape" => {
-                self.mutation_prompt = None;
+                self.cancel_mutation_prompt(cx);
                 cx.stop_propagation();
-                cx.notify();
             }
             "enter" => {
                 self.submit_mutation_prompt(cx);
@@ -9436,7 +13566,7 @@ impl DirectoryWindow {
             .or_else(|| self.browser.select_prefix(&text.to_lowercase()));
         if let Some(index) = selected {
             self.reveal_selected(index);
-            self.column_selection = self.browser.selected_path().map(PathBuf::from);
+            self.sync_column_selection_from_browser();
             cx.stop_propagation();
             cx.notify();
         }
@@ -9676,9 +13806,9 @@ impl DirectoryWindow {
                     .into_any_element()
             })
             .collect();
+        let control_input = self.native_text_input_element(TextInputTarget::ControlQuery);
         let editor = self.remote_editor.clone().map(|editor| {
             let label = editor.field.label(platform.as_deref());
-            let query = self.control_query.clone();
             let action = if editor.field.next().is_some() {
                 "Next"
             } else {
@@ -9700,15 +13830,7 @@ impl DirectoryWindow {
                         .items_center()
                         .gap_3()
                         .child(div().w(px(140.0)).text_sm().child(label))
-                        .child(
-                            div()
-                                .flex_1()
-                                .px_3()
-                                .py_2()
-                                .bg(self.palette.surface)
-                                .text_sm()
-                                .child(format!("{query}│")),
-                        )
+                        .child(div().flex_1().children(control_input))
                         .child(
                             toolbar_button(
                                 "commit-remote-profile-field",
@@ -9846,7 +13968,8 @@ impl DirectoryWindow {
             .aria_label("Remote drives")
             .flex()
             .flex_col()
-            .w(px(780.0))
+            .w_full()
+            .max_w(px(780.0 * self.palette.scale))
             .max_h(px(580.0))
             .border_1()
             .border_color(self.palette.border)
@@ -9936,54 +14059,67 @@ impl DirectoryWindow {
         };
         let active_field = editor.field;
         let palette = self.palette;
-        let rows: Vec<AnyElement> =
-            SmartFolderField::ALL
-                .into_iter()
-                .map(|field| {
-                    let active = field == active_field;
-                    let value = editor.value(field);
-                    let display = if active {
-                        format!("{value}│")
-                    } else if value.is_empty() {
-                        "—".to_string()
+        let rows: Vec<AnyElement> = SmartFolderField::ALL
+            .into_iter()
+            .map(|field| {
+                let active = field == active_field;
+                let value = editor.value(field);
+                let display = if value.is_empty() {
+                    "—".to_string()
+                } else {
+                    value.to_string()
+                };
+                let edit_label = format!("Edit {}, current value {display}", field.label());
+                let input = active
+                    .then(|| self.native_text_input_element(TextInputTarget::ControlQuery))
+                    .flatten();
+                div()
+                    .id(field.debug_id())
+                    .debug_selector(move || field.debug_id().to_string())
+                    .when(!active, |row| {
+                        row.role(Role::Button)
+                            .aria_label(edit_label)
+                            .focusable()
+                            .tab_stop(true)
+                            .focus(move |row| row.border_color(palette.accent).bg(palette.hover))
+                    })
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(if active {
+                        self.palette.accent
                     } else {
-                        value.to_string()
-                    };
-                    div()
-                        .id(field.debug_id())
-                        .debug_selector(move || field.debug_id().to_string())
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .px_3()
-                        .py_2()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(if active {
-                            self.palette.accent
-                        } else {
-                            self.palette.border
-                        })
-                        .bg(if active {
-                            self.palette.selected
-                        } else {
-                            self.palette.surface
-                        })
-                        .hover(move |row| row.bg(palette.hover))
-                        .cursor_pointer()
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(self.palette.muted)
-                                .child(field.label()),
-                        )
-                        .child(div().truncate().text_sm().child(display))
-                        .on_click(cx.listener(move |this, _, _, cx| {
+                        self.palette.border
+                    })
+                    .bg(if active {
+                        self.palette.selected
+                    } else {
+                        self.palette.surface
+                    })
+                    .hover(move |row| row.bg(palette.hover))
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(self.palette.muted)
+                            .child(field.label()),
+                    )
+                    .when(active, |row| row.child(div().children(input)))
+                    .when(!active, |row| {
+                        row.child(div().truncate().text_sm().child(display))
+                    })
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| {
                             this.select_smart_folder_field(field, cx)
-                        }))
-                        .into_any_element()
-                })
-                .collect();
+                        }),
+                    )
+                    .into_any_element()
+            })
+            .collect();
         let mut left = Vec::with_capacity(5);
         let mut right = Vec::with_capacity(5);
         for (index, row) in rows.into_iter().enumerate() {
@@ -10017,8 +14153,12 @@ impl DirectoryWindow {
             .flex()
             .flex_col()
             .w_full()
-            .max_w(px(760.0))
-            .max_h(px(520.0))
+            .max_w(px(760.0 * self.palette.scale))
+            .max_h(px((520.0 * self.palette.scale).min(
+                (self.last_window_bounds.height.unwrap_or(DEFAULT_WINDOW_HEIGHT)
+                    - 24.0 * self.palette.scale)
+                    .max(240.0 * self.palette.scale),
+            )))
             .border_1()
             .border_color(self.palette.border)
             .rounded_lg()
@@ -10156,11 +14296,15 @@ impl DirectoryWindow {
                     .child(
                         div()
                             .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .whitespace_nowrap()
                             .text_xs()
                             .text_color(self.palette.muted)
                             .child(format!(
-                                "{} • Tab moves fields • Ctrl/Cmd+Enter saves",
-                                active_field.hint()
+                                "{} • Tab moves fields • {} saves",
+                                active_field.hint(),
+                                display_binding("secondary-enter"),
                             )),
                     )
                     .child(
@@ -10294,18 +14438,7 @@ impl DirectoryWindow {
                     .into_any_element()
             })
             .collect();
-        let query = self.control_query.clone();
-        let prompt = if editing.is_some() {
-            if query.is_empty() {
-                "New workspace name…│".to_string()
-            } else {
-                format!("Rename: {query}│")
-            }
-        } else if query.is_empty() {
-            "Name this tab layout…│".to_string()
-        } else {
-            format!("Workspace name: {query}│")
-        };
+        let control_input = self.native_text_input_element(TextInputTarget::ControlQuery);
         div()
             .id("workspace-manager")
             .debug_selector(|| "workspace-manager".to_string())
@@ -10313,7 +14446,8 @@ impl DirectoryWindow {
             .aria_label("Workspaces")
             .flex()
             .flex_col()
-            .w(px(500.0))
+            .w_full()
+            .max_w(px(500.0 * self.palette.scale))
             .max_h(px(560.0))
             .border_1()
             .border_color(self.palette.border)
@@ -10343,15 +14477,7 @@ impl DirectoryWindow {
                     .py_3()
                     .border_b_1()
                     .border_color(self.palette.border)
-                    .child(
-                        div()
-                            .flex_1()
-                            .px_3()
-                            .py_2()
-                            .bg(self.palette.surface)
-                            .text_sm()
-                            .child(prompt),
-                    )
+                    .child(div().flex_1().children(control_input))
                     .child(
                         toolbar_button(
                             "commit-workspace-name",
@@ -10391,6 +14517,7 @@ impl DirectoryWindow {
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap_2()
                     .px_4()
@@ -10413,8 +14540,9 @@ impl DirectoryWindow {
                     )
                     .child(
                         div()
-                            .flex_1()
-                            .text_right()
+                            .w_full()
+                            .pt_1()
+                            .whitespace_nowrap()
                             .text_xs()
                             .text_color(self.palette.muted)
                             .child("Type a name • Enter save/rename • Esc cancel"),
@@ -10678,6 +14806,7 @@ impl DirectoryWindow {
                 | BatchRenameMode::PrefixSuffix
                 | BatchRenameMode::DateTime
         );
+        let control_input = self.native_text_input_element(TextInputTarget::ControlQuery);
         div()
             .id("batch-rename-manager")
             .debug_selector(|| "batch-rename-manager".to_string())
@@ -10685,7 +14814,8 @@ impl DirectoryWindow {
             .aria_label("Batch rename")
             .flex()
             .flex_col()
-            .w(px(600.0))
+            .w_full()
+            .max_w(px(600.0 * self.palette.scale))
             .max_h(px(590.0))
             .border_1()
             .border_color(self.palette.border)
@@ -10733,16 +14863,7 @@ impl DirectoryWindow {
                         .px_4()
                         .pb_3()
                         .child(div().w(px(130.0)).text_xs().child(editor.field_label()))
-                        .child(
-                            div()
-                                .id("batch-rename-input")
-                                .flex_1()
-                                .px_3()
-                                .py_2()
-                                .rounded_sm()
-                                .bg(self.palette.surface)
-                                .child(format!("{}│", self.control_query)),
-                        )
+                        .child(div().flex_1().children(control_input))
                         .when(supports_second_field, |row| {
                             row.child(
                                 toolbar_button(
@@ -10814,7 +14935,10 @@ impl DirectoryWindow {
                                 self.palette.disabled
                             },
                         )
-                        .on_click(cx.listener(|this, _, _, cx| this.apply_batch_rename(cx))),
+                        .when(changed >= 1, |button| {
+                            button
+                                .on_click(cx.listener(|this, _, _, cx| this.apply_batch_rename(cx)))
+                        }),
                     ),
             )
             .into_any_element()
@@ -10833,7 +14957,7 @@ impl DirectoryWindow {
             ControlSurface::Closed => return div().into_any_element(),
             ControlSurface::CommandPalette => {
                 let commands = self.visible_commands();
-                let query = self.control_query.clone();
+                let control_input = self.native_text_input_element(TextInputTarget::ControlQuery);
                 let rows: Vec<AnyElement> = commands
                     .into_iter()
                     .enumerate()
@@ -10888,30 +15012,19 @@ impl DirectoryWindow {
                     .aria_label("Command palette")
                     .flex()
                     .flex_col()
-                    .w(px(560.0))
+                    .w_full()
+                    .max_w(px(560.0 * self.palette.scale))
                     .max_h(px(520.0))
                     .border_1()
                     .border_color(self.palette.border)
                     .bg(self.palette.panel)
-                    .child(
-                        div()
-                            .px_4()
-                            .py_3()
-                            .border_b_1()
-                            .border_color(self.palette.border)
-                            .text_sm()
-                            .child(if query.is_empty() {
-                                "Type a command…│".to_string()
-                            } else {
-                                format!("{query}│")
-                            }),
-                    )
+                    .child(div().px_4().py_3().children(control_input))
                     .child(
                         div()
                             .id("command-results")
                             .flex_1()
                             .min_h_0()
-                            .overflow_y_scroll()
+                            .overflow_scroll()
                             .when(rows.is_empty(), |list| {
                                 list.child(
                                     div()
@@ -10937,6 +15050,7 @@ impl DirectoryWindow {
             }
             ControlSurface::Shortcuts => {
                 let query = self.control_query.to_lowercase();
+                let control_input = self.native_text_input_element(TextInputTarget::ControlQuery);
                 let mut groups = Vec::<AnyElement>::new();
                 for category in [
                     "Navigation",
@@ -11043,7 +15157,8 @@ impl DirectoryWindow {
                     .aria_label("Keyboard shortcuts")
                     .flex()
                     .flex_col()
-                    .w(px(720.0))
+                    .w_full()
+                    .max_w(px(720.0 * self.palette.scale))
                     .max_h(px(540.0))
                     .border_1()
                     .border_color(self.palette.border)
@@ -11058,19 +15173,7 @@ impl DirectoryWindow {
                             .border_b_1()
                             .border_color(self.palette.border)
                             .child(div().text_lg().child("Keyboard shortcuts"))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .px_3()
-                                    .py_1()
-                                    .bg(self.palette.surface)
-                                    .text_sm()
-                                    .child(if query.is_empty() {
-                                        "Search shortcuts…│".to_string()
-                                    } else {
-                                        format!("{}│", self.control_query)
-                                    }),
-                            )
+                            .child(div().flex_1().children(control_input))
                             .child(
                                 toolbar_button("close-shortcuts", "Close", self.palette.control)
                                     .on_click(
@@ -11121,7 +15224,8 @@ impl DirectoryWindow {
                     .aria_label("Native diagnostics")
                     .flex()
                     .flex_col()
-                    .w(px(560.0))
+                    .w_full()
+                    .max_w(px(560.0 * self.palette.scale))
                     .max_h(px(590.0))
                     .border_1()
                     .border_color(self.palette.border)
@@ -11349,8 +15453,7 @@ impl DirectoryWindow {
             .count();
         let running = self.operation_recovery_jobs.len();
         let message = if self.interrupted_operations.is_empty() && running == 0 {
-            "The previous native session did not close cleanly. Explorie restored its last atomic session snapshot."
-                .to_string()
+            "Previous session restored".to_string()
         } else {
             let mut states = Vec::new();
             if safe > 0 {
@@ -11367,8 +15470,12 @@ impl DirectoryWindow {
             }
             format!("Interrupted file operations: {}.", states.join(" • "))
         };
+        let restored_session = self
+            .previous_session_unclean
+            .then(|| recovery_session_context(self.browser.tabs().len(), self.browser.path()));
         div()
             .id("recovery-notice")
+            .debug_selector(|| "recovery-notice".to_string())
             .flex()
             .items_center()
             .gap_3()
@@ -11378,7 +15485,24 @@ impl DirectoryWindow {
             .border_color(self.palette.accent)
             .bg(self.palette.selected)
             .text_sm()
-            .child(div().flex_1().child(message))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w_0()
+                    .child(message)
+                    .when_some(restored_session, |content, context| {
+                        content.child(
+                            div()
+                                .id("recovery-session-context")
+                                .debug_selector(|| "recovery-session-context".to_string())
+                                .text_xs()
+                                .text_color(self.palette.muted)
+                                .child(context),
+                        )
+                    }),
+            )
             .when(safe > 0, |notice| {
                 notice.child(
                     toolbar_button(
@@ -11420,11 +15544,6 @@ impl DirectoryWindow {
     fn render_go_to_folder(&mut self, window_height: f32, cx: &mut Context<Self>) -> AnyElement {
         let Some(dialog) = self.go_to_folder.clone() else {
             return div().into_any_element();
-        };
-        let input_display = if dialog.input.is_empty() {
-            "Enter folder path…│".to_string()
-        } else {
-            format!("{}│", dialog.input)
         };
         let can_submit = !dialog.validating && !dialog.input.trim().is_empty();
         let palette = self.palette;
@@ -11506,8 +15625,10 @@ impl DirectoryWindow {
                     .flex_col()
                     .gap_3()
                     .w_full()
-                    .max_w(px(560.0))
-                    .max_h(px((window_height - 24.0).max(1.0)))
+                    .max_w(px(560.0 * self.palette.scale))
+                    .max_h(px(
+                        (window_height - 24.0 * self.palette.scale).max(1.0 * self.palette.scale)
+                    ))
                     .overflow_y_scroll()
                     .p_4()
                     .rounded_lg()
@@ -11540,24 +15661,13 @@ impl DirectoryWindow {
                                     .debug_selector(|| "go-to-folder-input".to_string())
                                     .role(Role::EditableComboBox)
                                     .aria_label("Folder path")
-                                    .flex()
-                                    .items_center()
-                                    .min_h(px(38.0))
-                                    .px_3()
-                                    .border_1()
-                                    .border_color(if dialog.error.is_some() {
-                                        rgb(0xff6b6b)
-                                    } else {
-                                        self.palette.accent
-                                    })
-                                    .bg(self.palette.window)
-                                    .text_color(if dialog.input.is_empty() {
-                                        self.palette.tertiary
-                                    } else {
-                                        self.palette.text
-                                    })
-                                    .font_family(if cfg!(windows) { "Consolas" } else { "Menlo" })
-                                    .child(input_display),
+                                    .font_family(monospace_font_family())
+                                    .child(
+                                        self.native_text_input_element(TextInputTarget::GoToFolder)
+                                            .unwrap_or_else(|| {
+                                                div().child(dialog.input.clone()).into_any_element()
+                                            }),
+                                    ),
                             )
                             .when_some(dialog.error, |input, error| {
                                 input.child(
@@ -11608,42 +15718,43 @@ impl DirectoryWindow {
                                 ),
                             )
                             .child(
-                                div()
-                                    .id("go-to-folder-submit")
-                                    .debug_selector(|| "go-to-folder-submit".to_string())
-                                    .role(Role::DefaultButton)
-                                    .aria_label(if dialog.validating {
-                                        "Validating folder"
-                                    } else {
-                                        "Go to folder"
-                                    })
-                                    .px_4()
-                                    .py_2()
-                                    .bg(if can_submit {
-                                        self.palette.accent
-                                    } else {
-                                        self.palette.disabled
-                                    })
-                                    .text_color(if self.palette.dark {
-                                        rgb(0x000000)
-                                    } else {
-                                        self.palette.text
-                                    })
-                                    .when(can_submit, |button| {
-                                        button
-                                            .hover(move |button| {
-                                                button.bg(adaptive_hover(self.palette.accent))
-                                            })
-                                            .cursor_pointer()
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.submit_go_to_folder(cx)
-                                            }))
-                                    })
-                                    .child(if dialog.validating {
+                                toolbar_button_enabled(
+                                    "go-to-folder-submit",
+                                    if dialog.validating {
                                         "Validating…"
                                     } else {
                                         "Go"
-                                    }),
+                                    },
+                                    if can_submit {
+                                        self.palette.accent
+                                    } else {
+                                        self.palette.disabled
+                                    },
+                                    can_submit,
+                                )
+                                .debug_selector(|| "go-to-folder-submit".to_string())
+                                .role(Role::DefaultButton)
+                                .aria_label(if dialog.validating {
+                                    "Validating folder"
+                                } else if dialog.input.trim().is_empty() {
+                                    "Enter a folder path before navigating"
+                                } else {
+                                    "Go to folder"
+                                })
+                                .px_4()
+                                .py_2()
+                                .text_color(if !can_submit {
+                                    self.palette.muted
+                                } else if self.palette.dark {
+                                    rgb(0x000000)
+                                } else {
+                                    self.palette.text
+                                })
+                                .when(can_submit, |button| {
+                                    button.on_click(
+                                        cx.listener(|this, _, _, cx| this.submit_go_to_folder(cx)),
+                                    )
+                                }),
                             ),
                     ),
             )
@@ -11673,7 +15784,8 @@ impl DirectoryWindow {
                     .flex()
                     .flex_col()
                     .gap_3()
-                    .w(px(520.0))
+                    .w_full()
+                    .max_w(px(520.0 * self.palette.scale))
                     .p_5()
                     .border_1()
                     .border_color(rgb(0xffb86c))
@@ -11794,17 +15906,6 @@ impl DirectoryWindow {
             | MutationPromptKind::ExtractPassword { .. } => "No password",
             _ => "Type here",
         };
-        let display_input = prompt.display_input();
-        let input_value = if display_input.is_empty() {
-            format!("{placeholder}│")
-        } else {
-            format!("{display_input}│")
-        };
-        let input_color = if display_input.is_empty() {
-            self.palette.tertiary
-        } else {
-            self.palette.text
-        };
         let destructive_items: Vec<(PathBuf, bool)> = match &prompt.kind {
             MutationPromptKind::PermanentDelete { items } => items.clone(),
             MutationPromptKind::Trash { paths } => {
@@ -11857,158 +15958,167 @@ impl DirectoryWindow {
             None
         };
 
-        let content =
-            div()
-                .id("mutation-prompt-content")
-                .debug_selector(|| "mutation-prompt-content".to_string())
-                .flex()
-                .flex_col()
-                .gap_3()
-                .when(is_destructive, |content| {
-                    content
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .p_3()
-                                .border_1()
-                                .border_color(self.palette.border)
-                                .bg(self.palette.surface)
-                                .text_sm()
-                                .child("Items selected")
-                                .child(
+        let content = div()
+            .id("mutation-prompt-content")
+            .debug_selector(|| "mutation-prompt-content".to_string())
+            .flex()
+            .flex_col()
+            .gap_3()
+            .when(is_destructive, |content| {
+                content
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .p_3()
+                            .border_1()
+                            .border_color(self.palette.border)
+                            .bg(self.palette.surface)
+                            .text_sm()
+                            .child("Items selected")
+                            .child(
+                                div()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(destructive_count.to_string()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("mutation-prompt-items")
+                            .debug_selector(|| "mutation-prompt-items".to_string())
+                            .flex()
+                            .flex_col()
+                            .max_h(px(200.0))
+                            .overflow_y_scroll()
+                            .border_1()
+                            .border_color(self.palette.border)
+                            .children(destructive_rows)
+                            .when(destructive_count > 10, |list| {
+                                list.child(
                                     div()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .child(destructive_count.to_string()),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .id("mutation-prompt-items")
-                                .debug_selector(|| "mutation-prompt-items".to_string())
-                                .flex()
-                                .flex_col()
-                                .max_h(px(200.0))
-                                .overflow_y_scroll()
-                                .border_1()
-                                .border_color(self.palette.border)
-                                .children(destructive_rows)
-                                .when(destructive_count > 10, |list| {
-                                    list.child(
-                                        div()
-                                            .px_3()
-                                            .py_2()
-                                            .text_center()
-                                            .text_xs()
-                                            .text_color(self.palette.muted)
-                                            .child(format!(
-                                                "…and {} more items",
-                                                destructive_count - 10
-                                            )),
-                                    )
-                                }),
-                        )
-                })
-                .when(!input_label.is_empty(), |content| {
-                    content
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(self.palette.muted)
-                                .child(input_label),
-                        )
-                        .child(
-                            div()
-                                .id("mutation-prompt-input")
-                                .debug_selector(|| "mutation-prompt-input".to_string())
-                                .min_h(px(36.0))
-                                .flex()
-                                .items_center()
-                                .px_3()
-                                .border_1()
-                                .border_color(if prompt.error.is_some() {
-                                    rgb(0x8b3340)
-                                } else {
-                                    self.palette.border
-                                })
-                                .bg(self.palette.surface)
-                                .text_color(input_color)
-                                .child(input_value),
-                        )
-                })
-                .when_some(
-                    archive_options,
-                    |content, (format_label, compression_label)| {
-                        content.child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    toolbar_button(
-                                        "archive-format",
-                                        &format_label,
-                                        self.palette.control,
-                                    )
-                                    .debug_selector(|| "archive-format".to_string())
-                                    .on_click(
-                                        cx.listener(|this, _, _, cx| this.cycle_archive_format(cx)),
-                                    ),
+                                        .px_3()
+                                        .py_2()
+                                        .text_center()
+                                        .text_xs()
+                                        .text_color(self.palette.muted)
+                                        .child(format!(
+                                            "…and {} more items",
+                                            destructive_count - 10
+                                        )),
                                 )
-                                .child(
-                                    toolbar_button(
-                                        "archive-compression",
-                                        &compression_label,
-                                        self.palette.control,
-                                    )
-                                    .debug_selector(|| "archive-compression".to_string())
-                                    .on_click(cx.listener(
-                                        |this, _, _, cx| this.cycle_archive_compression(cx),
-                                    )),
-                                ),
-                        )
-                    },
-                )
-                .when_some(prompt.error.clone(), |content, error| {
+                            }),
+                    )
+            })
+            .when(!input_label.is_empty(), |content| {
+                content
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(self.palette.muted)
+                            .child(input_label),
+                    )
+                    .child(
+                        div()
+                            .id("mutation-prompt-input")
+                            .debug_selector(|| "mutation-prompt-input".to_string())
+                            .child(
+                                self.native_text_input_element(TextInputTarget::MutationPrompt)
+                                    .unwrap_or_else(|| div().child(placeholder).into_any_element()),
+                            ),
+                    )
+            })
+            .when_some(
+                archive_options,
+                |content, (format_label, compression_label)| {
                     content.child(
                         div()
-                            .id("mutation-prompt-error")
-                            .debug_selector(|| "mutation-prompt-error".to_string())
-                            .px_3()
-                            .py_2()
-                            .border_1()
-                            .border_color(rgb(0x8b3340))
-                            .bg(with_alpha(rgb(0x8b3340), 0.2))
-                            .text_xs()
-                            .text_color(rgb(0xff8a80))
-                            .child(error),
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                toolbar_button(
+                                    "archive-format",
+                                    &format_label,
+                                    self.palette.control,
+                                )
+                                .debug_selector(|| "archive-format".to_string())
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.cycle_archive_format(cx)),
+                                ),
+                            )
+                            .child(
+                                toolbar_button(
+                                    "archive-compression",
+                                    &compression_label,
+                                    self.palette.control,
+                                )
+                                .debug_selector(|| "archive-compression".to_string())
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.cycle_archive_compression(cx)
+                                    }),
+                                ),
+                            ),
                     )
-                })
-                .child(
+                },
+            )
+            .when_some(prompt.error.clone(), |content, error| {
+                content.child(
                     div()
+                        .id("mutation-prompt-error")
+                        .debug_selector(|| "mutation-prompt-error".to_string())
+                        .px_3()
+                        .py_2()
+                        .border_1()
+                        .border_color(rgb(0x8b3340))
+                        .bg(with_alpha(rgb(0x8b3340), 0.2))
                         .text_xs()
-                        .text_color(self.palette.muted)
-                        .child(prompt.submit_hint()),
-                );
+                        .text_color(rgb(0xff8a80))
+                        .child(error),
+                )
+            })
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(self.palette.muted)
+                    .child(prompt.submit_hint()),
+            );
         let cancel = toolbar_button("mutation-prompt-cancel", "Cancel", self.palette.control)
             .debug_selector(|| "mutation-prompt-cancel".to_string())
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.mutation_prompt = None;
-                cx.notify();
-            }));
-        let submit_color = if matches!(&prompt.kind, MutationPromptKind::PermanentDelete { .. }) {
-            if prompt.input == "DELETE" {
+            .on_click(cx.listener(|this, _, _, cx| this.cancel_mutation_prompt(cx)));
+        let can_submit = match &prompt.kind {
+            MutationPromptKind::PermanentDelete { .. } => prompt.input == "DELETE",
+            MutationPromptKind::ArchivePassword { .. }
+            | MutationPromptKind::ExtractPassword { .. }
+            | MutationPromptKind::Trash { .. } => true,
+            MutationPromptKind::NewFolder
+            | MutationPromptKind::NewNote
+            | MutationPromptKind::NewWebsiteLinkName
+            | MutationPromptKind::NewWebsiteLinkUrl { .. }
+            | MutationPromptKind::Rename { .. }
+            | MutationPromptKind::ArchiveName { .. }
+            | MutationPromptKind::ExtractDirectory { .. } => !prompt.input.trim().is_empty(),
+        };
+        let submit_color = if can_submit {
+            if matches!(&prompt.kind, MutationPromptKind::PermanentDelete { .. }) {
                 rgb(0x8b3340)
             } else {
-                self.palette.disabled
+                self.palette.accent
             }
         } else {
-            self.palette.accent
+            self.palette.disabled
         };
-        let submit = toolbar_button("mutation-prompt-submit", submit_label, submit_color)
-            .debug_selector(|| "mutation-prompt-submit".to_string())
-            .on_click(cx.listener(|this, _, _, cx| this.submit_mutation_prompt(cx)));
+        let submit = toolbar_button_enabled(
+            "mutation-prompt-submit",
+            submit_label,
+            submit_color,
+            can_submit,
+        )
+        .debug_selector(|| "mutation-prompt-submit".to_string())
+        .when(can_submit, |button| {
+            button.on_click(cx.listener(|this, _, _, cx| this.submit_mutation_prompt(cx)))
+        });
 
         let dialog = if is_basic {
             div()
@@ -12020,7 +16130,7 @@ impl DirectoryWindow {
                 .flex_col()
                 .gap_4()
                 .w_full()
-                .max_w(px(360.0))
+                .max_w(px(360.0 * self.palette.scale))
                 .p_5()
                 .border_1()
                 .border_color(self.palette.border)
@@ -12056,13 +16166,15 @@ impl DirectoryWindow {
                 .flex()
                 .flex_col()
                 .w_full()
-                .max_w(px(if is_destructive { 540.0 } else { 500.0 }))
+                .max_w(px(
+                    if is_destructive { 540.0 } else { 500.0 } * self.palette.scale
+                ))
                 .max_h(px((self
                     .last_window_bounds
                     .height
                     .unwrap_or(DEFAULT_WINDOW_HEIGHT)
-                    - 24.0)
-                    .max(320.0)))
+                    - 24.0 * self.palette.scale)
+                    .max(320.0 * self.palette.scale)))
                 .border_1()
                 .border_color(self.palette.border)
                 .bg(self.palette.panel)
@@ -12178,7 +16290,7 @@ impl DirectoryWindow {
                     .flex_col()
                     .gap_3()
                     .w_full()
-                    .max_w(px(520.0))
+                    .max_w(px(520.0 * self.palette.scale))
                     .p_5()
                     .border_1()
                     .border_color(self.palette.accent)
@@ -12203,16 +16315,10 @@ impl DirectoryWindow {
                             .id("named-theme-name-input")
                             .debug_selector(|| "named-theme-name-input".to_string())
                             .w_full()
-                            .px_3()
-                            .py_2()
-                            .border_1()
-                            .border_color(if editor.error.is_some() {
-                                rgb(0xff6b6b)
-                            } else {
-                                self.palette.border
-                            })
-                            .bg(self.palette.surface)
-                            .child(format!("{}│", editor.input)),
+                            .child(
+                                self.native_text_input_element(TextInputTarget::NamedTheme)
+                                    .unwrap_or_else(|| div().child(editor.input.clone()).into_any_element()),
+                            ),
                     )
                     .when(replacing, |panel| {
                         panel.child(
@@ -12261,6 +16367,9 @@ impl DirectoryWindow {
                             .child(
                                 div()
                                     .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .whitespace_nowrap()
                                     .text_right()
                                     .text_xs()
                                     .text_color(self.palette.muted)
@@ -12301,7 +16410,7 @@ impl DirectoryWindow {
                     .flex_col()
                     .gap_3()
                     .w_full()
-                    .max_w(px(520.0))
+                    .max_w(px(520.0 * self.palette.scale))
                     .p_5()
                     .border_1()
                     .border_color(self.palette.accent)
@@ -12363,9 +16472,13 @@ impl DirectoryWindow {
                                     },
                                 )
                                 .debug_selector(|| "shortcut-save".to_string())
-                                .on_click(
-                                    cx.listener(|this, _, _, cx| this.submit_shortcut_editor(cx)),
-                                ),
+                                .when(!has_error, |button| {
+                                    button.on_click(
+                                        cx.listener(|this, _, _, cx| {
+                                            this.submit_shortcut_editor(cx)
+                                        }),
+                                    )
+                                }),
                             )
                             .child(
                                 toolbar_button("shortcut-cancel", "Cancel", self.palette.control)
@@ -12428,7 +16541,7 @@ impl DirectoryWindow {
                     .flex_col()
                     .gap_3()
                     .w_full()
-                    .max_w(px(560.0))
+                    .max_w(px(560.0 * self.palette.scale))
                     .p_5()
                     .border_1()
                     .border_color(self.palette.accent)
@@ -12451,16 +16564,12 @@ impl DirectoryWindow {
                             .id("appearance-value-input")
                             .debug_selector(|| "appearance-value-input".to_string())
                             .w_full()
-                            .px_3()
-                            .py_2()
-                            .border_1()
-                            .border_color(if editor.error.is_some() {
-                                rgb(0xff6b6b)
-                            } else {
-                                self.palette.border
-                            })
-                            .bg(self.palette.surface)
-                            .child(format!("{}│", editor.input)),
+                            .child(
+                                self.native_text_input_element(TextInputTarget::AppearanceValue)
+                                    .unwrap_or_else(|| {
+                                        div().child(editor.input.clone()).into_any_element()
+                                    }),
+                            ),
                     )
                     .child(preview)
                     .when_some(editor.error, |panel, error| {
@@ -12512,6 +16621,9 @@ impl DirectoryWindow {
                             .child(
                                 div()
                                     .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .whitespace_nowrap()
                                     .text_right()
                                     .text_xs()
                                     .text_color(self.palette.muted)
@@ -12548,8 +16660,8 @@ impl DirectoryWindow {
             .last_window_bounds
             .height
             .unwrap_or(DEFAULT_WINDOW_HEIGHT)
-            - 24.0)
-            .max(320.0);
+            - 24.0 * self.palette.scale)
+            .max(320.0 * self.palette.scale);
 
         div()
             .id("file-conflict-backdrop")
@@ -12570,7 +16682,7 @@ impl DirectoryWindow {
                     .flex()
                     .flex_col()
                     .w_full()
-                    .max_w(px(560.0))
+                    .max_w(px(560.0 * self.palette.scale))
                     .max_h(px(max_dialog_height))
                     .border_1()
                     .border_color(self.palette.border)
@@ -12595,7 +16707,7 @@ impl DirectoryWindow {
                                     .flex_1()
                                     .text_sm()
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .child("File Already Exists"),
+                                    .child("File already exists"),
                             )
                             .when(count > 1, |header| {
                                 header.child(
@@ -12643,6 +16755,7 @@ impl DirectoryWindow {
                                     .child(
                                         div()
                                             .flex()
+                                            .flex_wrap()
                                             .items_center()
                                             .px_1()
                                             .text_color(self.palette.muted)
@@ -12740,19 +16853,21 @@ impl DirectoryWindow {
             .role(Role::Alert)
             .aria_label(toast.message.clone())
             .absolute()
-            .right_4()
-            .bottom_4()
+            .right(px(16.0 * self.palette.scale))
+            .top(px(48.0 * self.palette.scale))
             .flex()
             .items_center()
             .gap_3()
-            .min_w(px(280.0))
-            .max_w(px(400.0))
+            .min_w(px(280.0 * self.palette.scale))
+            .max_w(px(400.0 * self.palette.scale))
             .px_4()
             .py_3()
+            .rounded(px(self.palette.radius))
             .border_1()
             .border_color(color)
             .bg(self.palette.panel)
             .shadow_lg()
+            .on_hover(cx.listener(|this, hovered, _, cx| this.pause_toast_dismissal(*hovered, cx)))
             .child(div().flex_1().text_sm().child(toast.message))
             .child(
                 toolbar_button("dismiss-toast", "Dismiss", self.palette.control)
@@ -12784,16 +16899,20 @@ impl DirectoryWindow {
         };
         let target = menu.paths.first();
         let favorite = target.is_some_and(|path| self.browser.is_favorite(path));
-        let width = 252.0;
-        let estimated_height = actions.len() as f32 * 34.0
-            + actions.iter().filter(|(_, separator)| *separator).count() as f32 * 6.0
-            + 12.0;
+        let scale = self.palette.scale;
+        let width = 252.0 * scale;
+        let margin = 8.0 * scale;
+        let estimated_height = actions.len() as f32 * 34.0 * scale
+            + actions.iter().filter(|(_, separator)| *separator).count() as f32 * 6.0 * scale
+            + 12.0 * scale;
         let window_width = f32::from(window_size.width);
         let window_height = f32::from(window_size.height);
-        let max_x = (window_width - width - 8.0).max(8.0);
-        let max_y = (window_height - estimated_height.min(window_height - 16.0) - 8.0).max(8.0);
-        let left = f32::from(menu.position.x).clamp(8.0, max_x);
-        let top = f32::from(menu.position.y).clamp(8.0, max_y);
+        let max_x = (window_width - width - margin).max(margin);
+        let max_y = (window_height - estimated_height.min(window_height - margin * 2.0) - margin)
+            .max(margin);
+        let left = f32::from(menu.position.x).clamp(margin, max_x);
+        let top = f32::from(menu.position.y).clamp(margin, max_y);
+        let menu_focus = menu.focus_handle.clone();
 
         let rows: Vec<AnyElement> = actions
             .into_iter()
@@ -12804,7 +16923,7 @@ impl DirectoryWindow {
                 let debug_selector = selector.clone();
                 let click_action = action.clone();
                 let label = action.label(label_count, favorite, menu.open_with_expanded);
-                let shortcut = action.shortcut();
+                let shortcut = action.shortcut(&self.settings.shortcut_bindings);
                 div()
                     .id(ElementId::Name(selector.into()))
                     .debug_selector(move || debug_selector.clone())
@@ -12820,7 +16939,7 @@ impl DirectoryWindow {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .min_h(px(32.0))
+                    .min_h(px(32.0 * scale))
                     .px_2()
                     .rounded_sm()
                     .bg(if selected {
@@ -12832,13 +16951,18 @@ impl DirectoryWindow {
                     .cursor_pointer()
                     .child(
                         div()
-                            .w(px(20.0))
-                            .text_center()
-                            .text_color(self.palette.muted)
-                            .child(action.icon()),
+                            .w(px(20.0 * scale))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(toolbar_icon(
+                                action.icon_name(),
+                                self.palette.icon_size.clamp(13.0, 17.0),
+                                self.palette.muted,
+                            )),
                     )
                     .child(div().flex_1().min_w_0().truncate().text_sm().child(label))
-                    .when(!shortcut.is_empty(), |row| {
+                    .when_some(shortcut, |row, shortcut| {
                         row.child(
                             div()
                                 .text_xs()
@@ -12873,6 +16997,13 @@ impl DirectoryWindow {
                     .id("file-context-menu")
                     .debug_selector(|| "file-context-menu".to_string())
                     .role(Role::Menu)
+                    .key_context("file-context-menu")
+                    .track_focus(&menu_focus)
+                    .focusable()
+                    .tab_stop(true)
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                        this.handle_context_menu_key(event, cx)
+                    }))
                     .aria_label(if selection_count == 0 {
                         "Folder actions".to_string()
                     } else if selection_count == 1 {
@@ -12884,7 +17015,7 @@ impl DirectoryWindow {
                     .left(px(left))
                     .top(px(top))
                     .w(px(width))
-                    .max_h(px((window_height - 16.0).max(80.0)))
+                    .max_h(px((window_height - margin * 2.0).max(80.0 * scale)))
                     .overflow_y_scroll()
                     .p_1()
                     .rounded_md()
@@ -12900,6 +17031,7 @@ impl DirectoryWindow {
     #[cfg(target_os = "windows")]
     fn render_title_bar(&mut self, maximized: bool, cx: &mut Context<Self>) -> AnyElement {
         let palette = self.palette;
+        let titlebar_height = 36.0 * palette.scale;
         let control =
             |id: &'static str, label: &'static str, icon: &'static str, area: WindowControlArea| {
                 div()
@@ -12911,11 +17043,15 @@ impl DirectoryWindow {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .w(px(46.0))
+                    .w(px(44.0 * palette.scale))
                     .h_full()
                     .flex_none()
                     .text_color(palette.muted)
-                    .child(toolbar_icon(icon, 14.0, palette.muted))
+                    .child(toolbar_icon(
+                        icon,
+                        palette.icon_size.clamp(13.0, 18.0),
+                        palette.muted,
+                    ))
             };
         let maximize_label = if maximized {
             "Restore window"
@@ -12929,10 +17065,8 @@ impl DirectoryWindow {
             .flex()
             .items_center()
             .w_full()
-            .h(px(38.0))
+            .h(px(titlebar_height))
             .flex_none()
-            .border_b_1()
-            .border_color(palette.border)
             .bg(palette.topbar)
             .text_color(palette.text)
             .child(
@@ -12947,10 +17081,25 @@ impl DirectoryWindow {
                     .min_w_0()
                     .pl_2()
                     .gap_1()
-                    .child(toolbar_icon("app-face", 18.0, palette.text))
                     .child(
                         div()
-                            .text_size(px(12.0 * self.settings.appearance.ui_scale))
+                            .id("title-bar-app-icon")
+                            .debug_selector(|| "title-bar-app-icon".to_string())
+                            .w(px(22.0))
+                            .h(px(22.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                img("icons/titlebar-icon.png")
+                                    .w(px(22.0))
+                                    .h(px(22.0))
+                                    .object_fit(ObjectFit::Contain),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(APP_NAME),
                     ),
@@ -12999,6 +17148,11 @@ impl DirectoryWindow {
 
     fn render_tabs(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let palette = self.palette;
+        let tab_height = if palette.density == Density::Compact {
+            32.0
+        } else {
+            36.0
+        } * palette.scale;
         let active = self.browser.active_tab_id();
         let tab_count = self.browser.tabs().len();
         let tabs: Vec<_> = self
@@ -13014,12 +17168,18 @@ impl DirectoryWindow {
             let label = path_label(&path);
             let drag_style_path = path.clone();
             let drop_path = path.clone();
+            let external_drop_path = path.clone();
             let leave_target = FileDragHoverTarget::Tab(id);
             let palette = self.palette;
             tab_elements.push(
                 div()
                     .id(("tab", id.value()))
                     .debug_selector(move || format!("tab-{}", id.value()))
+                    .role(Role::Tab)
+                    .aria_label(label.clone())
+                    .aria_selected(selected)
+                    .focusable()
+                    .tab_stop(true)
                     .flex()
                     .items_center()
                     .gap_2()
@@ -13027,13 +17187,11 @@ impl DirectoryWindow {
                     .max_w(px(220.0))
                     .px_2()
                     .py_1()
-                    .border_1()
-                    .border_r_1()
-                    .border_color(self.palette.border)
+                    .rounded(px(palette.radius))
                     .bg(if selected {
                         self.palette.window
                     } else {
-                        self.palette.panel
+                        with_alpha(self.palette.panel, 0.0)
                     })
                     .text_color(if selected {
                         self.palette.text
@@ -13041,17 +17199,35 @@ impl DirectoryWindow {
                         self.palette.muted
                     })
                     .hover(move |tab| tab.bg(palette.hover).text_color(palette.text))
+                    .focus(move |tab| tab.bg(palette.selected).text_color(palette.text))
                     .cursor_pointer()
-                    .child("▣")
+                    .child(toolbar_icon(
+                        "folder",
+                        palette.icon_size.clamp(13.0, 18.0),
+                        if selected {
+                            palette.accent
+                        } else {
+                            palette.muted
+                        },
+                    ))
                     .child(div().flex_1().min_w_0().truncate().text_sm().child(label))
                     .when(tab_count > 1, |tab| {
                         tab.child(
                             div()
                                 .id(("close-tab", id.value()))
+                                .role(Role::Button)
+                                .aria_label("Close tab")
+                                .focusable()
+                                .tab_stop(true)
                                 .px_1()
-                                .rounded_sm()
+                                .rounded(px(palette.radius))
+                                .focus(move |button| button.bg(palette.hover))
                                 .hover(move |button| button.bg(palette.hover))
-                                .child("×")
+                                .child(toolbar_icon(
+                                    "close",
+                                    palette.icon_size.clamp(11.0, 15.0),
+                                    palette.muted,
+                                ))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.close_tab(id, cx);
                                 })),
@@ -13083,6 +17259,13 @@ impl DirectoryWindow {
                         cx.stop_propagation();
                         this.drop_files_to(drag, drop_path.clone(), false, window, cx);
                     }))
+                    .drag_over::<ExternalPaths>(move |style, _, _, _| {
+                        style.border_color(palette.accent).bg(palette.selected)
+                    })
+                    .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
+                        cx.stop_propagation();
+                        this.drop_external_paths_to(paths, external_drop_path.clone(), cx);
+                    }))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.activate_tab(id, cx);
                     }))
@@ -13093,13 +17276,21 @@ impl DirectoryWindow {
         tab_elements.push(
             div()
                 .id("new-tab")
+                .role(Role::Button)
+                .aria_label("New tab")
+                .focusable()
+                .tab_stop(true)
                 .px_3()
                 .py_1()
-                .rounded_sm()
+                .rounded(px(palette.radius))
+                .focus(move |button| button.bg(palette.hover))
                 .hover(move |button| button.bg(palette.hover))
                 .cursor_pointer()
-                .text_sm()
-                .child("+")
+                .child(toolbar_icon(
+                    "plus",
+                    palette.icon_size.clamp(13.0, 18.0),
+                    palette.muted,
+                ))
                 .on_click(cx.listener(|this, _, _, cx| this.new_tab(cx)))
                 .into_any_element(),
         );
@@ -13107,24 +17298,40 @@ impl DirectoryWindow {
             tab_elements.push(
                 div()
                     .id("move-tab-left")
+                    .role(Role::Button)
+                    .aria_label("Move active tab left")
+                    .focusable()
+                    .tab_stop(true)
                     .px_2()
                     .py_1()
+                    .focus(move |button| button.bg(palette.hover))
                     .hover(move |button| button.bg(palette.hover))
                     .cursor_pointer()
-                    .text_sm()
-                    .child("←")
+                    .child(toolbar_icon(
+                        "arrow-left",
+                        palette.icon_size.clamp(13.0, 18.0),
+                        palette.muted,
+                    ))
                     .on_click(cx.listener(|this, _, _, cx| this.move_active_tab(-1, cx)))
                     .into_any_element(),
             );
             tab_elements.push(
                 div()
                     .id("move-tab-right")
+                    .role(Role::Button)
+                    .aria_label("Move active tab right")
+                    .focusable()
+                    .tab_stop(true)
                     .px_2()
                     .py_1()
+                    .focus(move |button| button.bg(palette.hover))
                     .hover(move |button| button.bg(palette.hover))
                     .cursor_pointer()
-                    .text_sm()
-                    .child("→")
+                    .child(toolbar_icon(
+                        "arrow-right",
+                        palette.icon_size.clamp(13.0, 18.0),
+                        palette.muted,
+                    ))
                     .on_click(cx.listener(|this, _, _, cx| this.move_active_tab(1, cx)))
                     .into_any_element(),
             );
@@ -13133,9 +17340,11 @@ impl DirectoryWindow {
         div()
             .id("tabs")
             .debug_selector(|| "tabs".to_string())
+            .role(Role::TabList)
+            .aria_label("Folder tabs")
             .flex()
             .w_full()
-            .h(px(40.0))
+            .h(px(tab_height))
             .items_center()
             .gap_1()
             .p_1()
@@ -13154,9 +17363,9 @@ impl DirectoryWindow {
         let palette = self.palette;
         let current_path = self.browser.path().to_path_buf();
         let favorite_label = if self.browser.is_favorite(&current_path) {
-            "★ Unfavorite current"
+            "Remove current from favorites"
         } else {
-            "☆ Favorite current"
+            "Add current to favorites"
         };
         let favorites: Vec<_> = self
             .browser
@@ -13192,34 +17401,56 @@ impl DirectoryWindow {
                 let drag_palette = self.palette;
                 let file_drag_style_path = path.clone();
                 let file_drop_path = path.clone();
+                let external_file_drop_path = path.clone();
                 let file_hover_path = path.clone();
                 let file_leave_target = FileDragHoverTarget::Folder(path.clone());
                 favorite_rows.push(
                     div()
                         .id(("favorite", index))
                         .debug_selector(move || format!("favorite-{index}"))
+                        .group("favorite-row")
                         .key_context("favorite")
                         .track_focus(&focus_handle)
+                        .tab_stop(true)
+                        .role(Role::Button)
+                        .aria_label(name.clone())
                         .flex()
                         .items_center()
                         .gap_1()
+                        .mx_2()
                         .px_2()
                         .py_1()
+                        .rounded(px(palette.radius))
                         .border_1()
-                        .border_color(self.palette.panel)
+                        .border_color(with_alpha(self.palette.border, 0.0))
                         .focus(move |row| row.border_color(palette.accent).bg(palette.selected))
                         .hover(move |row| row.bg(palette.hover))
-                        .cursor_move()
+                        .cursor_pointer()
+                        .child(toolbar_icon("bookmark", 14.0, palette.muted))
                         .child(div().flex_1().min_w_0().truncate().text_sm().child(name))
                         .child(
                             div()
                                 .id(("remove-favorite", index))
+                                .role(Role::Button)
+                                .aria_label("Remove favorite")
+                                .focusable()
+                                .tab_stop(true)
+                                .invisible()
                                 .px_1()
-                                .rounded_sm()
-                                .hover(move |button| button.bg(palette.hover))
-                                .child("×")
+                                .rounded(px(palette.radius))
+                                .group_hover("favorite-row", |button| button.visible())
+                                .focus(move |button| button.visible().bg(palette.hover))
+                                .hover(move |button| button.visible().bg(palette.hover))
+                                .cursor_pointer()
+                                .child(toolbar_icon(
+                                    "close",
+                                    palette.icon_size.clamp(11.0, 15.0),
+                                    palette.muted,
+                                ))
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.browser.remove_favorite(&path);
+                                    this.mutate_shared_session(|session| {
+                                        session.remove_favorite(&path)
+                                    });
                                     this.persist_session();
                                     cx.stop_propagation();
                                     cx.notify();
@@ -13279,6 +17510,15 @@ impl DirectoryWindow {
                             cx.stop_propagation();
                             this.drop_files_to(drag, file_drop_path.clone(), false, window, cx);
                         }))
+                        .drag_over::<ExternalPaths>(move |style, _, _, _| {
+                            style
+                                .border_color(drag_palette.accent)
+                                .bg(drag_palette.selected)
+                        })
+                        .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
+                            cx.stop_propagation();
+                            this.drop_external_paths_to(paths, external_file_drop_path.clone(), cx);
+                        }))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.navigate_to(navigation_path.clone(), cx);
                         }))
@@ -13305,21 +17545,33 @@ impl DirectoryWindow {
                 let drag_style_path = path.clone();
                 let hover_path = path.clone();
                 let drop_path = path.clone();
+                let external_drop_path = path.clone();
                 let leave_target = FileDragHoverTarget::Folder(path);
                 let palette = self.palette;
                 recent_rows.push(
                     div()
                         .id(("recent", index))
                         .debug_selector(move || format!("recent-{index}"))
+                        .role(Role::Button)
+                        .aria_label(label.clone())
+                        .focusable()
+                        .tab_stop(true)
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .mx_2()
                         .border_1()
-                        .border_color(self.palette.panel)
+                        .border_color(with_alpha(self.palette.border, 0.0))
+                        .focus(move |row| row.border_color(palette.accent).bg(palette.selected))
                         .px_2()
                         .py_1()
+                        .rounded(px(palette.radius))
                         .truncate()
                         .text_sm()
                         .hover(move |row| row.bg(palette.hover))
                         .cursor_pointer()
-                        .child(label)
+                        .child(toolbar_icon("folder", 14.0, palette.muted))
+                        .child(div().min_w_0().truncate().child(label))
                         .drag_over::<FileDrag>(move |style, drag, window, _| {
                             if valid_file_drop_target(
                                 &drag_style_path,
@@ -13352,6 +17604,13 @@ impl DirectoryWindow {
                             cx.stop_propagation();
                             this.drop_files_to(drag, drop_path.clone(), false, window, cx);
                         }))
+                        .drag_over::<ExternalPaths>(move |style, _, _, _| {
+                            style.border_color(palette.accent).bg(palette.selected)
+                        })
+                        .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
+                            cx.stop_propagation();
+                            this.drop_external_paths_to(paths, external_drop_path.clone(), cx);
+                        }))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.navigate_to(click_path.clone(), cx);
                         }))
@@ -13364,8 +17623,6 @@ impl DirectoryWindow {
         let favorites_section = div()
             .id("favorites-file-drop-target")
             .debug_selector(|| "favorites-file-drop-target".to_string())
-            .border_1()
-            .border_color(self.palette.panel)
             .child(sidebar_section_label("Favorites", palette))
             .children(favorite_rows)
             .drag_over::<FileDrag>(move |style, drag, _, _| {
@@ -13377,14 +17634,28 @@ impl DirectoryWindow {
                     style
                 }
             })
+            .drag_over::<ExternalPaths>(move |style, paths, _, _| {
+                if paths.paths().iter().any(|path| path.is_dir()) {
+                    style
+                        .border_color(favorites_drop_palette.accent)
+                        .bg(with_alpha(favorites_drop_palette.accent, 0.08))
+                } else {
+                    style
+                }
+            })
             .on_drag_move::<FileDrag>(cx.listener(
-                |this, event: &gpui::DragMoveEvent<FileDrag>, _, cx| {
+                |this, event: &gpui::DragMoveEvent<FileDrag>, window, cx| {
                     let drag = event.drag(cx).clone();
                     this.track_file_drag(&drag, cx);
+                    this.maybe_start_external_file_drag(&drag, event.event.position, window, cx);
                 },
             ))
             .on_drop(cx.listener(|this, drag: &FileDrag, _, cx| {
                 this.drop_files_to_favorites(drag, cx);
+            }))
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+                cx.stop_propagation();
+                this.drop_external_paths_to_favorites(paths, cx);
             }));
 
         let mut location_rows = Vec::new();
@@ -13416,21 +17687,37 @@ impl DirectoryWindow {
                 let drag_style_path = path.clone();
                 let hover_path = path.clone();
                 let drop_path = path.clone();
+                let external_drop_path = path.clone();
                 let leave_target = FileDragHoverTarget::Folder(path);
                 let palette = self.palette;
+                let active = click_path == current_path;
                 location_rows.push(
                     div()
                         .id(("location", index))
                         .debug_selector(move || format!("location-{index}"))
-                        .border_1()
-                        .border_color(self.palette.panel)
+                        .role(Role::Button)
+                        .aria_label(label.clone())
+                        .focusable()
+                        .tab_stop(true)
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .mx_2()
                         .px_2()
                         .py_1()
+                        .rounded_sm()
                         .truncate()
                         .text_sm()
+                        .bg(if active {
+                            palette.selected
+                        } else {
+                            palette.panel
+                        })
                         .hover(move |row| row.bg(palette.hover))
+                        .focus(move |row| row.bg(palette.selected))
                         .cursor_pointer()
-                        .child(label)
+                        .child(toolbar_icon("folder", 14.0, palette.muted))
+                        .child(div().min_w_0().truncate().child(label))
                         .drag_over::<FileDrag>(move |style, drag, window, _| {
                             if valid_file_drop_target(
                                 &drag_style_path,
@@ -13462,6 +17749,13 @@ impl DirectoryWindow {
                         .on_drop(cx.listener(move |this, drag: &FileDrag, window, cx| {
                             cx.stop_propagation();
                             this.drop_files_to(drag, drop_path.clone(), false, window, cx);
+                        }))
+                        .drag_over::<ExternalPaths>(move |style, _, _, _| {
+                            style.border_color(palette.accent).bg(palette.selected)
+                        })
+                        .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
+                            cx.stop_propagation();
+                            this.drop_external_paths_to(paths, external_drop_path.clone(), cx);
                         }))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.navigate_to(click_path.clone(), cx);
@@ -13519,11 +17813,19 @@ impl DirectoryWindow {
                 smart_rows.push(
                     div()
                         .id(("smart-folder", index))
+                        .group("smart-folder-row")
+                        .role(Role::Button)
+                        .aria_label(name.clone())
+                        .aria_selected(active_smart_folder == Some(id))
+                        .focusable()
+                        .tab_stop(true)
                         .flex()
                         .items_center()
                         .gap_1()
+                        .mx_2()
                         .px_2()
                         .py_1()
+                        .rounded_sm()
                         .bg(if active_smart_folder == Some(id) {
                             palette.selected
                         } else {
@@ -13531,14 +17833,22 @@ impl DirectoryWindow {
                         })
                         .hover(move |row| row.bg(palette.hover))
                         .cursor_pointer()
-                        .child("⌕")
+                        .child(toolbar_icon("search", 14.0, palette.muted))
                         .child(div().flex_1().min_w_0().truncate().text_sm().child(name))
                         .child(
                             div()
                                 .id(("edit-smart-folder", index))
+                                .role(Role::Button)
+                                .aria_label("Edit smart folder")
+                                .focusable()
+                                .tab_stop(true)
+                                .invisible()
                                 .px_1()
                                 .rounded_sm()
-                                .hover(move |button| button.bg(palette.hover))
+                                .group_hover("smart-folder-row", |button| button.visible())
+                                .focus(move |button| button.visible().bg(palette.hover))
+                                .hover(move |button| button.visible().bg(palette.hover))
+                                .cursor_pointer()
                                 .child("✎")
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     cx.stop_propagation();
@@ -13548,10 +17858,22 @@ impl DirectoryWindow {
                         .child(
                             div()
                                 .id(("delete-smart-folder", index))
+                                .role(Role::Button)
+                                .aria_label("Delete smart folder")
+                                .focusable()
+                                .tab_stop(true)
+                                .invisible()
                                 .px_1()
-                                .rounded_sm()
-                                .hover(move |button| button.bg(palette.hover))
-                                .child("×")
+                                .rounded(px(palette.radius))
+                                .group_hover("smart-folder-row", |button| button.visible())
+                                .focus(move |button| button.visible().bg(palette.hover))
+                                .hover(move |button| button.visible().bg(palette.hover))
+                                .cursor_pointer()
+                                .child(toolbar_icon(
+                                    "close",
+                                    palette.icon_size.clamp(11.0, 15.0),
+                                    palette.muted,
+                                ))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     cx.stop_propagation();
                                     this.delete_smart_folder(id, cx);
@@ -13565,33 +17887,39 @@ impl DirectoryWindow {
             }
         }
 
-        div()
-            .id("sidebar")
-            .debug_selector(|| "sidebar".to_string())
+        let scrollable_content = div()
+            .id("sidebar-scroll")
+            .debug_selector(|| "sidebar-scroll".to_string())
             .flex()
             .flex_col()
-            .flex_shrink_0()
-            .w(px(self.sidebar_width))
-            .h_full()
+            .flex_1()
+            .min_h_0()
+            .py_1()
             .overflow_y_scroll()
-            .border_r_1()
-            .border_color(self.palette.border)
-            .bg(self.palette.panel)
             .child(sidebar_section_label("Locations", palette))
             .children(location_rows)
             .child(
                 div()
                     .id("toggle-current-favorite")
+                    .role(Role::Button)
+                    .aria_label(favorite_label)
+                    .focusable()
+                    .tab_stop(true)
                     .mx_2()
                     .my_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
                     .px_2()
                     .py_1()
                     .rounded_sm()
                     .bg(palette.control)
+                    .focus(move |button| button.bg(palette.hover))
                     .hover(move |button| button.bg(palette.hover))
                     .cursor_pointer()
                     .text_sm()
-                    .child(favorite_label)
+                    .child(toolbar_icon("bookmark", 14.0, palette.muted))
+                    .child(div().min_w_0().truncate().child(favorite_label))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.toggle_current_favorite(cx);
                     })),
@@ -13600,49 +17928,335 @@ impl DirectoryWindow {
             .child(sidebar_section_label("Smart folders", palette))
             .children(smart_rows)
             .child(sidebar_section_label("Recents", palette))
-            .children(recent_rows)
+            .children(recent_rows);
+        let settings_button = div()
+            .id("sidebar-settings")
+            .debug_selector(|| "sidebar-settings".to_string())
+            .role(Role::Button)
+            .aria_label("Settings")
+            .focusable()
+            .tab_stop(true)
+            .flex()
+            .items_center()
+            .gap_2()
+            .h(px(34.0))
+            .mx_2()
+            .px_2()
+            .rounded_sm()
+            .text_sm()
+            .text_color(palette.muted)
+            .focus(move |button| button.bg(palette.hover).text_color(palette.text))
+            .hover(move |button| button.bg(palette.hover).text_color(palette.text))
+            .cursor_pointer()
+            .child(toolbar_icon("sliders", 15.0, palette.muted))
+            .child("Settings")
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_settings_panel(cx)));
+
+        div()
+            .id("sidebar")
+            .debug_selector(|| "sidebar".to_string())
+            .role(Role::Navigation)
+            .aria_label("Main navigation")
+            .flex()
+            .flex_col()
+            .flex_shrink_0()
+            .w(px(self.sidebar_width))
+            .h_full()
+            .overflow_hidden()
+            .bg(self.palette.panel)
+            .child(scrollable_content)
+            .child(
+                div()
+                    .id("sidebar-footer")
+                    .debug_selector(|| "sidebar-footer".to_string())
+                    .flex_none()
+                    .py_2()
+                    .border_t_1()
+                    .border_color(self.palette.border)
+                    .bg(self.palette.panel)
+                    .child(settings_button),
+            )
             .into_any_element()
     }
 
     fn render_sidebar_resizer(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        div()
+        if self.sidebar_collapsed {
+            return div().id("sidebar-resizer-slot").w_0().into_any_element();
+        }
+        let accessibility_view = cx.entity().downgrade();
+        let decrement_view = accessibility_view.clone();
+        let line_color = if self.sidebar_resize.is_some() {
+            self.palette.accent
+        } else {
+            self.palette.border
+        };
+
+        let handle = div()
             .id("sidebar-resizer")
             .debug_selector(|| "sidebar-resizer".to_string())
             .key_context("sidebar-resizer")
             .track_focus(&self.sidebar_resize_focus)
-            .flex_shrink_0()
-            .w(px(8.0))
-            .h_full()
-            .border_l_1()
-            .border_r_1()
-            .border_color(if self.sidebar_resize.is_some() {
-                self.palette.accent
-            } else {
-                self.palette.border
+            .tab_stop(true)
+            .role(Role::Splitter)
+            .aria_label("Resize sidebar")
+            .aria_orientation(Orientation::Vertical)
+            .aria_numeric_value(f64::from(self.sidebar_width))
+            .aria_min_numeric_value(160.0)
+            .aria_max_numeric_value(480.0)
+            .on_a11y_action(AccessibleAction::Increment, move |_, _, cx| {
+                accessibility_view
+                    .update(cx, |this, cx| this.adjust_sidebar_width(10.0, cx))
+                    .ok();
             })
+            .on_a11y_action(AccessibleAction::Decrement, move |_, _, cx| {
+                decrement_view
+                    .update(cx, |this, cx| this.adjust_sidebar_width(-10.0, cx))
+                    .ok();
+            })
+            .w_full()
+            .h_full()
             .hover(|resizer| resizer.bg(with_alpha(self.palette.accent, 0.22)))
             .focus(|resizer| resizer.bg(with_alpha(self.palette.accent, 0.28)))
+            .child(
+                div()
+                    .absolute()
+                    .left(px(7.0))
+                    .top(px(0.0))
+                    .w(px(1.0))
+                    .h_full()
+                    .bg(line_color),
+            )
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event, window, cx| this.begin_sidebar_resize(event, window, cx)),
             )
             .on_key_down(
                 cx.listener(|this, event, _, cx| this.handle_sidebar_resize_key(event, cx)),
+            );
+
+        div()
+            .id("sidebar-resizer-slot")
+            .absolute()
+            .left(px(self.sidebar_width - 8.0))
+            .top(px(0.0))
+            .w(px(8.0))
+            .h_full()
+            .child(handle)
+            .into_any_element()
+    }
+
+    fn render_grid_width_control(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let palette = self.palette;
+        let width = self.settings.appearance.grid_min_width;
+        let active_step = ((width.saturating_add(5) / 10) * 10).clamp(120, 260);
+        let presets = [
+            ("thumbnail-size-small", "S", "Small", 120_u16),
+            ("thumbnail-size-medium", "M", "Medium", 160_u16),
+            ("thumbnail-size-large", "L", "Large", 200_u16),
+            ("thumbnail-size-extra-large", "XL", "Extra Large", 260_u16),
+        ]
+        .into_iter()
+        .map(|(id, short_label, label, preset)| {
+            let active = width == preset;
+            div()
+                .id(id)
+                .debug_selector(move || id.to_string())
+                .role(Role::Button)
+                .aria_label(format!("{label}, {preset} pixels"))
+                .aria_selected(active)
+                .focusable()
+                .tab_stop(true)
+                .flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .h(px(28.0))
+                .border_1()
+                .border_color(if active {
+                    palette.accent
+                } else {
+                    palette.border
+                })
+                .bg(if active {
+                    palette.accent
+                } else {
+                    palette.window
+                })
+                .text_color(if active {
+                    palette.window
+                } else {
+                    palette.muted
+                })
+                .text_xs()
+                .font_weight(FontWeight::SEMIBOLD)
+                .hover(move |button| {
+                    button.bg(if active {
+                        palette.accent
+                    } else {
+                        palette.hover
+                    })
+                })
+                .focus(move |button| button.border_color(palette.accent))
+                .cursor_pointer()
+                .child(short_label)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.set_grid_width(preset, cx);
+                }))
+                .into_any_element()
+        })
+        .collect::<Vec<_>>();
+        let steps = (120_u16..=260)
+            .step_by(10)
+            .enumerate()
+            .map(|(index, step)| {
+                let selected = step == active_step;
+                let filled = step <= active_step;
+                div()
+                    .id(("thumbnail-size-step", index))
+                    .debug_selector(move || format!("thumbnail-size-step-{index}"))
+                    .flex()
+                    .flex_1()
+                    .h_full()
+                    .items_center()
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .w_full()
+                            .h(px(if selected { 12.0 } else { 4.0 }))
+                            .rounded(px(if selected { 6.0 } else { 2.0 }))
+                            .bg(if filled {
+                                palette.accent
+                            } else {
+                                palette.border
+                            }),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.set_grid_width(step, cx);
+                    }))
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+        let accessibility_view = cx.entity().downgrade();
+        let decrement_view = accessibility_view.clone();
+
+        div()
+            .id("thumbnail-size-control")
+            .debug_selector(|| "thumbnail-size-control".to_string())
+            .role(Role::Group)
+            .aria_label("Thumbnail size")
+            .flex()
+            .flex_col()
+            .gap_2()
+            .px_2()
+            .pt_2()
+            .pb_3()
+            .child(
+                div()
+                    .id("thumbnail-size-label")
+                    .debug_selector(|| "thumbnail-size-label".to_string())
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .text_xs()
+                    .text_color(palette.muted)
+                    .child("THUMBNAIL SIZE")
+                    .child(format!("{width}px")),
+            )
+            .child(
+                div()
+                    .id("thumbnail-size-presets")
+                    .debug_selector(|| "thumbnail-size-presets".to_string())
+                    .flex()
+                    .gap_1()
+                    .children(presets),
+            )
+            .child(
+                div()
+                    .id("thumbnail-size-slider")
+                    .debug_selector(|| "thumbnail-size-slider".to_string())
+                    .focusable()
+                    .tab_stop(true)
+                    .role(Role::Slider)
+                    .aria_label("Thumbnail size")
+                    .aria_numeric_value(f64::from(width))
+                    .aria_min_numeric_value(120.0)
+                    .aria_max_numeric_value(260.0)
+                    .on_a11y_action(AccessibleAction::Increment, move |_, _, cx| {
+                        accessibility_view
+                            .update(cx, |this, cx| this.adjust_grid_width(10, cx))
+                            .ok();
+                    })
+                    .on_a11y_action(AccessibleAction::Decrement, move |_, _, cx| {
+                        decrement_view
+                            .update(cx, |this, cx| this.adjust_grid_width(-10, cx))
+                            .ok();
+                    })
+                    .on_key_down(
+                        cx.listener(|this, event, _, cx| this.handle_grid_width_key(event, cx)),
+                    )
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .h(px(24.0))
+                    .border_1()
+                    .border_color(palette.border)
+                    .focus(move |slider| slider.border_color(palette.accent))
+                    .px_2()
+                    .child(toolbar_icon("grid", 12.0, palette.muted))
+                    .child(div().flex().flex_1().h_full().gap(px(2.0)).children(steps))
+                    .child(toolbar_icon("grid", 18.0, palette.muted)),
             )
             .into_any_element()
     }
 
     fn render_toolbar(&mut self, compact: bool, cx: &mut Context<Self>) -> AnyElement {
         let palette = self.palette;
+        let density_scale = if palette.density == Density::Compact {
+            0.94
+        } else {
+            1.0
+        };
+        let toolbar_button_size = 32.0 * palette.scale * density_scale;
+        let popover_top = toolbar_button_size + 4.0;
         let breadcrumbs = self.render_breadcrumbs(cx);
         let query_preview: String = self.browser.search_query().chars().take(20).collect();
         let search_label = if query_preview.is_empty() {
             "Search".to_string()
-        } else if self.search_active {
-            format!("{query_preview}│")
         } else {
             query_preview
         };
+        let syncthing_conflicts = self
+            .browser
+            .entries()
+            .iter()
+            .filter(|entry| file_name(entry).contains(".sync-conflict-"))
+            .count();
+        let wide_syncthing_badge = (!compact)
+            .then(|| {
+                self.syncthing_root.as_deref().map(|root| {
+                    render_syncthing_badge(
+                        root,
+                        syncthing_conflicts,
+                        palette,
+                        self.settings.appearance.ui_scale,
+                    )
+                })
+            })
+            .flatten();
+        let compact_syncthing_badge = compact
+            .then(|| {
+                self.syncthing_root.as_deref().map(|root| {
+                    render_syncthing_badge(
+                        root,
+                        syncthing_conflicts,
+                        palette,
+                        self.settings.appearance.ui_scale,
+                    )
+                })
+            })
+            .flatten();
         let can_undo = self.undo_ledger.can_undo(SystemTime::now());
         let can_redo = self.undo_ledger.can_redo();
         let view_icon = match self.browser.view_mode() {
@@ -13668,8 +18282,6 @@ impl DirectoryWindow {
             .cloned()
             .enumerate()
             .collect::<Vec<_>>();
-        let back_history_offset_y = 21.0 + back_history.len() as f32 * 16.0;
-        let forward_history_offset_y = 21.0 + forward_history.len() as f32 * 16.0;
         let back_menu = back_history
             .into_iter()
             .map(|(index, path)| {
@@ -13723,7 +18335,7 @@ impl DirectoryWindow {
             }))
             .into_any_element(),
         ];
-        let view_menu = vec![
+        let mut view_menu = vec![
             toolbar_menu_item(
                 "list-view",
                 "List",
@@ -13782,6 +18394,13 @@ impl DirectoryWindow {
             }))
             .into_any_element(),
         ];
+        let view_menu_width = if self.browser.view_mode() == ViewMode::Grid {
+            view_menu.push(toolbar_menu_separator(palette));
+            view_menu.push(self.render_grid_width_control(cx));
+            280.0
+        } else {
+            184.0
+        };
         let sort_menu = [SortKey::Name, SortKey::Size, SortKey::Modified]
             .into_iter()
             .map(|key| {
@@ -13945,21 +18564,16 @@ impl DirectoryWindow {
                 this.open_control_surface(ControlSurface::Shortcuts, cx);
             }))
             .into_any_element(),
-            toolbar_menu_item("settings", "Settings", "sliders", palette, false)
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.close_toolbar_menu(cx);
-                    this.toggle_settings_panel(cx);
-                }))
-                .into_any_element(),
         ];
 
-        let back_button = compact_toolbar_button(
+        let back_button = compact_toolbar_button_with_tooltip(
             "back",
             "Go back",
             "arrow-left",
             palette,
             self.toolbar_menu == ToolbarMenu::BackHistory,
             self.browser.can_go_back(),
+            shortcut_tooltip_text("Go back", &self.settings.shortcut_bindings, "nav-back"),
         )
         .on_click(cx.listener(|this, _, _, cx| this.go_back(cx)))
         .on_mouse_down(
@@ -13972,29 +18586,27 @@ impl DirectoryWindow {
             }),
         )
         .when(self.toolbar_menu == ToolbarMenu::BackHistory, |button| {
-            button.child(
-                deferred(
-                    anchored()
-                        .anchor(Anchor::TopLeft)
-                        .offset(point(px(76.0), px(back_history_offset_y)))
-                        .snap_to_window_with_margin(px(8.0))
-                        .child(
-                            toolbar_popover("back-history-menu", palette, back_menu)
-                                .on_mouse_down_out(
-                                    cx.listener(|this, _, _, cx| this.close_toolbar_menu(cx)),
-                                ),
-                        ),
-                )
+            button.relative().child(
+                deferred(div().absolute().top(px(popover_top)).left(px(0.0)).child(
+                    toolbar_popover("back-history-menu", palette, back_menu).on_mouse_down_out(
+                        cx.listener(|this, _, _, cx| this.close_toolbar_menu(cx)),
+                    ),
+                ))
                 .priority(1),
             )
         });
-        let forward_button = compact_toolbar_button(
+        let forward_button = compact_toolbar_button_with_tooltip(
             "forward",
             "Go forward",
             "arrow-right",
             palette,
             self.toolbar_menu == ToolbarMenu::ForwardHistory,
             self.browser.can_go_forward(),
+            shortcut_tooltip_text(
+                "Go forward",
+                &self.settings.shortcut_bindings,
+                "nav-forward",
+            ),
         )
         .on_click(cx.listener(|this, _, _, cx| this.go_forward(cx)))
         .on_mouse_down(
@@ -14007,18 +18619,14 @@ impl DirectoryWindow {
             }),
         )
         .when(self.toolbar_menu == ToolbarMenu::ForwardHistory, |button| {
-            button.child(
+            button.relative().child(
                 deferred(
-                    anchored()
-                        .anchor(Anchor::TopLeft)
-                        .offset(point(px(76.0), px(forward_history_offset_y)))
-                        .snap_to_window_with_margin(px(8.0))
-                        .child(
-                            toolbar_popover("forward-history-menu", palette, forward_menu)
-                                .on_mouse_down_out(
-                                    cx.listener(|this, _, _, cx| this.close_toolbar_menu(cx)),
-                                ),
-                        ),
+                    div().absolute().top(px(popover_top)).left(px(0.0)).child(
+                        toolbar_popover("forward-history-menu", palette, forward_menu)
+                            .on_mouse_down_out(
+                                cx.listener(|this, _, _, cx| this.close_toolbar_menu(cx)),
+                            ),
+                    ),
                 )
                 .priority(1),
             )
@@ -14033,18 +18641,12 @@ impl DirectoryWindow {
         )
         .on_click(cx.listener(|this, _, _, cx| this.toggle_toolbar_menu(ToolbarMenu::Create, cx)))
         .when(self.toolbar_menu == ToolbarMenu::Create, |button| {
-            button.child(
-                deferred(
-                    anchored()
-                        .anchor(Anchor::TopLeft)
-                        .offset(point(px(0.0), px(36.0)))
-                        .snap_to_window_with_margin(px(8.0))
-                        .child(
-                            toolbar_popover("create-menu", palette, create_menu).on_mouse_down_out(
-                                cx.listener(|this, _, _, cx| this.close_toolbar_menu(cx)),
-                            ),
-                        ),
-                )
+            button.relative().child(
+                deferred(div().absolute().top(px(popover_top)).left(px(0.0)).child(
+                    toolbar_popover("create-menu", palette, create_menu).on_mouse_down_out(
+                        cx.listener(|this, _, _, cx| this.close_toolbar_menu(cx)),
+                    ),
+                ))
                 .priority(1),
             )
         });
@@ -14058,17 +18660,15 @@ impl DirectoryWindow {
         )
         .on_click(cx.listener(|this, _, _, cx| this.toggle_toolbar_menu(ToolbarMenu::View, cx)))
         .when(self.toolbar_menu == ToolbarMenu::View, |button| {
-            button.child(
+            button.relative().child(
                 deferred(
-                    anchored()
-                        .anchor(Anchor::TopRight)
-                        .offset(point(px(32.0), px(36.0)))
-                        .snap_to_window_with_margin(px(8.0))
-                        .child(
-                            toolbar_popover("view-menu", palette, view_menu).on_mouse_down_out(
+                    div().absolute().top(px(popover_top)).right(px(0.0)).child(
+                        toolbar_popover("view-menu", palette, view_menu)
+                            .w(px(view_menu_width))
+                            .on_mouse_down_out(
                                 cx.listener(|this, _, _, cx| this.close_toolbar_menu(cx)),
                             ),
-                        ),
+                    ),
                 )
                 .priority(1),
             )
@@ -14083,18 +18683,12 @@ impl DirectoryWindow {
         )
         .on_click(cx.listener(|this, _, _, cx| this.toggle_toolbar_menu(ToolbarMenu::Sort, cx)))
         .when(self.toolbar_menu == ToolbarMenu::Sort, |button| {
-            button.child(
-                deferred(
-                    anchored()
-                        .anchor(Anchor::TopRight)
-                        .offset(point(px(32.0), px(36.0)))
-                        .snap_to_window_with_margin(px(8.0))
-                        .child(
-                            toolbar_popover("sort-menu", palette, sort_menu).on_mouse_down_out(
-                                cx.listener(|this, _, _, cx| this.close_toolbar_menu(cx)),
-                            ),
-                        ),
-                )
+            button.relative().child(
+                deferred(div().absolute().top(px(popover_top)).right(px(0.0)).child(
+                    toolbar_popover("sort-menu", palette, sort_menu).on_mouse_down_out(
+                        cx.listener(|this, _, _, cx| this.close_toolbar_menu(cx)),
+                    ),
+                ))
                 .priority(1),
             )
         });
@@ -14108,18 +18702,12 @@ impl DirectoryWindow {
         )
         .on_click(cx.listener(|this, _, _, cx| this.toggle_toolbar_menu(ToolbarMenu::Filter, cx)))
         .when(self.toolbar_menu == ToolbarMenu::Filter, |button| {
-            button.child(
-                deferred(
-                    anchored()
-                        .anchor(Anchor::TopRight)
-                        .offset(point(px(32.0), px(36.0)))
-                        .snap_to_window_with_margin(px(8.0))
-                        .child(
-                            toolbar_popover("filter-menu", palette, filter_menu).on_mouse_down_out(
-                                cx.listener(|this, _, _, cx| this.close_toolbar_menu(cx)),
-                            ),
-                        ),
-                )
+            button.relative().child(
+                deferred(div().absolute().top(px(popover_top)).right(px(0.0)).child(
+                    toolbar_popover("filter-menu", palette, filter_menu).on_mouse_down_out(
+                        cx.listener(|this, _, _, cx| this.close_toolbar_menu(cx)),
+                    ),
+                ))
                 .priority(1),
             )
         });
@@ -14133,18 +18721,12 @@ impl DirectoryWindow {
         )
         .on_click(cx.listener(|this, _, _, cx| this.toggle_toolbar_menu(ToolbarMenu::More, cx)))
         .when(self.toolbar_menu == ToolbarMenu::More, |button| {
-            button.child(
-                deferred(
-                    anchored()
-                        .anchor(Anchor::TopRight)
-                        .offset(point(px(32.0), px(36.0)))
-                        .snap_to_window_with_margin(px(8.0))
-                        .child(
-                            toolbar_popover("more-menu", palette, more_menu).on_mouse_down_out(
-                                cx.listener(|this, _, _, cx| this.close_toolbar_menu(cx)),
-                            ),
-                        ),
-                )
+            button.relative().child(
+                deferred(div().absolute().top(px(popover_top)).right(px(0.0)).child(
+                    toolbar_popover("more-menu", palette, more_menu).on_mouse_down_out(
+                        cx.listener(|this, _, _, cx| this.close_toolbar_menu(cx)),
+                    ),
+                ))
                 .priority(1),
             )
         });
@@ -14152,39 +18734,78 @@ impl DirectoryWindow {
         div()
             .id("browser-toolbar")
             .debug_selector(|| "browser-toolbar".to_string())
+            .role(Role::Toolbar)
+            .aria_label("File browser controls")
+            .aria_orientation(Orientation::Horizontal)
             .flex()
             .items_center()
             .gap_1()
             .w_full()
             .min_w_0()
-            .h(px(if compact { 76.0 } else { 44.0 }))
+            .h(px(if compact { 72.0 } else { 40.0 }
+                * palette.scale
+                * density_scale))
             .when(compact, |toolbar| toolbar.flex_wrap())
             .child(back_button)
             .child(forward_button)
             .child(
-                compact_toolbar_button(
+                compact_toolbar_button_with_tooltip(
                     "up",
                     "Go to parent folder",
                     "arrow-up",
                     palette,
                     false,
                     self.browser.can_go_up(),
+                    shortcut_tooltip_text(
+                        "Go to parent folder",
+                        &self.settings.shortcut_bindings,
+                        "nav-up",
+                    ),
                 )
                 .on_click(cx.listener(|this, _, _, cx| this.go_up(cx))),
             )
             .child(
-                compact_toolbar_button("refresh", "Refresh", "reload", palette, false, true)
-                    .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
+                compact_toolbar_button_with_tooltip(
+                    "refresh",
+                    "Refresh",
+                    "reload",
+                    palette,
+                    false,
+                    true,
+                    shortcut_tooltip_text(
+                        "Refresh",
+                        &self.settings.shortcut_bindings,
+                        "view-refresh",
+                    ),
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
             )
             .child(breadcrumbs)
+            .when_some(wide_syncthing_badge, |toolbar, badge| toolbar.child(badge))
             .child(create_button)
             .child(
-                compact_toolbar_button("undo", "Undo", "undo", palette, false, can_undo)
-                    .on_click(cx.listener(|this, _, _, cx| this.undo(cx))),
+                compact_toolbar_button_with_tooltip(
+                    "undo",
+                    "Undo",
+                    "undo",
+                    palette,
+                    false,
+                    can_undo,
+                    shortcut_tooltip_text("Undo", &self.settings.shortcut_bindings, "edit-undo"),
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.undo(cx))),
             )
             .child(
-                compact_toolbar_button("redo", "Redo", "redo", palette, false, can_redo)
-                    .on_click(cx.listener(|this, _, _, cx| this.redo(cx))),
+                compact_toolbar_button_with_tooltip(
+                    "redo",
+                    "Redo",
+                    "redo",
+                    palette,
+                    false,
+                    can_redo,
+                    shortcut_tooltip_text("Redo", &self.settings.shortcut_bindings, "edit-redo"),
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.redo(cx))),
             )
             .child(
                 div()
@@ -14194,11 +18815,17 @@ impl DirectoryWindow {
                     .items_center()
                     .gap_1()
                     .when(compact, |controls| controls.w_full().justify_end())
+                    .when_some(compact_syncthing_badge, |controls, badge| {
+                        controls.child(badge)
+                    })
                     .child(
                         div()
                             .id("search")
+                            .debug_selector(|| "search".to_string())
                             .role(Role::Button)
                             .aria_label("Search files and folders")
+                            .focusable()
+                            .tab_stop(true)
                             .flex()
                             .flex_shrink()
                             .items_center()
@@ -14206,7 +18833,7 @@ impl DirectoryWindow {
                             .min_w(px(112.0))
                             .w(px(180.0))
                             .when(compact, |search| search.flex_1())
-                            .h(px(32.0))
+                            .h(px(toolbar_button_size))
                             .px_2()
                             .border_1()
                             .border_color(if self.search_active {
@@ -14214,6 +18841,7 @@ impl DirectoryWindow {
                             } else {
                                 palette.border
                             })
+                            .focus(move |search| search.border_color(palette.accent))
                             .bg(if self.search_active {
                                 palette.window
                             } else if palette.dark {
@@ -14225,10 +18853,13 @@ impl DirectoryWindow {
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.toolbar_menu = ToolbarMenu::Closed;
                                 this.search_active = true;
-                                window.focus(&this.focus_handle, cx);
+                                let _ = window;
                                 cx.notify();
                             }))
-                            .child(
+                            .child(if self.search_active {
+                                self.native_text_input_element(TextInputTarget::Search)
+                                    .unwrap_or_else(|| div().child(search_label).into_any_element())
+                            } else {
                                 div()
                                     .flex_1()
                                     .min_w_0()
@@ -14239,8 +18870,9 @@ impl DirectoryWindow {
                                     } else {
                                         palette.text
                                     })
-                                    .child(search_label),
-                            )
+                                    .child(search_label)
+                                    .into_any_element()
+                            })
                             .when(!self.browser.search_query().is_empty(), |search| {
                                 search
                                     .child(
@@ -14252,12 +18884,13 @@ impl DirectoryWindow {
                                             false,
                                             true,
                                         )
-                                        .w(px(24.0))
-                                        .h(px(24.0))
+                                        .w(px(24.0 * palette.scale))
+                                        .h(px(24.0 * palette.scale))
                                         .on_click(
                                             cx.listener(|this, _, _, cx| {
                                                 this.browser.clear_search();
                                                 this.search_active = false;
+                                                this.deactivate_native_text_input();
                                                 cx.notify();
                                             }),
                                         ),
@@ -14271,8 +18904,8 @@ impl DirectoryWindow {
                                             false,
                                             true,
                                         )
-                                        .w(px(24.0))
-                                        .h(px(24.0))
+                                        .w(px(24.0 * palette.scale))
+                                        .h(px(24.0 * palette.scale))
                                         .on_click(
                                             cx.listener(|this, _, _, cx| {
                                                 this.save_current_search(cx)
@@ -14296,176 +18929,426 @@ impl DirectoryWindow {
         if !self.settings_panel_open {
             return div().into_any_element();
         }
-        let settings_control = |id: &'static str, label: &str, active| {
-            settings_control_with_palette(self.palette, id, label.to_string(), active)
+        let settings_palette = self.palette;
+        let settings_control = move |id: &'static str, label: &str, active| {
+            settings_control_with_palette(settings_palette, id, label.to_string(), active)
         };
 
-        let general = vec![
-            settings_control(
-                "settings-hidden",
-                &toggle_label("Hidden files", self.browser.show_hidden()),
-                self.browser.show_hidden(),
+        let mut general_files = Vec::new();
+        let mut general_workspace = Vec::new();
+        let mut general_safety = Vec::new();
+        let mut general_advanced = Vec::new();
+        macro_rules! toggle_setting {
+            ($target:ident, $id:literal, $label:literal, $description:literal, $value:expr, $method:ident) => {
+                $target.push(
+                    settings_toggle_control(self.palette, $id, $label, $description, $value, true)
+                        .on_click(cx.listener(|this, _, _, cx| this.$method(cx)))
+                        .into_any_element(),
+                );
+            };
+        }
+        toggle_setting!(
+            general_files,
+            "settings-hidden",
+            "Hidden files",
+            "Show dotfiles and items marked hidden by the operating system.",
+            self.browser.show_hidden(),
+            toggle_hidden
+        );
+        toggle_setting!(
+            general_files,
+            "settings-system",
+            "System files",
+            "Include protected operating-system entries in folder listings.",
+            self.browser.show_system_files(),
+            toggle_system_files
+        );
+        toggle_setting!(
+            general_files,
+            "settings-folder-sizes",
+            "Folder sizes",
+            "Calculate directory sizes in the background; large trees may take time.",
+            self.calculate_folder_sizes,
+            toggle_folder_sizes
+        );
+        toggle_setting!(
+            general_workspace,
+            "settings-preview-panel",
+            "Pinned preview",
+            "Keep the selected file preview visible beside or below the listing.",
+            self.settings.view.show_preview_panel,
+            toggle_preview_panel
+        );
+        toggle_setting!(
+            general_workspace,
+            "settings-status",
+            "Status bar",
+            "Show selection, filter, operation, disk, and watcher context.",
+            self.settings.view.show_status_bar,
+            toggle_status_bar
+        );
+        toggle_setting!(
+            general_safety,
+            "settings-confirm-delete",
+            "Confirm before Trash",
+            "Ask before moving selected files to the operating-system Trash.",
+            self.settings.behavior.confirm_before_delete,
+            toggle_confirm_delete
+        );
+        toggle_setting!(
+            general_safety,
+            "settings-script-preview",
+            "Executable-script previews",
+            "Allow source previews for executable script formats; scripts are never run.",
+            self.settings.behavior.preview_executable_scripts,
+            toggle_script_preview
+        );
+        toggle_setting!(
+            general_advanced,
+            "settings-error-reporting",
+            "Local error reporting",
+            "Keep path-redacted error details in memory for diagnostics export.",
+            self.settings.behavior.enable_error_reporting,
+            toggle_error_reporting
+        );
+        toggle_setting!(
+            general_advanced,
+            "settings-remote-drives",
+            "Remote drives",
+            "Enable rclone-backed remote profiles and automatic reconnect behavior.",
+            self.settings.behavior.remote_drives_enabled,
+            toggle_remote_drives
+        );
+        let undo_choices = [1_u32, 5, 15, 30, 60]
+            .into_iter()
+            .map(|minutes| {
+                settings_segment_button(
+                    self.palette,
+                    ("settings-undo-timeout-option", minutes as usize),
+                    if minutes == 60 {
+                        "1 hr".to_string()
+                    } else {
+                        format!("{minutes} min")
+                    },
+                    self.settings.behavior.undo_timeout_minutes == minutes,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| this.set_undo_timeout(minutes, cx)))
+                .into_any_element()
+            })
+            .collect::<Vec<_>>();
+        general_advanced.push(
+            settings_field_row(
+                "Undo window",
+                "How long completed file operations remain available for Undo.",
+                self.palette,
             )
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_hidden(cx)))
+            .child(
+                div()
+                    .id("settings-undo-window")
+                    .role(Role::RadioGroup)
+                    .aria_label("Undo window")
+                    .flex()
+                    .flex_wrap()
+                    .justify_end()
+                    .gap_1()
+                    .children(undo_choices),
+            )
             .into_any_element(),
-            settings_control(
-                "settings-system",
-                &toggle_label("System files", self.browser.show_system_files()),
-                self.browser.show_system_files(),
+        );
+
+        let theme_choices = [ThemeMode::Dark, ThemeMode::Light, ThemeMode::System]
+            .into_iter()
+            .enumerate()
+            .map(|(index, theme)| {
+                settings_segment_button(
+                    self.palette,
+                    ("settings-theme-option", index),
+                    theme.label(),
+                    self.settings.appearance.theme == theme,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| this.set_theme(theme, cx)))
+                .into_any_element()
+            })
+            .collect::<Vec<_>>();
+        let density_choices = [Density::Comfortable, Density::Compact]
+            .into_iter()
+            .enumerate()
+            .map(|(index, density)| {
+                settings_segment_button(
+                    self.palette,
+                    ("settings-density-option", index),
+                    density.label(),
+                    self.settings.appearance.density == density,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| this.set_density(density, cx)))
+                .into_any_element()
+            })
+            .collect::<Vec<_>>();
+        let radius_choices = [0_u8, 4, 8]
+            .into_iter()
+            .enumerate()
+            .map(|(index, radius)| {
+                settings_segment_button(
+                    self.palette,
+                    ("settings-radius-option", index),
+                    format!("{radius} px"),
+                    self.settings.appearance.border_radius == radius,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| this.set_border_radius(radius, cx)))
+                .into_any_element()
+            })
+            .collect::<Vec<_>>();
+        let accent_label = if self.settings.appearance.accent == AccentColor::Custom {
+            self.settings.appearance.accent_custom.clone()
+        } else {
+            self.settings.appearance.accent.label().to_string()
+        };
+        let accent_options = [
+            AccentColor::Blue,
+            AccentColor::Green,
+            AccentColor::Purple,
+            AccentColor::Orange,
+            AccentColor::Pink,
+            AccentColor::Custom,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, accent)| {
+            let selected = self.settings.appearance.accent == accent;
+            settings_segment_button(
+                self.palette,
+                ("settings-accent-option", index),
+                accent.label(),
+                selected,
             )
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_system_files(cx)))
+            .on_click(cx.listener(move |this, _, _, cx| this.set_accent_choice(accent, cx)))
+            .into_any_element()
+        })
+        .collect::<Vec<_>>();
+        let font_label = if self.settings.appearance.font == FontChoice::Custom {
+            self.settings.appearance.font_custom.clone()
+        } else {
+            self.settings.appearance.font.label().to_string()
+        };
+        let font_options = [
+            FontChoice::Mono,
+            FontChoice::System,
+            FontChoice::Serif,
+            FontChoice::Custom,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, font)| {
+            let selected = self.settings.appearance.font == font;
+            settings_segment_button(
+                self.palette,
+                ("settings-font-option", index),
+                font.label(),
+                selected,
+            )
+            .on_click(cx.listener(move |this, _, _, cx| this.set_font_choice(font, cx)))
+            .into_any_element()
+        })
+        .collect::<Vec<_>>();
+
+        let mut appearance = vec![
+            settings_field_row(
+                "Theme",
+                "Choose a dark, light, or operating-system appearance.",
+                self.palette,
+            )
+            .child(
+                div()
+                    .id("settings-theme-options")
+                    .debug_selector(|| "settings-theme-options".to_string())
+                    .role(Role::RadioGroup)
+                    .aria_label("Theme")
+                    .flex()
+                    .gap_1()
+                    .children(theme_choices),
+            )
             .into_any_element(),
-            settings_control(
-                "settings-folder-sizes",
-                &toggle_label("Folder sizes", self.calculate_folder_sizes),
-                self.calculate_folder_sizes,
+            div()
+                .flex()
+                .flex_col()
+                .child(
+                    settings_field_row(
+                        "Accent color",
+                        "Used for selection, focus, progress, and active controls.",
+                        self.palette,
+                    )
+                    .child(
+                        settings_segment_button(
+                            self.palette,
+                            "settings-accent",
+                            accent_label,
+                            self.settings_selector == Some(SettingsSelector::Accent),
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.settings_selector =
+                                if this.settings_selector == Some(SettingsSelector::Accent) {
+                                    None
+                                } else {
+                                    Some(SettingsSelector::Accent)
+                                };
+                            cx.notify();
+                        })),
+                    ),
+                )
+                .when(
+                    self.settings_selector == Some(SettingsSelector::Accent),
+                    |selector| {
+                        selector.child(
+                            div()
+                                .id("settings-accent-options")
+                                .role(Role::RadioGroup)
+                                .aria_label("Accent color")
+                                .flex()
+                                .flex_wrap()
+                                .gap_1()
+                                .px_3()
+                                .pb_2()
+                                .children(accent_options),
+                        )
+                    },
+                )
+                .into_any_element(),
+            settings_field_row(
+                "Density",
+                "Adjust spacing in common controls and Grid view without changing type size.",
+                self.palette,
             )
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_folder_sizes(cx)))
-            .into_any_element(),
-            settings_control(
-                "settings-preview-panel",
-                &toggle_label("Pinned preview", self.settings.view.show_preview_panel),
-                self.settings.view.show_preview_panel,
+            .child(
+                div()
+                    .id("settings-density-options")
+                    .role(Role::RadioGroup)
+                    .aria_label("Density")
+                    .flex()
+                    .gap_1()
+                    .children(density_choices),
             )
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_preview_panel(cx)))
-            .into_any_element(),
-            settings_control(
-                "settings-status",
-                &toggle_label("Status bar", self.settings.view.show_status_bar),
-                self.settings.view.show_status_bar,
-            )
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_status_bar(cx)))
-            .into_any_element(),
-            settings_control(
-                "settings-confirm-delete",
-                &toggle_label(
-                    "Confirm Trash",
-                    self.settings.behavior.confirm_before_delete,
-                ),
-                self.settings.behavior.confirm_before_delete,
-            )
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_confirm_delete(cx)))
-            .into_any_element(),
-            settings_control(
-                "settings-script-preview",
-                &toggle_label(
-                    "Script previews",
-                    self.settings.behavior.preview_executable_scripts,
-                ),
-                self.settings.behavior.preview_executable_scripts,
-            )
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_script_preview(cx)))
-            .into_any_element(),
-            settings_control(
-                "settings-error-reporting",
-                &toggle_label(
-                    "Error reporting",
-                    self.settings.behavior.enable_error_reporting,
-                ),
-                self.settings.behavior.enable_error_reporting,
-            )
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_error_reporting(cx)))
-            .into_any_element(),
-            settings_control(
-                "settings-remote-drives",
-                &toggle_label(
-                    "Remote drives",
-                    self.settings.behavior.remote_drives_enabled,
-                ),
-                self.settings.behavior.remote_drives_enabled,
-            )
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_remote_drives(cx)))
-            .into_any_element(),
-            settings_control(
-                "settings-undo-timeout",
-                &format!("Undo: {} min", self.settings.behavior.undo_timeout_minutes),
-                false,
-            )
-            .on_click(cx.listener(|this, _, _, cx| this.cycle_undo_timeout(cx)))
             .into_any_element(),
         ];
-
-        let accent_label = if self.settings.appearance.accent == AccentColor::Custom {
-            format!("Accent: {}", self.settings.appearance.accent_custom)
-        } else {
-            format!("Accent: {}", self.settings.appearance.accent.label())
-        };
-        let font_label = if self.settings.appearance.font == FontChoice::Custom {
-            format!("Font: {}", self.settings.appearance.font_custom)
-        } else {
-            format!("Font: {}", self.settings.appearance.font.label())
-        };
-        let appearance = vec![
-            settings_control(
-                "settings-theme",
-                &format!("Theme: {}", self.settings.appearance.theme.label()),
-                true,
-            )
-            .on_click(cx.listener(|this, _, _, cx| this.cycle_theme(cx)))
-            .into_any_element(),
-            settings_control("settings-accent", &accent_label, true)
-                .on_click(cx.listener(|this, _, _, cx| this.cycle_accent(cx)))
+        appearance.push(self.render_settings_slider(
+            SettingsSlider::UiScale,
+            "settings-ui-scale",
+            "UI scale",
+            "Scale interface typography, spacing, and common controls together.",
+            cx,
+        ));
+        appearance.push(self.render_settings_slider(
+            SettingsSlider::ListRowHeight,
+            "settings-row-height",
+            "List row height",
+            "Control vertical density in List and Column views.",
+            cx,
+        ));
+        appearance.push(self.render_settings_slider(
+            SettingsSlider::GridWidth,
+            "settings-grid-width",
+            "Grid item width",
+            "Set the minimum thumbnail card width in Grid view.",
+            cx,
+        ));
+        appearance.push(
+            div()
+                .flex()
+                .flex_col()
+                .child(
+                    settings_field_row(
+                        "Font",
+                        "Choose the interface font family or enter an installed custom font.",
+                        self.palette,
+                    )
+                    .child(
+                        settings_segment_button(
+                            self.palette,
+                            "settings-font",
+                            font_label,
+                            self.settings_selector == Some(SettingsSelector::Font),
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.settings_selector =
+                                if this.settings_selector == Some(SettingsSelector::Font) {
+                                    None
+                                } else {
+                                    Some(SettingsSelector::Font)
+                                };
+                            cx.notify();
+                        })),
+                    ),
+                )
+                .when(
+                    self.settings_selector == Some(SettingsSelector::Font),
+                    |selector| {
+                        selector.child(
+                            div()
+                                .id("settings-font-options")
+                                .role(Role::RadioGroup)
+                                .aria_label("Font")
+                                .flex()
+                                .flex_wrap()
+                                .gap_1()
+                                .px_3()
+                                .pb_2()
+                                .children(font_options),
+                        )
+                    },
+                )
                 .into_any_element(),
-            settings_control(
-                "settings-density",
-                &format!("Density: {}", self.settings.appearance.density.label()),
-                self.settings.appearance.density == Density::Compact,
+        );
+        appearance.push(
+            settings_field_row(
+                "Corner radius",
+                "Apply a consistent radius to supported surfaces and controls.",
+                self.palette,
             )
-            .on_click(cx.listener(|this, _, _, cx| this.cycle_density(cx)))
-            .into_any_element(),
-            settings_control(
-                "settings-ui-scale",
-                &format!("Scale: {:.2}×", self.settings.appearance.ui_scale),
-                false,
+            .child(
+                div()
+                    .id("settings-radius-options")
+                    .role(Role::RadioGroup)
+                    .aria_label("Corner radius")
+                    .flex()
+                    .gap_1()
+                    .children(radius_choices),
             )
-            .on_click(cx.listener(|this, _, _, cx| this.cycle_ui_scale(cx)))
             .into_any_element(),
-            settings_control(
-                "settings-row-height",
-                &format!("Rows: {} px", self.settings.appearance.list_row_height),
-                false,
-            )
-            .on_click(cx.listener(|this, _, _, cx| this.cycle_list_row_height(cx)))
-            .into_any_element(),
-            settings_control(
-                "settings-grid-width",
-                &format!("Grid: {} px", self.settings.appearance.grid_min_width),
-                false,
-            )
-            .on_click(cx.listener(|this, _, _, cx| this.cycle_grid_width(cx)))
-            .into_any_element(),
-            settings_control("settings-font", &font_label, false)
-                .on_click(cx.listener(|this, _, _, cx| this.cycle_font(cx)))
-                .into_any_element(),
-            settings_control(
-                "settings-radius",
-                &format!("Radius: {} px", self.settings.appearance.border_radius),
-                false,
-            )
-            .on_click(cx.listener(|this, _, _, cx| this.cycle_border_radius(cx)))
-            .into_any_element(),
-            settings_control(
-                "settings-icon-size",
-                &format!("Icons: {} px", self.settings.appearance.icon_size),
-                false,
-            )
-            .on_click(cx.listener(|this, _, _, cx| this.cycle_icon_size(cx)))
-            .into_any_element(),
-            settings_control(
+        );
+        appearance.push(self.render_settings_slider(
+            SettingsSlider::IconSize,
+            "settings-icon-size",
+            "Icon size",
+            "Adjust file and toolbar icon size independently of UI scale.",
+            cx,
+        ));
+        appearance.push(
+            settings_toggle_control(
+                self.palette,
                 "settings-reduce-motion",
-                &toggle_label("Reduce motion", self.settings.appearance.reduce_motion),
+                "Reduce motion",
+                "Limit nonessential movement and keep future transitions calm.",
                 self.settings.appearance.reduce_motion,
+                true,
             )
             .on_click(cx.listener(|this, _, _, cx| this.toggle_reduce_motion(cx)))
             .into_any_element(),
-            settings_control(
+        );
+        appearance.push(
+            settings_toggle_control(
+                self.palette,
                 "settings-high-contrast",
-                &toggle_label("High contrast", self.settings.appearance.high_contrast),
+                "High contrast",
+                "Increase separation between text, controls, and surfaces.",
                 self.settings.appearance.high_contrast,
+                true,
             )
             .on_click(cx.listener(|this, _, _, cx| this.toggle_high_contrast(cx)))
             .into_any_element(),
-        ];
+        );
+        let appearance_accessibility = appearance.split_off(9);
+        let appearance_typography = appearance.split_off(6);
+        let appearance_layout = appearance.split_off(2);
+        let appearance_color = appearance;
 
         let theme_rows: Vec<_> = self
             .settings
@@ -14508,7 +19391,10 @@ impl DirectoryWindow {
                     .child(
                         toolbar_button(("named-theme-delete", index), "Delete", rgb(0x6b3434))
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.delete_named_theme(&delete_name, cx)
+                                this.request_settings_confirmation(
+                                    SettingsConfirmation::DeleteTheme(delete_name.clone()),
+                                    cx,
+                                )
                             })),
                     )
                     .into_any_element()
@@ -14519,7 +19405,12 @@ impl DirectoryWindow {
             .flex()
             .flex_col()
             .gap_2()
-            .child(div().text_sm().child("Named themes"))
+            .child(
+                div()
+                    .text_lg()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("Named themes"),
+            )
             .child(
                 div()
                     .flex()
@@ -14533,7 +19424,7 @@ impl DirectoryWindow {
                             ),
                     )
                     .child(
-                        settings_control("settings-theme-default", "Apply Default", false)
+                        settings_control("settings-theme-default", "Apply default", false)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.apply_default_theme(cx)
                             })),
@@ -14637,11 +19528,14 @@ impl DirectoryWindow {
                                 "Reset",
                                 self.palette.control,
                             )
-                            .on_click(
-                                cx.listener(move |this, _, _, cx| {
-                                    this.reset_shortcut(reset_id, cx)
-                                }),
-                            ),
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.request_settings_confirmation(
+                                        SettingsConfirmation::ResetShortcut(reset_id.to_string()),
+                                        cx,
+                                    )
+                                },
+                            )),
                         )
                     })
                     .into_any_element()
@@ -14657,7 +19551,13 @@ impl DirectoryWindow {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(div().flex_1().text_sm().child("Keyboard shortcuts"))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_lg()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Keyboard shortcuts"),
+                    )
                     .child(
                         settings_control(
                             "settings-shortcuts-reset",
@@ -14665,7 +19565,12 @@ impl DirectoryWindow {
                             shortcut_override_count > 0,
                         )
                         .debug_selector(|| "settings-shortcuts-reset".to_string())
-                        .on_click(cx.listener(|this, _, _, cx| this.reset_all_shortcuts(cx))),
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.request_settings_confirmation(
+                                SettingsConfirmation::ResetAllShortcuts,
+                                cx,
+                            )
+                        })),
                     ),
             )
             .child(
@@ -14718,11 +19623,16 @@ impl DirectoryWindow {
             .last_window_bounds
             .height
             .unwrap_or(DEFAULT_WINDOW_HEIGHT);
-        let compact_settings = window_width <= 860.0;
-        let panel_inset = if compact_settings { 16.0 } else { 24.0 };
-        let panel_width = (window_width - panel_inset).clamp(520.0, 1040.0);
-        let panel_height = (window_height - panel_inset).clamp(480.0, 640.0);
         let palette = self.palette;
+        let logical_window_width = window_width / palette.scale.max(0.1);
+        let compact_settings = logical_window_width <= 860.0;
+        let panel_inset = if compact_settings { 16.0 } else { 24.0 } * palette.scale;
+        let panel_width = (window_width - panel_inset * 2.0)
+            .max(1.0)
+            .min(1040.0 * palette.scale);
+        let panel_height = (window_height - panel_inset * 2.0)
+            .max(1.0)
+            .min(640.0 * palette.scale);
         let tab_rows: Vec<_> = SettingsTab::ALL
             .into_iter()
             .enumerate()
@@ -14731,19 +19641,26 @@ impl DirectoryWindow {
                 div()
                     .id(("settings-tab", index))
                     .debug_selector(move || format!("settings-tab-{index}"))
-                    .role(Role::Button)
+                    .role(Role::Tab)
                     .aria_label(tab.label())
                     .aria_selected(active)
+                    .focusable()
+                    .tab_stop(true)
                     .flex()
                     .items_center()
-                    .h(px(36.0))
+                    .h(px(if palette.density == Density::Compact {
+                        32.0
+                    } else {
+                        36.0
+                    } * palette.scale))
                     .px_2()
-                    .border_1()
+                    .border_l_2()
                     .border_color(if active {
                         palette.accent
                     } else {
                         with_alpha(palette.border, 0.0)
                     })
+                    .rounded(px(palette.radius))
                     .bg(if active {
                         palette.selected
                     } else {
@@ -14758,16 +19675,148 @@ impl DirectoryWindow {
                     .child(tab.label())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.settings_tab = tab;
-                        cx.notify();
+                        if tab == SettingsTab::Integration {
+                            this.start_system_integration_status(cx);
+                        } else {
+                            cx.notify();
+                        }
                     }))
                     .into_any_element()
             })
             .collect();
+        let folder_handler_enabled = self
+            .system_integration_status
+            .as_ref()
+            .is_some_and(|status| status.enabled);
+        let folder_handler_available = !self.system_integration_pending
+            && self
+                .system_integration_status
+                .as_ref()
+                .is_none_or(|status| status.supported);
+        let integration_platform = if cfg!(target_os = "macos") {
+            "macOS"
+        } else if cfg!(windows) {
+            "Windows"
+        } else {
+            "this platform"
+        };
+        let folder_handler_state = if let Some(error) = self.system_integration_error.as_deref() {
+            format!("{integration_platform} integration could not be read: {error}")
+        } else if self
+            .system_integration_status
+            .as_ref()
+            .is_some_and(|status| !status.supported)
+        {
+            "Automatic folder opening is available on Windows and macOS.".to_string()
+        } else if folder_handler_enabled {
+            if cfg!(target_os = "macos") {
+                "Folder opens are routed to this installed copy of Explorie. Turning this off restores the previous macOS handler."
+                    .to_string()
+            } else {
+                "Windows folder and drive opens are routed to this installed copy of Explorie. Turning this off restores the previous handler."
+                    .to_string()
+            }
+        } else if cfg!(target_os = "macos") {
+            "Keep Finder as the macOS shell, but use Explorie when folders are opened. This is per-user and reversible."
+                .to_string()
+        } else {
+            "Keep Explorer as the Windows shell, but route folder and drive opens to Explorie. This is per-user and reversible."
+                .to_string()
+        };
+        let search_index_health = self.services.search.index_health();
+        let search_index_status = format!(
+            "Search index: {} cached root{} • {} indexed path{}",
+            search_index_health.roots,
+            if search_index_health.roots == 1 {
+                ""
+            } else {
+                "s"
+            },
+            search_index_health.indexed_entries,
+            if search_index_health.indexed_entries == 1 {
+                ""
+            } else {
+                "s"
+            }
+        );
+        let (update_message, update_button_label, update_action) = if !cfg!(windows) {
+            (
+                "Automatic installer updates are currently available on Windows.".to_string(),
+                "Unavailable",
+                None,
+            )
+        } else {
+            match &self.update_status {
+                UpdateStatus::Idle => (
+                    "Updates are checked automatically when Explorie starts.".to_string(),
+                    "Check for updates",
+                    Some(UpdateAction::Check),
+                ),
+                UpdateStatus::Checking => (
+                    "Checking the latest published release…".to_string(),
+                    "Checking…",
+                    None,
+                ),
+                UpdateStatus::UpToDate => (
+                    "Explorie is up to date.".to_string(),
+                    "Check again",
+                    Some(UpdateAction::Check),
+                ),
+                UpdateStatus::Available(update) => (
+                    format!("Explorie {} is available.", update.version),
+                    "Download and install",
+                    Some(UpdateAction::Download(update.clone())),
+                ),
+                UpdateStatus::Downloading(update) => (
+                    format!("Downloading and verifying Explorie {}…", update.version),
+                    "Downloading…",
+                    None,
+                ),
+                UpdateStatus::Ready(update) => (
+                    format!("Explorie {} is verified and ready.", update.info.version),
+                    "Install and restart",
+                    Some(UpdateAction::Install(update.clone())),
+                ),
+                UpdateStatus::Installing => (
+                    "Preparing the installer and closing Explorie…".to_string(),
+                    "Installing…",
+                    None,
+                ),
+                UpdateStatus::Failed(error) => (
+                    format!("Update unavailable: {error}"),
+                    "Retry",
+                    Some(UpdateAction::Check),
+                ),
+            }
+        };
+        let update_action_enabled = update_action.is_some();
+        let update_control = toolbar_button_enabled(
+            "settings-update-action",
+            update_button_label,
+            self.palette.control,
+            update_action_enabled,
+        )
+        .debug_selector(|| "settings-update-action".to_string())
+        .on_click(cx.listener(move |this, _, _, cx| {
+            let Some(action) = update_action.clone() else {
+                return;
+            };
+            match action {
+                UpdateAction::Check => this.start_update_check(true, cx),
+                UpdateAction::Download(update) => this.start_update_download(update, cx),
+                UpdateAction::Install(update) => this.start_prepared_update(update, cx),
+            }
+        }));
         let active_content = match self.settings_tab {
             SettingsTab::General => div()
                 .id("settings-general")
                 .debug_selector(|| "settings-general".to_string())
-                .child(settings_section("General", general, self.palette))
+                .children(vec![
+                    settings_section("Files and visibility", general_files, self.palette),
+                    settings_section("Workspace", general_workspace, self.palette),
+                    settings_section("Safety", general_safety, self.palette),
+                    settings_section("Advanced", general_advanced, self.palette),
+                ])
                 .into_any_element(),
             SettingsTab::Integration => div()
                 .id("settings-integration")
@@ -14776,14 +19825,58 @@ impl DirectoryWindow {
                 .flex_col()
                 .gap_3()
                 .p_3()
-                .child(div().text_sm().child("System Integration"))
+                .child(
+                    div()
+                        .text_lg()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child("System integration"),
+                )
                 .child(
                     div()
                         .text_xs()
                         .text_color(self.palette.muted)
-                        .child("Preview helpers and remote-drive support stay local to this app."),
+                        .child(format!(
+                            "Control how Explorie participates in {integration_platform} without replacing the desktop shell."
+                        )),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(
+                            settings_toggle_control(
+                                self.palette,
+                                "settings-folder-handler",
+                                "Open folders in Explorie",
+                                if cfg!(target_os = "macos") {
+                                    "Use Explorie for folder opens without replacing Finder."
+                                } else {
+                                    "Route Windows folder and drive opens here without replacing the desktop shell."
+                                },
+                                folder_handler_enabled,
+                                folder_handler_available,
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if !this.system_integration_pending {
+                                    this.toggle_system_integration(cx)
+                                }
+                            })),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(self.palette.muted)
+                                .child(folder_handler_state),
+                        ),
                 )
                 .children(helper_rows)
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(self.palette.muted)
+                        .child(search_index_status),
+                )
                 .child(
                     div()
                         .flex()
@@ -14798,15 +19891,43 @@ impl DirectoryWindow {
                         .child(
                             settings_control("settings-clear-cache", "Clear preview cache", false)
                                 .on_click(
-                                    cx.listener(|this, _, _, cx| this.clear_preview_cache(cx)),
+                                    cx.listener(|this, _, _, cx| {
+                                        this.request_settings_confirmation(
+                                            SettingsConfirmation::ClearPreviewCache,
+                                            cx,
+                                        )
+                                    }),
                                 ),
+                        )
+                        .child(
+                            settings_control(
+                                "settings-rebuild-search-index",
+                                "Rebuild search index",
+                                false,
+                            )
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.rebuild_search_index(cx)),
+                            ),
                         ),
                 )
                 .into_any_element(),
             SettingsTab::Appearance => div()
                 .id("settings-appearance")
                 .debug_selector(|| "settings-appearance".to_string())
-                .child(settings_section("Appearance", appearance, self.palette))
+                .children(vec![
+                    settings_section("Theme and color", appearance_color, self.palette),
+                    settings_section("Layout and sizing", appearance_layout, self.palette),
+                    settings_section(
+                        "Typography and icons",
+                        appearance_typography,
+                        self.palette,
+                    ),
+                    settings_section(
+                        "Accessibility",
+                        appearance_accessibility,
+                        self.palette,
+                    ),
+                ])
                 .into_any_element(),
             SettingsTab::Themes => div()
                 .id("settings-themes")
@@ -14827,7 +19948,12 @@ impl DirectoryWindow {
                 .flex_col()
                 .gap_3()
                 .p_3()
-                .child(div().text_sm().child("About"))
+                .child(
+                    div()
+                        .text_lg()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child("About"),
+                )
                 .child(
                     div()
                         .flex()
@@ -14843,6 +19969,27 @@ impl DirectoryWindow {
                         .gap_3()
                         .child(div().w(px(120.0)).text_sm().child("Desktop"))
                         .child("Native GPUI"),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .child(div().w(px(120.0)).text_sm().child("Updates"))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .items_start()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(self.palette.muted)
+                                        .child(update_message),
+                                )
+                                .child(update_control),
+                        ),
                 )
                 .when_some(import_status, |section, status| {
                     section.child(div().text_xs().text_color(self.palette.muted).child(status))
@@ -14871,6 +20018,7 @@ impl DirectoryWindow {
                     .w(px(panel_width))
                     .h(px(panel_height))
                     .min_h_0()
+                    .rounded(px((self.palette.radius + 2.0).min(12.0)))
                     .border_1()
                     .border_color(self.palette.border)
                     .bg(self.palette.surface)
@@ -14881,7 +20029,7 @@ impl DirectoryWindow {
                             .debug_selector(|| "settings-header".to_string())
                             .flex()
                             .items_center()
-                            .h(px(46.0))
+                            .h(px(46.0 * self.palette.scale))
                             .flex_none()
                             .px_3()
                             .border_b_1()
@@ -14890,7 +20038,7 @@ impl DirectoryWindow {
                             .child(
                                 div()
                                     .flex_1()
-                                    .text_sm()
+                                    .text_lg()
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .child("Settings"),
                             )
@@ -14903,8 +20051,6 @@ impl DirectoryWindow {
                                     false,
                                     true,
                                 )
-                                .w(px(34.0))
-                                .h(px(34.0))
                                 .on_click(
                                     cx.listener(|this, _, _, cx| this.close_settings_panel(cx)),
                                 ),
@@ -14924,23 +20070,21 @@ impl DirectoryWindow {
                                 div()
                                     .id("settings-tabs")
                                     .debug_selector(|| "settings-tabs".to_string())
-                                    .role(Role::List)
+                                    .role(Role::TabList)
                                     .aria_label("Settings sections")
                                     .flex()
                                     .gap_1()
                                     .flex_none()
-                                    .border_1()
-                                    .border_color(self.palette.border)
                                     .bg(self.palette.window)
                                     .when(compact_settings, |tabs| {
                                         tabs.flex_row()
                                             .w_full()
-                                            .h(px(48.0))
+                                            .h(px(48.0 * self.palette.scale))
                                             .p_1()
                                             .overflow_x_scroll()
                                     })
                                     .when(!compact_settings, |tabs| {
-                                        tabs.flex_col().w(px(172.0)).p_2()
+                                        tabs.flex_col().w(px(172.0 * self.palette.scale)).p_2()
                                     })
                                     .children(tab_rows),
                             )
@@ -14948,14 +20092,13 @@ impl DirectoryWindow {
                                 div()
                                     .id("settings-active-section")
                                     .debug_selector(|| "settings-active-section".to_string())
+                                    .role(Role::TabPanel)
                                     .flex()
                                     .flex_col()
                                     .flex_1()
                                     .min_w_0()
                                     .min_h_0()
                                     .overflow_y_scroll()
-                                    .border_1()
-                                    .border_color(self.palette.border)
                                     .bg(self.palette.window)
                                     .child(active_content),
                             ),
@@ -14966,7 +20109,7 @@ impl DirectoryWindow {
                             .debug_selector(|| "settings-footer".to_string())
                             .flex()
                             .items_center()
-                            .h(px(46.0))
+                            .h(px(46.0 * self.palette.scale))
                             .flex_none()
                             .gap_3()
                             .px_3()
@@ -14986,7 +20129,14 @@ impl DirectoryWindow {
                                     "Reset to defaults",
                                     self.palette.control,
                                 )
-                                .on_click(cx.listener(|this, _, _, cx| this.reset_settings(cx))),
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.request_settings_confirmation(
+                                            SettingsConfirmation::ResetSettings,
+                                            cx,
+                                        )
+                                    },
+                                )),
                             )
                             .child(
                                 div()
@@ -15011,18 +20161,226 @@ impl DirectoryWindow {
             .into_any_element()
     }
 
-    fn render_operation_panel(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let active_count = self.operations.active_count();
+    fn render_settings_confirmation(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(confirmation) = self.settings_confirmation.as_ref() else {
+            return div().into_any_element();
+        };
+        if self.settings_confirmation_focus_pending {
+            self.settings_confirmation_return_focus = window.focused(cx);
+            window.focus(&self.settings_confirmation_cancel_focus, cx);
+            self.settings_confirmation_focus_pending = false;
+        }
+        let (title, message, confirm_label, cancel_label, confirm_color): (
+            Cow<'_, str>,
+            Cow<'_, str>,
+            &str,
+            &str,
+            Rgba,
+        ) = match confirmation {
+            SettingsConfirmation::ResetSettings => (
+                Cow::Borrowed("Reset all settings?"),
+                Cow::Borrowed(
+                    "Appearance, behavior, view preferences, and shortcut overrides will return to their defaults.",
+                ),
+                "Reset settings",
+                "Cancel",
+                rgb(0x8b3340),
+            ),
+            SettingsConfirmation::ResetShortcut(command_id) => (
+                Cow::Borrowed("Reset this shortcut?"),
+                Cow::Borrowed(command_id.as_str()),
+                "Reset shortcut",
+                "Cancel",
+                rgb(0x8b3340),
+            ),
+            SettingsConfirmation::ResetAllShortcuts => (
+                Cow::Borrowed("Reset all shortcuts?"),
+                Cow::Borrowed("Every customized shortcut will return to its default binding."),
+                "Reset shortcuts",
+                "Cancel",
+                rgb(0x8b3340),
+            ),
+            SettingsConfirmation::ClearPreviewCache => (
+                Cow::Borrowed("Clear preview cache?"),
+                Cow::Borrowed(
+                    "Generated thumbnails and preview artifacts will be removed and recreated when needed.",
+                ),
+                "Clear cache",
+                "Cancel",
+                rgb(0x8b3340),
+            ),
+            SettingsConfirmation::DeleteTheme(name) => (
+                Cow::Borrowed("Delete saved theme?"),
+                Cow::Borrowed(name.as_str()),
+                "Delete theme",
+                "Cancel",
+                rgb(0x8b3340),
+            ),
+            SettingsConfirmation::RemoveCustomField(name) => (
+                Cow::Borrowed("Remove custom field?"),
+                Cow::Borrowed(name.as_str()),
+                "Remove field",
+                "Cancel",
+                rgb(0x8b3340),
+            ),
+            SettingsConfirmation::InstallUpdate(update) => (
+                Cow::Owned(format!("Install Explorie {}?", update.version)),
+                Cow::Borrowed(
+                    "The installer will be downloaded, verified with the published SHA-256 manifest, and launched silently. Explorie will restart to finish the update.",
+                ),
+                "Download and restart",
+                "Later",
+                self.palette.accent,
+            ),
+            SettingsConfirmation::DiscardDraft(_) => (
+                Cow::Borrowed("Discard unsaved changes?"),
+                Cow::Borrowed(
+                    "This draft has not been applied. Closing it will lose the changes you entered.",
+                ),
+                "Discard changes",
+                "Cancel",
+                rgb(0x8b3340),
+            ),
+        };
+        div()
+            .id("settings-confirmation-backdrop")
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .p_4()
+            .bg(with_alpha(rgb(0x000000), 0.64))
+            .child(
+                div()
+                    .id("settings-confirmation")
+                    .role(Role::AlertDialog)
+                    .aria_label(title.to_string())
+                    .key_context("settings-confirmation")
+                    .tab_group()
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                        match event.keystroke.key.as_str() {
+                            "tab" => {
+                                let focus = if event.keystroke.modifiers.shift
+                                    || this.settings_confirmation_confirm_focus.is_focused(window)
+                                {
+                                    this.settings_confirmation_cancel_focus.clone()
+                                } else {
+                                    this.settings_confirmation_confirm_focus.clone()
+                                };
+                                window.focus(&focus, cx);
+                            }
+                            "escape" => this.cancel_settings_confirmation(window, cx),
+                            "enter" => {
+                                if this.settings_confirmation_confirm_focus.is_focused(window) {
+                                    this.confirm_settings_confirmation(window, cx);
+                                } else {
+                                    this.cancel_settings_confirmation(window, cx);
+                                }
+                            }
+                            _ => return,
+                        }
+                        cx.stop_propagation();
+                    }))
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .w_full()
+                    .max_w(px(460.0 * self.palette.scale))
+                    .p_4()
+                    .border_1()
+                    .border_color(self.palette.border)
+                    .rounded_lg()
+                    .bg(self.palette.panel)
+                    .shadow_lg()
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(title.to_string()),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(self.palette.muted)
+                            .child(message.to_string()),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                toolbar_button(
+                                    "settings-confirmation-cancel",
+                                    cancel_label,
+                                    self.palette.control,
+                                )
+                                .track_focus(&self.settings_confirmation_cancel_focus)
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| {
+                                        this.cancel_settings_confirmation(window, cx);
+                                    },
+                                )),
+                            )
+                            .child(
+                                toolbar_button(
+                                    "settings-confirmation-confirm",
+                                    confirm_label,
+                                    confirm_color,
+                                )
+                                .track_focus(&self.settings_confirmation_confirm_focus)
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| {
+                                        this.confirm_settings_confirmation(window, cx);
+                                    },
+                                )),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_operation_panel(
+        &mut self,
+        status_message_visible: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let palette = self.palette;
+        let scale = self.palette.scale;
+        let foreign_operations = self.foreign_operation_summaries();
+        let queue_active_count = self.operations.active_count();
+        let local_active_count = queue_active_count
+            + usize::from(
+                self.archive_creation_id.is_some() || self.archive_extraction_id.is_some(),
+            )
+            + usize::from(self.undo_progress.is_some());
+        let active_count = local_active_count
+            + foreign_operations
+                .iter()
+                .filter(|operation| operation.status == OperationStatus::Running)
+                .count();
         let failed_count = self
             .operations
             .operations()
             .iter()
             .filter(|operation| operation.status() == OperationStatus::Failed)
-            .count();
-        let finished_count = self.operations.operations().len() - active_count;
+            .count()
+            + foreign_operations
+                .iter()
+                .filter(|operation| operation.status == OperationStatus::Failed)
+                .count();
+        let finished_count = self.operations.operations().len() - queue_active_count;
         let has_visible_content = self.clipboard.is_some()
             || !self.operations.operations().is_empty()
+            || !foreign_operations.is_empty()
             || self.archive_progress.is_some()
+            || self.archive_creation_id.is_some()
+            || self.archive_extraction_id.is_some()
             || self.undo_progress.is_some();
         if !has_visible_content || self.operation_panel_hidden {
             return div()
@@ -15032,25 +20390,29 @@ impl DirectoryWindow {
                 .into_any_element();
         }
 
-        let bottom = if self.settings.view.show_status_bar {
-            42.0
-        } else {
-            12.0
-        };
+        let mut bottom = 12.0 * scale;
+        if self.settings.view.show_status_bar {
+            bottom += 28.0 * scale;
+            if status_message_visible {
+                bottom += 34.0 * scale;
+            }
+        }
         if self.operation_panel_minimized && active_count > 0 {
             return div()
                 .id("operation-panel")
                 .debug_selector(|| "operation-panel".to_string())
                 .role(Role::Button)
                 .aria_label(format!("Expand operations: {active_count} in progress"))
+                .focusable()
+                .tab_stop(true)
                 .absolute()
-                .right(px(16.0))
+                .right(px(16.0 * scale))
                 .bottom(px(bottom))
                 .flex()
                 .items_center()
                 .gap_2()
-                .w(px(280.0))
-                .h(px(40.0))
+                .w(px(280.0 * scale))
+                .h(px(40.0 * scale))
                 .px_3()
                 .rounded_lg()
                 .border_1()
@@ -15058,6 +20420,7 @@ impl DirectoryWindow {
                 .bg(self.palette.panel)
                 .shadow_lg()
                 .occlude()
+                .focus(move |panel| panel.border_color(palette.accent))
                 .cursor_pointer()
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_operation_panel_minimized(cx)))
                 .child(
@@ -15153,6 +20516,43 @@ impl DirectoryWindow {
             );
         }
 
+        if self.archive_creation_id.is_some() && self.archive_progress.is_none() {
+            rows.push(
+                operation_context_row(
+                    "archive-creation",
+                    "Create archive",
+                    "In progress".to_string(),
+                    self.palette.accent,
+                    self.palette,
+                )
+                .into_any_element(),
+            );
+        }
+
+        if let Some(operation_id) = self.archive_extraction_id.clone() {
+            rows.push(
+                operation_context_row(
+                    "archive-extraction",
+                    "Extract archive",
+                    "In progress".to_string(),
+                    self.palette.accent,
+                    self.palette,
+                )
+                .child(
+                    toolbar_button("cancel-archive-extraction", "Cancel", rgb(0x493232)).on_click(
+                        cx.listener(move |this, _, _, cx| {
+                            if this.services.archives.cancel(&operation_id) {
+                                this.status_message =
+                                    Some("Cancelling archive extraction…".to_string());
+                                cx.notify();
+                            }
+                        }),
+                    ),
+                )
+                .into_any_element(),
+            );
+        }
+
         if let Some(progress) = self.undo_progress.as_ref() {
             let state = if progress.cancelling {
                 "Cancelling"
@@ -15177,6 +20577,99 @@ impl DirectoryWindow {
                         .on_click(cx.listener(|this, _, _, cx| this.cancel_undo(cx))),
                 )
                 .into_any_element(),
+            );
+        }
+
+        for (index, operation) in foreign_operations.iter().rev().enumerate() {
+            let status = match operation.status {
+                OperationStatus::Running => "In progress",
+                OperationStatus::Completed => "Completed",
+                OperationStatus::Cancelled => "Cancelled",
+                OperationStatus::Failed => "Failed",
+            };
+            let status_color = match operation.status {
+                OperationStatus::Running => self.palette.accent,
+                OperationStatus::Completed => rgb(0x6fcf97),
+                OperationStatus::Cancelled => rgb(0xffb86c),
+                OperationStatus::Failed => rgb(0xff6b6b),
+            };
+            let destination = operation
+                .destination
+                .as_deref()
+                .map(path_label)
+                .map(|destination| format!(" → {destination}"))
+                .unwrap_or_default();
+            let progress = if operation.total_bytes > 0 {
+                format!(
+                    " • {} / {}",
+                    format_size(operation.processed_bytes),
+                    format_size(operation.total_bytes)
+                )
+            } else if operation.total_entries > 0 {
+                format!(
+                    " • {} / {} entries",
+                    operation.processed_entries, operation.total_entries
+                )
+            } else {
+                String::new()
+            };
+            let error = operation
+                .error
+                .as_deref()
+                .map(|error| format!(" • {error}"))
+                .unwrap_or_default();
+            let current_path = operation
+                .current_path
+                .as_deref()
+                .map(path_label)
+                .map(|path| format!(" • {path}"))
+                .unwrap_or_default();
+            let details = format!(
+                "Another window • {} item{}{}{progress}{current_path}{error}",
+                operation.item_count,
+                if operation.item_count == 1 { "" } else { "s" },
+                destination,
+            );
+            rows.push(
+                div()
+                    .id(("foreign-operation-row", index))
+                    .debug_selector(move || format!("foreign-operation-row-{index}"))
+                    .role(Role::Group)
+                    .aria_label(format!("{} in another window: {status}", operation.label))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .p_3()
+                    .rounded_sm()
+                    .bg(self.palette.surface)
+                    .child(
+                        div()
+                            .w(px(10.0))
+                            .h(px(10.0))
+                            .rounded_full()
+                            .bg(status_color),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(format!("{} • {status}", operation.label)),
+                            )
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(self.palette.tertiary)
+                                    .child(details),
+                            ),
+                    )
+                    .into_any_element(),
             );
         }
 
@@ -15274,8 +20767,8 @@ impl DirectoryWindow {
                                     .flex()
                                     .items_center()
                                     .justify_center()
-                                    .w(px(24.0))
-                                    .h(px(24.0))
+                                    .w(px(24.0 * self.palette.scale))
+                                    .h(px(24.0 * self.palette.scale))
                                     .rounded_sm()
                                     .bg(with_alpha(status_color, 0.14))
                                     .text_color(status_color)
@@ -15367,7 +20860,7 @@ impl DirectoryWindow {
                                         .child(
                                             div()
                                                 .h_full()
-                                                .w(px(330.0 * progress_fraction))
+                                                .w(px(330.0 * scale * progress_fraction))
                                                 .bg(status_color),
                                         ),
                                 )
@@ -15422,7 +20915,7 @@ impl DirectoryWindow {
             .role(Role::Group)
             .aria_label("File operations")
             .absolute()
-            .right(px(12.0))
+            .right(px(12.0 * scale))
             .bottom(px(bottom))
             .flex()
             .flex_col()
@@ -15430,8 +20923,15 @@ impl DirectoryWindow {
                 280.0
             } else {
                 380.0
-            }))
-            .max_h(px(440.0))
+            } * scale))
+            .max_h(px((440.0 * scale).min(
+                (self
+                    .last_window_bounds
+                    .height
+                    .unwrap_or(DEFAULT_WINDOW_HEIGHT)
+                    - 80.0 * scale)
+                    .max(160.0 * scale),
+            )))
             .rounded_lg()
             .overflow_hidden()
             .border_1()
@@ -15707,7 +21207,14 @@ impl DirectoryWindow {
             .enumerate()
             .map(|(index, tag)| {
                 let color = tag.color();
+                let tag_color = rgb(color.rgb);
+                let foreground = if tag.color_index == 0 {
+                    self.palette.text
+                } else {
+                    contrasting_text(tag_color)
+                };
                 let raw = tag.raw.clone();
+                let remove_label = format!("Remove Finder tag {}", tag.name);
                 div()
                     .id(ElementId::Name(format!("finder-tag-{index}").into()))
                     .debug_selector(move || format!("finder-tag-{index}"))
@@ -15721,21 +21228,17 @@ impl DirectoryWindow {
                     .border_color(if tag.color_index == 0 {
                         self.palette.border
                     } else {
-                        rgb(color.rgb)
+                        tag_color
                     })
                     .bg(if tag.color_index == 0 {
                         self.palette.control
                     } else {
-                        rgb(color.rgb)
+                        tag_color
                     })
                     .text_xs()
-                    .text_color(if tag.color_index == 0 {
-                        self.palette.text
-                    } else {
-                        rgb(0xffffff)
-                    })
+                    .text_color(foreground)
                     .when(tag.color_index > 0, |chip| {
-                        chip.child(div().w(px(7.0)).h(px(7.0)).rounded_md().bg(rgb(0xffffff)))
+                        chip.child(div().w(px(7.0)).h(px(7.0)).rounded_md().bg(foreground))
                     })
                     .child(div().max_w(px(120.0)).truncate().child(tag.name.clone()))
                     .when(!state.saving, |chip| {
@@ -15743,14 +21246,36 @@ impl DirectoryWindow {
                             div()
                                 .id(ElementId::Name(format!("remove-finder-tag-{index}").into()))
                                 .debug_selector(move || format!("remove-finder-tag-{index}"))
+                                .role(Role::Button)
+                                .aria_label(remove_label)
+                                .focusable()
+                                .tab_stop(true)
                                 .ml_1()
+                                .px_1()
+                                .rounded_sm()
+                                .border_1()
+                                .border_color(with_alpha(foreground, 0.0))
+                                .focus(move |button| {
+                                    button
+                                        .border_color(foreground)
+                                        .bg(with_alpha(foreground, 0.16))
+                                })
+                                .hover(move |button| button.bg(with_alpha(foreground, 0.12)))
                                 .cursor_pointer()
                                 .text_color(if tag.color_index == 0 {
                                     self.palette.muted
                                 } else {
-                                    rgb(0xffffff)
+                                    foreground
                                 })
-                                .child("×")
+                                .child(toolbar_icon(
+                                    "close",
+                                    self.palette.icon_size.clamp(10.0, 14.0),
+                                    if tag.color_index == 0 {
+                                        self.palette.muted
+                                    } else {
+                                        foreground
+                                    },
+                                ))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.remove_finder_tag(&raw, cx)
                                 })),
@@ -15828,20 +21353,31 @@ impl DirectoryWindow {
                         .gap_2()
                         .child(
                             div()
+                                .id("finder-tag-name-input")
+                                .debug_selector(|| "finder-tag-name-input".to_string())
                                 .min_w(px(120.0))
                                 .max_w(px(200.0))
                                 .flex_1()
-                                .px_2()
-                                .py_1()
-                                .border_1()
-                                .border_color(self.palette.accent)
-                                .bg(self.palette.window)
-                                .text_xs()
-                                .child(if editor.input.is_empty() {
-                                    "Tag name…".to_string()
-                                } else {
-                                    editor.input
-                                }),
+                                .child(
+                                    self.native_text_input_element(TextInputTarget::FinderTag)
+                                        .unwrap_or_else(|| {
+                                            div()
+                                                .h(px(34.0))
+                                                .px_2()
+                                                .flex()
+                                                .items_center()
+                                                .border_1()
+                                                .border_color(self.palette.accent)
+                                                .bg(self.palette.window)
+                                                .text_sm()
+                                                .child(if editor.input.is_empty() {
+                                                    "Tag name…".to_string()
+                                                } else {
+                                                    editor.input
+                                                })
+                                                .into_any_element()
+                                        }),
+                                ),
                         )
                         .child(
                             toolbar_button(
@@ -15913,12 +21449,17 @@ impl DirectoryWindow {
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            let file_type = entry
-                .path
-                .extension()
-                .map(|extension| extension.to_string_lossy().to_ascii_uppercase())
-                .filter(|extension| !extension.is_empty())
-                .unwrap_or_else(|| "Unknown".to_string());
+            let file_type = self.preview_detection.as_ref().map_or_else(
+                || {
+                    entry
+                        .path
+                        .extension()
+                        .map(|extension| extension.to_string_lossy().to_ascii_uppercase())
+                        .filter(|extension| !extension.is_empty())
+                        .unwrap_or_else(|| "Unknown".to_string())
+                },
+                |detection| detection.description.clone(),
+            );
             rows.insert(0, metadata_row("Name", name, self.palette));
             rows.push(metadata_row("Size", format_size(entry.size), self.palette));
             rows.push(metadata_row(
@@ -15927,6 +21468,13 @@ impl DirectoryWindow {
                 self.palette,
             ));
             rows.push(metadata_row("Type", file_type, self.palette));
+            if let Some(mime_type) = self
+                .preview_detection
+                .as_ref()
+                .and_then(|detection| detection.mime_type.clone())
+            {
+                rows.push(metadata_row("Content type", mime_type, self.palette));
+            }
             rows.push(metadata_row(
                 "Link",
                 if entry.is_symlink {
@@ -16051,7 +21599,7 @@ impl DirectoryWindow {
                             self.palette.control,
                         )
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.remove_custom_field(&remove_name, cx)
+                            this.request_remove_custom_field(&remove_name, cx)
                         })),
                     )
                     .into_any_element()
@@ -16103,42 +21651,82 @@ impl DirectoryWindow {
                         .gap_2()
                         .child(
                             div()
+                                .id("custom-field-name-input")
                                 .flex_1()
-                                .p_2()
-                                .border_1()
-                                .border_color(if name_active {
-                                    self.palette.accent
-                                } else {
-                                    self.palette.border
-                                })
-                                .bg(self.palette.window)
                                 .text_sm()
-                                .child(if draft.name.is_empty() {
-                                    "Field name…│".to_string()
-                                } else if name_active {
-                                    format!("{}│", draft.name)
+                                .cursor_text()
+                                .when(!name_active, |input| {
+                                    input
+                                        .role(Role::Button)
+                                        .aria_label("Edit custom field name")
+                                        .focusable()
+                                        .tab_stop(true)
+                                        .h(px(34.0))
+                                        .px_2()
+                                        .border_1()
+                                        .border_color(self.palette.border)
+                                        .bg(self.palette.window)
+                                        .focus(|input| input.border_color(self.palette.accent))
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.select_custom_field_input(CustomFieldInput::Name, cx)
+                                }))
+                                .child(if name_active {
+                                    self.native_text_input_element(TextInputTarget::CustomField)
+                                        .unwrap_or_else(|| {
+                                            div().child(draft.name.clone()).into_any_element()
+                                        })
                                 } else {
-                                    draft.name.clone()
+                                    div()
+                                        .flex()
+                                        .h_full()
+                                        .items_center()
+                                        .child(if draft.name.is_empty() {
+                                            "Field name…".to_string()
+                                        } else {
+                                            draft.name.clone()
+                                        })
+                                        .into_any_element()
                                 }),
                         )
                         .child(
                             div()
+                                .id("custom-field-value-input")
                                 .flex_1()
-                                .p_2()
-                                .border_1()
-                                .border_color(if value_active {
-                                    self.palette.accent
-                                } else {
-                                    self.palette.border
-                                })
-                                .bg(self.palette.window)
                                 .text_sm()
-                                .child(if draft.value.is_empty() {
-                                    "Value…│".to_string()
-                                } else if value_active {
-                                    format!("{}│", draft.value)
+                                .cursor_text()
+                                .when(!value_active, |input| {
+                                    input
+                                        .role(Role::Button)
+                                        .aria_label("Edit custom field value")
+                                        .focusable()
+                                        .tab_stop(true)
+                                        .h(px(34.0))
+                                        .px_2()
+                                        .border_1()
+                                        .border_color(self.palette.border)
+                                        .bg(self.palette.window)
+                                        .focus(|input| input.border_color(self.palette.accent))
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.select_custom_field_input(CustomFieldInput::Value, cx)
+                                }))
+                                .child(if value_active {
+                                    self.native_text_input_element(TextInputTarget::CustomField)
+                                        .unwrap_or_else(|| {
+                                            div().child(draft.value.clone()).into_any_element()
+                                        })
                                 } else {
-                                    draft.value.clone()
+                                    div()
+                                        .flex()
+                                        .h_full()
+                                        .items_center()
+                                        .child(if draft.value.is_empty() {
+                                            "Value…".to_string()
+                                        } else {
+                                            draft.value.clone()
+                                        })
+                                        .into_any_element()
                                 }),
                         ),
                 )
@@ -16153,18 +21741,28 @@ impl DirectoryWindow {
                         .child(
                             div()
                                 .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .whitespace_nowrap()
                                 .text_xs()
                                 .text_color(self.palette.muted)
                                 .child("Tab switches fields • Enter saves • Esc cancels"),
                         )
                         .child(
-                            toolbar_button("cancel-custom-field", "Cancel", self.palette.control)
-                                .on_click(
+                            toolbar_button_enabled(
+                                "cancel-custom-field",
+                                "Cancel",
+                                self.palette.control,
+                                !editor.pending,
+                            )
+                            .when(!editor.pending, |button| {
+                                button.on_click(
                                     cx.listener(|this, _, _, cx| this.cancel_custom_field_edit(cx)),
-                                ),
+                                )
+                            }),
                         )
                         .child(
-                            toolbar_button(
+                            toolbar_button_enabled(
                                 "save-custom-field",
                                 if editor.pending { "Saving…" } else { "Save" },
                                 if editor.pending {
@@ -16172,8 +21770,13 @@ impl DirectoryWindow {
                                 } else {
                                     self.palette.accent
                                 },
+                                !editor.pending,
                             )
-                            .on_click(cx.listener(|this, _, _, cx| this.save_custom_field(cx))),
+                            .when(!editor.pending, |button| {
+                                button.on_click(
+                                    cx.listener(|this, _, _, cx| this.save_custom_field(cx)),
+                                )
+                            }),
                         ),
                 )
                 .into_any_element()
@@ -16259,735 +21862,1314 @@ impl DirectoryWindow {
                     .join(" • ")
             )
         };
-        let preview_body =
-            match state {
-                PreviewState::Closed => unreachable!("closed previews have no path"),
-                PreviewState::Loading { .. } => div()
-                    .px_3()
-                    .py_4()
-                    .text_sm()
-                    .text_color(rgb(0x909090))
-                    .child("Loading native preview…")
-                    .into_any_element(),
-                PreviewState::Failed { error, .. } => div()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .px_3()
-                    .py_4()
-                    .text_sm()
-                    .text_color(rgb(0xffb86c))
-                    .child(div().flex_1().child(error.to_string()))
-                    .child(
-                        toolbar_button("retry-preview", "Retry", rgb(0x493232))
-                            .on_click(cx.listener(|this, _, _, cx| this.retry_preview(cx))),
-                    )
-                    .into_any_element(),
-                PreviewState::Ready { content, .. } => match content {
-                    PreviewContent::Text(preview) => {
-                        let wrapped = preview.wrapped;
-                        let language = preview
-                            .language
-                            .clone()
-                            .unwrap_or_else(|| "Plain text".into());
-                        let highlighted = StyledText::new(if preview.text.is_empty() && wrapped {
-                            "Empty markdown file".to_string()
-                        } else {
-                            preview.text.clone()
+        let preview_body = match state {
+            PreviewState::Closed => unreachable!("closed previews have no path"),
+            PreviewState::Loading { .. } => div()
+                .flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .min_h(px(if quick_look { 320.0 } else { 160.0 }))
+                .px_4()
+                .py_6()
+                .text_sm()
+                .text_color(self.palette.muted)
+                .child("Preparing preview…")
+                .into_any_element(),
+            PreviewState::Failed { error, .. } => div()
+                .flex()
+                .flex_col()
+                .items_start()
+                .gap_3()
+                .px_4()
+                .py_5()
+                .text_sm()
+                .text_color(rgb(0xffb86c))
+                .child(error.to_string())
+                .child(
+                    toolbar_button("retry-preview", "Retry", rgb(0x493232))
+                        .on_click(cx.listener(|this, _, _, cx| this.retry_preview(cx))),
+                )
+                .into_any_element(),
+            PreviewState::Ready { content, .. } => match content {
+                PreviewContent::Text(preview) => {
+                    let wrapped = self.text_preview.wrap_override.unwrap_or(preview.wrapped);
+                    let show_line_numbers = preview.language.is_some() && !wrapped;
+                    let language = preview
+                        .language
+                        .clone()
+                        .unwrap_or_else(|| "Plain text".into());
+                    let text = if preview.text.is_empty() && wrapped {
+                        "Empty markdown file".to_string()
+                    } else {
+                        preview.text.clone()
+                    };
+                    let highlights = if text == preview.text {
+                        syntax_highlights(&preview, self.palette)
+                    } else {
+                        Vec::new()
+                    };
+                    let line_count = text.split('\n').count();
+                    let find_query = self.text_preview.find.clone();
+                    let find_regex = text_find_regex(&find_query);
+                    let find_count = self.text_preview_match_count();
+                    let active_find_match = find_regex.as_ref().and_then(|regex| {
+                        regex
+                            .find_iter(&text)
+                            .nth(self.text_preview.find_match)
+                            .map(|found| found.start()..found.end())
+                    });
+                    let find_open =
+                        self.native_text_input_target == Some(TextInputTarget::PreviewFind);
+                    let find_input = self.native_text_input_element(TextInputTarget::PreviewFind);
+                    let preview_scale = self.settings.appearance.ui_scale;
+                    let gutter_width =
+                        (24.0 + line_count.to_string().len() as f32 * 8.0) * preview_scale;
+                    let mut next_line_start = 0;
+                    let line_ranges: Vec<_> = text
+                        .split('\n')
+                        .map(|raw_line| {
+                            let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+                            let range = next_line_start..next_line_start + line.len();
+                            next_line_start += raw_line.len() + 1;
+                            range
                         })
-                        .with_highlights(syntax_highlights(&preview, self.palette));
-                        div()
-                            .id("text-preview-surface")
-                            .flex()
-                            .flex_col()
-                            .w_full()
-                            .max_h(px(if quick_look { 820.0 } else { 360.0 }))
-                            .when(quick_look, |surface| surface.flex_1().h_full())
-                            .border_1()
-                            .border_color(self.palette.border)
-                            .bg(self.palette.window)
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .px_3()
-                                    .py_2()
-                                    .border_b_1()
-                                    .border_color(self.palette.border)
-                                    .bg(self.palette.surface)
-                                    .text_xs()
-                                    .text_color(self.palette.muted)
-                                    .child(language)
-                                    .when(wrapped, |header| header.child("Wrapped text")),
-                            )
-                            .child(
-                                div()
-                                    .id(if wrapped {
-                                        "text-preview-wrapped"
-                                    } else {
-                                        "text-preview-code"
-                                    })
-                                    .flex_1()
-                                    .min_h_0()
-                                    .overflow_x_scroll()
-                                    .overflow_y_scroll()
-                                    .px_3()
-                                    .py_3()
-                                    .text_xs()
-                                    .line_height(px(19.0))
-                                    .font_family("monospace")
-                                    .text_color(self.palette.text)
-                                    .when(wrapped, |body| body.whitespace_normal())
-                                    .when(!wrapped, |body| body.whitespace_nowrap())
-                                    .child(highlighted),
-                            )
-                            .when(preview.truncated, |body| {
-                                body.child(
-                                    div()
-                                        .id("text-preview-truncated")
-                                        .px_3()
-                                        .py_2()
-                                        .border_t_1()
-                                        .border_color(self.palette.border)
-                                        .bg(self.palette.surface)
-                                        .text_xs()
-                                        .text_color(rgb(0xffb86c))
-                                        .child("Preview limited to the first 512 KiB"),
+                        .collect();
+                    let text_body = if wrapped {
+                        let text = Arc::new(text.clone());
+                        let line_ranges = Arc::new(line_ranges);
+                        let syntax = Arc::new(highlights);
+                        let find_regex = find_regex.clone();
+                        let active_find_match = active_find_match.clone();
+                        let palette = self.palette;
+                        let count = line_ranges.len();
+                        if self.text_preview.wrapped_list.item_count() != count {
+                            self.text_preview.wrapped_list.reset(count);
+                        }
+                        let wrapped_lines = list(
+                            self.text_preview.wrapped_list.clone(),
+                            move |line_index, _, _| {
+                                let Some(range) = line_ranges.get(line_index).cloned() else {
+                                    return div().into_any_element();
+                                };
+                                let line = &text[range.clone()];
+                                let line_highlights = merge_text_highlight_layers(
+                                    syntax_highlights_for_line(&syntax, range.start, range.end),
+                                    find_highlights_for_line(
+                                        line,
+                                        range.start,
+                                        find_regex.as_ref(),
+                                        active_find_match.as_ref(),
+                                        palette,
+                                    ),
+                                );
+                                text_preview_line_element(
+                                    line_index,
+                                    line,
+                                    line_highlights,
+                                    show_line_numbers,
+                                    gutter_width,
+                                    true,
+                                    palette,
                                 )
-                            })
-                            .into_any_element()
-                    }
-                    PreviewContent::Audio => {
-                        let status = self.audio_status.clone();
-                        let playing = status.as_ref().is_some_and(|status| status.playing);
-                        let position_ms = status.as_ref().map_or(0, |status| status.position_ms);
-                        let duration_ms = status.as_ref().and_then(|status| status.duration_ms);
-                        let progress = duration_ms
-                            .filter(|duration| *duration > 0)
-                            .map_or(0.0, |duration| position_ms as f32 / duration as f32)
-                            .clamp(0.0, 1.0);
-                        let volume = status.as_ref().map_or(0.8, |status| status.volume);
-                        let file_label = path
-                            .file_name()
-                            .unwrap_or_else(|| path.as_os_str())
-                            .to_string_lossy()
-                            .into_owned();
-                        let progress_segments: Vec<AnyElement> = (0_usize..32)
-                            .map(|index| {
-                                let fraction = (index + 1) as f32 / 32.0;
-                                div()
-                                    .id(("audio-seek-segment", index))
-                                    .flex_1()
-                                    .h(px(8.0))
-                                    .rounded_sm()
-                                    .bg(if fraction <= progress {
-                                        self.palette.accent
-                                    } else {
-                                        self.palette.border
-                                    })
-                                    .hover(|segment| segment.bg(self.palette.accent))
-                                    .cursor_pointer()
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.seek_audio_fraction(fraction, cx)
-                                    }))
-                                    .into_any_element()
-                            })
-                            .collect();
+                                .into_any_element()
+                            },
+                        )
+                        .flex_1()
+                        .w_full()
+                        .px_3()
+                        .py_3();
                         div()
-                            .id("audio-preview")
+                            .id("text-preview-wrapped")
                             .flex()
-                            .flex_col()
-                            .items_center()
-                            .justify_center()
-                            .gap_3()
-                            .min_h(px(220.0))
-                            .px_4()
-                            .py_5()
-                            .child(
-                                div()
-                                    .text_size(px(34.0))
-                                    .text_color(self.palette.muted)
-                                    .child("♫"),
-                            )
-                            .child(
-                                div()
-                                    .id("audio-controls")
-                                    .flex()
-                                    .flex_col()
-                                    .gap_3()
-                                    .w_full()
-                                    .max_w(px(400.0))
-                                    .p_3()
-                                    .rounded_md()
-                                    .border_1()
-                                    .border_color(self.palette.border)
-                                    .bg(self.palette.window)
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap_1()
-                                            .children(progress_segments),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .justify_between()
-                                            .text_xs()
-                                            .text_color(self.palette.muted)
-                                            .child(format_audio_time(position_ms))
-                                            .child(duration_ms.map_or_else(
-                                                || "--:--".to_string(),
-                                                format_audio_time,
-                                            )),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .gap_2()
-                                            .child(
-                                                toolbar_button(
-                                                    "audio-back-ten",
-                                                    "−10s",
-                                                    self.palette.control,
-                                                )
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.skip_audio(-10_000, cx)
-                                                })),
-                                            )
-                                            .child(
-                                                toolbar_button(
-                                                    "audio-play-pause",
-                                                    if playing { "Pause" } else { "Play" },
-                                                    self.palette.accent,
-                                                )
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.toggle_audio_playback(cx)
-                                                })),
-                                            )
-                                            .child(
-                                                toolbar_button(
-                                                    "audio-forward-ten",
-                                                    "+10s",
-                                                    self.palette.control,
-                                                )
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.skip_audio(10_000, cx)
-                                                })),
-                                            )
-                                            .child(
-                                                toolbar_button(
-                                                    "audio-volume-down",
-                                                    "Vol −",
-                                                    self.palette.control,
-                                                )
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.adjust_audio_volume(-0.1, cx)
-                                                })),
-                                            )
-                                            .child(
-                                                toolbar_button(
-                                                    "audio-volume-up",
-                                                    "Vol +",
-                                                    self.palette.control,
-                                                )
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.adjust_audio_volume(0.1, cx)
-                                                })),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(self.palette.muted)
-                                                    .child(format!(
-                                                        "{}%",
-                                                        (volume * 100.0).round()
-                                                    )),
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_hidden()
+                            .text_xs()
+                            .line_height(px(19.0 * preview_scale))
+                            .font_family(monospace_font_family())
+                            .text_color(self.palette.text)
+                            .child(wrapped_lines)
+                            .into_any_element()
+                    } else {
+                        let text = Arc::new(text.clone());
+                        let line_ranges = Arc::new(line_ranges);
+                        let syntax = Arc::new(highlights);
+                        let find_regex = find_regex.clone();
+                        let active_find_match = active_find_match.clone();
+                        let palette = self.palette;
+                        let count = line_ranges.len();
+                        let virtual_lines = uniform_list(
+                            "text-preview-virtual-lines",
+                            count,
+                            cx.processor(move |_, visible: std::ops::Range<usize>, _, _| {
+                                visible
+                                    .filter_map(|line_index| {
+                                        let range = line_ranges.get(line_index)?.clone();
+                                        let line = &text[range.clone()];
+                                        let line_highlights = merge_text_highlight_layers(
+                                            syntax_highlights_for_line(
+                                                &syntax,
+                                                range.start,
+                                                range.end,
                                             ),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(self.palette.muted)
-                                    .child(file_label),
-                            )
-                            .into_any_element()
-                    }
-                    PreviewContent::Video => {
-                        let status = self.video_status.clone();
-                        let playing = status.as_ref().is_some_and(|status| status.playing);
-                        let finished = status.as_ref().is_some_and(|status| status.finished);
-                        let position_ms = status.as_ref().map_or(0, |status| status.position_ms);
-                        let duration_ms = status.as_ref().and_then(|status| status.duration_ms);
-                        let progress = duration_ms
-                            .filter(|duration| *duration > 0)
-                            .map_or(0.0, |duration| position_ms as f32 / duration as f32)
-                            .clamp(0.0, 1.0);
-                        let volume = status.as_ref().map_or(0.8, |status| status.volume);
-                        let has_audio = status.as_ref().is_some_and(|status| status.has_audio);
-                        let frame = self.video_frame.clone();
-                        let file_label = path
-                            .file_name()
-                            .unwrap_or_else(|| path.as_os_str())
-                            .to_string_lossy()
-                            .into_owned();
-                        let open_path = path.clone();
-                        let progress_segments: Vec<AnyElement> = (0_usize..40)
-                            .map(|index| {
-                                let fraction = (index + 1) as f32 / 40.0;
-                                div()
-                                    .id(("video-seek-segment", index))
-                                    .flex_1()
-                                    .h(px(8.0))
-                                    .rounded_sm()
-                                    .bg(if fraction <= progress {
-                                        self.palette.accent
-                                    } else {
-                                        self.palette.border
-                                    })
-                                    .hover(|segment| segment.bg(self.palette.accent))
-                                    .cursor_pointer()
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.seek_video_fraction(fraction, cx)
-                                    }))
-                                    .into_any_element()
-                            })
-                            .collect();
-                        div()
-                            .id("video-preview")
-                            .flex()
-                            .flex_col()
-                            .w_full()
-                            .min_h(px(300.0))
-                            .border_1()
-                            .border_color(self.palette.border)
-                            .bg(self.palette.window)
-                            .child(
-                                div()
-                                    .id("video-viewport")
-                                    .flex()
-                                    .flex_1()
-                                    .min_h(px(220.0))
-                                    .max_h(px(if quick_look { 760.0 } else { 520.0 }))
-                                    .items_center()
-                                    .justify_center()
-                                    .overflow_hidden()
-                                    .bg(rgb(0x000000))
-                                    .when_some(frame, |viewport, frame| {
-                                        viewport.child(
-                                            img(frame).max_w_full().max_h(px(if quick_look {
-                                                740.0
-                                            } else {
-                                                500.0
-                                            })),
-                                        )
-                                    })
-                                    .when(self.video_frame.is_none(), |viewport| {
-                                        viewport.child(
-                                            div()
-                                                .text_sm()
-                                                .text_color(rgb(0x9ca3af))
-                                                .child("Decoding video frame…"),
-                                        )
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .id("video-controls")
-                                    .flex()
-                                    .flex_col()
-                                    .gap_2()
-                                    .px_3()
-                                    .py_3()
-                                    .border_t_1()
-                                    .border_color(self.palette.border)
-                                    .bg(self.palette.surface)
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap_1()
-                                            .children(progress_segments),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .justify_between()
-                                            .text_xs()
-                                            .text_color(self.palette.muted)
-                                            .child(format_audio_time(position_ms))
-                                            .child(duration_ms.map_or_else(
-                                                || "--:--".to_string(),
-                                                format_audio_time,
-                                            )),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .flex_wrap()
-                                            .items_center()
-                                            .justify_center()
-                                            .gap_2()
-                                            .child(
-                                                toolbar_button(
-                                                    "video-back-ten",
-                                                    "−10s",
-                                                    self.palette.control,
-                                                )
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.skip_video(-10_000, cx)
-                                                })),
-                                            )
-                                            .child(
-                                                toolbar_button(
-                                                    "video-play-pause",
-                                                    if playing {
-                                                        "Pause"
-                                                    } else if finished {
-                                                        "Replay"
-                                                    } else {
-                                                        "Play"
-                                                    },
-                                                    self.palette.accent,
-                                                )
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.toggle_video_playback(cx)
-                                                })),
-                                            )
-                                            .child(
-                                                toolbar_button(
-                                                    "video-forward-ten",
-                                                    "+10s",
-                                                    self.palette.control,
-                                                )
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.skip_video(10_000, cx)
-                                                })),
-                                            )
-                                            .child(
-                                                toolbar_button(
-                                                    "video-volume-down",
-                                                    "Vol −",
-                                                    self.palette.control,
-                                                )
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.adjust_video_volume(-0.1, cx)
-                                                })),
-                                            )
-                                            .child(
-                                                toolbar_button(
-                                                    "video-volume-up",
-                                                    "Vol +",
-                                                    self.palette.control,
-                                                )
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.adjust_video_volume(0.1, cx)
-                                                })),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(self.palette.muted)
-                                                    .child(if has_audio {
-                                                        format!("{}%", (volume * 100.0).round())
-                                                    } else {
-                                                        "No audio".to_string()
-                                                    }),
-                                            )
-                                            .child(
-                                                toolbar_button(
-                                                    "video-open",
-                                                    "Open",
-                                                    self.palette.control,
-                                                )
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.open_entry(open_path.clone(), false, cx)
-                                                })),
+                                            find_highlights_for_line(
+                                                line,
+                                                range.start,
+                                                find_regex.as_ref(),
+                                                active_find_match.as_ref(),
+                                                palette,
                                             ),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_center()
-                                            .text_xs()
-                                            .text_color(self.palette.muted)
-                                            .child(file_label),
-                                    ),
-                            )
-                            .into_any_element()
-                    }
-                    PreviewContent::Pdf { page, tool } => {
-                        let can_previous = page.page_index > 0;
-                        let can_next = page.page_index + 1 < page.page_count;
-                        let zoom_label = if self.pdf_fit {
-                            "Fit".to_string()
-                        } else {
-                            format!("{}%", self.pdf_zoom_percent)
-                        };
-                        let display_width =
-                            page.display_width as f32 * f32::from(self.pdf_zoom_percent) / 100.0;
-                        let display_height =
-                            page.display_height as f32 * f32::from(self.pdf_zoom_percent) / 100.0;
-                        let open_path = path.clone();
-                        let image_path = page.image_path.clone();
+                                        );
+                                        Some(text_preview_line_element(
+                                            line_index,
+                                            line,
+                                            line_highlights,
+                                            show_line_numbers,
+                                            gutter_width,
+                                            false,
+                                            palette,
+                                        ))
+                                    })
+                                    .collect::<Vec<_>>()
+                            }),
+                        )
+                        .flex_1()
+                        .w_full()
+                        .track_scroll(&self.text_preview.unwrapped_scroll);
                         div()
-                            .id("pdf-preview")
+                            .id("text-preview-code")
                             .flex()
-                            .flex_col()
-                            .w_full()
-                            .border_1()
-                            .border_color(self.palette.border)
-                            .bg(self.palette.window)
-                            .child(
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_x_scroll()
+                            .px_3()
+                            .py_3()
+                            .text_xs()
+                            .line_height(px(19.0 * preview_scale))
+                            .font_family(monospace_font_family())
+                            .text_color(self.palette.text)
+                            .child(virtual_lines)
+                            .into_any_element()
+                    };
+                    div()
+                        .id("text-preview-surface")
+                        .flex()
+                        .flex_col()
+                        .w_full()
+                        .max_h(px((if quick_look { 820.0 } else { 360.0 }) * preview_scale))
+                        .when(quick_look, |surface| surface.flex_1().h_full())
+                        .bg(self.palette.window)
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .px_3()
+                                .py_2()
+                                .border_b_1()
+                                .border_color(self.palette.border)
+                                .bg(self.palette.surface)
+                                .text_xs()
+                                .text_color(self.palette.muted)
+                                .child(div().flex_1().min_w_0().truncate().child(format!(
+                                    "{language}  •  {}  •  {line_count} line{}",
+                                    preview.encoding,
+                                    if line_count == 1 { "" } else { "s" }
+                                )))
+                                .child(
+                                    toolbar_button(
+                                        "text-preview-find",
+                                        "Find",
+                                        if find_open {
+                                            self.palette.selected
+                                        } else {
+                                            self.palette.control
+                                        },
+                                    )
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| {
+                                            this.open_text_preview_find(cx)
+                                        }),
+                                    ),
+                                )
+                                .child(
+                                    toolbar_button(
+                                        "text-preview-copy",
+                                        "Copy",
+                                        self.palette.control,
+                                    )
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.copy_text_preview(cx)),
+                                    ),
+                                )
+                                .child(
+                                    toolbar_button(
+                                        "text-preview-wrap",
+                                        if wrapped { "Wrap: on" } else { "Wrap: off" },
+                                        if wrapped {
+                                            self.palette.selected
+                                        } else {
+                                            self.palette.control
+                                        },
+                                    )
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            this.toggle_text_preview_wrap(preview.wrapped, cx)
+                                        },
+                                    )),
+                                ),
+                        )
+                        .when(find_open, |surface| {
+                            surface.child(
                                 div()
-                                    .id("pdf-toolbar")
                                     .flex()
-                                    .flex_wrap()
                                     .items_center()
-                                    .justify_center()
                                     .gap_2()
                                     .px_3()
                                     .py_2()
                                     .border_b_1()
                                     .border_color(self.palette.border)
                                     .bg(self.palette.surface)
+                                    .child(div().flex_1().children(find_input))
                                     .child(
                                         toolbar_button(
-                                            "pdf-previous-page",
+                                            "text-find-previous",
                                             "Previous",
-                                            if can_previous {
-                                                self.palette.control
-                                            } else {
-                                                self.palette.surface
-                                            },
-                                        )
-                                        .when(
-                                            can_previous,
-                                            |button| {
-                                                button.on_click(cx.listener(|this, _, _, cx| {
-                                                    this.move_pdf_page(-1, cx)
-                                                }))
-                                            },
-                                        ),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("pdf-page-label")
-                                            .text_xs()
-                                            .text_color(self.palette.text)
-                                            .child(format!(
-                                                "Page {} of {}",
-                                                page.page_index + 1,
-                                                page.page_count
-                                            )),
-                                    )
-                                    .child(
-                                        toolbar_button(
-                                            "pdf-next-page",
-                                            "Next",
-                                            if can_next {
-                                                self.palette.control
-                                            } else {
-                                                self.palette.surface
-                                            },
-                                        )
-                                        .when(
-                                            can_next,
-                                            |button| {
-                                                button.on_click(cx.listener(|this, _, _, cx| {
-                                                    this.move_pdf_page(1, cx)
-                                                }))
-                                            },
-                                        ),
-                                    )
-                                    .child(
-                                        toolbar_button("pdf-zoom-out", "−", self.palette.control)
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.adjust_pdf_zoom(-25, cx)
-                                            })),
-                                    )
-                                    .child(
-                                        toolbar_button(
-                                            "pdf-fit-page",
-                                            &zoom_label,
-                                            if self.pdf_fit {
-                                                self.palette.accent
-                                            } else {
-                                                self.palette.control
-                                            },
-                                        )
-                                        .on_click(
-                                            cx.listener(|this, _, _, cx| this.fit_pdf_page(cx)),
-                                        ),
-                                    )
-                                    .child(
-                                        toolbar_button("pdf-zoom-in", "+", self.palette.control)
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.adjust_pdf_zoom(25, cx)
-                                            })),
-                                    )
-                                    .child(
-                                        toolbar_button(
-                                            "pdf-open-external",
-                                            "Open",
                                             self.palette.control,
                                         )
                                         .on_click(
-                                            cx.listener(move |this, _, _, cx| {
-                                                this.open_entry(open_path.clone(), false, cx)
+                                            cx.listener(|this, _, _, cx| {
+                                                this.advance_text_preview_match(-1, cx)
                                             }),
                                         ),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .id("pdf-page-viewport")
-                                    .w_full()
-                                    .min_h(px(if quick_look || side_panel {
-                                        420.0
-                                    } else {
-                                        300.0
-                                    }))
-                                    .max_h(px(if quick_look {
-                                        760.0
-                                    } else if side_panel {
-                                        620.0
-                                    } else {
-                                        360.0
-                                    }))
-                                    .overflow_scroll()
-                                    .bg(rgb(0x262626))
+                                    )
+                                    .child(
+                                        toolbar_button(
+                                            "text-find-next",
+                                            "Next",
+                                            self.palette.control,
+                                        )
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| {
+                                                this.advance_text_preview_match(1, cx)
+                                            }),
+                                        ),
+                                    )
                                     .child(
                                         div()
-                                            .flex()
-                                            .min_w_full()
-                                            .justify_center()
-                                            .items_start()
-                                            .p_3()
-                                            .child(
-                                                img(image_path)
-                                                    .when(self.pdf_fit, |image| image.max_w_full())
-                                                    .when(!self.pdf_fit, |image| {
-                                                        image
-                                                            .w(px(display_width))
-                                                            .h(px(display_height))
-                                                    }),
-                                            ),
+                                            .w(px(72.0))
+                                            .text_right()
+                                            .text_xs()
+                                            .text_color(self.palette.muted)
+                                            .child(if find_query.trim().is_empty() {
+                                                "0 matches".to_string()
+                                            } else if find_count == 0 {
+                                                "No matches".to_string()
+                                            } else {
+                                                format!(
+                                                    "{} / {find_count}",
+                                                    self.text_preview.find_match + 1
+                                                )
+                                            }),
                                     ),
                             )
-                            .when_some(tool, |preview, tool| {
-                                preview.child(
-                                    div()
-                                        .px_3()
-                                        .py_2()
-                                        .border_t_1()
-                                        .border_color(self.palette.border)
-                                        .text_xs()
-                                        .text_color(self.palette.muted)
-                                        .child(format!("Converted locally by {tool}")),
-                                )
-                            })
-                            .into_any_element()
-                    }
-                    PreviewContent::BlockedScript => div()
+                        })
+                        .child(text_body)
+                        .when(preview.truncated, |body| {
+                            body.child(
+                                div()
+                                    .id("text-preview-truncated")
+                                    .px_3()
+                                    .py_2()
+                                    .border_t_1()
+                                    .border_color(self.palette.border)
+                                    .bg(self.palette.surface)
+                                    .text_xs()
+                                    .text_color(rgb(0xffb86c))
+                                    .child("Preview limited to the first 512 KiB"),
+                            )
+                        })
+                        .into_any_element()
+                }
+                PreviewContent::Audio => {
+                    let status = self.audio_status.clone();
+                    let playing = status.as_ref().is_some_and(|status| status.playing);
+                    let position_ms = status.as_ref().map_or(0, |status| status.position_ms);
+                    let duration_ms = status.as_ref().and_then(|status| status.duration_ms);
+                    let progress = duration_ms
+                        .filter(|duration| *duration > 0)
+                        .map_or(0.0, |duration| position_ms as f32 / duration as f32)
+                        .clamp(0.0, 1.0);
+                    let volume = status.as_ref().map_or(0.8, |status| status.volume);
+                    let file_label = path
+                        .file_name()
+                        .unwrap_or_else(|| path.as_os_str())
+                        .to_string_lossy()
+                        .into_owned();
+                    let audio_seek_bounds = Rc::new(Cell::new(None));
+                    let store_audio_seek_bounds = audio_seek_bounds.clone();
+                    let click_audio_seek_bounds = audio_seek_bounds.clone();
+                    let drag_audio_seek_bounds = audio_seek_bounds.clone();
+                    let audio_volume_bounds = Rc::new(Cell::new(None));
+                    let store_audio_volume_bounds = audio_volume_bounds.clone();
+                    let click_audio_volume_bounds = audio_volume_bounds.clone();
+                    let drag_audio_volume_bounds = audio_volume_bounds.clone();
+                    let audio_seek_increment = cx.entity().downgrade();
+                    let audio_seek_decrement = audio_seek_increment.clone();
+                    let audio_volume_increment = audio_seek_increment.clone();
+                    let audio_volume_decrement = audio_seek_increment.clone();
+                    div()
+                        .id("audio-preview")
                         .flex()
                         .flex_col()
                         .items_center()
                         .justify_center()
-                        .gap_2()
-                        .min_h(px(180.0))
+                        .gap_3()
+                        .min_h(px(220.0))
                         .px_4()
-                        .border_1()
-                        .border_color(self.palette.border)
-                        .bg(self.palette.window)
-                        .text_center()
+                        .py_5()
                         .child(
                             div()
-                                .text_sm()
-                                .text_color(self.palette.text)
-                                .child("Script previews are disabled for executable files."),
+                                .text_size(px(34.0))
+                                .text_color(self.palette.muted)
+                                .child("♫"),
+                        )
+                        .child(
+                            div()
+                                .id("audio-controls")
+                                .flex()
+                                .flex_col()
+                                .gap_3()
+                                .w_full()
+                                .max_w(px(400.0 * self.palette.scale))
+                                .px_2()
+                                .py_3()
+                                .child(
+                                    div()
+                                        .on_children_prepainted(move |bounds, _, _| {
+                                            store_audio_seek_bounds.set(bounds.first().copied());
+                                        })
+                                        .id("audio-seek")
+                                        .role(Role::Slider)
+                                        .aria_label("Audio position")
+                                        .aria_numeric_value(position_ms as f64)
+                                        .aria_min_numeric_value(0.0)
+                                        .aria_max_numeric_value(duration_ms.unwrap_or(0) as f64)
+                                        .focusable()
+                                        .tab_stop(true)
+                                        .on_a11y_action(
+                                            AccessibleAction::Increment,
+                                            move |_, _, cx| {
+                                                audio_seek_increment
+                                                    .update(cx, |this, cx| {
+                                                        this.skip_audio(5_000, cx)
+                                                    })
+                                                    .ok();
+                                            },
+                                        )
+                                        .on_a11y_action(
+                                            AccessibleAction::Decrement,
+                                            move |_, _, cx| {
+                                                audio_seek_decrement
+                                                    .update(cx, |this, cx| {
+                                                        this.skip_audio(-5_000, cx)
+                                                    })
+                                                    .ok();
+                                            },
+                                        )
+                                        .on_key_down(cx.listener(|this, event, _, cx| {
+                                            this.handle_audio_seek_key(event, cx)
+                                        }))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                                                if let Some(bounds) = drag_audio_seek_bounds.get() {
+                                                    this.start_media_slider_drag(
+                                                        MediaSliderKind::AudioSeek,
+                                                        bounds,
+                                                        event.position.x,
+                                                        cx,
+                                                    );
+                                                }
+                                            }),
+                                        )
+                                        .on_click(cx.listener(
+                                            move |this, event: &gpui::ClickEvent, _, cx| {
+                                                if let Some(bounds) = click_audio_seek_bounds.get()
+                                                {
+                                                    this.seek_audio_fraction(
+                                                        slider_fraction(bounds, event.position().x),
+                                                        cx,
+                                                    );
+                                                }
+                                            },
+                                        ))
+                                        .flex()
+                                        .items_center()
+                                        .h(px(32.0 * self.palette.scale))
+                                        .px_1()
+                                        .rounded_full()
+                                        .border_1()
+                                        .border_color(with_alpha(self.palette.border, 0.0))
+                                        .focus_visible(|slider| {
+                                            slider.border_color(self.palette.accent)
+                                        })
+                                        .cursor_pointer()
+                                        .child(media_slider_track(progress, self.palette)),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .text_xs()
+                                        .text_color(self.palette.muted)
+                                        .child(format_audio_time(position_ms))
+                                        .child(duration_ms.map_or_else(
+                                            || "--:--".to_string(),
+                                            format_audio_time,
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .gap_2()
+                                        .child(
+                                            toolbar_button(
+                                                "audio-back-ten",
+                                                "−10s",
+                                                self.palette.control,
+                                            )
+                                            .on_click(
+                                                cx.listener(|this, _, _, cx| {
+                                                    this.skip_audio(-10_000, cx)
+                                                }),
+                                            ),
+                                        )
+                                        .child(
+                                            toolbar_button(
+                                                "audio-play-pause",
+                                                if playing { "Pause" } else { "Play" },
+                                                self.palette.accent,
+                                            )
+                                            .on_click(
+                                                cx.listener(|this, _, _, cx| {
+                                                    this.toggle_audio_playback(cx)
+                                                }),
+                                            ),
+                                        )
+                                        .child(
+                                            toolbar_button(
+                                                "audio-forward-ten",
+                                                "+10s",
+                                                self.palette.control,
+                                            )
+                                            .on_click(
+                                                cx.listener(|this, _, _, cx| {
+                                                    this.skip_audio(10_000, cx)
+                                                }),
+                                            ),
+                                        )
+                                        .child(
+                                            toolbar_button(
+                                                "audio-mute",
+                                                if volume <= 0.01 { "Unmute" } else { "Mute" },
+                                                self.palette.control,
+                                            )
+                                            .on_click(
+                                                cx.listener(|this, _, _, cx| {
+                                                    this.toggle_audio_mute(cx)
+                                                }),
+                                            ),
+                                        )
+                                        .child(
+                                            div()
+                                                .on_children_prepainted(move |bounds, _, _| {
+                                                    store_audio_volume_bounds
+                                                        .set(bounds.first().copied());
+                                                })
+                                                .id("audio-volume")
+                                                .role(Role::Slider)
+                                                .aria_label("Audio volume")
+                                                .aria_numeric_value(f64::from(volume * 100.0))
+                                                .aria_min_numeric_value(0.0)
+                                                .aria_max_numeric_value(100.0)
+                                                .focusable()
+                                                .tab_stop(true)
+                                                .on_a11y_action(
+                                                    AccessibleAction::Increment,
+                                                    move |_, _, cx| {
+                                                        audio_volume_increment
+                                                            .update(cx, |this, cx| {
+                                                                this.adjust_audio_volume(0.1, cx)
+                                                            })
+                                                            .ok();
+                                                    },
+                                                )
+                                                .on_a11y_action(
+                                                    AccessibleAction::Decrement,
+                                                    move |_, _, cx| {
+                                                        audio_volume_decrement
+                                                            .update(cx, |this, cx| {
+                                                                this.adjust_audio_volume(-0.1, cx)
+                                                            })
+                                                            .ok();
+                                                    },
+                                                )
+                                                .on_key_down(cx.listener(|this, event, _, cx| {
+                                                    this.handle_audio_volume_key(event, cx)
+                                                }))
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                                                        if let Some(bounds) =
+                                                            drag_audio_volume_bounds.get()
+                                                        {
+                                                            this.start_media_slider_drag(
+                                                                MediaSliderKind::AudioVolume,
+                                                                bounds,
+                                                                event.position.x,
+                                                                cx,
+                                                            );
+                                                        }
+                                                    }),
+                                                )
+                                                .on_click(cx.listener(
+                                                    move |this, event: &gpui::ClickEvent, _, cx| {
+                                                        if let Some(bounds) =
+                                                            click_audio_volume_bounds.get()
+                                                        {
+                                                            this.set_audio_volume(
+                                                                slider_fraction(
+                                                                    bounds,
+                                                                    event.position().x,
+                                                                ),
+                                                                cx,
+                                                            );
+                                                        }
+                                                    },
+                                                ))
+                                                .flex()
+                                                .items_center()
+                                                .w(px(120.0 * self.palette.scale))
+                                                .h(px(32.0 * self.palette.scale))
+                                                .px_2()
+                                                .border_1()
+                                                .border_color(self.palette.border)
+                                                .rounded_full()
+                                                .focus_visible(|slider| {
+                                                    slider.border_color(self.palette.accent)
+                                                })
+                                                .cursor_pointer()
+                                                .child(media_slider_track(volume, self.palette)),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(self.palette.muted)
+                                                .child(format!("{}%", (volume * 100.0).round())),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .text_center()
+                                        .text_xs()
+                                        .text_color(self.palette.tertiary)
+                                        .child("J/L seek  •  K play/pause  •  M mute"),
+                                ),
                         )
                         .child(
                             div()
                                 .text_xs()
                                 .text_color(self.palette.muted)
-                                .child("Enable this in Settings > General."),
+                                .child(file_label),
                         )
-                        .into_any_element(),
-                    PreviewContent::Image(image_path) => div()
+                        .into_any_element()
+                }
+                PreviewContent::Video => {
+                    let status = self.video_status.clone();
+                    let playing = status.as_ref().is_some_and(|status| status.playing);
+                    let finished = status.as_ref().is_some_and(|status| status.finished);
+                    let position_ms = status.as_ref().map_or(0, |status| status.position_ms);
+                    let duration_ms = status.as_ref().and_then(|status| status.duration_ms);
+                    let progress = duration_ms
+                        .filter(|duration| *duration > 0)
+                        .map_or(0.0, |duration| position_ms as f32 / duration as f32)
+                        .clamp(0.0, 1.0);
+                    let volume = status.as_ref().map_or(0.8, |status| status.volume);
+                    let has_audio = status.as_ref().is_some_and(|status| status.has_audio);
+                    let frame = self.video_frame.clone();
+                    let file_label = path
+                        .file_name()
+                        .unwrap_or_else(|| path.as_os_str())
+                        .to_string_lossy()
+                        .into_owned();
+                    let open_path = path.clone();
+                    let video_seek_bounds = Rc::new(Cell::new(None));
+                    let store_video_seek_bounds = video_seek_bounds.clone();
+                    let click_video_seek_bounds = video_seek_bounds.clone();
+                    let drag_video_seek_bounds = video_seek_bounds.clone();
+                    let video_volume_bounds = Rc::new(Cell::new(None));
+                    let store_video_volume_bounds = video_volume_bounds.clone();
+                    let click_video_volume_bounds = video_volume_bounds.clone();
+                    let drag_video_volume_bounds = video_volume_bounds.clone();
+                    let video_seek_increment = cx.entity().downgrade();
+                    let video_seek_decrement = video_seek_increment.clone();
+                    let video_volume_increment = video_seek_increment.clone();
+                    let video_volume_decrement = video_seek_increment.clone();
+                    div()
+                        .id("video-preview")
                         .flex()
-                        .flex_1()
-                        .items_center()
-                        .justify_center()
-                        .max_h(px(if quick_look { 820.0 } else { 420.0 }))
-                        .overflow_hidden()
-                        .p_3()
-                        .child(img(image_path).max_w_full().max_h(px(if quick_look {
-                            790.0
-                        } else {
-                            390.0
-                        })))
-                        .into_any_element(),
-                    PreviewContent::Artifact(artifact) => {
-                        let open_path = artifact.path.clone();
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_3()
-                            .px_3()
-                            .py_4()
-                            .text_sm()
-                            .child(div().flex_1().child(format!(
-                                "{} preview generated by {} ({})",
-                                artifact.kind, artifact.tool, artifact.mime_type
-                            )))
-                            .child(
-                                toolbar_button(
-                                    "open-preview-artifact",
-                                    "Open preview",
-                                    rgb(0x31506b),
+                        .flex_col()
+                        .w_full()
+                        .min_h(px(300.0))
+                        .bg(self.palette.window)
+                        .child(
+                            div()
+                                .id("video-viewport")
+                                .flex()
+                                .flex_1()
+                                .min_h(px(220.0))
+                                .max_h(px(if quick_look { 760.0 } else { 520.0 }))
+                                .items_center()
+                                .justify_center()
+                                .overflow_hidden()
+                                .bg(rgb(0x000000))
+                                .when_some(frame, |viewport, frame| {
+                                    viewport.child(
+                                        img(frame).max_w_full().max_h(px(if quick_look {
+                                            740.0
+                                        } else {
+                                            500.0
+                                        })),
+                                    )
+                                })
+                                .when(self.video_frame.is_none(), |viewport| {
+                                    viewport.child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(rgb(0x9ca3af))
+                                            .child("Decoding video frame…"),
+                                    )
+                                }),
+                        )
+                        .child(
+                            div()
+                                .id("video-controls")
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .px_3()
+                                .py_3()
+                                .border_t_1()
+                                .border_color(self.palette.border)
+                                .bg(self.palette.surface)
+                                .child(
+                                    div()
+                                        .on_children_prepainted(move |bounds, _, _| {
+                                            store_video_seek_bounds.set(bounds.first().copied());
+                                        })
+                                        .id("video-seek")
+                                        .role(Role::Slider)
+                                        .aria_label("Video position")
+                                        .aria_numeric_value(position_ms as f64)
+                                        .aria_min_numeric_value(0.0)
+                                        .aria_max_numeric_value(duration_ms.unwrap_or(0) as f64)
+                                        .focusable()
+                                        .tab_stop(true)
+                                        .on_a11y_action(
+                                            AccessibleAction::Increment,
+                                            move |_, _, cx| {
+                                                video_seek_increment
+                                                    .update(cx, |this, cx| {
+                                                        this.skip_video(5_000, cx)
+                                                    })
+                                                    .ok();
+                                            },
+                                        )
+                                        .on_a11y_action(
+                                            AccessibleAction::Decrement,
+                                            move |_, _, cx| {
+                                                video_seek_decrement
+                                                    .update(cx, |this, cx| {
+                                                        this.skip_video(-5_000, cx)
+                                                    })
+                                                    .ok();
+                                            },
+                                        )
+                                        .on_key_down(cx.listener(|this, event, _, cx| {
+                                            this.handle_video_seek_key(event, cx)
+                                        }))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                                                if let Some(bounds) = drag_video_seek_bounds.get() {
+                                                    this.start_media_slider_drag(
+                                                        MediaSliderKind::VideoSeek,
+                                                        bounds,
+                                                        event.position.x,
+                                                        cx,
+                                                    );
+                                                }
+                                            }),
+                                        )
+                                        .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+                                            if let Some(bounds) = click_video_seek_bounds.get() {
+                                                this.seek_video_fraction(
+                                                    slider_fraction(bounds, event.position().x),
+                                                    cx,
+                                                );
+                                            }
+                                        }))
+                                        .flex()
+                                        .items_center()
+                                        .h(px(32.0 * self.palette.scale))
+                                        .px_1()
+                                        .rounded_full()
+                                        .border_1()
+                                        .border_color(with_alpha(self.palette.border, 0.0))
+                                        .focus_visible(|slider| {
+                                            slider.border_color(self.palette.accent)
+                                        })
+                                        .cursor_pointer()
+                                        .child(media_slider_track(progress, self.palette)),
                                 )
-                                .on_click(cx.listener(
-                                    move |this, _, _, cx| {
-                                        this.open_entry(open_path.clone(), false, cx)
-                                    },
-                                )),
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .text_xs()
+                                        .text_color(self.palette.muted)
+                                        .child(format_audio_time(position_ms))
+                                        .child(duration_ms.map_or_else(
+                                            || "--:--".to_string(),
+                                            format_audio_time,
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_wrap()
+                                        .items_center()
+                                        .justify_center()
+                                        .gap_2()
+                                        .child(
+                                            toolbar_button(
+                                                "video-back-ten",
+                                                "−10s",
+                                                self.palette.control,
+                                            )
+                                            .on_click(
+                                                cx.listener(|this, _, _, cx| {
+                                                    this.skip_video(-10_000, cx)
+                                                }),
+                                            ),
+                                        )
+                                        .child(
+                                            toolbar_button(
+                                                "video-play-pause",
+                                                if playing {
+                                                    "Pause"
+                                                } else if finished {
+                                                    "Replay"
+                                                } else {
+                                                    "Play"
+                                                },
+                                                self.palette.accent,
+                                            )
+                                            .on_click(
+                                                cx.listener(|this, _, _, cx| {
+                                                    this.toggle_video_playback(cx)
+                                                }),
+                                            ),
+                                        )
+                                        .child(
+                                            toolbar_button(
+                                                "video-forward-ten",
+                                                "+10s",
+                                                self.palette.control,
+                                            )
+                                            .on_click(
+                                                cx.listener(|this, _, _, cx| {
+                                                    this.skip_video(10_000, cx)
+                                                }),
+                                            ),
+                                        )
+                                        .child(
+                                            toolbar_button(
+                                                "video-mute",
+                                                if volume <= 0.01 { "Unmute" } else { "Mute" },
+                                                self.palette.control,
+                                            )
+                                            .on_click(
+                                                cx.listener(|this, _, _, cx| {
+                                                    this.toggle_video_mute(cx)
+                                                }),
+                                            ),
+                                        )
+                                        .when(has_audio, |controls| {
+                                            controls.child(
+                                                div()
+                                                    .on_children_prepainted(move |bounds, _, _| {
+                                                        store_video_volume_bounds
+                                                            .set(bounds.first().copied());
+                                                    })
+                                                    .id("video-volume")
+                                                    .role(Role::Slider)
+                                                    .aria_label("Video volume")
+                                                    .aria_numeric_value(f64::from(volume * 100.0))
+                                                    .aria_min_numeric_value(0.0)
+                                                    .aria_max_numeric_value(100.0)
+                                                    .focusable()
+                                                    .tab_stop(true)
+                                                    .on_a11y_action(
+                                                        AccessibleAction::Increment,
+                                                        move |_, _, cx| {
+                                                            video_volume_increment
+                                                                .update(cx, |this, cx| {
+                                                                    this.adjust_video_volume(
+                                                                        0.1, cx,
+                                                                    )
+                                                                })
+                                                                .ok();
+                                                        },
+                                                    )
+                                                    .on_a11y_action(
+                                                        AccessibleAction::Decrement,
+                                                        move |_, _, cx| {
+                                                            video_volume_decrement
+                                                                .update(cx, |this, cx| {
+                                                                    this.adjust_video_volume(
+                                                                        -0.1, cx,
+                                                                    )
+                                                                })
+                                                                .ok();
+                                                        },
+                                                    )
+                                                    .on_key_down(cx.listener(
+                                                        |this, event, _, cx| {
+                                                            this.handle_video_volume_key(event, cx)
+                                                        },
+                                                    ))
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                                                            if let Some(bounds) =
+                                                                drag_video_volume_bounds.get()
+                                                            {
+                                                                this.start_media_slider_drag(
+                                                                    MediaSliderKind::VideoVolume,
+                                                                    bounds,
+                                                                    event.position.x,
+                                                                    cx,
+                                                                );
+                                                            }
+                                                        }),
+                                                    )
+                                                    .on_click(cx.listener(
+                                                        move |this, event: &gpui::ClickEvent, _, cx| {
+                                                            if let Some(bounds) =
+                                                                click_video_volume_bounds.get()
+                                                            {
+                                                                this.set_video_volume(
+                                                                    slider_fraction(
+                                                                        bounds,
+                                                                        event.position().x,
+                                                                    ),
+                                                                    cx,
+                                                                );
+                                                            }
+                                                        },
+                                                    ))
+                                                    .flex()
+                                                    .items_center()
+                                                    .w(px(120.0 * self.palette.scale))
+                                                    .h(px(32.0 * self.palette.scale))
+                                                    .px_2()
+                                                    .border_1()
+                                                    .border_color(self.palette.border)
+                                                    .rounded_full()
+                                                    .focus_visible(|slider| {
+                                                        slider.border_color(self.palette.accent)
+                                                    })
+                                                    .cursor_pointer()
+                                                    .child(media_slider_track(
+                                                        volume,
+                                                        self.palette,
+                                                    )),
+                                            )
+                                        })
+                                        .child(
+                                            div().text_xs().text_color(self.palette.muted).child(
+                                                if has_audio {
+                                                    format!("{}%", (volume * 100.0).round())
+                                                } else {
+                                                    "No audio".to_string()
+                                                },
+                                            ),
+                                        )
+                                        .child(
+                                            toolbar_button(
+                                                "video-open",
+                                                "Open",
+                                                self.palette.control,
+                                            )
+                                            .on_click(
+                                                cx.listener(move |this, _, _, cx| {
+                                                    this.open_entry(open_path.clone(), false, cx)
+                                                }),
+                                            ),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .text_center()
+                                        .text_xs()
+                                        .text_color(self.palette.muted)
+                                        .child(file_label),
+                                )
+                                .child(
+                                    div()
+                                        .text_center()
+                                        .text_xs()
+                                        .text_color(self.palette.tertiary)
+                                        .child("J/L seek  •  K play/pause  •  M mute"),
+                                ),
+                        )
+                        .into_any_element()
+                }
+                PreviewContent::Pdf { page, tool } => {
+                    let can_previous = page.page_index > 0;
+                    let can_next = page.page_index + 1 < page.page_count;
+                    let zoom_label = if self.pdf_fit {
+                        "Fit".to_string()
+                    } else {
+                        format!("{}%", self.pdf_zoom_percent)
+                    };
+                    let display_width =
+                        page.display_width as f32 * f32::from(self.pdf_zoom_percent) / 100.0;
+                    let display_height =
+                        page.display_height as f32 * f32::from(self.pdf_zoom_percent) / 100.0;
+                    let open_path = path.clone();
+                    let image_path = page.image_path.clone();
+                    div()
+                        .id("pdf-preview")
+                        .flex()
+                        .flex_col()
+                        .w_full()
+                        .bg(self.palette.window)
+                        .child(
+                            div()
+                                .id("pdf-toolbar")
+                                .flex()
+                                .flex_wrap()
+                                .items_center()
+                                .justify_center()
+                                .gap_2()
+                                .px_3()
+                                .py_2()
+                                .border_b_1()
+                                .border_color(self.palette.border)
+                                .bg(self.palette.surface)
+                                .child(
+                                    toolbar_button(
+                                        "pdf-previous-page",
+                                        "Previous",
+                                        if can_previous {
+                                            self.palette.control
+                                        } else {
+                                            self.palette.surface
+                                        },
+                                    )
+                                    .when(
+                                        can_previous,
+                                        |button| {
+                                            button.on_click(cx.listener(|this, _, _, cx| {
+                                                this.move_pdf_page(-1, cx)
+                                            }))
+                                        },
+                                    ),
+                                )
+                                .child(
+                                    div()
+                                        .id("pdf-page-label")
+                                        .text_xs()
+                                        .text_color(self.palette.text)
+                                        .child(format!(
+                                            "Page {} of {}",
+                                            page.page_index + 1,
+                                            page.page_count
+                                        )),
+                                )
+                                .child(
+                                    toolbar_button(
+                                        "pdf-next-page",
+                                        "Next",
+                                        if can_next {
+                                            self.palette.control
+                                        } else {
+                                            self.palette.surface
+                                        },
+                                    )
+                                    .when(can_next, |button| {
+                                        button.on_click(
+                                            cx.listener(|this, _, _, cx| this.move_pdf_page(1, cx)),
+                                        )
+                                    }),
+                                )
+                                .child(
+                                    toolbar_button("pdf-zoom-out", "−", self.palette.control)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.adjust_pdf_zoom(-25, cx)
+                                        })),
+                                )
+                                .child(
+                                    toolbar_button(
+                                        "pdf-fit-page",
+                                        &zoom_label,
+                                        if self.pdf_fit {
+                                            self.palette.accent
+                                        } else {
+                                            self.palette.control
+                                        },
+                                    )
+                                    .on_click(cx.listener(|this, _, _, cx| this.fit_pdf_page(cx))),
+                                )
+                                .child(
+                                    toolbar_button("pdf-zoom-in", "+", self.palette.control)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.adjust_pdf_zoom(25, cx)
+                                        })),
+                                )
+                                .child(
+                                    toolbar_button(
+                                        "pdf-open-external",
+                                        "Open",
+                                        self.palette.control,
+                                    )
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            this.open_entry(open_path.clone(), false, cx)
+                                        },
+                                    )),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("pdf-page-viewport")
+                                .w_full()
+                                .min_h(px(if quick_look || side_panel {
+                                    420.0
+                                } else {
+                                    300.0
+                                }))
+                                .max_h(px(if quick_look {
+                                    760.0
+                                } else if side_panel {
+                                    620.0
+                                } else {
+                                    360.0
+                                }))
+                                .overflow_scroll()
+                                .bg(rgb(0x262626))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .min_w_full()
+                                        .justify_center()
+                                        .items_start()
+                                        .p_3()
+                                        .child(
+                                            img(image_path)
+                                                .when(self.pdf_fit, |image| image.max_w_full())
+                                                .when(!self.pdf_fit, |image| {
+                                                    image.w(px(display_width)).h(px(display_height))
+                                                }),
+                                        ),
+                                ),
+                        )
+                        .when_some(tool, |preview, tool| {
+                            preview.child(
+                                div()
+                                    .px_3()
+                                    .py_2()
+                                    .border_t_1()
+                                    .border_color(self.palette.border)
+                                    .text_xs()
+                                    .text_color(self.palette.muted)
+                                    .child(format!("Converted locally by {tool}")),
                             )
-                            .into_any_element()
-                    }
-                    PreviewContent::Archive => div()
+                        })
+                        .into_any_element()
+                }
+                PreviewContent::BlockedScript => div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .min_h(px(180.0))
+                    .px_4()
+                    .bg(self.palette.window)
+                    .text_center()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(self.palette.text)
+                            .child("Script previews are disabled for executable files."),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(self.palette.muted)
+                            .child("Enable this in Settings > General."),
+                    )
+                    .into_any_element(),
+                PreviewContent::Image(image_path) => div()
+                    .flex()
+                    .flex_1()
+                    .items_center()
+                    .justify_center()
+                    .max_h(px(if quick_look { 820.0 } else { 420.0 }))
+                    .overflow_hidden()
+                    .p_3()
+                    .child(img(image_path).max_w_full().max_h(px(if quick_look {
+                        790.0
+                    } else {
+                        390.0
+                    })))
+                    .into_any_element(),
+                PreviewContent::Artifact(artifact) => {
+                    let open_path = artifact.path.clone();
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_3()
                         .px_3()
                         .py_4()
                         .text_sm()
-                        .child("Archive selected • use Inspect archive to browse its entries")
-                        .into_any_element(),
-                    PreviewContent::External => {
-                        let open_path = path.clone();
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_3()
-                            .px_3()
-                            .py_4()
-                            .text_sm()
-                            .child(div().flex_1().child(
-                                "This format uses the platform viewer; the source stays local",
-                            ))
-                            .child(
-                                toolbar_button("open-external-preview", "Open", rgb(0x31506b))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.open_entry(open_path.clone(), false, cx)
-                                    })),
+                        .child(div().flex_1().child(format!(
+                            "{} preview generated by {} ({})",
+                            artifact.kind, artifact.tool, artifact.mime_type
+                        )))
+                        .child(
+                            toolbar_button("open-preview-artifact", "Open preview", rgb(0x31506b))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.open_entry(open_path.clone(), false, cx)
+                                })),
+                        )
+                        .into_any_element()
+                }
+                PreviewContent::Archive => div()
+                    .px_3()
+                    .py_4()
+                    .text_sm()
+                    .child("Archive selected • use Inspect archive to browse its entries")
+                    .into_any_element(),
+                PreviewContent::Fallback { detection, error } => {
+                    let open_path = path.clone();
+                    let mime_type = detection
+                        .mime_type
+                        .clone()
+                        .unwrap_or_else(|| "Unknown content type".to_string());
+                    div()
+                        .id("preview-fallback")
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .max_h(px(if quick_look { 760.0 } else { 420.0 }))
+                        .overflow_y_scroll()
+                        .px_4()
+                        .py_5()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(self.palette.text)
+                                .child(detection.description),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(self.palette.muted)
+                                .child(mime_type),
+                        )
+                        .when_some(error, |fallback, error| {
+                            fallback.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(0xffb86c))
+                                    .child(format!("Inline preview unavailable: {error}")),
                             )
-                            .into_any_element()
-                    }
-                },
-            };
+                        })
+                        .when_some(detection.byte_sample, |fallback, sample| {
+                            fallback.child(
+                                div()
+                                    .id("preview-byte-sample")
+                                    .overflow_x_scroll()
+                                    .p_3()
+                                    .rounded_md()
+                                    .bg(self.palette.surface)
+                                    .font_family(monospace_font_family())
+                                    .text_xs()
+                                    .line_height(px(18.0))
+                                    .whitespace_nowrap()
+                                    .text_color(self.palette.muted)
+                                    .child(sample),
+                            )
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .gap_2()
+                                .child(
+                                    toolbar_button(
+                                        "open-external-preview",
+                                        "Open",
+                                        self.palette.accent,
+                                    )
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            this.open_entry(open_path.clone(), false, cx)
+                                        },
+                                    )),
+                                )
+                                .when(std::env::consts::OS == "windows", |actions| {
+                                    actions.child(
+                                        toolbar_button(
+                                            "open-with-external-preview",
+                                            "Open with…",
+                                            self.palette.control,
+                                        )
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| {
+                                                this.open_previewed_with(cx)
+                                            }),
+                                        ),
+                                    )
+                                })
+                                .child(
+                                    toolbar_button(
+                                        "reveal-external-preview",
+                                        "Reveal",
+                                        self.palette.control,
+                                    )
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| {
+                                            this.reveal_previewed_item(cx)
+                                        }),
+                                    ),
+                                ),
+                        )
+                        .into_any_element()
+                }
+            },
+        };
         let body = if quick_look {
             preview_body
         } else {
@@ -17008,14 +23190,18 @@ impl DirectoryWindow {
                 .iter()
                 .find(|entry| entry.path == path)
                 .cloned();
-            let file_kind = path
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .filter(|extension| !extension.is_empty())
-                .map_or_else(
-                    || "File".to_string(),
-                    |extension| format!("{} file", extension.to_ascii_uppercase()),
-                );
+            let file_kind = self.preview_detection.as_ref().map_or_else(
+                || {
+                    path.extension()
+                        .and_then(|extension| extension.to_str())
+                        .filter(|extension| !extension.is_empty())
+                        .map_or_else(
+                            || "File".to_string(),
+                            |extension| format!("{} file", extension.to_ascii_uppercase()),
+                        )
+                },
+                |detection| detection.description.clone(),
+            );
             let file_size = entry
                 .as_ref()
                 .map_or_else(|| "—".to_string(), |entry| format_preview_size(entry.size));
@@ -17143,9 +23329,6 @@ impl DirectoryWindow {
                                                 .min_w(px(60.0))
                                                 .px_2()
                                                 .py_1()
-                                                .border_1()
-                                                .border_color(self.palette.border)
-                                                .bg(self.palette.window)
                                                 .text_center()
                                                 .text_xs()
                                                 .text_color(self.palette.muted)
@@ -17290,20 +23473,29 @@ impl DirectoryWindow {
                     .id(ElementId::Name(
                         format!("preview-tab-{}", tab.label()).into(),
                     ))
+                    .role(Role::Tab)
+                    .aria_label(tab.label())
+                    .aria_selected(active)
+                    .focusable()
+                    .tab_stop(true)
                     .px_3()
                     .py_2()
-                    .border_1()
+                    .border_b_1()
                     .border_color(if active {
                         self.palette.accent
                     } else {
-                        self.palette.border
+                        with_alpha(self.palette.border, 0.0)
                     })
                     .bg(if active {
                         self.palette.selected
                     } else {
-                        self.palette.control
+                        with_alpha(self.palette.control, 0.0)
+                    })
+                    .focus_visible(|tab| {
+                        tab.bg(self.palette.hover).border_color(self.palette.accent)
                     })
                     .hover(|tab| tab.bg(self.palette.hover))
+                    .active(|tab| tab.opacity(0.82))
                     .cursor_pointer()
                     .text_sm()
                     .child(tab.label())
@@ -17319,7 +23511,11 @@ impl DirectoryWindow {
             .border_color(self.palette.border)
             .bg(self.palette.panel)
             .when(side_panel, |panel| {
-                panel.w(px(360.0)).min_w(px(280.0)).h_full().border_l_1()
+                panel
+                    .w(px(360.0 * self.palette.scale))
+                    .min_w(px(280.0 * self.palette.scale))
+                    .h_full()
+                    .border_l_1()
             })
             .when(!side_panel, |panel| panel.border_t_1())
             .child(
@@ -17377,6 +23573,11 @@ impl DirectoryWindow {
                             .min_w_0()
                             .truncate()
                             .font_weight(FontWeight::MEDIUM)
+                            .tooltip({
+                                let label = path.display().to_string();
+                                let palette = self.palette;
+                                move |_, cx| app_tooltip(label.clone(), palette, cx)
+                            })
                             .child(path_label(&path)),
                     )
                     .child(
@@ -17397,6 +23598,7 @@ impl DirectoryWindow {
                 div()
                     .id("preview-tools")
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap_2()
                     .px_3()
@@ -17426,23 +23628,69 @@ impl DirectoryWindow {
             .child(
                 div()
                     .id("preview-tabs")
+                    .role(Role::TabList)
+                    .aria_label("Preview sections")
                     .flex()
                     .items_end()
                     .gap_2()
                     .px_3()
                     .py_2()
-                    .border_t_1()
                     .border_b_1()
                     .border_color(self.palette.border)
                     .bg(self.palette.surface)
                     .children(tabs),
             )
-            .child(body)
+            .child(
+                div()
+                    .id("preview-tab-panel")
+                    .role(Role::TabPanel)
+                    .aria_label(self.preview_tab.label())
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .child(body),
+            )
             .into_any_element()
     }
 
     fn render_breadcrumbs(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let palette = self.palette;
+        if let Some(editor) = self.breadcrumb_editor.as_ref() {
+            return div()
+                .id("breadcrumbs")
+                .debug_selector(|| "breadcrumbs".to_string())
+                .role(Role::Group)
+                .aria_label("Edit folder path")
+                .flex()
+                .flex_1()
+                .min_w(px(96.0))
+                .items_center()
+                .px_2()
+                .py_1()
+                .rounded_sm()
+                .border_1()
+                .border_color(palette.accent)
+                .bg(palette.window)
+                .cursor_text()
+                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                    this.cancel_breadcrumb_edit(cx);
+                }))
+                .child(
+                    div()
+                        .id("breadcrumb-path-input")
+                        .debug_selector(|| "breadcrumb-path-input".to_string())
+                        .w_full()
+                        .font_family(monospace_font_family())
+                        .child(
+                            self.native_text_input_element(TextInputTarget::Breadcrumb)
+                                .unwrap_or_else(|| {
+                                    div().child(editor.input.clone()).into_any_element()
+                                }),
+                        ),
+                )
+                .into_any_element();
+        }
         let current_path = self.browser.path().to_path_buf();
         let stack = build_path_stack(&current_path);
         let stack_len = stack.len();
@@ -17453,7 +23701,11 @@ impl DirectoryWindow {
                 crumbs.push(
                     div()
                         .text_color(self.palette.tertiary)
-                        .child("›")
+                        .child(toolbar_icon(
+                            "arrow-right",
+                            self.palette.icon_size.clamp(10.0, 13.0),
+                            self.palette.tertiary,
+                        ))
                         .into_any_element(),
                 );
             }
@@ -17462,23 +23714,41 @@ impl DirectoryWindow {
                 .unwrap_or_else(|| path.as_os_str())
                 .to_string_lossy()
                 .into_owned();
+            let tooltip_label = label.clone();
             crumbs.push(
                 div()
                     .id(("breadcrumb", index))
                     .debug_selector(move || format!("breadcrumb-{index}"))
+                    .role(Role::Button)
+                    .aria_label(if is_current {
+                        format!("Edit current folder path, {label}")
+                    } else {
+                        format!("Navigate to {label}")
+                    })
+                    .focusable()
+                    .tab_stop(true)
                     .px_1()
                     .rounded_sm()
+                    .focus(move |crumb| crumb.bg(palette.hover))
                     .hover(move |crumb| crumb.bg(palette.hover))
-                    .cursor_pointer()
+                    .when(is_current, |crumb| crumb.cursor_text())
+                    .when(!is_current, |crumb| crumb.cursor_pointer())
                     .whitespace_nowrap()
-                    .max_w(px(if is_current { 180.0 } else { 120.0 }))
+                    .max_w(px(if is_current { 180.0 } else { 120.0 } * palette.scale))
                     .truncate()
                     .text_sm()
                     .text_color(palette.text)
                     .when(is_current, |crumb| crumb.font_weight(FontWeight::SEMIBOLD))
+                    .tooltip(move |_, cx| app_tooltip(tooltip_label.clone(), palette, cx))
                     .child(label)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.navigate_to(path.clone(), cx);
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        if is_current {
+                            this.begin_breadcrumb_edit(cx);
+                            window.focus(&this.focus_handle, cx);
+                        } else {
+                            this.navigate_to(path.clone(), cx);
+                        }
                     }))
                     .into_any_element(),
             );
@@ -17491,47 +23761,103 @@ impl DirectoryWindow {
             .flex_1()
             .min_w(px(96.0))
             .items_center()
-            .justify_end()
+            .justify_start()
             .gap_1()
             .overflow_x_scroll()
             .children(crumbs)
+            .child(
+                div()
+                    .id("breadcrumb-edit-hit-area")
+                    .debug_selector(|| "breadcrumb-edit-hit-area".to_string())
+                    .flex_1()
+                    .min_w(px(8.0))
+                    .h_full()
+                    .cursor_text(),
+            )
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.begin_breadcrumb_edit(cx);
+                window.focus(&this.focus_handle, cx);
+            }))
             .into_any_element()
     }
 
     fn render_header(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let palette = self.palette;
         let name = sort_label(&self.browser, &SortKey::Name);
         let size = sort_label(&self.browser, &SortKey::Size);
         let modified = sort_label(&self.browser, &SortKey::Modified);
         let columns = self.browser.custom_columns();
-        let custom_width = list_custom_column_width(self.listing_viewport_width, columns.len());
-        let (size_width, modified_width) = list_builtin_column_widths(columns.len());
-        let custom_headers = columns.into_iter().map(|column| {
+        let custom_default = list_custom_column_width(self.listing_viewport_width, columns.len());
+        let (default_size_width, default_modified_width) =
+            list_builtin_column_widths(columns.len());
+        let size_width = self
+            .browser
+            .column_width("size")
+            .map_or(default_size_width, f32::from);
+        let modified_width = self
+            .browser
+            .column_width("modified")
+            .map_or(default_modified_width, f32::from);
+        let mut custom_headers = Vec::with_capacity(columns.len());
+        for column in columns {
             let key = SortKey::Custom(column.clone());
             let label = sort_label(&self.browser, &key);
             let selector = format!("sort-custom-{}", column.to_lowercase());
             let aria_label = format!("Sort by custom field {column}");
-            div()
-                .id(ElementId::Name(selector.clone().into()))
-                .debug_selector(move || selector.clone())
-                .role(Role::Button)
-                .aria_label(aria_label)
-                .w(px(custom_width))
-                .min_w(px(custom_width))
-                .px_2()
-                .truncate()
-                .cursor_pointer()
-                .child(label)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.set_sort(key.clone(), cx);
-                }))
-                .into_any_element()
-        });
+            let width_key = format!("custom:{column}");
+            let width = self
+                .browser
+                .column_width(&width_key)
+                .map_or(custom_default, f32::from);
+            let resize_handle = self.render_list_column_resize_handle(
+                width_key,
+                width,
+                format!("Resize {column} column"),
+                cx,
+            );
+            custom_headers.push(
+                div()
+                    .id(ElementId::Name(selector.clone().into()))
+                    .debug_selector(move || selector.clone())
+                    .role(Role::Button)
+                    .aria_label(aria_label)
+                    .focusable()
+                    .tab_stop(true)
+                    .w(px(width))
+                    .min_w(px(width))
+                    .relative()
+                    .px_2()
+                    .truncate()
+                    .focus(move |header| header.bg(palette.hover).text_color(palette.text))
+                    .hover(move |header| header.bg(palette.hover).text_color(palette.text))
+                    .cursor_pointer()
+                    .child(label)
+                    .child(resize_handle)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_sort(key.clone(), cx);
+                    }))
+                    .into_any_element(),
+            );
+        }
+
+        let size_resize = self.render_list_column_resize_handle(
+            "size".to_string(),
+            size_width,
+            "Resize size column".to_string(),
+            cx,
+        );
+        let modified_resize = self.render_list_column_resize_handle(
+            "modified".to_string(),
+            modified_width,
+            "Resize modified column".to_string(),
+            cx,
+        );
 
         div()
             .id("listing-header")
             .flex()
             .w_full()
-            .h(px(32.0))
+            .h(px(30.0 * self.palette.scale))
             .items_center()
             .border_b_1()
             .border_color(self.palette.border)
@@ -17542,8 +23868,14 @@ impl DirectoryWindow {
                 div()
                     .id("sort-name")
                     .debug_selector(|| "sort-name".to_string())
+                    .role(Role::Button)
+                    .aria_label("Sort by name")
+                    .focusable()
+                    .tab_stop(true)
                     .flex_1()
                     .px_3()
+                    .focus(move |header| header.bg(palette.hover).text_color(palette.text))
+                    .hover(move |header| header.bg(palette.hover).text_color(palette.text))
                     .cursor_pointer()
                     .child(name)
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -17555,10 +23887,18 @@ impl DirectoryWindow {
                 div()
                     .id("sort-size")
                     .debug_selector(|| "sort-size".to_string())
+                    .role(Role::Button)
+                    .aria_label("Sort by size")
+                    .focusable()
+                    .tab_stop(true)
                     .w(px(size_width))
+                    .relative()
                     .px_3()
+                    .focus(move |header| header.bg(palette.hover).text_color(palette.text))
+                    .hover(move |header| header.bg(palette.hover).text_color(palette.text))
                     .cursor_pointer()
                     .child(size)
+                    .child(size_resize)
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.set_sort(SortKey::Size, cx);
                     })),
@@ -17567,14 +23907,74 @@ impl DirectoryWindow {
                 div()
                     .id("sort-modified")
                     .debug_selector(|| "sort-modified".to_string())
+                    .role(Role::Button)
+                    .aria_label("Sort by modified date")
+                    .focusable()
+                    .tab_stop(true)
                     .w(px(modified_width))
+                    .relative()
                     .px_3()
+                    .focus(move |header| header.bg(palette.hover).text_color(palette.text))
+                    .hover(move |header| header.bg(palette.hover).text_color(palette.text))
                     .cursor_pointer()
                     .child(modified)
+                    .child(modified_resize)
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.set_sort(SortKey::Modified, cx);
                     })),
             )
+            .into_any_element()
+    }
+
+    fn render_list_column_resize_handle(
+        &mut self,
+        key: String,
+        width: f32,
+        aria_label: String,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let active = self
+            .list_column_resize
+            .as_ref()
+            .is_some_and(|resize| resize.key == key);
+        let down_key = key.clone();
+        let keyboard_key = key.clone();
+        div()
+            .id(ElementId::Name(format!("resize-list-column-{key}").into()))
+            .role(Role::Splitter)
+            .aria_label(aria_label)
+            .aria_orientation(Orientation::Vertical)
+            .aria_numeric_value(f64::from(width))
+            .aria_min_numeric_value(56.0)
+            .aria_max_numeric_value(360.0)
+            .focusable()
+            .tab_stop(true)
+            .absolute()
+            .right_0()
+            .top_0()
+            .w(px(8.0))
+            .h_full()
+            .cursor_col_resize()
+            .when(active, |handle| {
+                handle.bg(with_alpha(self.palette.accent, 0.3))
+            })
+            .hover(|handle| handle.bg(with_alpha(self.palette.accent, 0.22)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event, _, cx| {
+                    this.begin_list_column_resize(down_key.clone(), width, event, cx)
+                }),
+            )
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                let next = match event.keystroke.key.as_str() {
+                    "left" => width - 10.0,
+                    "right" => width + 10.0,
+                    _ => return,
+                };
+                this.set_list_column_width(keyboard_key.clone(), next, true, cx);
+                cx.stop_propagation();
+            }))
+            .on_click(|_, _, cx| cx.stop_propagation())
             .into_any_element()
     }
 
@@ -17754,6 +24154,132 @@ impl DirectoryWindow {
         }
     }
 
+    fn render_empty_listing(
+        &mut self,
+        id: impl Into<ElementId>,
+        column: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let query = self.browser.search_query().trim().to_string();
+        let filter = self.browser.filter();
+        let underlying_entries = self.browser.entries().len();
+        let (title, description) = if column {
+            (
+                "This folder is empty".to_string(),
+                "There are no items in this column.".to_string(),
+            )
+        } else if !query.is_empty() {
+            (
+                "No search results".to_string(),
+                format!("No items match “{query}”."),
+            )
+        } else if filter != EntryFilter::All {
+            (
+                format!("No {} here", filter.label().to_lowercase()),
+                format!("The current {} filter hides every item.", filter.label()),
+            )
+        } else if underlying_entries > 0 {
+            (
+                "No visible items".to_string(),
+                "Hidden or system-file preferences are hiding this folder’s contents.".to_string(),
+            )
+        } else {
+            (
+                "This folder is empty".to_string(),
+                "Create a folder or paste items here to get started.".to_string(),
+            )
+        };
+        let mut actions = Vec::<AnyElement>::new();
+        if !column && !query.is_empty() {
+            actions.push(
+                toolbar_button("empty-clear-search", "Clear search", self.palette.control)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.browser.clear_search();
+                        this.search_active = false;
+                        this.persist_session();
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+        } else if !column && filter != EntryFilter::All {
+            actions.push(
+                toolbar_button("empty-show-all", "Show all items", self.palette.control)
+                    .on_click(cx.listener(|this, _, _, cx| this.set_filter(EntryFilter::All, cx)))
+                    .into_any_element(),
+            );
+        } else if !column && underlying_entries > 0 && !self.browser.show_hidden() {
+            actions.push(
+                toolbar_button(
+                    "empty-show-hidden",
+                    "Show hidden files",
+                    self.palette.control,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_hidden(cx)))
+                .into_any_element(),
+            );
+        } else if !column && underlying_entries > 0 && !self.browser.show_system_files() {
+            actions.push(
+                toolbar_button(
+                    "empty-show-system",
+                    "Show system files",
+                    self.palette.control,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_system_files(cx)))
+                .into_any_element(),
+            );
+        } else if !column {
+            actions.push(
+                toolbar_button("empty-new-folder", "New folder", self.palette.control)
+                    .on_click(cx.listener(|this, _, _, cx| this.prompt_new_folder(cx)))
+                    .into_any_element(),
+            );
+            if self.clipboard.is_some() {
+                actions.push(
+                    toolbar_button("empty-paste", "Paste", self.palette.control)
+                        .on_click(cx.listener(|this, _, _, cx| this.paste(cx)))
+                        .into_any_element(),
+                );
+            }
+        }
+
+        div()
+            .id(id)
+            .flex()
+            .flex_1()
+            .min_h(px(if column { 120.0 } else { 240.0 } * self.palette.scale))
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .p_4()
+            .text_center()
+            .child(
+                div()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(self.palette.text)
+                    .child(title),
+            )
+            .child(
+                div()
+                    .max_w(px(420.0 * self.palette.scale))
+                    .text_xs()
+                    .text_color(self.palette.muted)
+                    .child(description),
+            )
+            .when(!actions.is_empty(), |state| {
+                state.child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .justify_center()
+                        .gap_2()
+                        .mt_2()
+                        .children(actions),
+                )
+            })
+            .into_any_element()
+    }
+
     fn render_listing(&mut self, cx: &mut Context<Self>) -> AnyElement {
         if self.browser.view_mode() == ViewMode::Column {
             return self.render_column_view(cx);
@@ -17762,9 +24288,13 @@ impl DirectoryWindow {
         let content = match &self.state {
             ListingState::Loading => div()
                 .id("listing-loading")
+                .flex()
                 .flex_1()
-                .p_3()
+                .items_center()
+                .justify_center()
+                .p_4()
                 .text_sm()
+                .text_color(self.palette.muted)
                 .child("Loading files…")
                 .into_any_element(),
             ListingState::Failed(error) => {
@@ -17817,7 +24347,7 @@ impl DirectoryWindow {
                     )
                     .child(
                         div()
-                            .max_w(px(560.0))
+                            .max_w(px(560.0 * palette.scale))
                             .truncate()
                             .text_xs()
                             .text_color(palette.text)
@@ -17825,7 +24355,7 @@ impl DirectoryWindow {
                     )
                     .child(
                         div()
-                            .max_w(px(560.0))
+                            .max_w(px(560.0 * palette.scale))
                             .text_sm()
                             .text_color(palette.muted)
                             .child(error),
@@ -17874,7 +24404,7 @@ impl DirectoryWindow {
                             div()
                                 .id("folder-picker-error")
                                 .debug_selector(|| "folder-picker-error".to_string())
-                                .max_w(px(560.0))
+                                .max_w(px(560.0 * palette.scale))
                                 .mt_1()
                                 .text_sm()
                                 .text_color(danger)
@@ -17883,14 +24413,9 @@ impl DirectoryWindow {
                     })
                     .into_any_element()
             }
-            ListingState::Ready if self.browser.visible_entries().is_empty() => div()
-                .id("listing-empty")
-                .flex_1()
-                .p_3()
-                .text_sm()
-                .text_color(rgb(0x9a9a9a))
-                .child("No matching files")
-                .into_any_element(),
+            ListingState::Ready if self.browser.visible_entries().is_empty() => {
+                self.render_empty_listing("listing-empty", false, cx)
+            }
             ListingState::Ready => match self.browser.view_mode() {
                 ViewMode::List => self.render_list_view(cx),
                 ViewMode::Grid => self.render_grid_view(cx),
@@ -17908,7 +24433,7 @@ impl DirectoryWindow {
         div()
             .id("listing-drop-surface")
             .debug_selector(|| "listing-drop-surface".to_string())
-            .role(Role::Main)
+            .role(Role::Group)
             .aria_label(accessibility_label)
             .flex()
             .flex_1()
@@ -17930,9 +24455,10 @@ impl DirectoryWindow {
                 }
             })
             .on_drag_move::<FileDrag>(cx.listener(
-                |this, event: &gpui::DragMoveEvent<FileDrag>, _, cx| {
+                |this, event: &gpui::DragMoveEvent<FileDrag>, window, cx| {
                     let drag = event.drag(cx).clone();
                     this.track_file_drag(&drag, cx);
+                    this.maybe_start_external_file_drag(&drag, event.event.position, window, cx);
                     this.auto_scroll_primary_file_drag(event);
                 },
             ))
@@ -17944,9 +24470,39 @@ impl DirectoryWindow {
 
     fn render_list_view(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let count = self.browser.visible_entries().len();
+        let marquee_layout = MarqueeLayout::List {
+            row_height: self.settings.appearance.list_row_height as f32,
+        };
+        if self
+            .selection_marquee
+            .as_ref()
+            .is_some_and(|marquee| marquee.layout != marquee_layout)
+        {
+            self.selection_marquee = None;
+        }
+        let marquee_overlay = self.selection_marquee_overlay_rect(marquee_layout);
         let columns = self.browser.custom_columns();
-        let custom_width = list_custom_column_width(self.listing_viewport_width, columns.len());
-        let (size_width, modified_width) = list_builtin_column_widths(columns.len());
+        let custom_default = list_custom_column_width(self.listing_viewport_width, columns.len());
+        let columns = columns
+            .into_iter()
+            .map(|column| {
+                let width = self
+                    .browser
+                    .column_width(&format!("custom:{column}"))
+                    .map_or(custom_default, f32::from);
+                (column, width)
+            })
+            .collect::<Vec<_>>();
+        let (default_size_width, default_modified_width) =
+            list_builtin_column_widths(columns.len());
+        let size_width = self
+            .browser
+            .column_width("size")
+            .map_or(default_size_width, f32::from);
+        let modified_width = self
+            .browser
+            .column_width("modified")
+            .map_or(default_modified_width, f32::from);
         let list = uniform_list(
             "listing-results",
             count,
@@ -17975,7 +24531,7 @@ impl DirectoryWindow {
                     let icon = entry_icon_visual(&entry, native_icon, icon_size, palette);
                     let size = entry_detail(&entry, this.calculate_folder_sizes, false);
                     let modified = format_modified(entry.modified);
-                    let custom_cells = columns.iter().map(|column| {
+                    let custom_cells = columns.iter().map(|(column, width)| {
                         let value = entry
                             .custom
                             .get(column)
@@ -17988,8 +24544,8 @@ impl DirectoryWindow {
                             .debug_selector(move || selector.clone())
                             .role(Role::Group)
                             .aria_label(aria_label)
-                            .w(px(custom_width))
-                            .min_w(px(custom_width))
+                            .w(px(*width))
+                            .min_w(px(*width))
                             .px_2()
                             .truncate()
                             .text_xs()
@@ -18004,6 +24560,44 @@ impl DirectoryWindow {
                     );
                     let accessibility_path = path.clone();
                     let accessibility_view = cx.entity().downgrade();
+                    let row_content = div()
+                        .id(("entry-drag-source", index))
+                        .flex()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .items_center()
+                        .cursor_pointer()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_1()
+                                .min_w_0()
+                                .gap_2()
+                                .px_3()
+                                .child(icon)
+                                .child(
+                                    div().flex_1().min_w_0().truncate().child(file_name(&entry)),
+                                ),
+                        )
+                        .children(custom_cells)
+                        .child(div().w(px(size_width)).px_3().text_sm().child(size))
+                        .child(div().w(px(modified_width)).px_3().text_sm().child(modified))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                                window.focus(&this.focus_handle, cx);
+                                this.select_from_pointer(pointer_path.clone(), event, cx);
+                                if event.click_count >= 2 {
+                                    this.open_entry(pointer_path.clone(), is_dir, cx);
+                                }
+                                cx.stop_propagation();
+                                cx.notify();
+                            }),
+                        )
+                        .on_drag(drag, |drag, position, _, cx| {
+                            cx.new(|_| drag.clone().at(position))
+                        });
                     rows.push(
                         div()
                             .id(("entry", index))
@@ -18026,8 +24620,6 @@ impl DirectoryWindow {
                             .w_full()
                             .h(px(this.settings.appearance.list_row_height as f32))
                             .items_center()
-                            .border_b_1()
-                            .border_color(palette.border)
                             .bg(if selected {
                                 palette.selected
                             } else {
@@ -18035,38 +24627,14 @@ impl DirectoryWindow {
                             })
                             .opacity(if dragging { 0.45 } else { 1.0 })
                             .hover(move |row| row.bg(palette.hover))
-                            .cursor_pointer()
+                            .child(row_content)
                             .child(
                                 div()
-                                    .flex()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .gap_2()
-                                    .px_3()
-                                    .child(icon)
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .truncate()
-                                            .child(file_name(&entry)),
-                                    ),
-                            )
-                            .children(custom_cells)
-                            .child(div().w(px(size_width)).px_3().text_sm().child(size))
-                            .child(div().w(px(modified_width)).px_3().text_sm().child(modified))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(
-                                    move |this, event: &gpui::MouseDownEvent, window, cx| {
-                                        window.focus(&this.focus_handle, cx);
-                                        this.select_from_pointer(pointer_path.clone(), event, cx);
-                                        if event.click_count >= 2 {
-                                            this.open_entry(pointer_path.clone(), is_dir, cx);
-                                        }
-                                        cx.notify();
-                                    },
-                                ),
+                                    .id(("list-marquee-gutter", index))
+                                    .debug_selector(move || format!("list-marquee-gutter-{index}"))
+                                    .flex_none()
+                                    .w(px(SELECTION_MARQUEE_GUTTER))
+                                    .h_full(),
                             )
                             .on_mouse_down(
                                 MouseButton::Right,
@@ -18083,19 +24651,23 @@ impl DirectoryWindow {
                                     },
                                 ),
                             )
-                            .on_drag(drag, |drag, position, _, cx| {
-                                cx.new(|_| drag.clone().at(position))
-                            })
                             .on_drag_move::<FileDrag>(cx.listener(
-                                |this, event: &gpui::DragMoveEvent<FileDrag>, _, cx| {
+                                |this, event: &gpui::DragMoveEvent<FileDrag>, window, cx| {
                                     let drag = event.drag(cx).clone();
                                     this.track_file_drag(&drag, cx);
+                                    this.maybe_start_external_file_drag(
+                                        &drag,
+                                        event.event.position,
+                                        window,
+                                        cx,
+                                    );
                                 },
                             ))
                             .when(is_dir, |row| {
                                 let hover_target = path.clone();
                                 let leave_target = FileDragHoverTarget::Folder(path.clone());
                                 let drop_target = path.clone();
+                                let external_drop_target = path.clone();
                                 row.drag_over::<FileDrag>(move |style, drag, window, _| {
                                     if !target_is_link
                                         && valid_file_drop_target(
@@ -18129,18 +24701,31 @@ impl DirectoryWindow {
                                         this.cancel_file_drag_hover(&leave_target);
                                     }
                                 }))
-                                .on_drop(cx.listener(
-                                    move |this, drag: &FileDrag, window, cx| {
-                                        cx.stop_propagation();
-                                        this.drop_files_to(
-                                            drag,
-                                            drop_target.clone(),
-                                            target_is_link,
-                                            window,
-                                            cx,
-                                        );
-                                    },
-                                ))
+                                .on_drop(cx.listener(move |this, drag: &FileDrag, window, cx| {
+                                    cx.stop_propagation();
+                                    this.drop_files_to(
+                                        drag,
+                                        drop_target.clone(),
+                                        target_is_link,
+                                        window,
+                                        cx,
+                                    );
+                                }))
+                                .when(!target_is_link, |row| {
+                                    row.drag_over::<ExternalPaths>(move |style, _, _, _| {
+                                        style.border_color(palette.accent).bg(palette.selected)
+                                    })
+                                    .on_drop(cx.listener(
+                                        move |this, paths: &ExternalPaths, _, cx| {
+                                            cx.stop_propagation();
+                                            this.drop_external_paths_to(
+                                                paths,
+                                                external_drop_target.clone(),
+                                                cx,
+                                            );
+                                        },
+                                    ))
+                                })
                             })
                             .into_any_element(),
                     );
@@ -18152,7 +24737,7 @@ impl DirectoryWindow {
         .w_full()
         .track_scroll(&self.scroll_handle)
         .into_any_element();
-        div()
+        let list = div()
             .id("file-list-accessibility")
             .role(Role::List)
             .aria_label(format!("File list, {count} items"))
@@ -18160,6 +24745,26 @@ impl DirectoryWindow {
             .flex_1()
             .min_h_0()
             .child(list)
+            .into_any_element();
+        div()
+            .id("list-marquee-surface")
+            .debug_selector(|| "list-marquee-surface".to_string())
+            .relative()
+            .flex()
+            .flex_1()
+            .w_full()
+            .min_h_0()
+            .overflow_hidden()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event, window, cx| {
+                    this.begin_selection_marquee(marquee_layout, event, window, cx);
+                }),
+            )
+            .child(list)
+            .when_some(marquee_overlay, |surface, rect| {
+                surface.child(self.render_selection_marquee_overlay(rect))
+            })
             .into_any_element()
     }
 
@@ -18170,15 +24775,16 @@ impl DirectoryWindow {
             self.settings.appearance.density,
             self.settings.appearance.ui_scale,
         );
+        let marquee_layout = MarqueeLayout::Grid(metrics);
         if self
-            .grid_marquee
+            .selection_marquee
             .as_ref()
-            .is_some_and(|marquee| marquee.metrics != metrics)
+            .is_some_and(|marquee| marquee.layout != marquee_layout)
         {
-            self.grid_marquee = None;
+            self.selection_marquee = None;
         }
         self.grid_columns = metrics.columns;
-        let marquee_overlay = self.grid_marquee_overlay_rect();
+        let marquee_overlay = self.selection_marquee_overlay_rect(marquee_layout);
         let item_count = self.browser.visible_entries().len();
         let row_count = item_count.div_ceil(metrics.columns);
         let list = uniform_list(
@@ -18202,8 +24808,10 @@ impl DirectoryWindow {
                         let dragging = this.file_drag_sources.contains(&path);
                         let drag = this.file_drag_for_entry(&entry);
                         let palette = this.palette;
-                        let icon_size =
-                            (38.0 * this.settings.appearance.ui_scale).clamp(32.0, 52.0);
+                        let icon_size = (f32::from(this.settings.appearance.icon_size)
+                            * 2.5
+                            * this.settings.appearance.ui_scale)
+                            .clamp(30.0, 60.0);
                         let thumbnail_max_size = u32::from(
                             (this.settings.appearance.grid_min_width * 2).clamp(128, 512),
                         );
@@ -18261,12 +24869,12 @@ impl DirectoryWindow {
                                 .border_color(if selected {
                                     palette.accent
                                 } else {
-                                    palette.border
+                                    with_alpha(palette.border, 0.0)
                                 })
                                 .bg(if selected {
                                     palette.selected
                                 } else {
-                                    palette.surface
+                                    palette.window
                                 })
                                 .opacity(if dragging { 0.45 } else { 1.0 })
                                 .hover(move |card| card.bg(palette.hover))
@@ -18321,15 +24929,22 @@ impl DirectoryWindow {
                                     cx.new(|_| drag.clone().at(position))
                                 })
                                 .on_drag_move::<FileDrag>(cx.listener(
-                                    |this, event: &gpui::DragMoveEvent<FileDrag>, _, cx| {
+                                    |this, event: &gpui::DragMoveEvent<FileDrag>, window, cx| {
                                         let drag = event.drag(cx).clone();
                                         this.track_file_drag(&drag, cx);
+                                        this.maybe_start_external_file_drag(
+                                            &drag,
+                                            event.event.position,
+                                            window,
+                                            cx,
+                                        );
                                     },
                                 ))
                                 .when(is_dir, |card| {
                                     let hover_target = path.clone();
                                     let leave_target = FileDragHoverTarget::Folder(path.clone());
                                     let drop_target = path.clone();
+                                    let external_drop_target = path.clone();
                                     card.drag_over::<FileDrag>(move |style, drag, window, _| {
                                         if !target_is_link
                                             && valid_file_drop_target(
@@ -18375,6 +24990,30 @@ impl DirectoryWindow {
                                             );
                                         },
                                     ))
+                                    .when(
+                                        !target_is_link,
+                                        |card| {
+                                            card.drag_over::<ExternalPaths>(
+                                                move |style, _, _, _| {
+                                                    style
+                                                        .border_color(palette.accent)
+                                                        .bg(palette.selected)
+                                                },
+                                            )
+                                            .on_drop(
+                                                cx.listener(
+                                                    move |this, paths: &ExternalPaths, _, cx| {
+                                                        cx.stop_propagation();
+                                                        this.drop_external_paths_to(
+                                                            paths,
+                                                            external_drop_target.clone(),
+                                                            cx,
+                                                        );
+                                                    },
+                                                ),
+                                            )
+                                        },
+                                    )
                                 })
                                 .into_any_element(),
                         );
@@ -18418,33 +25057,67 @@ impl DirectoryWindow {
             .overflow_hidden()
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, event, window, cx| this.begin_grid_marquee(event, window, cx)),
-            )
-            .on_mouse_move(cx.listener(|this, event, _, cx| this.update_grid_marquee(event, cx)))
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| this.finish_grid_marquee(cx)),
-            )
-            .on_mouse_up_out(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| this.finish_grid_marquee(cx)),
+                cx.listener(move |this, event, window, cx| {
+                    this.begin_selection_marquee(marquee_layout, event, window, cx);
+                }),
             )
             .child(list)
             .when_some(marquee_overlay, |surface, rect| {
-                surface.child(
-                    div()
-                        .id("grid-marquee-overlay")
-                        .debug_selector(|| "grid-marquee-overlay".to_string())
-                        .absolute()
-                        .left(px(rect.left))
-                        .top(px(rect.top))
-                        .w(px(rect.width()))
-                        .h(px(rect.height()))
-                        .border_1()
-                        .border_color(self.palette.accent)
-                        .bg(with_alpha(self.palette.accent, 0.15)),
-                )
+                surface.child(self.render_selection_marquee_overlay(rect))
             })
+            .into_any_element()
+    }
+
+    fn render_column_view_resize_handle(
+        &mut self,
+        column_index: usize,
+        path: PathBuf,
+        width: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let active = self
+            .column_view_resize
+            .as_ref()
+            .is_some_and(|resize| resize.path == path);
+        let down_path = path.clone();
+        let keyboard_path = path;
+        div()
+            .id(("resize-column-view", column_index))
+            .debug_selector(move || format!("resize-column-view-{column_index}"))
+            .role(Role::Splitter)
+            .aria_label("Resize folder column")
+            .aria_orientation(Orientation::Vertical)
+            .aria_numeric_value(f64::from(width))
+            .aria_min_numeric_value(f64::from(MIN_COLUMN_VIEW_WIDTH))
+            .aria_max_numeric_value(f64::from(MAX_COLUMN_VIEW_WIDTH))
+            .focusable()
+            .tab_stop(true)
+            .absolute()
+            .right_0()
+            .top_0()
+            .w(px(8.0))
+            .h_full()
+            .cursor_col_resize()
+            .when(active, |handle| {
+                handle.bg(with_alpha(self.palette.accent, 0.3))
+            })
+            .hover(|handle| handle.bg(with_alpha(self.palette.accent, 0.22)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event, _, cx| {
+                    this.begin_column_view_resize(down_path.clone(), width, event, cx)
+                }),
+            )
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                let next = match event.keystroke.key.as_str() {
+                    "left" => width - 10.0,
+                    "right" => width + 10.0,
+                    _ => return,
+                };
+                this.set_column_view_width(keyboard_path.clone(), next, true, cx);
+                cx.stop_propagation();
+            }))
+            .on_click(|_, _, cx| cx.stop_propagation())
             .into_any_element()
     }
 
@@ -18465,9 +25138,27 @@ impl DirectoryWindow {
             })
             .collect();
         let column_count = snapshots.len();
+        if self.selection_marquee.as_ref().is_some_and(|marquee| {
+            matches!(
+                marquee.layout,
+                MarqueeLayout::Column { index, .. } if index >= column_count
+            )
+        }) {
+            self.selection_marquee = None;
+        }
         let mut rendered_columns = Vec::with_capacity(column_count);
 
         for (column_index, column_path, loading, error, entry_count) in snapshots {
+            let column_width = self
+                .browser
+                .column_view_width(&column_path)
+                .map(f32::from)
+                .unwrap_or(DEFAULT_COLUMN_VIEW_WIDTH);
+            let marquee_layout = MarqueeLayout::Column {
+                index: column_index,
+                row_height: f32::from(self.settings.appearance.list_row_height),
+            };
+            let column_row_height = f32::from(self.settings.appearance.list_row_height);
             let handle = self
                 .column_scroll_handles
                 .get(column_index)
@@ -18487,23 +25178,24 @@ impl DirectoryWindow {
             let column_accessibility_label = format!("{title} column, {entry_count} items");
 
             let body = if entry_count == 0 {
-                div()
-                    .flex_1()
-                    .p_3()
-                    .text_sm()
-                    .text_color(if error.is_some() {
-                        rgb(0xff8f8f)
-                    } else {
-                        rgb(0x909090)
-                    })
-                    .child(error.unwrap_or_else(|| {
-                        if loading {
-                            "Loading files…".to_string()
+                if error.is_none() && !loading {
+                    self.render_empty_listing(("column-empty", column_index), true, cx)
+                } else {
+                    div()
+                        .flex()
+                        .flex_1()
+                        .items_center()
+                        .justify_center()
+                        .p_4()
+                        .text_sm()
+                        .text_color(if error.is_some() {
+                            rgb(0xff8f8f)
                         } else {
-                            "No matching files".to_string()
-                        }
-                    }))
-                    .into_any_element()
+                            rgb(0x909090)
+                        })
+                        .child(error.unwrap_or_else(|| "Loading files…".to_string()))
+                        .into_any_element()
+                }
             } else {
                 let list = uniform_list(
                     ("column-list", column_index),
@@ -18541,13 +25233,9 @@ impl DirectoryWindow {
                             let icon =
                                 entry_icon_visual(&entry, native_icon, icon_size, this.palette);
                             let detail = entry_detail(&entry, this.calculate_folder_sizes, false);
-                            let selected = if is_last {
-                                this.column_selection.as_ref() == Some(&path)
-                                    || this.browser.is_selected(&path)
-                            } else {
-                                this.column_selection.as_ref() == Some(&path)
-                                    || child_path.as_ref() == Some(&path)
-                            };
+                            let selected = this.column_selection.contains(&path)
+                                || (is_last && this.browser.is_selected(&path))
+                                || (!is_last && child_path.as_ref() == Some(&path));
                             let accessibility_label = format!(
                                 "{}: {}",
                                 if is_dir { "Folder" } else { "File" },
@@ -18555,6 +25243,65 @@ impl DirectoryWindow {
                             );
                             let accessibility_path = path.clone();
                             let accessibility_view = cx.entity().downgrade();
+                            let row_content = div()
+                                .id(("column-entry-drag-source", column_index * 1_000_000 + index))
+                                .flex()
+                                .flex_1()
+                                .min_w_0()
+                                .h_full()
+                                .items_center()
+                                .gap_2()
+                                .cursor_pointer()
+                                .child(icon)
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_sm()
+                                        .child(file_name(&entry)),
+                                )
+                                .when(!detail.is_empty(), |row| {
+                                    row.child(
+                                        div().text_xs().text_color(rgb(0x888888)).child(detail),
+                                    )
+                                })
+                                .when(is_dir, |row| {
+                                    row.child(toolbar_icon(
+                                        "arrow-right",
+                                        palette.icon_size.clamp(10.0, 13.0),
+                                        palette.tertiary,
+                                    ))
+                                })
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(
+                                        move |this, event: &gpui::MouseDownEvent, window, cx| {
+                                            window.focus(&this.focus_handle, cx);
+                                            if is_last {
+                                                this.select_from_pointer(
+                                                    pointer_path.clone(),
+                                                    event,
+                                                    cx,
+                                                );
+                                                this.sync_column_selection_from_browser();
+                                            } else {
+                                                this.set_column_selection(pointer_path.clone());
+                                                this.browser.clear_selection();
+                                            }
+                                            if is_dir {
+                                                this.navigate_to(pointer_path.clone(), cx);
+                                            } else if event.click_count >= 2 {
+                                                this.open_entry(pointer_path.clone(), false, cx);
+                                            }
+                                            cx.stop_propagation();
+                                            cx.notify();
+                                        },
+                                    ),
+                                )
+                                .on_drag(drag, |drag, position, _, cx| {
+                                    cx.new(|_| drag.clone().at(position))
+                                });
                             rows.push(
                                 div()
                                     .id(("column-entry", column_index * 1_000_000 + index))
@@ -18569,11 +25316,15 @@ impl DirectoryWindow {
                                     .on_a11y_action(AccessibleAction::Click, move |_, _, cx| {
                                         accessibility_view
                                             .update(cx, |this, cx| {
-                                                this.column_selection =
-                                                    Some(accessibility_path.clone());
                                                 if is_last {
                                                     this.browser.select(accessibility_path.clone());
+                                                    this.sync_column_selection_from_browser();
                                                     this.sync_pinned_preview(cx);
+                                                } else {
+                                                    this.set_column_selection(
+                                                        accessibility_path.clone(),
+                                                    );
+                                                    this.browser.clear_selection();
                                                 }
                                                 if is_dir {
                                                     this.navigate_to(
@@ -18587,9 +25338,8 @@ impl DirectoryWindow {
                                     })
                                     .flex()
                                     .w_full()
-                                    .h(px(32.0))
+                                    .h(px(column_row_height))
                                     .items_center()
-                                    .gap_2()
                                     .px_2()
                                     .bg(if selected {
                                         palette.selected
@@ -18598,52 +25348,21 @@ impl DirectoryWindow {
                                     })
                                     .opacity(if dragging { 0.45 } else { 1.0 })
                                     .hover(move |row| row.bg(palette.hover))
-                                    .cursor_pointer()
-                                    .child(icon)
+                                    .child(row_content)
                                     .child(
                                         div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .truncate()
-                                            .text_sm()
-                                            .child(file_name(&entry)),
-                                    )
-                                    .when(!detail.is_empty(), |row| {
-                                        row.child(
-                                            div().text_xs().text_color(rgb(0x888888)).child(detail),
-                                        )
-                                    })
-                                    .when(is_dir, |row| {
-                                        row.child(div().text_color(rgb(0x888888)).child("›"))
-                                    })
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(
-                                            move |this,
-                                                  event: &gpui::MouseDownEvent,
-                                                  window,
-                                                  cx| {
-                                                window.focus(&this.focus_handle, cx);
-                                                this.column_selection = Some(pointer_path.clone());
-                                                if is_last {
-                                                    this.select_from_pointer(
-                                                        pointer_path.clone(),
-                                                        event,
-                                                        cx,
-                                                    );
-                                                }
-                                                if is_dir {
-                                                    this.navigate_to(pointer_path.clone(), cx);
-                                                } else if event.click_count >= 2 {
-                                                    this.open_entry(
-                                                        pointer_path.clone(),
-                                                        false,
-                                                        cx,
-                                                    );
-                                                }
-                                                cx.notify();
-                                            },
-                                        ),
+                                            .id((
+                                                "column-marquee-gutter",
+                                                column_index * 1_000_000 + index,
+                                            ))
+                                            .debug_selector(move || {
+                                                format!(
+                                                    "column-marquee-gutter-{column_index}-{index}"
+                                                )
+                                            })
+                                            .flex_none()
+                                            .w(px(SELECTION_MARQUEE_GUTTER))
+                                            .h_full(),
                                     )
                                     .on_mouse_down(
                                         MouseButton::Right,
@@ -18653,7 +25372,6 @@ impl DirectoryWindow {
                                                   window,
                                                   cx| {
                                                 window.focus(&this.focus_handle, cx);
-                                                this.column_selection = Some(context_path.clone());
                                                 if is_last {
                                                     this.open_file_context_menu(
                                                         context_path.clone(),
@@ -18662,8 +25380,22 @@ impl DirectoryWindow {
                                                         cx,
                                                     );
                                                 } else {
+                                                    if !this
+                                                        .column_selection
+                                                        .contains(&context_path)
+                                                    {
+                                                        this.set_column_selection(
+                                                            context_path.clone(),
+                                                        );
+                                                        this.browser.clear_selection();
+                                                    }
+                                                    let entries = this.effective_selected_entries();
                                                     this.open_context_menu_for_entries(
-                                                        vec![context_entry.clone()],
+                                                        if entries.is_empty() {
+                                                            vec![context_entry.clone()]
+                                                        } else {
+                                                            entries
+                                                        },
                                                         event.position,
                                                         cx,
                                                     );
@@ -18672,13 +25404,19 @@ impl DirectoryWindow {
                                             },
                                         ),
                                     )
-                                    .on_drag(drag, |drag, position, _, cx| {
-                                        cx.new(|_| drag.clone().at(position))
-                                    })
                                     .on_drag_move::<FileDrag>(cx.listener(
-                                        |this, event: &gpui::DragMoveEvent<FileDrag>, _, cx| {
+                                        |this,
+                                         event: &gpui::DragMoveEvent<FileDrag>,
+                                         window,
+                                         cx| {
                                             let drag = event.drag(cx).clone();
                                             this.track_file_drag(&drag, cx);
+                                            this.maybe_start_external_file_drag(
+                                                &drag,
+                                                event.event.position,
+                                                window,
+                                                cx,
+                                            );
                                         },
                                     ))
                                     .when(is_dir, |row| {
@@ -18686,6 +25424,7 @@ impl DirectoryWindow {
                                         let leave_target =
                                             FileDragHoverTarget::Folder(path.clone());
                                         let drop_target = path.clone();
+                                        let external_drop_target = path.clone();
                                         row.drag_over::<FileDrag>(move |style, drag, window, _| {
                                             if !target_is_link
                                                 && valid_file_drop_target(
@@ -18721,19 +25460,39 @@ impl DirectoryWindow {
                                                 this.cancel_file_drag_hover(&leave_target);
                                             }
                                         }))
-                                        .on_drop(
-                                            cx.listener(
-                                                move |this, drag: &FileDrag, window, cx| {
-                                                    cx.stop_propagation();
-                                                    this.drop_files_to(
-                                                        drag,
-                                                        drop_target.clone(),
-                                                        target_is_link,
-                                                        window,
-                                                        cx,
-                                                    );
-                                                },
-                                            ),
+                                        .on_drop(cx.listener(
+                                            move |this, drag: &FileDrag, window, cx| {
+                                                cx.stop_propagation();
+                                                this.drop_files_to(
+                                                    drag,
+                                                    drop_target.clone(),
+                                                    target_is_link,
+                                                    window,
+                                                    cx,
+                                                );
+                                            },
+                                        ))
+                                        .when(
+                                            !target_is_link,
+                                            |row| {
+                                                row.drag_over::<ExternalPaths>(
+                                                    move |style, _, _, _| {
+                                                        style
+                                                            .border_color(palette.accent)
+                                                            .bg(palette.selected)
+                                                    },
+                                                )
+                                                .on_drop(cx.listener(
+                                                    move |this, paths: &ExternalPaths, _, cx| {
+                                                        cx.stop_propagation();
+                                                        this.drop_external_paths_to(
+                                                            paths,
+                                                            external_drop_target.clone(),
+                                                            cx,
+                                                        );
+                                                    },
+                                                ))
+                                            },
                                         )
                                     })
                                     .into_any_element(),
@@ -18757,17 +25516,45 @@ impl DirectoryWindow {
                     .into_any_element()
             };
 
+            let marquee_overlay = self.selection_marquee_overlay_rect(marquee_layout);
+            let body = div()
+                .id(("column-marquee-surface", column_index))
+                .debug_selector(move || format!("column-marquee-surface-{column_index}"))
+                .relative()
+                .flex()
+                .flex_1()
+                .min_h_0()
+                .overflow_hidden()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event, window, cx| {
+                        this.begin_selection_marquee(marquee_layout, event, window, cx);
+                    }),
+                )
+                .child(body)
+                .when_some(marquee_overlay, |surface, rect| {
+                    surface.child(self.render_selection_marquee_overlay(rect))
+                })
+                .into_any_element();
+
             let column_drop_target = column_path.clone();
             let column_drag_target = column_path.clone();
+            let resize_handle = self.render_column_view_resize_handle(
+                column_index,
+                column_path.clone(),
+                column_width,
+                cx,
+            );
             let palette = self.palette;
             rendered_columns.push(
                 div()
                     .id(("column", column_index))
                     .debug_selector(move || format!("column-{column_index}"))
+                    .relative()
                     .flex()
                     .flex_col()
                     .flex_shrink_0()
-                    .w(px(280.0))
+                    .w(px(column_width))
                     .h_full()
                     .border_r_1()
                     .border_color(palette.border)
@@ -18785,6 +25572,7 @@ impl DirectoryWindow {
                             .child(div().text_xs().text_color(palette.muted).child(state_label)),
                     )
                     .child(body)
+                    .child(resize_handle)
                     .drag_over::<FileDrag>(move |style, drag, window, _| {
                         if valid_file_drop_target(
                             &column_drag_target,
@@ -18797,9 +25585,15 @@ impl DirectoryWindow {
                         }
                     })
                     .on_drag_move::<FileDrag>(cx.listener(
-                        move |this, event: &gpui::DragMoveEvent<FileDrag>, _, cx| {
+                        move |this, event: &gpui::DragMoveEvent<FileDrag>, window, cx| {
                             let drag = event.drag(cx).clone();
                             this.track_file_drag(&drag, cx);
+                            this.maybe_start_external_file_drag(
+                                &drag,
+                                event.event.position,
+                                window,
+                                cx,
+                            );
                             this.auto_scroll_column_file_drag(column_index, event);
                         },
                     ))
@@ -18921,6 +25715,31 @@ fn constrain_workspace_bounds(
     gpui::Bounds::new(gpui::point(px(x), px(y)), gpui::size(px(width), px(height)))
 }
 
+pub fn initial_window_bounds(
+    config_dir: &Path,
+    fallback: gpui::Bounds<gpui::Pixels>,
+    cx: &mut App,
+) -> gpui::Bounds<gpui::Pixels> {
+    let Some(placement) = settings::load_window_placement(config_dir) else {
+        return fallback;
+    };
+    let displays: Vec<_> = cx
+        .displays()
+        .into_iter()
+        .map(|display| display.bounds())
+        .collect();
+    constrain_workspace_bounds(
+        WorkspaceWindowState {
+            width: placement.width,
+            height: placement.height,
+            x: placement.x,
+            y: placement.y,
+        },
+        fallback,
+        &displays,
+    )
+}
+
 #[cfg(all(windows, not(test)))]
 fn move_native_window(
     window: &gpui::Window,
@@ -18957,12 +25776,61 @@ fn move_native_window(
     }
 }
 
-#[cfg(any(not(windows), test))]
+#[cfg(all(target_os = "macos", not(test)))]
+#[allow(deprecated, unexpected_cfgs)]
+fn move_native_window(
+    window: &gpui::Window,
+    origin: gpui::Point<gpui::Pixels>,
+) -> Result<(), String> {
+    use cocoa::appkit::{NSScreen, NSWindow};
+    use cocoa::base::{id, nil};
+    use cocoa::foundation::NSPoint;
+    use objc::{msg_send, sel, sel_impl};
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let handle = HasWindowHandle::window_handle(window).map_err(|error| error.to_string())?;
+    let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
+        return Ok(());
+    };
+    let view = handle.ns_view.as_ptr() as id;
+    let native_window: id = unsafe { msg_send![view, window] };
+    if native_window == nil {
+        return Err("AppKit window handle is unavailable".to_string());
+    }
+    let screen = unsafe { NSWindow::screen(native_window) };
+    if screen == nil {
+        return Err("AppKit screen is unavailable".to_string());
+    }
+    let screen_frame = unsafe { NSScreen::frame(screen) };
+    let top_left = NSPoint::new(
+        screen_frame.origin.x + f64::from(f32::from(origin.x)),
+        screen_frame.origin.y + screen_frame.size.height - f64::from(f32::from(origin.y)),
+    );
+    unsafe { NSWindow::setFrameTopLeftPoint_(native_window, top_left) };
+    Ok(())
+}
+
+#[cfg(any(not(any(windows, target_os = "macos")), test))]
 fn move_native_window(
     _window: &gpui::Window,
     _origin: gpui::Point<gpui::Pixels>,
 ) -> Result<(), String> {
     Ok(())
+}
+
+impl Drop for DirectoryWindow {
+    fn drop(&mut self) {
+        self.sync_active_tab_view_state();
+        self.browser.set_window_placement(SessionWindowPlacement {
+            width: self.last_window_bounds.width,
+            height: self.last_window_bounds.height,
+            x: self.last_window_bounds.x,
+            y: self.last_window_bounds.y,
+        });
+        if let Some(store) = &self.session_store {
+            let _ = store.save(&self.browser);
+        }
+    }
 }
 
 impl Focusable for DirectoryWindow {
@@ -18973,6 +25841,7 @@ impl Focusable for DirectoryWindow {
 
 impl Render for DirectoryWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        window.set_rem_size(px(16.0 * self.settings.appearance.ui_scale));
         if let Some(saved) = self.pending_workspace_bounds.take() {
             let current = window.bounds();
             let displays: Vec<_> = cx
@@ -18995,8 +25864,144 @@ impl Render for DirectoryWindow {
             y: Some(f32::from(bounds.origin.y)),
         };
         self.palette = UiPalette::for_settings(&self.settings, window.appearance());
-        let item_count = self.browser.visible_entries().len();
-        let selection_count = self.browser.selection_count();
+        self.capture_overlay_focus(window, cx);
+        self.ensure_native_text_input(cx);
+        if self.native_text_input_focus_pending
+            && let Some(input) = self.native_text_input.as_ref()
+        {
+            window.focus(&input.focus_handle(cx), cx);
+            self.native_text_input_focus_pending = false;
+        }
+        self.sync_overlay_focus(window, cx);
+        let selection_count = self.effective_selection_count();
+        let folder_count = self
+            .browser
+            .entries()
+            .iter()
+            .filter(|entry| entry.is_dir)
+            .count();
+        let file_count = self.browser.entries().len() - folder_count;
+        let total_file_size = self
+            .browser
+            .entries()
+            .iter()
+            .filter(|entry| !entry.is_dir)
+            .map(|entry| entry.size)
+            .sum::<u64>();
+        let hidden_count = self
+            .browser
+            .entries()
+            .iter()
+            .filter(|entry| entry.hidden)
+            .count();
+        let item_summary = if folder_count == 0 && file_count == 0 {
+            "Empty folder".to_string()
+        } else {
+            let mut parts = Vec::with_capacity(2);
+            if folder_count > 0 {
+                parts.push(format!(
+                    "{folder_count} folder{}",
+                    if folder_count == 1 { "" } else { "s" }
+                ));
+            }
+            if file_count > 0 {
+                parts.push(format!(
+                    "{file_count} file{}",
+                    if file_count == 1 { "" } else { "s" }
+                ));
+            }
+            parts.join(", ")
+        };
+        let total_size_summary = (total_file_size > 0).then(|| format_size(total_file_size));
+        let mut filter_parts = Vec::with_capacity(3);
+        if self.browser.filter() != EntryFilter::All {
+            filter_parts.push(format!(
+                "Showing {}",
+                self.browser.filter().label().to_lowercase()
+            ));
+        }
+        if !self.browser.search_query().is_empty() {
+            filter_parts.push(format!("Searching \"{}\"", self.browser.search_query()));
+        }
+        if !self.browser.show_hidden() && hidden_count > 0 {
+            filter_parts.push(format!("{hidden_count} hidden"));
+        }
+        let filter_summary = (!filter_parts.is_empty()).then(|| filter_parts.join(" / "));
+        let selection_summary = if selection_count > 1 {
+            Some(format!("{selection_count} selected"))
+        } else {
+            self.effective_selected_entry().map(|entry| {
+                let name = file_name(&entry);
+                if entry.is_dir {
+                    format!("Selected: {name}")
+                } else {
+                    format!("Selected: {name} ({})", format_size(entry.size))
+                }
+            })
+        };
+        let disk_summary = self.disk_info.as_ref().map(|disk| {
+            (
+                format!(
+                    "{} free of {}",
+                    format_size(disk.available_space),
+                    format_size(disk.total_space)
+                ),
+                format!("Disk: {}", disk.name),
+            )
+        });
+        let active_operation_count = self.process_active_operation_count();
+        let operation_summary = if active_operation_count > 1 {
+            Some((
+                format!("{active_operation_count} operations"),
+                format!("{active_operation_count} file operations in progress"),
+            ))
+        } else if active_operation_count == 1 {
+            self.operations
+                .operations()
+                .iter()
+                .rev()
+                .find(|operation| operation.status() == OperationStatus::Running)
+                .map(|operation| {
+                    let kind = match operation.request().kind {
+                        FileOperationKind::Copy => "Copying",
+                        FileOperationKind::Move => "Moving",
+                        FileOperationKind::Trash => "Deleting",
+                    };
+                    let progress = operation.progress();
+                    let percent = progress.and_then(|progress| {
+                        let (processed, total) = if progress.total_bytes > 0 {
+                            (progress.processed_bytes, progress.total_bytes)
+                        } else {
+                            (progress.processed_entries, progress.total_entries)
+                        };
+                        (total > 0).then(|| processed.saturating_mul(100) / total)
+                    });
+                    let label = percent
+                        .map_or_else(|| kind.to_string(), |value| format!("{kind} {value}%"));
+                    let detail = progress
+                        .filter(|progress| progress.total_entries > 0)
+                        .map(|progress| {
+                            format!(
+                                "{}/{} items",
+                                progress.processed_entries, progress.total_entries
+                            )
+                        })
+                        .or_else(|| {
+                            progress
+                                .and_then(|progress| progress.current_path.as_deref())
+                                .map(path_label)
+                        })
+                        .unwrap_or_default();
+                    let description = if detail.is_empty() {
+                        format!("{label}. Show operation details")
+                    } else {
+                        format!("{label}, {detail}. Show operation details")
+                    };
+                    (label, description)
+                })
+        } else {
+            None
+        };
         let status = self
             .status_message
             .clone()
@@ -19033,20 +26038,35 @@ impl Render for DirectoryWindow {
             - if self.sidebar_collapsed {
                 0.0
             } else {
-                self.sidebar_width + 8.0
+                self.sidebar_width
             };
+        let logical_main_width = main_area_width / self.palette.scale.max(0.1);
+        let status_selection_width = if logical_main_width <= 620.0 && operation_summary.is_some() {
+            96.0 * self.palette.scale
+        } else if logical_main_width <= 620.0 {
+            200.0 * self.palette.scale
+        } else {
+            300.0 * self.palette.scale
+        };
         let title_bar = self.render_title_bar(window.is_maximized(), cx);
-        let toolbar = self.render_toolbar(main_area_width < 900.0, cx);
+        let toolbar = self.render_toolbar(logical_main_width < 900.0, cx);
         let settings_panel = self.render_settings_panel(cx);
+        let settings_confirmation = self.render_settings_confirmation(window, cx);
         let go_to_folder = self.render_go_to_folder(f32::from(bounds.size.height), cx);
         let recovery_notice = self.render_recovery_notice(cx);
-        let operation_panel = self.render_operation_panel(cx);
+        let operation_panel = self.render_operation_panel(status.is_some(), cx);
         let archive_inspection = self.render_archive_inspection(cx);
         let preview_open = !matches!(self.preview_state, PreviewState::Closed);
         let inspector_preview_open = preview_open && !self.quick_look_open;
-        let preview_as_side_panel = inspector_preview_open && main_area_width >= 708.0;
-        self.listing_viewport_width =
-            (main_area_width - 16.0 - if preview_as_side_panel { 368.0 } else { 0.0 }).max(1.0);
+        let preview_as_side_panel = inspector_preview_open && logical_main_width >= 708.0;
+        self.listing_viewport_width = (main_area_width
+            - 16.0 * self.palette.scale
+            - if preview_as_side_panel {
+                368.0 * self.palette.scale
+            } else {
+                0.0
+            })
+        .max(1.0);
         let side_preview =
             preview_as_side_panel.then(|| self.render_preview_panel(true, false, cx));
         let bottom_preview = (inspector_preview_open && !preview_as_side_panel)
@@ -19072,45 +26092,165 @@ impl Render for DirectoryWindow {
         let appearance_value_editor = self.render_appearance_value_editor(cx);
         let context_menu = self.render_file_context_menu(bounds.size, cx);
         let toast = self.render_toast(cx);
+        let search_running =
+            self.search_task.is_some() && self.browser.active_smart_folder().is_some();
         let status_panel = self.settings.view.show_status_bar.then(|| {
             let status_line = div()
                 .id("watcher-status")
                 .debug_selector(|| "watcher-status".to_string())
+                .role(Role::Status)
+                .aria_label("Folder status")
                 .flex()
                 .items_center()
                 .justify_between()
                 .gap_2()
-                .min_h(px(30.0))
+                .h(px(28.0 * self.palette.scale))
+                .min_h(px(28.0 * self.palette.scale))
                 .px_2()
-                .py_1()
                 .border_t_1()
                 .border_color(self.palette.border)
                 .bg(self.palette.surface)
                 .text_xs()
                 .text_color(self.palette.muted)
+                .overflow_hidden()
                 .child(
                     div()
+                        .id("status-left-cluster")
+                        .debug_selector(|| "status-left-cluster".to_string())
+                        .flex()
+                        .items_center()
+                        .gap_2()
                         .flex_1()
                         .min_w_0()
-                        .truncate()
-                        .text_color(self.palette.text)
-                        .child(if selection_count == 0 {
-                            format!("{item_count} items")
-                        } else {
-                            format!("{item_count} items • {selection_count} selected")
+                        .child(
+                            div()
+                                .id("status-item-summary")
+                                .debug_selector(|| "status-item-summary".to_string())
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .flex_shrink_0()
+                                .text_color(self.palette.text)
+                                .child(item_summary)
+                                .when_some(total_size_summary, |summary, size| {
+                                    summary
+                                        .child(div().text_color(self.palette.border).child("/"))
+                                        .child(div().text_color(self.palette.tertiary).child(size))
+                                }),
+                        )
+                        .when_some(filter_summary, |cluster, summary| {
+                            cluster.child(
+                                div()
+                                    .id("status-filter-summary")
+                                    .debug_selector(|| "status-filter-summary".to_string())
+                                    .flex_1()
+                                    .w(px(0.0))
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_color(self.palette.accent)
+                                    .child(summary),
+                            )
+                        })
+                        .when_some(operation_summary, |cluster, (label, description)| {
+                            cluster.child(
+                                div()
+                                    .id("status-operation-summary")
+                                    .debug_selector(|| "status-operation-summary".to_string())
+                                    .role(Role::Button)
+                                    .aria_label(description)
+                                    .focusable()
+                                    .tab_stop(true)
+                                    .flex()
+                                    .items_center()
+                                    .h(px(24.0 * self.palette.scale))
+                                    .flex_shrink_0()
+                                    .px_2()
+                                    .border_1()
+                                    .border_color(with_alpha(self.palette.border, 0.0))
+                                    .text_color(self.palette.accent)
+                                    .focus(|button| {
+                                        button
+                                            .bg(self.palette.hover)
+                                            .border_color(self.palette.accent)
+                                    })
+                                    .hover(|button| {
+                                        button
+                                            .bg(self.palette.hover)
+                                            .border_color(self.palette.border)
+                                    })
+                                    .cursor_pointer()
+                                    .child(label)
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.open_operation_panel(cx)),
+                                    ),
+                            )
+                        })
+                        .when(search_running, |cluster| {
+                            cluster.child(
+                                toolbar_button("stop-search", "Stop search", self.palette.control)
+                                    .aria_label("Stop the active search")
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.cancel_smart_search(cx)),
+                                    ),
+                            )
                         }),
                 )
                 .child(
                     div()
-                        .flex_shrink_0()
-                        .text_color(watch_color)
-                        .child(watch_label),
-                )
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .text_color(self.palette.tertiary)
-                        .child(format!("{} view", self.browser.view_mode().label())),
+                        .id("status-right-cluster")
+                        .debug_selector(|| "status-right-cluster".to_string())
+                        .flex()
+                        .flex_shrink()
+                        .items_center()
+                        .justify_end()
+                        .gap_2()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .when_some(selection_summary, |cluster, summary| {
+                            cluster.child(
+                                div()
+                                    .id("status-selection-summary")
+                                    .debug_selector(|| "status-selection-summary".to_string())
+                                    .flex_shrink()
+                                    .max_w(px(status_selection_width))
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .truncate()
+                                    .text_color(self.palette.muted)
+                                    .child(summary),
+                            )
+                        })
+                        .when(main_area_width > 820.0, |cluster| {
+                            cluster.when_some(disk_summary, |cluster, (summary, label)| {
+                                cluster.child(
+                                    div()
+                                        .id("status-disk-summary")
+                                        .debug_selector(|| "status-disk-summary".to_string())
+                                        .aria_label(label)
+                                        .flex_shrink_0()
+                                        .text_color(self.palette.tertiary)
+                                        .child(summary),
+                                )
+                            })
+                        })
+                        .child(
+                            div()
+                                .id("status-watcher-summary")
+                                .debug_selector(|| "status-watcher-summary".to_string())
+                                .flex_shrink_0()
+                                .text_color(watch_color)
+                                .child(watch_label),
+                        )
+                        .when(main_area_width > 620.0, |cluster| {
+                            cluster.child(
+                                div()
+                                    .id("status-view-summary")
+                                    .debug_selector(|| "status-view-summary".to_string())
+                                    .flex_shrink_0()
+                                    .text_color(self.palette.tertiary)
+                                    .child(format!("{} view", self.browser.view_mode().label())),
+                            )
+                        }),
                 )
                 .into_any_element();
             div()
@@ -19146,7 +26286,9 @@ impl Render for DirectoryWindow {
             .id("explorie-window")
             .role(Role::Application)
             .aria_label("Explorie file manager")
-            .key_context(if self.quick_look_open {
+            .key_context(if self.settings_confirmation.is_some() {
+                "settings-confirmation"
+            } else if self.quick_look_open {
                 "quick-look"
             } else if self.go_to_folder.is_some() {
                 "go-to-folder"
@@ -19154,6 +26296,11 @@ impl Render for DirectoryWindow {
                 "browser"
             })
             .track_focus(&self.focus_handle)
+            .drag_over::<ExternalPaths>(|style, _, _, _| style.bg(with_alpha(rgb(0x4ea1ff), 0.06)))
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+                this.drop_external_paths_to(paths, this.browser.path().to_path_buf(), cx);
+                cx.stop_propagation();
+            }))
             .on_key_down(cx.listener(Self::handle_search_key))
             .on_action(cx.listener(|this, _: &GoBack, _, cx| this.go_back(cx)))
             .on_action(cx.listener(|this, _: &GoForward, _, cx| this.go_forward(cx)))
@@ -19181,11 +26328,16 @@ impl Render for DirectoryWindow {
                     this.open_selected(cx);
                 }
             }))
-            .on_action(cx.listener(|this, _: &ClearSelection, _, cx| {
-                if this.quick_look_open {
+            .on_action(cx.listener(|this, _: &ClearSelection, window, cx| {
+                if this.settings_confirmation.is_some() {
+                    this.cancel_settings_confirmation(window, cx);
+                } else if this.quick_look_open {
                     this.close_quick_look(cx);
                 } else if this.go_to_folder.is_some() {
                     this.close_go_to_folder(cx);
+                } else if this.search_task.is_some() && this.browser.active_smart_folder().is_some()
+                {
+                    this.cancel_smart_search(cx);
                 } else if this.context_menu.is_some() {
                     this.close_context_menu(cx);
                 } else if this.shortcut_editor.is_some() {
@@ -19196,8 +26348,8 @@ impl Render for DirectoryWindow {
                     this.cancel_appearance_value_editor(cx);
                 } else if this.undo_progress.is_some() {
                     this.cancel_undo(cx);
-                } else if this.grid_marquee.is_some() {
-                    this.cancel_grid_marquee(cx);
+                } else if this.selection_marquee.is_some() {
+                    this.cancel_selection_marquee(cx);
                 } else if this.mutation_exit_waiting {
                     this.keep_app_open(cx);
                 } else if this.toolbar_menu != ToolbarMenu::Closed {
@@ -19233,6 +26385,12 @@ impl Render for DirectoryWindow {
             }))
             .on_action(cx.listener(|this, _: &ToggleFolderSizes, _, cx| {
                 this.toggle_folder_sizes(cx);
+            }))
+            .on_action(cx.listener(|this, _: &NewWindow, _, cx| {
+                this.open_new_window(false, cx);
+            }))
+            .on_action(cx.listener(|this, _: &MoveTabToNewWindow, _, cx| {
+                this.open_new_window(true, cx);
             }))
             .on_action(cx.listener(|this, _: &NewTab, _, cx| this.new_tab(cx)))
             .on_action(cx.listener(|this, _: &CloseTab, _, cx| {
@@ -19305,7 +26463,7 @@ impl Render for DirectoryWindow {
                 this.retry_preview(cx);
             }))
             .on_action(cx.listener(|this, _: &ClearPreviewCache, _, cx| {
-                this.clear_preview_cache(cx);
+                this.request_settings_confirmation(SettingsConfirmation::ClearPreviewCache, cx);
             }))
             .on_action(cx.listener(|this, _: &RefreshPreviewHelpers, _, cx| {
                 this.start_preview_helpers(cx);
@@ -19349,7 +26507,7 @@ impl Render for DirectoryWindow {
                 this.close_settings_panel(cx);
             }))
             .on_action(cx.listener(|this, _: &ResetSettings, _, cx| {
-                this.reset_settings(cx);
+                this.request_settings_confirmation(SettingsConfirmation::ResetSettings, cx);
             }))
             .on_action(cx.listener(|this, _: &CycleTheme, _, cx| this.cycle_theme(cx)))
             .on_action(cx.listener(|this, _: &CycleAccent, _, cx| this.cycle_accent(cx)))
@@ -19435,17 +26593,31 @@ impl Render for DirectoryWindow {
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
                     this.finish_sidebar_resize(cx);
+                    this.finish_list_column_resize(cx);
+                    this.finish_column_view_resize(cx);
+                    this.finish_selection_marquee(cx);
                     this.finish_file_drag(cx);
+                    this.finish_media_slider_drag();
                 }),
             )
             .on_mouse_up_out(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
                     this.finish_sidebar_resize(cx);
+                    this.finish_list_column_resize(cx);
+                    this.finish_column_view_resize(cx);
+                    this.finish_selection_marquee(cx);
                     this.finish_file_drag(cx);
+                    this.finish_media_slider_drag();
                 }),
             )
-            .on_mouse_move(cx.listener(|this, event, _, cx| this.update_sidebar_resize(event, cx)))
+            .on_mouse_move(cx.listener(|this, event, _, cx| {
+                this.update_sidebar_resize(event, cx);
+                this.update_list_column_resize(event, cx);
+                this.update_column_view_resize(event, cx);
+                this.update_selection_marquee(event, cx);
+                this.update_media_slider_drag(event, cx);
+            }))
             .relative()
             .flex()
             .flex_col()
@@ -19453,11 +26625,12 @@ impl Render for DirectoryWindow {
             .bg(self.palette.window)
             .text_color(self.palette.text)
             .font_family(font_family(&self.settings))
-            .text_size(px(14.0 * self.settings.appearance.ui_scale))
+            .text_sm()
             .child(title_bar)
             .child(
                 div()
                     .id("app-body")
+                    .relative()
                     .flex()
                     .flex_1()
                     .min_h_0()
@@ -19465,7 +26638,6 @@ impl Render for DirectoryWindow {
                     .w_full()
                     .overflow_hidden()
                     .child(sidebar)
-                    .child(sidebar_resizer)
                     .child(
                         div()
                             .id("main-area")
@@ -19475,48 +26647,41 @@ impl Render for DirectoryWindow {
                             .w(px(0.0))
                             .min_w_0()
                             .overflow_hidden()
-                            .child(
-                                div()
-                                    .px_2()
-                                    .pt_2()
-                                    .border_b_1()
-                                    .border_color(self.palette.border)
-                                    .bg(self.palette.topbar)
-                                    .child(toolbar),
-                            )
-                            .child(div().px_2().child(tabs))
+                            .child(div().px_2().bg(self.palette.topbar).child(toolbar))
+                            .child(tabs)
                             .child(recovery_notice)
                             .child(
                                 div()
                                     .id("main-content")
                                     .debug_selector(|| "main-content".to_string())
+                                    .role(Role::Main)
+                                    .aria_label("File browser")
                                     .flex()
                                     .flex_1()
                                     .min_h_0()
                                     .min_w_0()
                                     .w_full()
                                     .gap_2()
-                                    .px_2()
-                                    .py_2()
                                     .overflow_hidden()
                                     .child(
                                         div()
                                             .id("file-surface")
                                             .debug_selector(|| "file-surface".to_string())
+                                            .role(Role::Region)
+                                            .aria_label("File list")
                                             .flex()
                                             .flex_col()
                                             .flex_1()
                                             .w(px(0.0))
                                             .min_w_0()
-                                            .border_1()
-                                            .border_color(self.palette.border)
                                             .child(header)
                                             .child(listing),
                                     )
                                     .when_some(side_preview, |body, preview| body.child(preview)),
                             )
                             .child(main_footer),
-                    ),
+                    )
+                    .child(sidebar_resizer),
             )
             .child(settings_panel)
             .child(control_surface)
@@ -19527,6 +26692,7 @@ impl Render for DirectoryWindow {
             .child(named_theme_editor)
             .child(shortcut_editor)
             .child(appearance_value_editor)
+            .child(settings_confirmation)
             .child(context_menu)
             .child(operation_panel)
             .when_some(quick_look, |window, quick_look| window.child(quick_look))
@@ -19594,6 +26760,51 @@ fn path_label(path: &std::path::Path) -> String {
         .into_owned()
 }
 
+fn recovery_session_context(tab_count: usize, path: &Path) -> String {
+    format!(
+        "{tab_count} tab{} • Last: {} • Restored from the last atomic snapshot",
+        if tab_count == 1 { "" } else { "s" },
+        path_label(path)
+    )
+}
+
+fn syncthing_badge_label(conflict_count: usize) -> String {
+    if conflict_count == 0 {
+        "Syncthing".to_string()
+    } else {
+        format!(
+            "Syncthing · {conflict_count} conflict{}",
+            if conflict_count == 1 { "" } else { "s" }
+        )
+    }
+}
+
+fn render_syncthing_badge(
+    root: &Path,
+    conflict_count: usize,
+    palette: UiPalette,
+    ui_scale: f32,
+) -> AnyElement {
+    let label = syncthing_badge_label(conflict_count);
+    div()
+        .id("syncthing-badge")
+        .debug_selector(|| "syncthing-badge".to_string())
+        .role(Role::Status)
+        .aria_label(format!("Synced by Syncthing: {}. {label}", root.display()))
+        .flex()
+        .flex_none()
+        .items_center()
+        .h(px(24.0))
+        .px_2()
+        .border_1()
+        .border_color(with_alpha(palette.accent, 0.35))
+        .bg(palette.selected)
+        .text_size(px(10.0 * ui_scale))
+        .text_color(palette.accent)
+        .child(label)
+        .into_any_element()
+}
+
 fn sidebar_section_label(label: &'static str, palette: UiPalette) -> impl IntoElement {
     div()
         .mt_2()
@@ -19612,8 +26823,7 @@ fn conflict_path_card(label: &'static str, path: &Path, palette: UiPalette) -> A
         .min_w_0()
         .gap_2()
         .p_3()
-        .border_1()
-        .border_color(palette.border)
+        .rounded(px(palette.radius))
         .bg(palette.surface)
         .child(div().text_xs().text_color(palette.muted).child(label))
         .child(
@@ -19677,6 +26887,51 @@ fn operation_icon_button(
     icon: &'static str,
     palette: UiPalette,
 ) -> impl gpui::StatefulInteractiveElement + IntoElement {
+    let size = 28.0 * palette.scale;
+    div()
+        .id(id)
+        .role(Role::Button)
+        .aria_label(label.to_string())
+        .focusable()
+        .tab_stop(true)
+        .flex()
+        .flex_shrink_0()
+        .items_center()
+        .justify_center()
+        .w(px(size))
+        .h(px(size))
+        .rounded(px(palette.radius))
+        .border_1()
+        .border_color(with_alpha(palette.border, 0.0))
+        .focus_visible(move |button| button.bg(palette.hover).border_color(palette.accent))
+        .hover(move |button| button.bg(palette.hover))
+        .active(|button| button.opacity(0.82))
+        .cursor_pointer()
+        .tooltip({
+            let label = label.to_string();
+            move |_, cx| app_tooltip(label.clone(), palette, cx)
+        })
+        .child(toolbar_icon(
+            icon,
+            palette.icon_size.clamp(13.0, 18.0),
+            palette.muted,
+        ))
+}
+
+fn toolbar_button(
+    id: impl Into<ElementId>,
+    label: &str,
+    color: gpui::Rgba,
+) -> gpui::Stateful<gpui::Div> {
+    toolbar_button_enabled(id, label, color, true)
+}
+
+fn toolbar_button_enabled(
+    id: impl Into<ElementId>,
+    label: &str,
+    color: gpui::Rgba,
+    enabled: bool,
+) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
         .role(Role::Button)
@@ -19685,29 +26940,27 @@ fn operation_icon_button(
         .flex_shrink_0()
         .items_center()
         .justify_center()
-        .w(px(28.0))
-        .h(px(28.0))
-        .rounded_sm()
-        .hover(move |button| button.bg(palette.hover))
-        .cursor_pointer()
-        .child(toolbar_icon(icon, 13.0, palette.muted))
-}
-
-fn toolbar_button(
-    id: impl Into<ElementId>,
-    label: &str,
-    color: gpui::Rgba,
-) -> impl gpui::StatefulInteractiveElement + IntoElement {
-    div()
-        .id(id)
-        .role(Role::Button)
-        .aria_label(label.to_string())
         .px_3()
         .py_1()
         .rounded_sm()
+        .border_1()
+        .border_color(with_alpha(color, 0.0))
         .bg(color)
-        .hover(move |button| button.bg(adaptive_hover(color)))
-        .cursor_pointer()
+        .when(enabled, |button| {
+            button
+                .focusable()
+                .tab_stop(true)
+                .hover(move |button| button.bg(adaptive_hover(color)))
+                .focus_visible(move |button| {
+                    button
+                        .bg(adaptive_hover(color))
+                        .border_color(adaptive_hover(adaptive_hover(color)))
+                })
+                .active(|button| button.opacity(0.82))
+                .cursor_pointer()
+        })
+        .when(!enabled, |button| button.opacity(0.58))
+        .whitespace_nowrap()
         .text_sm()
         .child(label.to_string())
 }
@@ -19728,6 +26981,32 @@ fn compact_toolbar_button(
     active: bool,
     enabled: bool,
 ) -> gpui::Stateful<gpui::Div> {
+    compact_toolbar_button_with_tooltip(
+        id,
+        label,
+        icon,
+        palette,
+        active,
+        enabled,
+        control_tooltip_text(label),
+    )
+}
+
+fn compact_toolbar_button_with_tooltip(
+    id: &'static str,
+    label: &str,
+    icon: &'static str,
+    palette: UiPalette,
+    active: bool,
+    enabled: bool,
+    tooltip: String,
+) -> gpui::Stateful<gpui::Div> {
+    let density_scale = if palette.density == Density::Compact {
+        0.94
+    } else {
+        1.0
+    };
+    let size = 32.0 * palette.scale * density_scale;
     let foreground = if !enabled {
         palette.tertiary
     } else if active {
@@ -19744,8 +27023,9 @@ fn compact_toolbar_button(
         .flex_shrink_0()
         .items_center()
         .justify_center()
-        .w(px(32.0))
-        .h(px(32.0))
+        .w(px(size))
+        .h(px(size))
+        .rounded(px(palette.radius))
         .border_1()
         .border_color(if active {
             palette.accent
@@ -19759,10 +27039,19 @@ fn compact_toolbar_button(
         })
         .when(enabled, |button| {
             button
+                .focusable()
+                .tab_stop(true)
+                .focus_visible(move |button| button.bg(palette.hover).border_color(palette.accent))
                 .hover(move |button| button.bg(palette.hover).border_color(palette.border))
+                .active(|button| button.opacity(0.82))
                 .cursor_pointer()
+                .tooltip(move |_, cx| app_tooltip(tooltip.clone(), palette, cx))
         })
-        .child(toolbar_icon(icon, 16.0, foreground))
+        .child(toolbar_icon(
+            icon,
+            palette.icon_size.clamp(14.0, 20.0),
+            foreground,
+        ))
 }
 
 fn toolbar_menu_item(
@@ -19780,17 +27069,28 @@ fn toolbar_menu_item(
         .role(Role::Button)
         .aria_label(label.clone())
         .aria_selected(active)
+        .focusable()
+        .tab_stop(true)
         .flex()
         .items_center()
         .gap_2()
-        .min_h(px(32.0))
+        .min_h(px(if palette.density == Density::Compact {
+            30.0
+        } else {
+            34.0
+        } * palette.scale))
         .px_2()
+        .rounded(px(palette.radius))
+        .border_1()
+        .border_color(with_alpha(palette.border, 0.0))
         .bg(if active {
             palette.selected
         } else {
             with_alpha(palette.surface, 0.0)
         })
         .hover(move |row| row.bg(palette.hover))
+        .focus_visible(move |row| row.bg(palette.hover).border_color(palette.accent))
+        .active(|row| row.opacity(0.82))
         .cursor_pointer()
         .text_sm()
         .text_color(foreground)
@@ -19800,9 +27100,13 @@ fn toolbar_menu_item(
                 .items_center()
                 .justify_center()
                 .w(px(20.0))
-                .child(toolbar_icon(icon, 14.0, foreground)),
+                .child(toolbar_icon(
+                    icon,
+                    palette.icon_size.clamp(13.0, 18.0),
+                    foreground,
+                )),
         )
-        .child(label)
+        .child(div().flex_1().min_w_0().child(label))
 }
 
 fn history_menu_item(
@@ -19817,12 +27121,20 @@ fn history_menu_item(
         .debug_selector(move || selector.clone())
         .role(Role::Button)
         .aria_label(format!("Go {direction} to {label}"))
+        .focusable()
+        .tab_stop(true)
         .flex()
         .items_center()
         .gap_2()
-        .min_h(px(32.0))
+        .min_h(px(if palette.density == Density::Compact {
+            30.0
+        } else {
+            34.0
+        } * palette.scale))
         .px_2()
+        .rounded(px(palette.radius))
         .bg(with_alpha(palette.surface, 0.0))
+        .focus(move |row| row.bg(palette.hover))
         .hover(move |row| row.bg(palette.hover))
         .cursor_pointer()
         .text_sm()
@@ -19833,7 +27145,11 @@ fn history_menu_item(
                 .items_center()
                 .justify_center()
                 .w(px(20.0))
-                .child(toolbar_icon("folder", 14.0, palette.muted)),
+                .child(toolbar_icon(
+                    "folder",
+                    palette.icon_size.clamp(13.0, 18.0),
+                    palette.muted,
+                )),
         )
         .child(div().flex_1().min_w_0().truncate().child(label))
 }
@@ -19848,13 +27164,16 @@ fn toolbar_popover(
         .debug_selector(move || id.to_string())
         .flex()
         .flex_col()
-        .w(px(184.0))
+        .w(px(220.0 * palette.scale))
         .max_h(px(440.0))
         .overflow_y_scroll()
+        .p_1()
+        .rounded(px((palette.radius + 2.0).min(12.0)))
         .border_1()
         .border_color(palette.border)
         .bg(palette.surface)
         .text_color(palette.text)
+        .shadow_lg()
         .occlude()
         .children(children)
 }
@@ -19879,23 +27198,204 @@ fn settings_control_with_palette(
         .role(Role::Button)
         .aria_label(label.clone())
         .aria_selected(active)
+        .focusable()
+        .tab_stop(true)
         .flex()
         .items_center()
         .w_full()
-        .min_h(px(40.0))
+        .min_h(px(if palette.density == Density::Compact {
+            36.0
+        } else {
+            40.0
+        } * palette.scale))
         .px_3()
         .py_2()
-        .border_b_1()
-        .border_color(palette.border)
+        .rounded(px(palette.radius))
+        .border_1()
+        .border_color(with_alpha(palette.border, 0.0))
         .bg(if active {
             palette.selected
         } else {
             palette.window
         })
         .hover(move |button| button.bg(palette.hover))
+        .focus_visible(move |button| button.bg(palette.hover).border_color(palette.accent))
+        .active(|button| button.opacity(0.82))
         .cursor_pointer()
         .text_sm()
         .text_color(if active { palette.text } else { palette.muted })
+        .child(label)
+}
+
+fn settings_field_row(
+    label: &'static str,
+    description: &'static str,
+    palette: UiPalette,
+) -> gpui::Div {
+    let compact = palette.density == Density::Compact;
+    div()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .justify_between()
+        .gap_4()
+        .min_h(px(if compact { 48.0 } else { 56.0 } * palette.scale))
+        .px_3()
+        .when(compact, |row| row.py_1())
+        .when(!compact, |row| row.py_2())
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .flex_1()
+                .min_w(px(220.0 * palette.scale))
+                .child(div().text_sm().text_color(palette.text).child(label))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(palette.tertiary)
+                        .child(description),
+                ),
+        )
+}
+
+fn settings_toggle_control(
+    palette: UiPalette,
+    id: &'static str,
+    label: &'static str,
+    description: &'static str,
+    enabled: bool,
+    available: bool,
+) -> gpui::Stateful<gpui::Div> {
+    let foreground = if available {
+        palette.text
+    } else {
+        palette.tertiary
+    };
+    let track = if enabled {
+        palette.accent
+    } else {
+        palette.control
+    };
+    let compact = palette.density == Density::Compact;
+    div()
+        .id(id)
+        .debug_selector(move || id.to_string())
+        .role(Role::Switch)
+        .aria_label(label)
+        .aria_selected(enabled)
+        .when(available, |control| control.focusable().tab_stop(true))
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_4()
+        .min_h(px(if compact { 48.0 } else { 56.0 } * palette.scale))
+        .px_3()
+        .when(compact, |row| row.py_1())
+        .when(!compact, |row| row.py_2())
+        .rounded(px(palette.radius))
+        .border_1()
+        .border_color(with_alpha(palette.border, 0.0))
+        .when(available, |control| {
+            control
+                .hover(move |row| row.bg(palette.hover))
+                .focus_visible(move |row| row.bg(palette.hover).border_color(palette.accent))
+                .active(|row| row.opacity(0.82))
+                .cursor_pointer()
+        })
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .flex_1()
+                .min_w_0()
+                .child(div().text_sm().text_color(foreground).child(label))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(palette.tertiary)
+                        .child(description),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .when(enabled, |track| track.justify_end())
+                .when(!enabled, |track| track.justify_start())
+                .w(px(36.0 * palette.scale))
+                .h(px(20.0 * palette.scale))
+                .p(px(2.0 * palette.scale))
+                .rounded_full()
+                .border_1()
+                .border_color(if enabled {
+                    palette.accent
+                } else {
+                    palette.border
+                })
+                .bg(track)
+                .child(
+                    div()
+                        .w(px(14.0 * palette.scale))
+                        .h(px(14.0 * palette.scale))
+                        .rounded_full()
+                        .bg(if enabled {
+                            palette.window
+                        } else {
+                            palette.muted
+                        }),
+                ),
+        )
+}
+
+fn settings_segment_button(
+    palette: UiPalette,
+    id: impl Into<ElementId>,
+    label: impl Into<String>,
+    selected: bool,
+) -> gpui::Stateful<gpui::Div> {
+    let label = label.into();
+    div()
+        .id(id)
+        .role(Role::RadioButton)
+        .aria_label(label.clone())
+        .aria_selected(selected)
+        .focusable()
+        .tab_stop(true)
+        .flex()
+        .items_center()
+        .justify_center()
+        .min_w(px(54.0 * palette.scale))
+        .h(px(if palette.density == Density::Compact {
+            28.0
+        } else {
+            32.0
+        } * palette.scale))
+        .px_2()
+        .rounded(px(palette.radius))
+        .border_1()
+        .border_color(if selected {
+            palette.accent
+        } else {
+            palette.border
+        })
+        .bg(if selected {
+            palette.selected
+        } else {
+            palette.window
+        })
+        .hover(move |button| button.bg(palette.hover))
+        .focus_visible(move |button| button.border_color(palette.accent))
+        .active(|button| button.opacity(0.82))
+        .cursor_pointer()
+        .text_xs()
+        .text_color(if selected {
+            palette.text
+        } else {
+            palette.muted
+        })
         .child(label)
 }
 
@@ -19904,30 +27404,27 @@ fn settings_section(
     controls: Vec<AnyElement>,
     palette: UiPalette,
 ) -> AnyElement {
+    let compact = palette.density == Density::Compact;
     div()
         .flex()
         .flex_col()
+        .gap_2()
+        .when(compact, |section| section.p_2())
+        .when(!compact, |section| section.p_3())
         .child(
             div()
                 .flex()
                 .items_center()
-                .h(px(38.0))
+                .min_h(px(32.0 * palette.scale))
                 .flex_none()
-                .px_3()
-                .border_b_1()
-                .border_color(palette.border)
-                .bg(palette.surface)
-                .text_xs()
+                .px_2()
+                .text_sm()
                 .font_weight(FontWeight::SEMIBOLD)
-                .text_color(palette.muted)
-                .child(label.to_uppercase()),
+                .text_color(palette.text)
+                .child(label),
         )
-        .child(div().flex().flex_col().children(controls))
+        .child(div().flex().flex_col().gap_1().children(controls))
         .into_any_element()
-}
-
-fn toggle_label(label: &str, enabled: bool) -> String {
-    format!("{label}: {}", on_off(enabled))
 }
 
 fn selected_control_color(selected: bool, palette: UiPalette) -> gpui::Rgba {
@@ -21144,6 +28641,29 @@ mod tests {
     fn embedded_toolbar_assets_match_the_pinned_legacy_icon_vocabulary() {
         let assets = ExplorieAssets;
         let names = assets.list("icons").unwrap();
+        assert!(names.iter().any(|asset| asset.as_ref() == "icon.png"));
+        let app_icon = assets
+            .load("icons/icon.png")
+            .unwrap()
+            .expect("embedded PNG app icon");
+        assert_eq!(&app_icon[..8], b"\x89PNG\r\n\x1a\n");
+        let titlebar_icon = assets
+            .load("icons/titlebar-icon.png")
+            .unwrap()
+            .expect("optimized title-bar icon");
+        let titlebar_icon = image::load_from_memory(&titlebar_icon)
+            .unwrap()
+            .into_rgba8();
+        assert_eq!(titlebar_icon.dimensions(), (44, 36));
+        let visible = titlebar_icon
+            .enumerate_pixels()
+            .filter(|(_, _, pixel)| pixel[3] > 8)
+            .map(|(x, y, _)| (x, y))
+            .collect::<Vec<_>>();
+        assert_eq!(visible.iter().map(|(x, _)| *x).min(), Some(0));
+        assert_eq!(visible.iter().map(|(x, _)| *x).max(), Some(43));
+        assert!(visible.iter().map(|(_, y)| *y).min().unwrap_or(36) <= 1);
+        assert!(visible.iter().map(|(_, y)| *y).max().unwrap_or(0) >= 34);
         for name in [
             "app-face.svg",
             "arrow-left.svg",
@@ -21175,6 +28695,155 @@ mod tests {
     }
 
     #[gpui::test]
+    fn syncthing_badge_restores_root_conflicts_and_compact_toolbar_geometry(
+        cx: &mut TestAppContext,
+    ) {
+        let root = fixture_dir();
+        let unsynced = fixture_dir();
+        let nested = root.join("Synced").join("Projects");
+        fs::create_dir(root.join(".stfolder")).unwrap();
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(
+            nested.join("notes.sync-conflict-20260825-120000.txt"),
+            b"conflict",
+        )
+        .unwrap();
+        fs::write(nested.join("normal.txt"), b"normal").unwrap();
+
+        let services = NativeServices::new(ResourcePaths::test(&root));
+        assert_eq!(
+            services.listing.syncthing_root_blocking(&nested),
+            Some(root.clone())
+        );
+        assert_eq!(syncthing_badge_label(0), "Syncthing");
+        assert_eq!(syncthing_badge_label(1), "Syncthing · 1 conflict");
+        assert_eq!(syncthing_badge_label(2), "Syncthing · 2 conflicts");
+
+        let (view, window) =
+            cx.add_window_view(|_, cx| DirectoryWindow::new(nested.clone(), services.clone(), cx));
+        view.update(window, |view, cx| {
+            view.browser.replace_entries(vec![
+                metadata_entry(nested.join("notes.sync-conflict-20260825-120000.txt")),
+                metadata_entry(nested.join("normal.txt")),
+            ]);
+            view.state = ListingState::Ready;
+            view.start_syncthing_root(cx);
+        });
+        window.simulate_resize(gpui::size(px(1_200.0), px(720.0)));
+        for _ in 0..1_000 {
+            window.run_until_parked();
+            if view.update(window, |view, _| view.syncthing_root.is_some()) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        view.update(window, |view, _| {
+            assert_eq!(view.syncthing_root.as_deref(), Some(root.as_path()));
+            assert_eq!(view.syncthing_path.as_deref(), Some(nested.as_path()));
+            assert_eq!(view.browser.entries().len(), 2);
+        });
+        let wide_toolbar = window.debug_bounds("browser-toolbar").unwrap();
+        let wide_badge = window.debug_bounds("syncthing-badge").unwrap();
+        assert_eq!(f32::from(wide_badge.size.height), 24.0);
+        assert!(wide_badge.left() >= wide_toolbar.left());
+        assert!(wide_badge.right() <= wide_toolbar.right());
+        assert!(
+            wide_badge.right() <= window.debug_bounds("create-menu-button").unwrap().left(),
+            "Syncthing badge must retain its place between breadcrumbs and Create"
+        );
+
+        window.simulate_resize(gpui::size(px(800.0), px(600.0)));
+        window.run_until_parked();
+        let compact_toolbar = window.debug_bounds("browser-toolbar").unwrap();
+        let compact_badge = window.debug_bounds("syncthing-badge").unwrap();
+        assert_eq!(f32::from(compact_toolbar.size.height), 72.0);
+        assert_eq!(f32::from(compact_badge.size.height), 24.0);
+        assert!(compact_badge.left() >= compact_toolbar.left());
+        assert!(compact_badge.right() <= compact_toolbar.right());
+        for selector in [
+            "create-menu-button",
+            "search",
+            "view-menu-button",
+            "sort",
+            "filter",
+            "more-menu-button",
+        ] {
+            assert!(
+                window.debug_bounds(selector).is_some(),
+                "Syncthing badge displaced compact toolbar action {selector}: toolbar={compact_toolbar:?}, badge={compact_badge:?}, trailing={:?}",
+                window.debug_bounds("toolbar-trailing-controls")
+            );
+        }
+        view.update(window, |view, cx| {
+            assert!(view.browser.navigate(root.clone()));
+            view.start_syncthing_root(cx);
+            assert!(view.browser.navigate(unsynced.clone()));
+            view.start_syncthing_root(cx);
+        });
+        window.run_until_parked();
+        view.update(window, |view, _| {
+            assert_eq!(view.syncthing_path.as_deref(), Some(unsynced.as_path()));
+            assert!(view.syncthing_root.is_none());
+        });
+        view.update(window, |_, cx| cx.notify());
+        window.run_until_parked();
+        assert!(window.debug_bounds("syncthing-badge").is_none());
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(unsynced).unwrap();
+    }
+
+    #[gpui::test]
+    fn breadcrumb_background_restores_inline_path_edit_submit_and_cancel(cx: &mut TestAppContext) {
+        let directory = fixture_dir();
+        let target = directory.join("Target");
+        fs::create_dir(&target).unwrap();
+        let services = NativeServices::new(ResourcePaths::test(&directory));
+        let (view, window) =
+            cx.add_window_view(|_, cx| DirectoryWindow::new(directory.clone(), services, cx));
+
+        window.simulate_resize(gpui::size(px(1_200.0), px(720.0)));
+        window.run_until_parked();
+        let hit_area = window.debug_bounds("breadcrumb-edit-hit-area").unwrap();
+        window.simulate_click(hit_area.center(), gpui::Modifiers::default());
+        window.run_until_parked();
+        view.update(window, |view, _| {
+            let editor = view.breadcrumb_editor.as_ref().unwrap();
+            assert_eq!(editor.input, directory.to_string_lossy());
+            assert!(editor.replace_on_type);
+        });
+        let breadcrumbs = window.debug_bounds("breadcrumbs").unwrap();
+        let input = window.debug_bounds("breadcrumb-path-input").unwrap();
+        assert!(input.left() >= breadcrumbs.left());
+        assert!(input.right() <= breadcrumbs.right());
+        assert!(input.top() >= breadcrumbs.top());
+        assert!(input.bottom() <= breadcrumbs.bottom());
+
+        view.update(window, |view, cx| {
+            view.breadcrumb_editor.as_mut().unwrap().input = target.to_string_lossy().into_owned();
+            view.submit_breadcrumb_edit(cx);
+            assert!(view.breadcrumb_editor.is_none());
+            assert_eq!(view.browser.path(), target.as_path());
+        });
+        window.run_until_parked();
+
+        view.update(window, |view, cx| {
+            view.begin_breadcrumb_edit(cx);
+            view.cancel_breadcrumb_edit(cx);
+        });
+        view.update(window, |view, _| assert!(view.breadcrumb_editor.is_none()));
+
+        let current = build_path_stack(&target).len() - 1;
+        let selector = Box::leak(format!("breadcrumb-{current}").into_boxed_str());
+        let current = window.debug_bounds(selector).unwrap();
+        window.simulate_click(current.center(), gpui::Modifiers::default());
+        view.update(window, |view, _| {
+            assert!(view.breadcrumb_editor.is_some());
+            assert_eq!(view.browser.path(), target.as_path());
+        });
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[gpui::test]
     fn compact_toolbar_popovers_preserve_actions_at_the_minimum_window_size(
         cx: &mut TestAppContext,
     ) {
@@ -21197,15 +28866,20 @@ mod tests {
         window.run_until_parked();
         let title_bar = window.debug_bounds("title-bar").unwrap();
         let drag_region = window.debug_bounds("title-bar-drag-region").unwrap();
-        assert_eq!(f32::from(title_bar.size.height), 38.0);
+        let app_icon = window.debug_bounds("title-bar-app-icon").unwrap();
+        assert_eq!(f32::from(title_bar.size.height), 36.0);
         assert_eq!(title_bar.top(), px(0.0));
         assert_eq!(drag_region.top(), title_bar.top());
-        assert_eq!(drag_region.bottom() + px(1.0), title_bar.bottom());
+        assert_eq!(drag_region.bottom(), title_bar.bottom());
+        assert_eq!(f32::from(app_icon.size.width), 22.0);
+        assert_eq!(f32::from(app_icon.size.height), 22.0);
+        assert!(app_icon.left() >= drag_region.left());
+        assert!(app_icon.right() <= drag_region.right());
         for selector in ["window-minimize", "window-maximize", "window-close"] {
             let bounds = window.debug_bounds(selector).unwrap();
-            assert_eq!(f32::from(bounds.size.width), 46.0);
+            assert_eq!(f32::from(bounds.size.width), 44.0);
             assert_eq!(bounds.top(), title_bar.top());
-            assert_eq!(bounds.bottom() + px(1.0), title_bar.bottom());
+            assert_eq!(bounds.bottom(), title_bar.bottom());
         }
 
         view.update(window, |view, cx| {
@@ -21220,7 +28894,7 @@ mod tests {
         );
 
         let toolbar = window.debug_bounds("browser-toolbar").unwrap();
-        assert_eq!(f32::from(toolbar.size.height), 76.0);
+        assert_eq!(f32::from(toolbar.size.height), 72.0);
         let sidebar = window.debug_bounds("sidebar").unwrap();
         let tabs = window.debug_bounds("tabs").unwrap();
         assert_eq!(sidebar.top(), title_bar.bottom());
@@ -21280,14 +28954,16 @@ mod tests {
         }
         assert!(window.debug_bounds("new-folder").is_none());
 
-        let create = window.debug_bounds("create-menu-button").unwrap().center();
-        window.simulate_click(create, gpui::Modifiers::default());
+        let create = window.debug_bounds("create-menu-button").unwrap();
+        window.simulate_click(create.center(), gpui::Modifiers::default());
         window.run_until_parked();
-        assert!(window.debug_bounds("create-menu").is_some());
+        let create_menu = window.debug_bounds("create-menu").unwrap();
+        assert!((f32::from(create_menu.left()) - f32::from(create.left())).abs() <= 2.0);
+        assert!(create_menu.top() >= create.bottom() + px(2.0));
         let new_folder = window.debug_bounds("new-folder").unwrap().center();
         window.simulate_click(new_folder, gpui::Modifiers::default());
         window.run_until_parked();
-        view.update(window, |view, _| {
+        view.update(window, |view, cx| {
             assert_eq!(view.toolbar_menu, ToolbarMenu::Closed);
             assert!(matches!(
                 view.mutation_prompt,
@@ -21296,7 +28972,7 @@ mod tests {
                     ..
                 })
             ));
-            view.mutation_prompt = None;
+            view.cancel_mutation_prompt(cx);
         });
 
         let view_trigger = window.debug_bounds("view-menu-button").unwrap().center();
@@ -21311,9 +28987,12 @@ mod tests {
             assert_eq!(view.toolbar_menu, ToolbarMenu::Closed);
         });
 
-        let sort_trigger = window.debug_bounds("sort").unwrap().center();
-        window.simulate_click(sort_trigger, gpui::Modifiers::default());
+        let sort_trigger = window.debug_bounds("sort").unwrap();
+        window.simulate_click(sort_trigger.center(), gpui::Modifiers::default());
         window.run_until_parked();
+        let sort_menu = window.debug_bounds("sort-menu").unwrap();
+        assert!((f32::from(sort_menu.right()) - f32::from(sort_trigger.right())).abs() <= 2.0);
+        assert!(sort_menu.top() >= sort_trigger.bottom() + px(2.0));
         let sort_size = window.debug_bounds("toolbar-sort-size").unwrap().center();
         window.simulate_click(sort_size, gpui::Modifiers::default());
         window.run_until_parked();
@@ -21321,9 +29000,12 @@ mod tests {
             assert_eq!(view.browser.sort_key(), SortKey::Size)
         });
 
-        let filter_trigger = window.debug_bounds("filter").unwrap().center();
-        window.simulate_click(filter_trigger, gpui::Modifiers::default());
+        let filter_trigger = window.debug_bounds("filter").unwrap();
+        window.simulate_click(filter_trigger.center(), gpui::Modifiers::default());
         window.run_until_parked();
+        let filter_menu = window.debug_bounds("filter-menu").unwrap();
+        assert!((f32::from(filter_menu.right()) - f32::from(filter_trigger.right())).abs() <= 2.0);
+        assert!(filter_menu.top() >= filter_trigger.bottom() + px(2.0));
         let folders = window
             .debug_bounds("toolbar-filter-folders")
             .unwrap()
@@ -21334,9 +29016,12 @@ mod tests {
             assert_eq!(view.browser.filter(), EntryFilter::Folders)
         });
 
-        let more = window.debug_bounds("more-menu-button").unwrap().center();
-        window.simulate_click(more, gpui::Modifiers::default());
+        let more = window.debug_bounds("more-menu-button").unwrap();
+        window.simulate_click(more.center(), gpui::Modifiers::default());
         window.run_until_parked();
+        let more_menu = window.debug_bounds("more-menu").unwrap();
+        assert!((f32::from(more_menu.right()) - f32::from(more.right())).abs() <= 2.0);
+        assert!(more_menu.top() >= more.bottom() + px(2.0));
         for selector in [
             "toolbar-theme",
             "folder-sizes",
@@ -21345,16 +29030,109 @@ mod tests {
             "remote-drive-manager-button",
             "command-palette-button",
             "shortcut-help-button",
-            "settings",
         ] {
             assert!(
                 window.debug_bounds(selector).is_some(),
                 "missing More action {selector}"
             );
         }
+        assert!(
+            window.debug_bounds("sidebar-settings").is_some(),
+            "missing fixed sidebar Settings action"
+        );
         window.simulate_keystrokes("escape");
         view.update(window, |view, _| {
             assert_eq!(view.toolbar_menu, ToolbarMenu::Closed)
+        });
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[gpui::test]
+    fn grid_view_popover_restores_thumbnail_presets_slider_and_geometry(cx: &mut TestAppContext) {
+        let directory = fixture_dir();
+        let services = NativeServices::new(ResourcePaths::test(&directory));
+        let (view, window) =
+            cx.add_window_view(|_, cx| DirectoryWindow::new(directory.clone(), services, cx));
+        view.update(window, |view, cx| {
+            view.set_view_mode(ViewMode::Grid, cx);
+            view.settings.appearance.grid_min_width = 140;
+            view.state = ListingState::Ready;
+            cx.notify();
+        });
+
+        window.simulate_resize(gpui::size(px(800.0), px(600.0)));
+        window.run_until_parked();
+        let trigger = window.debug_bounds("view-menu-button").unwrap();
+        window.simulate_click(trigger.center(), gpui::Modifiers::default());
+        window.run_until_parked();
+
+        let menu = window.debug_bounds("view-menu").unwrap();
+        let control = window.debug_bounds("thumbnail-size-control").unwrap();
+        let label = window.debug_bounds("thumbnail-size-label").unwrap();
+        let presets = window.debug_bounds("thumbnail-size-presets").unwrap();
+        let slider = window.debug_bounds("thumbnail-size-slider").unwrap();
+        assert_eq!(f32::from(menu.size.width), 280.0);
+        assert!(
+            (f32::from(menu.right()) - f32::from(trigger.right())).abs() <= 2.0,
+            "view menu {menu:?} must remain right-aligned under trigger {trigger:?}"
+        );
+        assert!(menu.top() >= trigger.bottom() + px(2.0));
+        assert!(control.left() >= menu.left());
+        assert!(control.right() <= menu.right());
+        assert!(label.top() >= control.top());
+        assert!(label.bottom() <= presets.top());
+        assert!(presets.bottom() <= slider.top());
+        assert!(slider.bottom() <= control.bottom());
+        for selector in [
+            "thumbnail-size-small",
+            "thumbnail-size-medium",
+            "thumbnail-size-large",
+            "thumbnail-size-extra-large",
+        ] {
+            let preset = window.debug_bounds(selector).unwrap();
+            assert!(preset.left() >= presets.left());
+            assert!(preset.right() <= presets.right());
+        }
+
+        let extra_large = window
+            .debug_bounds("thumbnail-size-extra-large")
+            .unwrap()
+            .center();
+        window.simulate_click(extra_large, gpui::Modifiers::default());
+        window.run_until_parked();
+        view.update(window, |view, _| {
+            assert_eq!(view.settings.appearance.grid_min_width, 260);
+            assert_eq!(view.toolbar_menu, ToolbarMenu::View);
+        });
+
+        let step_170 = window
+            .debug_bounds("thumbnail-size-step-5")
+            .unwrap()
+            .center();
+        window.simulate_click(step_170, gpui::Modifiers::default());
+        window.run_until_parked();
+        view.update(window, |view, cx| {
+            assert_eq!(view.settings.appearance.grid_min_width, 170);
+            view.handle_grid_width_key(
+                &KeyDownEvent {
+                    keystroke: Keystroke::parse("right").unwrap(),
+                    is_held: false,
+                    prefer_character_input: false,
+                },
+                cx,
+            );
+            assert_eq!(view.settings.appearance.grid_min_width, 180);
+            view.handle_grid_width_key(
+                &KeyDownEvent {
+                    keystroke: Keystroke::parse("home").unwrap(),
+                    is_held: false,
+                    prefer_character_input: false,
+                },
+                cx,
+            );
+            assert_eq!(view.settings.appearance.grid_min_width, 120);
+            assert_eq!(view.toolbar_menu, ToolbarMenu::View);
         });
 
         fs::remove_dir_all(directory).unwrap();
@@ -21528,7 +29306,7 @@ mod tests {
                 view.browser
                     .visible_entries()
                     .iter()
-                    .map(file_name)
+                    .map(|entry| file_name(entry))
                     .collect::<Vec<_>>(),
                 ["beta.txt", "alpha.txt", "gamma.txt"]
             );
@@ -21541,7 +29319,7 @@ mod tests {
                 view.browser
                     .visible_entries()
                     .iter()
-                    .map(file_name)
+                    .map(|entry| file_name(entry))
                     .collect::<Vec<_>>(),
                 ["gamma.txt", "alpha.txt", "beta.txt"]
             );
@@ -21615,18 +29393,33 @@ mod tests {
             vec![0, 2],
             "the legacy inclusive AABB rule includes both touching rows"
         );
-        assert_eq!(grid_marquee_scroll_delta(39.0, 500.0), 10.0);
-        assert_eq!(grid_marquee_scroll_delta(250.0, 500.0), 0.0);
-        assert_eq!(grid_marquee_scroll_delta(461.0, 500.0), -10.0);
+        assert_eq!(selection_marquee_scroll_delta(39.0, 500.0), 10.0);
+        assert_eq!(selection_marquee_scroll_delta(250.0, 500.0), 0.0);
+        assert_eq!(selection_marquee_scroll_delta(461.0, 500.0), -10.0);
 
-        let mut marquee = GridMarquee {
+        assert_eq!(
+            row_marquee_hit_indices(
+                GridRect::between(
+                    GridPoint { x: 0.0, y: 31.0 },
+                    GridPoint { x: 200.0, y: 65.0 },
+                ),
+                5,
+                32.0,
+                280.0,
+            ),
+            vec![0, 1, 2],
+            "row marquee uses the same inclusive intersection rule"
+        );
+
+        let mut marquee = SelectionMarquee {
             start_window: GridPoint { x: 20.0, y: 20.0 },
             start_content: GridPoint { x: 20.0, y: 20.0 },
             current_content: GridPoint { x: 20.0, y: 20.0 },
             activated: false,
             additive: false,
-            metrics,
-            accumulated: BTreeSet::new(),
+            layout: MarqueeLayout::Grid(metrics),
+            initial_selection: BTreeSet::new(),
+            paths: Vec::new(),
         };
         marquee.update(
             GridPoint { x: 24.0, y: 24.0 },
@@ -21643,8 +29436,9 @@ mod tests {
     #[test]
     fn grid_thumbnail_matrix_matches_legacy_and_keys_track_source_identity() {
         for extension in [
-            "png", "jpg", "jpeg", "gif", "bmp", "webp", "mp4", "webm", "m4v", "mov", "avi", "mkv",
-            "wmv", "flv", "m2ts", "mts", "mpeg", "mpg", "3gp",
+            "png", "jpg", "jpeg", "gif", "bmp", "webp", "svg", "svgz", "tif", "tiff", "ico", "tga",
+            "dds", "hdr", "pnm", "pbm", "pgm", "ppm", "pam", "qoi", "mp4", "webm", "m4v", "mov",
+            "avi", "mkv", "wmv", "flv", "m2ts", "mts", "mpeg", "mpg", "3gp",
         ] {
             let entry = absolute_entry(PathBuf::from(format!("media.{extension}")));
             assert!(
@@ -21652,7 +29446,7 @@ mod tests {
                 "{extension} should use a Grid thumbnail"
             );
         }
-        for extension in ["tif", "tiff", "heic", "svg", "txt", "pdf"] {
+        for extension in ["heic", "psd", "txt", "pdf"] {
             let entry = absolute_entry(PathBuf::from(format!("other.{extension}")));
             assert!(
                 !entry_supports_grid_thumbnail(&entry),
@@ -21906,7 +29700,7 @@ mod tests {
         window.simulate_mouse_move(end, Some(MouseButton::Left), gpui::Modifiers::default());
         view.update(window, |view, _| {
             assert!(
-                view.grid_marquee
+                view.selection_marquee
                     .as_ref()
                     .is_some_and(|drag| drag.activated)
             );
@@ -21915,10 +29709,10 @@ mod tests {
             assert!(view.browser.is_selected(&directory.join("01.txt")));
         });
         window.run_until_parked();
-        assert!(window.debug_bounds("grid-marquee-overlay").is_some());
+        assert!(window.debug_bounds("selection-marquee-overlay").is_some());
         window.simulate_mouse_up(end, MouseButton::Left, gpui::Modifiers::default());
         view.update(window, |view, _| {
-            assert!(view.grid_marquee.is_none());
+            assert!(view.selection_marquee.is_none());
             assert_eq!(view.browser.selection_count(), 2);
         });
 
@@ -21942,7 +29736,7 @@ mod tests {
         window.simulate_mouse_up(start, MouseButton::Left, gpui::Modifiers::default());
         view.update(window, |view, _| {
             assert_eq!(view.browser.selection_count(), 0);
-            assert!(view.grid_marquee.is_none());
+            assert!(view.selection_marquee.is_none());
         });
 
         let scroll_handle = view.update(window, |view, _| {
@@ -21967,7 +29761,7 @@ mod tests {
             Some(MouseButton::Left),
             gpui::Modifiers::default(),
         );
-        view.update(window, |view, _| assert!(view.grid_marquee.is_some()));
+        view.update(window, |view, _| assert!(view.selection_marquee.is_some()));
         window.simulate_resize(gpui::size(px(1200.0), px(720.0)));
         window.run_until_parked();
         window.draw(
@@ -21977,7 +29771,7 @@ mod tests {
         );
         view.update(window, |view, _| {
             assert_eq!(view.grid_columns, 6);
-            assert!(view.grid_marquee.is_none());
+            assert!(view.selection_marquee.is_none());
         });
 
         fs::remove_dir_all(directory).unwrap();
@@ -23211,9 +31005,17 @@ mod tests {
             view.mutation_prompt.as_mut().unwrap().input = "DELETE".to_string();
             view.submit_mutation_prompt(cx);
         });
-        for _ in 0..300 {
+        for _ in 0..1_000 {
             cx.run_until_parked();
-            if view.update(cx, |view, _| !view.mutation_in_progress) {
+            let finished = view.update(cx, |view, _| {
+                !view.mutation_in_progress
+                    && view.mutation_prompt.is_none()
+                    && view
+                        .status_message
+                        .as_deref()
+                        .is_some_and(|message| message.contains("cannot be undone"))
+            });
+            if finished && !file.exists() && !folder.exists() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -23351,10 +31153,22 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
 
-        assert_eq!(
-            fs::read_to_string(directory.join("unpacked").join("source.txt")).unwrap(),
-            "archive proof"
+        let extracted = directory.join("unpacked").join("source.txt");
+        let extraction_state = view.update(cx, |view, _| {
+            (
+                view.status_message.clone(),
+                view.mutation_prompt
+                    .as_ref()
+                    .and_then(|prompt| prompt.error.clone()),
+            )
+        });
+        assert!(
+            extracted.is_file(),
+            "extraction did not produce {}: {:?}",
+            extracted.display(),
+            extraction_state
         );
+        assert_eq!(fs::read_to_string(extracted).unwrap(), "archive proof");
         view.update(cx, |view, _| {
             assert!(view.mutation_prompt.is_none());
             assert!(!view.undo_ledger.can_undo(SystemTime::now()));
@@ -23473,6 +31287,23 @@ mod tests {
                 .replace_entries(vec![entry(image_path.clone())]);
             view.browser.select(image_path.clone());
             view.preview_selected(cx);
+        });
+        for _ in 0..300 {
+            cx.run_until_parked();
+            if view.update(cx, |view, _| {
+                matches!(
+                    &view.preview_state,
+                    PreviewState::Ready {
+                        path,
+                        content: PreviewContent::Image(render_path),
+                    } if path == &image_path && render_path == &image_path
+                )
+            }) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        view.update(cx, |view, _| {
             assert!(matches!(
                 &view.preview_state,
                 PreviewState::Ready {
@@ -23633,7 +31464,7 @@ mod tests {
                 matches!(
                     view.preview_state,
                     PreviewState::Ready {
-                        content: PreviewContent::Text(_),
+                        content: PreviewContent::Fallback { .. },
                         ..
                     }
                 )
@@ -23796,18 +31627,33 @@ mod tests {
         for _ in 0..300 {
             cx.run_until_parked();
             if view.update(cx, |view, _| {
-                matches!(view.preview_state, PreviewState::Failed { .. })
+                matches!(
+                    view.preview_state,
+                    PreviewState::Ready {
+                        content: PreviewContent::Text(_),
+                        ..
+                    }
+                )
             }) {
                 break;
             }
             std::thread::sleep(Duration::from_millis(5));
         }
         view.update(cx, |view, cx| {
-            assert!(matches!(
-                &view.preview_state,
-                PreviewState::Failed { path, error }
-                    if path == &malformed_path && error.code == ErrorCode::InvalidInput
-            ));
+            assert!(
+                matches!(
+                    &view.preview_state,
+                    PreviewState::Ready {
+                        path,
+                        content: PreviewContent::Fallback {
+                            error: Some(error),
+                            ..
+                        },
+                    } if path == &malformed_path && error.code == ErrorCode::InvalidInput
+                ),
+                "unexpected malformed PDF preview state: {:?}",
+                view.preview_state
+            );
             fs::write(&malformed_path, minimal_pdf(1)).unwrap();
             view.retry_preview(cx);
         });
@@ -24232,7 +32078,13 @@ mod tests {
         for _ in 0..300 {
             cx.run_until_parked();
             if view.update(cx, |view, _| {
-                matches!(view.preview_state, PreviewState::Failed { .. })
+                matches!(
+                    view.preview_state,
+                    PreviewState::Ready {
+                        content: PreviewContent::Fallback { .. },
+                        ..
+                    }
+                )
             }) {
                 break;
             }
@@ -24241,9 +32093,12 @@ mod tests {
         view.update(cx, |view, _| {
             assert!(matches!(
                 view.preview_state,
-                PreviewState::Failed {
-                    error: ServiceError {
-                        code: ErrorCode::InvalidInput,
+                PreviewState::Ready {
+                    content: PreviewContent::Fallback {
+                        error: Some(ServiceError {
+                            code: ErrorCode::InvalidInput,
+                            ..
+                        }),
                         ..
                     },
                     ..
@@ -24505,7 +32360,7 @@ mod tests {
         assert!(narrow_preview.left() >= narrow_sidebar.right());
         assert_eq!(
             f32::from(window.debug_bounds("browser-toolbar").unwrap().size.height),
-            76.0
+            72.0
         );
         window.simulate_resize(gpui::size(px(1200.0), px(720.0)));
         window.run_until_parked();
@@ -24516,7 +32371,7 @@ mod tests {
         let wide_tabs = window.debug_bounds("tabs").unwrap();
         let wide_surface = window.debug_bounds("file-surface").unwrap();
         let wide_preview = window.debug_bounds("preview-panel").unwrap();
-        assert_eq!(f32::from(wide_toolbar.size.height), 44.0);
+        assert_eq!(f32::from(wide_toolbar.size.height), 40.0);
         assert!(wide_toolbar.bottom() <= wide_tabs.top());
         assert!(wide_preview.left() >= wide_surface.right());
         assert!(wide_preview.top() >= wide_tabs.bottom());
@@ -24702,7 +32557,7 @@ mod tests {
             view.browser.select(photo.clone());
             view.preview_state = PreviewState::Ready {
                 path: photo.clone(),
-                content: PreviewContent::External,
+                content: PreviewContent::Archive,
             };
             view.preview_tab = PreviewTab::Metadata;
             view.photo_metadata_state = PhotoMetadataState::Ready {
@@ -24824,7 +32679,13 @@ mod tests {
             |_, _| view.clone().into_element(),
         );
         assert!(window.debug_bounds("finder-tag-editor").is_some());
-        window.simulate_keystrokes("r e v i e w right right right right enter");
+        window.simulate_keystrokes("r e v i e w");
+        view.update(window, |view, cx| {
+            for _ in 0..4 {
+                view.cycle_finder_tag_color(1, cx);
+            }
+        });
+        window.simulate_keystrokes("enter");
         for _ in 0..200 {
             window.run_until_parked();
             if view.update(window, |view, _| {
@@ -24879,6 +32740,11 @@ mod tests {
         );
         assert!(window.debug_bounds("add-finder-tag").is_some());
         view.update(window, |view, cx| view.begin_add_finder_tag(cx));
+        window.draw(
+            gpui::point(px(0.0), px(0.0)),
+            gpui::size(px(1200.0), px(720.0)),
+            |_, _| view.clone().into_element(),
+        );
         window.simulate_keystrokes("d e n i e d enter");
         for _ in 0..200 {
             window.run_until_parked();
@@ -25625,7 +33491,8 @@ mod tests {
         });
         window.run_until_parked();
         let resized = window.debug_bounds("sidebar-resizer").unwrap();
-        assert_eq!(f32::from(resized.left()), 280.0);
+        assert_eq!(f32::from(resized.left()), 272.0);
+        assert_eq!(f32::from(resized.right()), 280.0);
 
         let saved: AppSettings = serde_json::from_slice(
             &fs::read(resources.config_dir.join("settings-v1.json")).unwrap(),
@@ -25649,6 +33516,15 @@ mod tests {
                     .debug_bounds("sidebar-resizer")
                     .unwrap()
                     .left()
+            ),
+            272.0
+        );
+        assert_eq!(
+            f32::from(
+                restarted_window
+                    .debug_bounds("sidebar-resizer")
+                    .unwrap()
+                    .right()
             ),
             280.0
         );
@@ -25911,13 +33787,13 @@ mod tests {
         let footer = window.debug_bounds("settings-footer").unwrap();
         assert_eq!(f32::from(backdrop.size.width), 1040.0);
         assert_eq!(f32::from(backdrop.size.height), 720.0);
-        assert_eq!(f32::from(panel.size.width), 1016.0);
+        assert_eq!(f32::from(panel.size.width), 992.0);
         assert_eq!(f32::from(panel.size.height), 640.0);
         assert_eq!(f32::from(header.size.height), 46.0);
         assert_eq!(f32::from(footer.size.height), 46.0);
         assert_eq!(f32::from(tabs.size.width), 172.0);
         assert_eq!(panel.top(), px(40.0));
-        assert_eq!(panel.left(), px(12.0));
+        assert_eq!(panel.left(), px(24.0));
         assert_eq!(header.top(), panel.top() + px(1.0));
         assert_eq!(header.bottom(), content.top());
         assert_eq!(content.bottom(), footer.top());
@@ -25928,10 +33804,10 @@ mod tests {
 
         for (tab_index, section_selector, control_selector) in [
             (1, "settings-integration", "settings-refresh-helpers"),
-            (2, "settings-appearance", "settings-theme"),
+            (2, "settings-appearance", "settings-theme-options"),
             (3, "settings-themes", "settings-theme-save"),
             (4, "settings-shortcuts", "settings-shortcuts-reset"),
-            (5, "settings-about", "settings-about"),
+            (5, "settings-about", "settings-update-action"),
         ] {
             let tab_selector = Box::leak(format!("settings-tab-{tab_index}").into_boxed_str());
             let target = window.debug_bounds(tab_selector).unwrap().center();
@@ -25952,10 +33828,10 @@ mod tests {
         let compact_panel = window.debug_bounds("settings-panel").unwrap();
         let compact_tabs = window.debug_bounds("settings-tabs").unwrap();
         let compact_active = window.debug_bounds("settings-active-section").unwrap();
-        assert_eq!(f32::from(compact_panel.size.width), 784.0);
-        assert_eq!(f32::from(compact_panel.size.height), 584.0);
-        assert_eq!(compact_panel.left(), px(8.0));
-        assert_eq!(compact_panel.top(), px(8.0));
+        assert_eq!(f32::from(compact_panel.size.width), 768.0);
+        assert_eq!(f32::from(compact_panel.size.height), 568.0);
+        assert_eq!(compact_panel.left(), px(16.0));
+        assert_eq!(compact_panel.top(), px(16.0));
         assert_eq!(f32::from(compact_tabs.size.height), 48.0);
         assert!(compact_active.top() > compact_tabs.bottom());
         assert_eq!(compact_active.left(), compact_tabs.left());
@@ -26038,7 +33914,7 @@ mod tests {
                         .into_iter()
                         .find(|command| command.id == CommandId::OpenSettings)
                         .and_then(|command| command.shortcut),
-                    Some("Ctrl/Cmd + Alt + J".to_string())
+                    Some(display_binding("secondary-alt-j"))
                 );
                 view.close_settings_panel(cx);
                 view.settings_store.as_ref().unwrap().flush();
@@ -26088,10 +33964,163 @@ mod tests {
                     binding_for(&view.settings.shortcut_bindings, "settings-open")
                         .as_deref()
                         .map(display_binding),
-                    Some("Ctrl/Cmd + Alt + J".to_string())
+                    Some(display_binding("secondary-alt-j"))
                 );
             })
             .unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[gpui::test]
+    fn status_bar_restores_listing_context_operations_and_responsive_detail(
+        cx: &mut TestAppContext,
+    ) {
+        let directory = fixture_dir();
+        let folder = directory.join("Folder");
+        let report = directory.join("report.txt");
+        let photo = directory.join("photo.png");
+        let hidden = directory.join("secret.txt");
+        fs::create_dir(&folder).unwrap();
+        fs::write(&report, vec![b'r'; 2_048]).unwrap();
+        fs::write(&photo, vec![b'p'; 1_024]).unwrap();
+        fs::write(&hidden, vec![b's'; 512]).unwrap();
+
+        let mut folder_entry = metadata_entry(folder);
+        folder_entry.is_dir = true;
+        let report_entry = metadata_entry(report.clone());
+        let photo_entry = metadata_entry(photo);
+        let mut hidden_entry = metadata_entry(hidden);
+        hidden_entry.hidden = true;
+
+        let services = NativeServices::new(ResourcePaths::test(&directory));
+        let (view, window) =
+            cx.add_window_view(|_, cx| DirectoryWindow::new(directory.clone(), services, cx));
+        let request = FileOperationRequest {
+            kind: FileOperationKind::Copy,
+            sources: vec![report.clone()],
+            destination: Some(directory.join("destination")),
+            conflict_policy: ConflictPolicy::Rename,
+        };
+        view.update(window, |view, cx| {
+            view.browser.replace_entries(vec![
+                folder_entry,
+                report_entry,
+                photo_entry,
+                hidden_entry,
+            ]);
+            view.browser.set_filter(EntryFilter::Files);
+            view.browser.set_search_query("report".to_string());
+            view.browser.select(report.clone());
+            view.disk_info = Some(DiskInfo {
+                mount_point: "C:\\".to_string(),
+                total_space: 1_000_000_000,
+                available_space: 625_000_000,
+                name: "Fixture disk".to_string(),
+            });
+            view.operations.track("status-running".into(), request);
+            assert!(view.operations.apply(FileOperationEvent {
+                job_id: "status-running".into(),
+                state: explorie_native_services::FileOperationState::Running,
+                progress: Some(FileOperationProgress {
+                    processed_entries: 1,
+                    total_entries: 4,
+                    processed_bytes: 512,
+                    total_bytes: 2_048,
+                    current_path: Some(report),
+                }),
+                result: None,
+                retryable_sources: Vec::new(),
+                error: None,
+            }));
+            view.operation_panel_hidden = true;
+            view.operation_panel_minimized = true;
+            view.state = ListingState::Ready;
+            cx.notify();
+        });
+
+        window.simulate_resize(gpui::size(px(1_200.0), px(720.0)));
+        window.run_until_parked();
+        for selector in [
+            "status-item-summary",
+            "status-filter-summary",
+            "status-operation-summary",
+            "status-selection-summary",
+            "status-disk-summary",
+            "status-watcher-summary",
+            "status-view-summary",
+        ] {
+            let bounds = window
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("missing wide status detail: {selector}"));
+            assert!(f32::from(bounds.size.width) > 0.0, "empty {selector}");
+        }
+        let left = window.debug_bounds("status-left-cluster").unwrap();
+        let right = window.debug_bounds("status-right-cluster").unwrap();
+        assert!(left.right() <= right.right());
+        assert!(
+            window
+                .debug_bounds("status-operation-summary")
+                .unwrap()
+                .right()
+                <= window
+                    .debug_bounds("status-selection-summary")
+                    .unwrap()
+                    .left(),
+            "wide status clusters must not overlap"
+        );
+        assert_eq!(
+            f32::from(window.debug_bounds("watcher-status").unwrap().size.height),
+            28.0
+        );
+        assert_eq!(
+            f32::from(window.debug_bounds("operation-panel").unwrap().size.height),
+            0.0
+        );
+
+        let operation = window.debug_bounds("status-operation-summary").unwrap();
+        window.simulate_click(operation.center(), gpui::Modifiers::default());
+        window.run_until_parked();
+        view.update(window, |view, _| {
+            assert!(!view.operation_panel_hidden);
+            assert!(!view.operation_panel_minimized);
+        });
+        assert!(
+            f32::from(window.debug_bounds("operation-panel").unwrap().size.height) > 40.0,
+            "status operation summary should reveal the full operation panel"
+        );
+
+        window.simulate_resize(gpui::size(px(800.0), px(600.0)));
+        window.run_until_parked();
+        assert!(window.debug_bounds("status-item-summary").is_some());
+        assert!(window.debug_bounds("status-filter-summary").is_some());
+        assert!(window.debug_bounds("status-operation-summary").is_some());
+        assert!(window.debug_bounds("status-watcher-summary").is_some());
+        assert!(window.debug_bounds("status-disk-summary").is_none());
+        assert!(window.debug_bounds("status-view-summary").is_none());
+        let compact_status = window.debug_bounds("watcher-status").unwrap();
+        assert_eq!(f32::from(compact_status.size.height), 28.0);
+        for selector in [
+            "status-item-summary",
+            "status-operation-summary",
+            "status-selection-summary",
+            "status-watcher-summary",
+        ] {
+            let bounds = window.debug_bounds(selector).unwrap();
+            assert!(
+                bounds.left() >= compact_status.left(),
+                "{selector} escaped left"
+            );
+            assert!(
+                bounds.right() <= compact_status.right(),
+                "{selector} escaped right"
+            );
+        }
+        let compact_operation = window.debug_bounds("status-operation-summary").unwrap();
+        let compact_selection = window.debug_bounds("status-selection-summary").unwrap();
+        assert!(
+            compact_operation.right() <= compact_selection.left(),
+            "compact status clusters must not overlap: operation={compact_operation:?}, selection={compact_selection:?}, status={compact_status:?}"
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -26144,6 +34173,7 @@ mod tests {
                     processed_entries: 1,
                     processed_bytes: 10,
                     targets: vec![directory.join("destination/alpha.txt")],
+                    target_snapshots: Vec::new(),
                 }),
                 retryable_sources: Vec::new(),
                 error: None,
@@ -26157,7 +34187,7 @@ mod tests {
         assert_eq!(f32::from(panel.size.width), 380.0);
         assert!(f32::from(panel.size.height) <= 440.0);
         assert_eq!(panel.right(), px(788.0));
-        assert_eq!(panel.bottom(), px(558.0));
+        assert_eq!(panel.bottom(), px(560.0));
         assert_eq!(f32::from(header.size.height), 44.0);
         assert!(window.debug_bounds("operation-panel-body").is_some());
         assert_eq!(
@@ -26173,7 +34203,7 @@ mod tests {
         assert_eq!(f32::from(minimized.size.width), 280.0);
         assert_eq!(f32::from(minimized.size.height), 40.0);
         assert_eq!(minimized.right(), px(784.0));
-        assert_eq!(minimized.bottom(), px(558.0));
+        assert_eq!(minimized.bottom(), px(560.0));
         assert!(window.debug_bounds("operation-panel-body").is_none());
 
         window.simulate_click(minimized.center(), gpui::Modifiers::default());
@@ -26449,11 +34479,7 @@ mod tests {
         assert_eq!(f32::from(text_dialog.size.width), 360.0);
         assert_eq!(text_dialog.center().x, backdrop.center().x);
         assert!((f32::from(text_dialog.center().y) - f32::from(backdrop.center().y)).abs() <= 0.5);
-        let submit = window
-            .debug_bounds("mutation-prompt-submit")
-            .unwrap()
-            .center();
-        window.simulate_click(submit, gpui::Modifiers::default());
+        window.simulate_keystrokes("enter");
         window.run_until_parked();
         assert!(window.debug_bounds("mutation-prompt-error").is_some());
         let cancel = window
@@ -26485,7 +34511,7 @@ mod tests {
         );
         let format = window.debug_bounds("archive-format").unwrap().center();
         window.simulate_click(format, gpui::Modifiers::default());
-        view.update(window, |view, _| {
+        view.update(window, |view, cx| {
             assert!(matches!(
                 view.mutation_prompt.as_ref().map(|prompt| &prompt.kind),
                 Some(MutationPromptKind::ArchiveName {
@@ -26494,7 +34520,7 @@ mod tests {
                     ..
                 })
             ));
-            view.mutation_prompt = None;
+            view.cancel_mutation_prompt(cx);
         });
 
         view.update(window, |view, cx| view.prompt_permanent_delete_selected(cx));
@@ -26503,15 +34529,12 @@ mod tests {
         assert_eq!(f32::from(destructive_dialog.size.width), 540.0);
         assert_eq!(destructive_dialog.center().x, backdrop.center().x);
         assert!(window.debug_bounds("mutation-prompt-items").is_some());
-        let submit = window
-            .debug_bounds("mutation-prompt-submit")
-            .unwrap()
-            .center();
-        window.simulate_click(submit, gpui::Modifiers::default());
+        window.simulate_keystrokes("enter");
         window.run_until_parked();
         assert!(window.debug_bounds("mutation-prompt-error").is_some());
         view.update(window, |view, cx| {
-            view.mutation_prompt = None;
+            view.cancel_mutation_prompt(cx);
+            view.dismiss_toast(cx);
             view.show_toast("Native operation completed", ToastKind::Success, cx);
         });
         window.run_until_parked();
@@ -26519,7 +34542,7 @@ mod tests {
         assert!(f32::from(toast.size.width) >= 280.0);
         assert!(f32::from(toast.size.width) <= 400.0);
         assert_eq!(toast.right(), px(784.0));
-        assert_eq!(toast.bottom(), px(584.0));
+        assert_eq!(toast.top(), px(48.0));
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -26683,6 +34706,26 @@ mod tests {
             gpui::size(px(800.0), px(600.0)),
             |_, _| view.clone().into_element(),
         );
+        assert_eq!(
+            recovery_session_context(1, &directory),
+            format!(
+                "1 tab • Last: {} • Restored from the last atomic snapshot",
+                path_label(&directory)
+            )
+        );
+        assert_eq!(
+            recovery_session_context(2, &directory),
+            format!(
+                "2 tabs • Last: {} • Restored from the last atomic snapshot",
+                path_label(&directory)
+            )
+        );
+        let notice = cx.debug_bounds("recovery-notice").unwrap();
+        let context = cx.debug_bounds("recovery-session-context").unwrap();
+        assert!(context.left() >= notice.left());
+        assert!(context.right() <= notice.right());
+        assert!(context.top() >= notice.top());
+        assert!(context.bottom() <= notice.bottom());
         let diagnostics = cx
             .read_from_clipboard()
             .and_then(|item| item.text())
@@ -26716,7 +34759,7 @@ mod tests {
         let (store, interrupted, warning) = OperationRecoveryStore::open(&resources.config_dir);
         assert!(interrupted.is_empty());
         assert!(warning.is_none());
-        let mut store = store.unwrap();
+        let store = store.unwrap();
         let request = FileOperationRequest {
             kind: FileOperationKind::Copy,
             sources: vec![source],
@@ -26871,14 +34914,14 @@ mod tests {
         };
 
         let final_action = pollster::block_on(async {
-            let result = await_file_operation(services.clone(), request.clone())
+            let result = await_file_operation(services.clone(), request.clone(), None)
                 .await
                 .unwrap();
             let record = UndoRecord::from_file_operation(request, result).unwrap();
             let undone = undo_action(record.action, services.clone()).await.unwrap();
             assert!(source.is_file());
             assert!(!destination.join("round-trip.txt").exists());
-            redo_action(undone, services).await.unwrap()
+            redo_action(undone, services, None).await.unwrap()
         });
 
         assert!(!source.exists());
@@ -26910,7 +34953,7 @@ mod tests {
         };
 
         let error = pollster::block_on(async {
-            let result = await_file_operation(services.clone(), request.clone())
+            let result = await_file_operation(services.clone(), request.clone(), None)
                 .await
                 .unwrap();
             fs::write(&source, "external replacement").unwrap();
@@ -26951,7 +34994,7 @@ mod tests {
             .unwrap();
             assert!(before.is_file());
             assert!(!directory.join("after.txt").exists());
-            redo_action(undone, services).await.unwrap()
+            redo_action(undone, services, None).await.unwrap()
         });
 
         assert!(!before.exists());
@@ -27197,6 +35240,12 @@ mod tests {
             })
             .unwrap();
         cx.dispatch_keystroke(*window, Keystroke::parse("escape").unwrap());
+        window
+            .update(cx, |view, window, cx| {
+                assert!(view.settings_confirmation.is_some());
+                view.confirm_settings_confirmation(window, cx);
+            })
+            .unwrap();
 
         let first = window
             .update(cx, |view, _, _| view.browser.active_tab_id())
@@ -27502,6 +35551,7 @@ mod tests {
         let result = pollster::block_on(undo_action_with_progress(
             action.clone(),
             services.clone(),
+            None,
             Arc::clone(&cancellation),
             |update| {
                 if matches!(update, UndoProgressUpdate::ItemCompleted) {
@@ -27516,6 +35566,7 @@ mod tests {
         pollster::block_on(undo_action_with_progress(
             action,
             services,
+            None,
             Arc::new(AtomicBool::new(false)),
             |_| {},
         ))
@@ -27570,7 +35621,7 @@ mod tests {
         let (view, cx) = cx.add_window_view(|_, cx| {
             DirectoryWindow::new(PathBuf::from("sample"), NativeServices::default(), cx)
         });
-        view.update(cx, |view, _| {
+        view.update(cx, |view, cx| {
             let id = view.browser.save_smart_folder(
                 "Text".into(),
                 SearchCriteria {
@@ -27582,26 +35633,34 @@ mod tests {
             );
             assert!(view.browser.activate_smart_folder(id));
             view.search_generation = 4;
-            view.apply_search_event(SearchEvent::Completed {
-                generation: 3,
-                result: SearchResult {
-                    entries: vec![fixture_entry("stale.txt")],
-                    indexed_entries: 1,
-                    content_reads: 0,
-                    reused_index: true,
+            view.apply_search_event(
+                SearchEvent::Completed {
+                    generation: 3,
+                    result: SearchResult {
+                        entries: vec![fixture_entry("stale.txt")],
+                        indexed_entries: 1,
+                        content_reads: 0,
+                        reused_index: true,
+                        truncated: false,
+                    },
                 },
-            });
+                cx,
+            );
             assert!(view.browser.visible_entries().is_empty());
 
-            view.apply_search_event(SearchEvent::Completed {
-                generation: 4,
-                result: SearchResult {
-                    entries: vec![fixture_entry("text.txt")],
-                    indexed_entries: 1,
-                    content_reads: 0,
-                    reused_index: true,
+            view.apply_search_event(
+                SearchEvent::Completed {
+                    generation: 4,
+                    result: SearchResult {
+                        entries: vec![fixture_entry("text.txt")],
+                        indexed_entries: 1,
+                        content_reads: 0,
+                        reused_index: true,
+                        truncated: false,
+                    },
                 },
-            });
+                cx,
+            );
             assert_eq!(view.browser.visible_entries().len(), 1);
             assert!(view.browser.visible_entries()[0].path.ends_with("text.txt"));
             assert!(matches!(view.state, ListingState::Ready));
@@ -28049,19 +36108,26 @@ mod tests {
                 RemoteDriveState::Connected
             );
             view.toggle_remote_drives(cx);
+            assert!(view.remote_disable_pending);
+        });
+        for _ in 0..100 {
+            cx.run_until_parked();
+            if view.read_with(cx, |view, _| !view.remote_disable_pending) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        view.update(cx, |view, _| {
             assert!(!view.settings.behavior.remote_drives_enabled);
             assert!(view.remote_poll_task.is_none());
+            assert!(view.remote_statuses.is_empty());
             backend.state.lock().unwrap().quit_requested = true;
         });
         cx.executor().advance_clock(REMOTE_STATUS_POLL_INTERVAL * 2);
         cx.run_until_parked();
         view.update(cx, |view, _| {
             assert_eq!(backend.state.lock().unwrap().start_attempts, 3);
-            assert_eq!(
-                view.remote_statuses.get(&id).unwrap().state,
-                RemoteDriveState::Connected,
-                "disabled polling must not mutate remote state"
-            );
+            assert!(view.remote_statuses.is_empty());
         });
         fs::remove_dir_all(root).unwrap();
     }

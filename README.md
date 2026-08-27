@@ -89,7 +89,7 @@ sample/                    # Demo data + .explorie.json examples
 
 Download the latest build from [GitHub Releases](https://github.com/oshtz/explorie/releases/latest):
 
-- **Windows 10/11 x64:** Download `explorie-<version>-windows-x64-portable-unsigned.exe` and run it directly. No installation is required; Windows may show an unsigned-app warning.
+- **Windows 10/11 x64:** Download `explorie-<version>-windows-x64-setup-unsigned.exe` and run the per-user installer. Windows may show an unsigned-app warning. After installation, Settings → System Integration can reversibly make Explorie the app Windows uses to open folders.
 - **macOS 13+ on Apple silicon:** Download `explorie-<version>-macos-arm64.dmg`, open it, and move Explorie to Applications.
 
 Platform-specific `SHA256SUMS` files are published alongside each release.
@@ -190,7 +190,7 @@ pnpm release:check
 
 The command writes local evidence under `.release-checks/`, which is ignored by git. It requires a clean, version-aligned working tree; runs dependency audits, Rust formatting, the full workspace tests, strict clippy, and a locked GPUI release build; then verifies the executable under the workspace `target/release` directory.
 
-Automated updates are disabled. Releases are immutable and version-tag based. Bump the matching versions in the root package and GPUI Cargo manifest, then push a new `v<version>` tag. That tag builds the candidate packages once and attaches them to a draft release. After those exact assets pass the real-machine checklist below, manually dispatch the release workflow from that tag with the Windows and macOS attestations enabled. The dispatch verifies and publishes the existing draft without rebuilding it. Existing releases and assets are never replaced; failures are fixed in a new version.
+Windows installer builds check the latest published GitHub Release automatically. Updates use the exact versioned unsigned Inno Setup asset and refuse to install unless its size and SHA-256 match `SHA256SUMS-windows.txt`; failed checks leave the installed app untouched. Releases remain immutable and version-tag based. Bump the matching versions in the root package and GPUI Cargo manifest, then push a new `v<version>` tag. That tag builds the candidate packages once and attaches them to a draft release. After those exact assets pass the real-machine checklist below, manually dispatch the release workflow from that tag with the Windows and macOS attestations enabled. The dispatch verifies and publishes the existing draft without rebuilding it. Existing releases and assets are never replaced; failures are fixed in a new version.
 
 Protect `v*` tags and enable immutable releases in the GitHub repository settings before public distribution.
 
@@ -198,9 +198,9 @@ macOS releases require these signing secrets:
 
 - macOS: base64-encoded P12 in `APPLE_CERTIFICATE`, plus `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID`.
 
-The v0.2.7 workflow publishes an explicitly named unsigned Windows x64 EVB portable executable, a signed/notarized macOS arm64 DMG, and platform SHA-256 manifests. Windows signing remains optional when `WINDOWS_CODESIGN_CERTIFICATE` and `WINDOWS_CODESIGN_PASSWORD` are later configured; until then, SmartScreen or antivirus warnings are expected. CI launch-smokes each package on its target runner; publication additionally requires explicit proof that both candidates passed disposable filesystem operations on real machines.
+The v0.2.8 workflow publishes an explicitly named unsigned per-user Windows x64 installer, a signed/notarized macOS arm64 DMG, and platform SHA-256 manifests. Windows packages intentionally remain unsigned, so SmartScreen or antivirus warnings are expected. CI installs, launch-smokes, and uninstalls the Windows package; publication additionally requires explicit proof that both candidates passed disposable filesystem operations on real machines.
 
-The v0.2.7 draft contains `explorie-0.2.7-windows-x64-portable-unsigned.exe`, `explorie-0.2.7-macos-arm64.dmg`, `SHA256SUMS-windows.txt`, and `SHA256SUMS-macos.txt`.
+The v0.2.8 draft contains `explorie-0.2.8-windows-x64-setup-unsigned.exe`, `explorie-0.2.8-macos-arm64.dmg`, `SHA256SUMS-windows.txt`, and `SHA256SUMS-macos.txt`.
 
 Before creating a new tag, manually verify:
 
@@ -211,7 +211,9 @@ Before creating a new tag, manually verify:
 - Reopen the app and confirm persisted settings.
 - Confirm Windows and macOS packaged-app behavior on real machines.
 - Remove or uninstall v0.1.0 before first running v0.2.6; the permanent `com.omershatz.explorie` identity intentionally starts a clean application lineage.
-- Run the Windows portable executable and install the macOS package on real machines, confirm the Windows unsigned warning is expected, and verify macOS signing/notarization plus both SHA-256 manifests.
+- Install the Windows package, verify the System Integration toggle routes folder opens to Explorie and restores the prior handler when disabled or uninstalled, and confirm the unsigned warning is expected. Install the macOS package and verify signing/notarization plus both SHA-256 manifests.
+
+Create a per-candidate real-machine evidence file with `pnpm platform:proof:init`, fill in the exact artifact names and SHA-256 hashes, then mark each observed check. `pnpm platform:proof:verify` rejects missing Windows multi-window/DnD/mixed-DPI/crash/folder-handler proof and missing macOS multi-window/DnD/multi-monitor/crash/signing/notarization/Gatekeeper proof. The evidence stays under ignored `.release-checks/`; archive it alongside the candidate checksums before enabling the workflow attestations.
 
 ---
 

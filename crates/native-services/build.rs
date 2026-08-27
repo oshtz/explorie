@@ -11,11 +11,17 @@ fn main() {
             "cargo:rerun-if-changed={}",
             root.join("MountBridge.m").display()
         );
+        println!(
+            "cargo:rerun-if-changed={}",
+            root.join("FolderIntegrationBridge.m").display()
+        );
         println!("cargo:rustc-link-lib=framework=Foundation");
+        println!("cargo:rustc-link-lib=framework=CoreServices");
         println!("cargo:rustc-link-lib=framework=Security");
         println!("cargo:rustc-link-lib=framework=ServiceManagement");
         cc::Build::new()
             .file(root.join("MountBridge.m"))
+            .file(root.join("FolderIntegrationBridge.m"))
             .flag("-fobjc-arc")
             .flag("-fblocks")
             .flag("-mmacosx-version-min=13.0")

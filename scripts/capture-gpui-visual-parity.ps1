@@ -171,7 +171,10 @@ function Capture-Appearance(
     [bool]$openOperations = $false,
     [bool]$openGoToFolder = $false,
     [bool]$openLoadError = $false,
-    [bool]$openHistory = $false
+    [bool]$openHistory = $false,
+    [bool]$openGridView = $false,
+    [bool]$selectFile = $false,
+    [bool]$showSyncthing = $false
 ) {
     $profile = Join-Path $proofRoot $name
     Initialize-Profile $profile
@@ -184,6 +187,12 @@ function Capture-Appearance(
     }
     if ($openPreview) {
         Set-PinnedPreview $profile
+    }
+    $syncthingMarker = Join-Path $fixture ".stfolder"
+    $syncthingConflict = Join-Path $fixture "migration-notes.sync-conflict-20260825-120000.md"
+    if ($showSyncthing) {
+        New-Item -ItemType Directory -Path $syncthingMarker -Force | Out-Null
+        Set-Content -LiteralPath $syncthingConflict -Value "# Resolve this Syncthing conflict"
     }
     $browsePath = if ($openLoadError) {
         $null
@@ -300,6 +309,22 @@ function Capture-Appearance(
             [ExplorieVisualWindow]::mouse_event(0x0010, 0, 0, 0, [UIntPtr]::Zero)
             Start-Sleep -Milliseconds 800
         }
+        if ($openGridView) {
+            [ExplorieVisualWindow]::SetForegroundWindow($handle) | Out-Null
+            Send-KeyChord 0x32 0x11
+            Start-Sleep -Milliseconds 300
+            [ExplorieVisualWindow]::SetCursorPos($rect.Right - 133, $rect.Top + 108) | Out-Null
+            [ExplorieVisualWindow]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)
+            [ExplorieVisualWindow]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)
+            Start-Sleep -Milliseconds 800
+        }
+        if ($selectFile) {
+            [ExplorieVisualWindow]::SetForegroundWindow($handle) | Out-Null
+            [ExplorieVisualWindow]::SetCursorPos($rect.Left + 390, $rect.Top + 185) | Out-Null
+            [ExplorieVisualWindow]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)
+            [ExplorieVisualWindow]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)
+            Start-Sleep -Milliseconds 500
+        }
         [ExplorieVisualWindow]::SetCursorPos(
             [Math]::Max(0, $rect.Left - 16),
             [Math]::Max(0, $rect.Top - 16)
@@ -318,12 +343,20 @@ function Capture-Appearance(
             $bitmap.Dispose()
         }
     } finally {
-        if (($openConflict -or $openCommands -or $openWorkspaces -or $openNewFolder -or $openArchive -or $openDelete -or $openQuickLook -or $openGoToFolder -or $openHistory) -and -not $process.HasExited) {
+        if (($openConflict -or $openCommands -or $openWorkspaces -or $openNewFolder -or $openArchive -or $openDelete -or $openQuickLook -or $openGoToFolder -or $openHistory -or $openGridView) -and -not $process.HasExited) {
             [ExplorieVisualWindow]::SetForegroundWindow($process.MainWindowHandle) | Out-Null
             Send-KeyChord 0x1B
             Start-Sleep -Milliseconds 300
         }
         Close-Explorie $process
+        if ($showSyncthing) {
+            if (Test-Path -LiteralPath $syncthingConflict -PathType Leaf) {
+                Remove-Item -LiteralPath $syncthingConflict -Force
+            }
+            if (Test-Path -LiteralPath $syncthingMarker -PathType Container) {
+                Remove-Item -LiteralPath $syncthingMarker -Force
+            }
+        }
     }
     return [pscustomobject]@{ Name = $name; Capture = $capture; Width = $width; Height = $height }
 }
@@ -331,6 +364,7 @@ function Capture-Appearance(
 try {
     $captures = @(
         Capture-Appearance "dark" "dark" $false
+        Capture-Appearance -name "dark-status-wide" -theme "dark" -highContrast $false -windowWidth 1216 -windowHeight 736 -selectFile $true
         Capture-Appearance "dark-more" "dark" $false $true
         Capture-Appearance "dark-settings" "dark" $false $false $false 1040 784 $true
         Capture-Appearance "dark-settings-narrow" "dark" $false $false $false 816 616 $true
@@ -366,6 +400,8 @@ try {
         Capture-Appearance -name "dark-go-to-folder" -theme "dark" -highContrast $false -openGoToFolder $true
         Capture-Appearance -name "dark-load-error" -theme "dark" -highContrast $false -openLoadError $true
         Capture-Appearance -name "dark-navigation-history" -theme "dark" -highContrast $false -openHistory $true
+        Capture-Appearance -name "dark-grid-view-options" -theme "dark" -highContrast $false -openGridView $true
+        Capture-Appearance -name "dark-syncthing" -theme "dark" -highContrast $false -windowWidth 1216 -windowHeight 736 -showSyncthing $true
     )
     $captures | ConvertTo-Json
 } finally {

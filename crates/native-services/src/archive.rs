@@ -6,8 +6,11 @@ use explorie_core::archive::{self, CompressOptions};
 pub use explorie_core::archive::{ArchiveFormat, ArchiveInfo, CompressionLevel};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -42,6 +45,9 @@ pub struct ExtractRequest {
     pub output_dir: PathBuf,
     #[serde(default)]
     pub password: Option<String>,
+    #[serde(default)]
+    pub allow_extended_limits: bool,
+    pub operation_id: String,
 }
 
 impl fmt::Debug for ExtractRequest {
@@ -51,6 +57,8 @@ impl fmt::Debug for ExtractRequest {
             .field("archive_path", &self.archive_path)
             .field("output_dir", &self.output_dir)
             .field("password", &self.password.as_ref().map(|_| "[redacted]"))
+            .field("allow_extended_limits", &self.allow_extended_limits)
+            .field("operation_id", &self.operation_id)
             .finish()
     }
 }
@@ -125,24 +133,54 @@ impl ArchiveService {
     pub fn extract(&self, request: ExtractRequest) -> BlockingTask<ExtractResult> {
         let shared = Arc::clone(&self.shared);
         let guard = ActiveOperation::new(Arc::clone(&shared));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        shared
+            .cancellations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                archive_cancellation_key(&request.operation_id),
+                Arc::clone(&cancelled),
+            );
         self.context.spawn_blocking(move || {
-            if remote_root(&shared, &request.output_dir) {
-                return Err(ServiceError::new(
-                    ErrorCode::RemoteUnavailable,
-                    "Refusing to mutate a managed remote-drive root",
-                ));
-            }
             let _guard = guard;
-            let total_bytes = archive::extract_archive_with_password(
-                &request.archive_path,
-                &request.output_dir,
-                request.password.as_deref(),
-            )
-            .map_err(ServiceError::from)?;
-            Ok(ExtractResult {
-                output_dir: request.output_dir,
-                total_bytes,
-            })
+            let result = (|| {
+                if remote_root(&shared, &request.output_dir) {
+                    return Err(ServiceError::new(
+                        ErrorCode::RemoteUnavailable,
+                        "Refusing to mutate a managed remote-drive root",
+                    ));
+                }
+                let mut limits = if request.allow_extended_limits {
+                    archive::ExtractionLimits::extended()
+                } else {
+                    archive::ExtractionLimits::default()
+                };
+                limits.max_available_bytes = extraction_available_bytes(&request.output_dir)?;
+                let total_bytes = archive::extract_archive_with_password_and_limits(
+                    &request.archive_path,
+                    &request.output_dir,
+                    request.password.as_deref(),
+                    limits,
+                    &cancelled,
+                )
+                .map_err(|error| {
+                    let can_override = !request.allow_extended_limits
+                        && error.kind() == std::io::ErrorKind::InvalidData
+                        && error.to_string().contains("safety limit");
+                    ServiceError::from(error).retryable(can_override)
+                })?;
+                Ok(ExtractResult {
+                    output_dir: request.output_dir,
+                    total_bytes,
+                })
+            })();
+            shared
+                .cancellations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&archive_cancellation_key(&request.operation_id));
+            result
         })
     }
 
@@ -152,10 +190,70 @@ impl ArchiveService {
         })
     }
 
+    pub fn cancel(&self, operation_id: &str) -> bool {
+        let cancellations = self
+            .shared
+            .cancellations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(cancelled) = cancellations.get(&archive_cancellation_key(operation_id)) {
+            cancelled.store(true, Ordering::Release);
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn is_archive(&self, path: PathBuf) -> BlockingTask<bool> {
         self.context
             .spawn_blocking(move || Ok(archive::is_archive(Path::new(&path))))
     }
+}
+
+fn archive_cancellation_key(operation_id: &str) -> String {
+    format!("archive:{operation_id}")
+}
+
+fn extraction_available_bytes(output_dir: &Path) -> Result<u64, ServiceError> {
+    const MIN_RESERVED_BYTES: u64 = 64 * 1024 * 1024;
+    const MAX_RESERVED_BYTES: u64 = 512 * 1024 * 1024;
+    let check_path = output_dir.parent().unwrap_or(output_dir);
+    let check_path = if check_path.is_absolute() {
+        check_path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(ServiceError::from)?
+            .join(check_path)
+    };
+    let check_path = fs::canonicalize(&check_path).unwrap_or(check_path);
+    let check_key = disk_path_key(&check_path);
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    let disk = disks
+        .iter()
+        .filter(|disk| check_key.starts_with(&disk_path_key(disk.mount_point())))
+        .max_by_key(|disk| disk_path_key(disk.mount_point()).len())
+        .ok_or_else(|| {
+            ServiceError::new(
+                ErrorCode::Io,
+                "Could not determine free space for archive extraction",
+            )
+        })?;
+    let free = disk.available_space();
+    let reserved = (free / 10).clamp(MIN_RESERVED_BYTES, MAX_RESERVED_BYTES);
+    let available = free.saturating_sub(reserved);
+    if available == 0 {
+        return Err(ServiceError::new(
+            ErrorCode::Io,
+            "At least 64 MiB of free disk space must remain available during extraction",
+        ));
+    }
+    Ok(available)
+}
+
+fn disk_path_key(path: &Path) -> String {
+    crate::listing::normalize_path(path)
+        .trim_start_matches("//?/")
+        .to_string()
 }
 
 fn remote_root(shared: &SharedState, path: &Path) -> bool {

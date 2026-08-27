@@ -1,3 +1,5 @@
+#[cfg(target_os = "macos")]
+use crate::process::{ProcessError, run_with_timeout};
 use crate::{ActiveOperation, BlockingTask, ErrorCode, ServiceContext, ServiceError, SharedState};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -7,6 +9,13 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+#[cfg(target_os = "macos")]
+use std::time::Duration;
+
+#[cfg(target_os = "macos")]
+const METADATA_HELPER_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(target_os = "macos")]
+const MAX_METADATA_OUTPUT: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -248,7 +257,7 @@ fn remote_root(shared: &SharedState, path: &Path) -> bool {
         .contains(&crate::listing::normalize_path(path))
 }
 
-fn system_integration_status() -> io::Result<SystemIntegrationStatus> {
+pub fn system_integration_status() -> io::Result<SystemIntegrationStatus> {
     #[cfg(windows)]
     {
         windows_integration::enabled().map(|enabled| SystemIntegrationStatus {
@@ -256,25 +265,37 @@ fn system_integration_status() -> io::Result<SystemIntegrationStatus> {
             enabled,
         })
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        Ok(SystemIntegrationStatus {
+            supported: true,
+            enabled: macos_folder_integration::enabled(),
+        })
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     Ok(SystemIntegrationStatus {
         supported: false,
         enabled: false,
     })
 }
 
-fn set_system_integration(enabled: bool) -> io::Result<SystemIntegrationStatus> {
+pub fn set_system_integration(enabled: bool) -> io::Result<SystemIntegrationStatus> {
     #[cfg(windows)]
     {
         windows_integration::set_enabled(enabled)?;
         system_integration_status()
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        macos_folder_integration::set_enabled(enabled)?;
+        system_integration_status()
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = enabled;
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "System integration is currently available only on Windows.",
+            "System integration is currently available only on Windows and macOS.",
         ))
     }
 }
@@ -324,10 +345,12 @@ fn quick_look(_path: &Path) -> io::Result<()> {
 
 #[cfg(target_os = "macos")]
 fn get_finder_tags(path: &Path) -> io::Result<Vec<String>> {
-    let output = Command::new("mdls")
-        .args(["-name", "kMDItemUserTags", "-raw"])
-        .arg(path)
-        .output()?;
+    let output = run_metadata_helper(
+        Command::new("mdls")
+            .args(["-name", "kMDItemUserTags", "-raw"])
+            .arg(path),
+        MAX_METADATA_OUTPUT,
+    )?;
     if !output.status.success() {
         return Ok(Vec::new());
     }
@@ -388,11 +411,13 @@ fn set_finder_tags(path: &Path, tags: &[String]) -> io::Result<()> {
         uuid::Uuid::new_v4()
     ));
     fs::write(&temp, plist)?;
-    let converted = Command::new("plutil")
-        .args(["-convert", "binary1"])
-        .arg(&temp)
-        .status()?;
-    if !converted.success() {
+    let converted = run_metadata_helper(
+        Command::new("plutil")
+            .args(["-convert", "binary1"])
+            .arg(&temp),
+        0,
+    )?;
+    if !converted.status.success() {
         let _ = fs::remove_file(&temp);
         return Err(io::Error::other("Failed to convert Finder tag plist"));
     }
@@ -469,10 +494,12 @@ fn open_with_app(_path: &Path, _app_name: &str) -> io::Result<()> {
 #[cfg(target_os = "macos")]
 fn apps_for_file(path: &Path) -> io::Result<Vec<AppInfo>> {
     use std::collections::HashSet;
-    let output = Command::new("mdls")
-        .args(["-name", "kMDItemContentType", "-raw"])
-        .arg(path)
-        .output()?;
+    let output = run_metadata_helper(
+        Command::new("mdls")
+            .args(["-name", "kMDItemContentType", "-raw"])
+            .arg(path),
+        MAX_METADATA_OUTPUT,
+    )?;
     if !output.status.success() {
         return Ok(Vec::new());
     }
@@ -523,6 +550,29 @@ fn apps_for_file(path: &Path) -> io::Result<Vec<AppInfo>> {
         .collect())
 }
 
+#[cfg(target_os = "macos")]
+fn run_metadata_helper(
+    command: &mut Command,
+    max_stdout: usize,
+) -> io::Result<crate::process::ProcessOutput> {
+    let output =
+        run_with_timeout(command, METADATA_HELPER_TIMEOUT, max_stdout, 0).map_err(|error| {
+            match error {
+                ProcessError::Io(error) => error,
+                ProcessError::TimedOut => {
+                    io::Error::new(io::ErrorKind::TimedOut, "macOS metadata helper timed out")
+                }
+            }
+        })?;
+    if output.stdout_truncated {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "macOS metadata helper returned too much output",
+        ));
+    }
+    Ok(output)
+}
+
 #[cfg(windows)]
 fn apps_for_file(_path: &Path) -> io::Result<Vec<AppInfo>> {
     Ok(vec![AppInfo {
@@ -537,92 +587,260 @@ fn apps_for_file(_path: &Path) -> io::Result<Vec<AppInfo>> {
     Ok(Vec::new())
 }
 
+#[cfg(target_os = "macos")]
+mod macos_folder_integration {
+    use super::*;
+
+    unsafe extern "C" {
+        fn explorie_folder_integration_enabled() -> i32;
+        fn explorie_folder_integration_set(enabled: i32) -> i32;
+    }
+
+    pub fn enabled() -> bool {
+        // SAFETY: The Objective-C bridge has no arguments and returns a plain
+        // integer after querying LaunchServices.
+        unsafe { explorie_folder_integration_enabled() != 0 }
+    }
+
+    pub fn set_enabled(enabled: bool) -> io::Result<()> {
+        // SAFETY: The Objective-C bridge accepts a 0/1 integer and returns an
+        // OSStatus without retaining Rust-owned memory.
+        let status = unsafe { explorie_folder_integration_set(i32::from(enabled)) };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "LaunchServices rejected the folder-handler change (OSStatus {status})"
+            )))
+        }
+    }
+}
+
 #[cfg(windows)]
 mod windows_integration {
     use super::*;
-    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::UI::Shell::{SHCNE_ASSOCCHANGED, SHCNF_IDLIST, SHChangeNotify};
+    use winreg::RegKey;
+    use winreg::enums::HKEY_CURRENT_USER;
 
-    const CREATE_NO_WINDOW: u32 = 0x08000000;
-    const MENU_KEYS: [(&str, &str); 3] = [
-        (r"HKCU\Software\Classes\Directory\shell\Explorie", "%1"),
-        (r"HKCU\Software\Classes\Drive\shell\Explorie", "%1"),
-        (
-            r"HKCU\Software\Classes\Directory\Background\shell\Explorie",
-            "%V",
-        ),
+    const VERB: &str = "Explorie";
+    const BACKUP_KEY: &str = r"Software\Explorie\FolderOpenHandler";
+    const SHELL_KEYS: [(&str, &str, &str); 2] = [
+        (r"Software\Classes\Directory\shell", "Directory", "%1"),
+        (r"Software\Classes\Drive\shell", "Drive", "%1"),
     ];
+    const BACKGROUND_SHELL_KEY: &str = r"Software\Classes\Directory\Background\shell";
 
-    fn reg() -> Command {
-        let mut command = Command::new("reg.exe");
-        command.creation_flags(CREATE_NO_WINDOW);
-        command
-    }
-
-    fn run(command: &mut Command) -> io::Result<()> {
-        let output = command.output()?;
-        if output.status.success() {
-            Ok(())
-        } else {
-            Err(io::Error::other(
-                String::from_utf8_lossy(&output.stderr).trim().to_string(),
-            ))
+    fn read_default(key: &RegKey) -> io::Result<Option<String>> {
+        match key.get_value::<String, _>("") {
+            Ok(value) => Ok(Some(value)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
         }
     }
 
-    fn key_exists(key: &str) -> io::Result<bool> {
-        Ok(reg().args(["query", key]).status()?.success())
-    }
-
-    fn add_value(key: &str, name: Option<&str>, value: &str) -> io::Result<()> {
-        let mut command = reg();
-        command.args(["add", key]);
-        if let Some(name) = name {
-            command.args(["/v", name]);
-        } else {
-            command.arg("/ve");
+    fn delete_tree_if_present(root: &RegKey, path: &str) -> io::Result<()> {
+        match root.delete_subkey_all(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
         }
-        run(command.args(["/d", value, "/f"]))
     }
 
-    fn remove() -> io::Result<()> {
-        for (key, _) in MENU_KEYS {
-            if key_exists(key)? {
-                run(reg().args(["delete", key, "/f"]))?;
+    fn command_for(executable: &Path, path_argument: &str) -> String {
+        format!(r#""{}" "{}""#, executable.display(), path_argument)
+    }
+
+    fn register_verb(root: &RegKey, shell_key: &str, path_argument: &str) -> io::Result<()> {
+        let executable = std::env::current_exe()?;
+        let (verb, _) = root.create_subkey(format!(r"{shell_key}\{VERB}"))?;
+        verb.set_value("", &"Open in Explorie")?;
+        verb.set_value("Icon", &executable.to_string_lossy().as_ref())?;
+        let (command, _) = verb.create_subkey("command")?;
+        command.set_value("", &command_for(&executable, path_argument))
+    }
+
+    fn backup_defaults(root: &RegKey) -> io::Result<()> {
+        let (backup, _) = root.create_subkey(BACKUP_KEY)?;
+        for (shell_key, backup_name, _) in SHELL_KEYS {
+            let (shell, _) = root.create_subkey(shell_key)?;
+            let current = read_default(&shell)?;
+            let has_backup = backup
+                .get_value::<u32, _>(format!("{backup_name}Present"))
+                .is_ok();
+            if current.as_deref() == Some(VERB) {
+                if has_backup {
+                    continue;
+                }
+                backup.set_value(format!("{backup_name}Present"), &0_u32)?;
+                match backup.delete_value(format!("{backup_name}Value")) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+                continue;
+            }
+            match current {
+                Some(value) => {
+                    backup.set_value(format!("{backup_name}Present"), &1_u32)?;
+                    backup.set_value(format!("{backup_name}Value"), &value)?;
+                }
+                None => {
+                    backup.set_value(format!("{backup_name}Present"), &0_u32)?;
+                    match backup.delete_value(format!("{backup_name}Value")) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error),
+                    }
+                }
             }
         }
-        Ok(())
+        backup.set_value("Version", &1_u32)
+    }
+
+    fn restore_defaults(root: &RegKey) -> io::Result<()> {
+        let backup = match root.open_subkey(BACKUP_KEY) {
+            Ok(backup) => Some(backup),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        let mut first_error = None;
+        for (shell_key, backup_name, _) in SHELL_KEYS {
+            let result = (|| {
+                let (shell, _) = root.create_subkey(shell_key)?;
+                if read_default(&shell)?.as_deref() != Some(VERB) {
+                    return Ok(());
+                }
+                let present = backup.as_ref().and_then(|key| {
+                    key.get_value::<u32, _>(format!("{backup_name}Present"))
+                        .ok()
+                }) == Some(1);
+                if present
+                    && let Some(value) = backup.as_ref().and_then(|key| {
+                        key.get_value::<String, _>(format!("{backup_name}Value"))
+                            .ok()
+                    })
+                {
+                    return shell.set_value("", &value);
+                }
+                match shell.delete_value("") {
+                    Ok(()) => Ok(()),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                    Err(error) => Err(error),
+                }
+            })();
+            if first_error.is_none()
+                && let Err(error) = result
+            {
+                first_error = Some(error);
+            }
+        }
+        if let Some(error) = first_error {
+            Err(error)
+        } else {
+            delete_tree_if_present(root, BACKUP_KEY)
+        }
+    }
+
+    fn notify_shell() {
+        // SAFETY: SHChangeNotify accepts null item pointers for the global
+        // association-change event when SHCNF_IDLIST is used.
+        unsafe {
+            SHChangeNotify(
+                SHCNE_ASSOCCHANGED as i32,
+                SHCNF_IDLIST,
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+    }
+
+    fn remove(root: &RegKey) -> io::Result<()> {
+        let mut first_error = restore_defaults(root).err();
+        for (shell_key, _, _) in SHELL_KEYS {
+            if let Err(error) = delete_tree_if_present(root, &format!(r"{shell_key}\{VERB}"))
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        if let Err(error) = delete_tree_if_present(root, &format!(r"{BACKGROUND_SHELL_KEY}\{VERB}"))
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+        notify_shell();
+        first_error.map_or(Ok(()), Err)
     }
 
     pub fn enabled() -> io::Result<bool> {
-        for (key, _) in MENU_KEYS {
-            if !key_exists(key)? {
+        let root = RegKey::predef(HKEY_CURRENT_USER);
+        let executable = std::env::current_exe()?;
+        for (shell_key, _, path_argument) in SHELL_KEYS {
+            let shell = match root.open_subkey(shell_key) {
+                Ok(shell) => shell,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            if read_default(&shell)?.as_deref() != Some(VERB) {
                 return Ok(false);
             }
+            let command = match root.open_subkey(format!(r"{shell_key}\{VERB}\command")) {
+                Ok(command) => command,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            if read_default(&command)?.as_deref()
+                != Some(command_for(&executable, path_argument).as_str())
+            {
+                return Ok(false);
+            }
+        }
+        let background_command =
+            match root.open_subkey(format!(r"{BACKGROUND_SHELL_KEY}\{VERB}\command")) {
+                Ok(command) => command,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(error),
+            };
+        if read_default(&background_command)?.as_deref()
+            != Some(command_for(&executable, "%V").as_str())
+        {
+            return Ok(false);
         }
         Ok(true)
     }
 
     pub fn set_enabled(enabled: bool) -> io::Result<()> {
+        let root = RegKey::predef(HKEY_CURRENT_USER);
         if !enabled {
-            return remove();
+            return remove(&root);
         }
-        let executable = std::env::current_exe()?;
-        let icon = executable.to_string_lossy();
-        for (key, path_argument) in MENU_KEYS {
-            let result = (|| {
-                add_value(key, None, "Open in Explorie")?;
-                add_value(key, Some("Icon"), &icon)?;
-                add_value(
-                    &format!(r"{key}\command"),
-                    None,
-                    &format!(r#""{}" "{}""#, executable.display(), path_argument),
-                )
-            })();
-            if let Err(error) = result {
-                let _ = remove();
-                return Err(error);
+        if self::enabled()? {
+            return Ok(());
+        }
+        // Refresh each shell key that no longer points at Explorie while
+        // retaining the previous snapshot for keys from a partial install.
+        backup_defaults(&root)?;
+        let result = (|| {
+            for (shell_key, _, path_argument) in SHELL_KEYS {
+                register_verb(&root, shell_key, path_argument)?;
+                let (shell, _) = root.create_subkey(shell_key)?;
+                shell.set_value("", &VERB)?;
             }
+            register_verb(&root, BACKGROUND_SHELL_KEY, "%V")
+        })();
+        if let Err(error) = result {
+            return match remove(&root) {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "folder integration setup failed ({error}); rollback also failed ({rollback})"
+                    ),
+                )),
+            };
         }
+        notify_shell();
         Ok(())
     }
 }

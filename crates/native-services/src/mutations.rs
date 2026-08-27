@@ -9,8 +9,9 @@ use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 use uuid::Uuid;
 
 /// Typed requests for the small, user-initiated mutations that do not need a
@@ -80,11 +81,23 @@ pub struct BatchRenameResult {
 pub struct MutationService {
     context: ServiceContext,
     shared: Arc<SharedState>,
+    batch_rename_lock: Arc<Mutex<()>>,
 }
 
 impl MutationService {
     pub(crate) fn new(context: ServiceContext, shared: Arc<SharedState>) -> Self {
-        Self { context, shared }
+        let journal_path = batch_rename_journal_path(context.resources().config_dir.as_path());
+        if let Err(error) = recover_batch_rename_journal(&journal_path) {
+            eprintln!(
+                "unable to recover interrupted batch rename at {}: {error}",
+                journal_path.display()
+            );
+        }
+        Self {
+            context,
+            shared,
+            batch_rename_lock: Arc::new(Mutex::new(())),
+        }
     }
 
     pub fn start_file_operation(
@@ -116,7 +129,7 @@ impl MutationService {
             .cancellations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(job_id.clone(), Arc::clone(&cancelled));
+            .insert(file_cancellation_key(&job_id), Arc::clone(&cancelled));
         let guard = ActiveOperation::new(Arc::clone(&self.shared));
         let shared = Arc::clone(&self.shared);
         let events = self.context.events();
@@ -192,7 +205,7 @@ impl MutationService {
             .cancellations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(cancelled) = cancellations.get(job_id) {
+        if let Some(cancelled) = cancellations.get(&file_cancellation_key(job_id)) {
             cancelled.store(true, Ordering::Relaxed);
             true
         } else {
@@ -241,10 +254,16 @@ impl MutationService {
 
     pub fn batch_rename(&self, items: Vec<BatchRenameItem>) -> BlockingTask<BatchRenameResult> {
         let shared = Arc::clone(&self.shared);
+        let lock = Arc::clone(&self.batch_rename_lock);
+        let journal_path = batch_rename_journal_path(self.context.resources().config_dir.as_path());
         let guard = ActiveOperation::new(Arc::clone(&shared));
         self.context.spawn_blocking(move || {
             let _guard = guard;
-            batch_rename_impl(&shared, items).map_err(ServiceError::from)
+            let _transaction = lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            recover_batch_rename_journal(&journal_path).map_err(ServiceError::from)?;
+            batch_rename_impl(&shared, items, &journal_path).map_err(ServiceError::from)
         })
     }
 
@@ -352,6 +371,16 @@ impl MutationService {
     pub fn path_exists(&self, path: PathBuf) -> BlockingTask<bool> {
         self.context
             .spawn_blocking(move || path.try_exists().map_err(ServiceError::from))
+    }
+
+    pub fn path_matches_snapshot(
+        &self,
+        path: PathBuf,
+        snapshot: explorie_core::FileTreeSnapshot,
+    ) -> BlockingTask<bool> {
+        self.context.spawn_blocking(move || {
+            explorie_core::path_matches_snapshot(&path, &snapshot).map_err(ServiceError::from)
+        })
     }
 
     pub fn run_safe(&self, request: SafeMutationRequest) -> BlockingTask<String> {
@@ -623,9 +652,368 @@ fn rename_path_impl(source: &Path, new_base_name: &str) -> io::Result<String> {
     Ok(destination.to_string_lossy().into_owned())
 }
 
+const BATCH_RENAME_JOURNAL: &str = "batch-rename-recovery-v1.json";
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchRenameJournalItem {
+    source: PathBuf,
+    temporary: PathBuf,
+    target: PathBuf,
+    #[serde(default)]
+    identity: Option<BatchRenameIdentity>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchRenameIdentity {
+    kind: u8,
+    len: u64,
+    modified_ns: Option<u64>,
+    platform_id: Option<(u64, u64)>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", tag = "phase")]
+enum BatchRenameJournalPhase {
+    Staging { staged: usize },
+    Committing { committed: usize },
+    Finished,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchRenameJournal {
+    version: u32,
+    phase: BatchRenameJournalPhase,
+    items: Vec<BatchRenameJournalItem>,
+}
+
+fn batch_rename_journal_path(config_dir: &Path) -> PathBuf {
+    config_dir.join(BATCH_RENAME_JOURNAL)
+}
+
+fn write_batch_rename_journal(path: &Path, journal: &BatchRenameJournal) -> io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "batch rename journal has no parent",
+        )
+    })?;
+    fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(
+        ".{BATCH_RENAME_JOURNAL}.{}.tmp",
+        Uuid::new_v4().simple()
+    ));
+    let result = (|| {
+        let bytes = serde_json::to_vec_pretty(journal).map_err(io::Error::other)?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        replace_journal_file(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+#[cfg(not(windows))]
+fn replace_journal_file(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(source, destination)?;
+    sync_parent_directory(destination)
+}
+
+#[cfg(not(windows))]
+fn sync_parent_directory(path: &Path) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "journal path has no parent"))?;
+    fs::File::open(parent)?.sync_all()
+}
+
+#[cfg(windows)]
+fn replace_journal_file(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    if unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    } == 0
+    {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn remove_batch_rename_journal(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => {
+            #[cfg(not(windows))]
+            sync_parent_directory(path)?;
+            Ok(())
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn recover_batch_rename(journal: &BatchRenameJournal) -> io::Result<()> {
+    if !matches!(journal.version, 1 | 2) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "unsupported batch rename recovery version {}",
+                journal.version
+            ),
+        ));
+    }
+    if matches!(journal.phase, BatchRenameJournalPhase::Finished) {
+        return Ok(());
+    }
+
+    validate_batch_rename_journal(journal)?;
+    if journal.version == 2 {
+        return recover_identified_batch_rename(journal);
+    }
+
+    // A commit may have completed immediately before its progress update was
+    // persisted. Move every published target back to its unique staging path
+    // first so swaps and rename cycles can be restored without collisions.
+    if matches!(journal.phase, BatchRenameJournalPhase::Committing { .. }) {
+        for item in &journal.items {
+            if !item.temporary.exists() && item.target.exists() {
+                explorie_core::rename_noreplace(&item.target, &item.temporary)?;
+            }
+        }
+    }
+    for item in journal.items.iter().rev() {
+        if item.temporary.exists() {
+            explorie_core::rename_noreplace(&item.temporary, &item.source)?;
+        } else if !item.source.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "batch rename recovery could not find {} or {}",
+                    item.source.display(),
+                    item.temporary.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_batch_rename_journal(journal: &BatchRenameJournal) -> io::Result<()> {
+    if journal.items.is_empty() || journal.items.len() > 10_000 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "batch rename recovery journal has an invalid item count",
+        ));
+    }
+    let completed = match journal.phase {
+        BatchRenameJournalPhase::Staging { staged } => staged,
+        BatchRenameJournalPhase::Committing { committed } => committed,
+        BatchRenameJournalPhase::Finished => 0,
+    };
+    if completed > journal.items.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "batch rename recovery journal has an invalid progress count",
+        ));
+    }
+
+    let mut sources = HashSet::with_capacity(journal.items.len());
+    let mut temporaries = HashSet::with_capacity(journal.items.len());
+    let mut targets = HashSet::with_capacity(journal.items.len());
+    for item in &journal.items {
+        if !item.source.is_absolute() || !item.temporary.is_absolute() || !item.target.is_absolute()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "batch rename recovery paths must be absolute",
+            ));
+        }
+        let parent = item.source.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "batch rename recovery source has no parent",
+            )
+        })?;
+        if item.temporary.parent() != Some(parent) || item.target.parent() != Some(parent) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "batch rename recovery paths must share one parent per item",
+            ));
+        }
+        let temporary_name = item
+            .temporary
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        if !temporary_name.starts_with(".explorie-rename-") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "batch rename recovery temporary path is not owned by Explorie",
+            ));
+        }
+        if journal.version == 2 && item.identity.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "batch rename recovery journal is missing an item identity",
+            ));
+        }
+        if !sources.insert(normalize_path(&item.source))
+            || !temporaries.insert(normalize_path(&item.temporary))
+            || !targets.insert(normalize_path(&item.target))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "batch rename recovery journal contains duplicate paths",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BatchRenameLocation {
+    Source,
+    Temporary,
+    Target,
+}
+
+fn recover_identified_batch_rename(journal: &BatchRenameJournal) -> io::Result<()> {
+    let mut locations = Vec::with_capacity(journal.items.len());
+    for item in &journal.items {
+        let identity = item.identity.as_ref().expect("validated journal identity");
+        if item.temporary.exists()
+            && batch_rename_identity(&item.temporary).as_ref() != Some(identity)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "batch rename recovery temporary item changed: {}",
+                    item.temporary.display()
+                ),
+            ));
+        }
+        let matches = [
+            (BatchRenameLocation::Source, &item.source),
+            (BatchRenameLocation::Temporary, &item.temporary),
+            (BatchRenameLocation::Target, &item.target),
+        ]
+        .into_iter()
+        .filter_map(|(location, path)| {
+            (batch_rename_identity(path).as_ref() == Some(identity)).then_some(location)
+        })
+        .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [location] => locations.push(*location),
+            [] => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "batch rename recovery could not identify the original item for {}",
+                        item.source.display()
+                    ),
+                ));
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "batch rename recovery found duplicate copies of {}",
+                        item.source.display()
+                    ),
+                ));
+            }
+        }
+    }
+
+    for (item, location) in journal.items.iter().zip(&locations) {
+        if *location == BatchRenameLocation::Target {
+            explorie_core::rename_noreplace(&item.target, &item.temporary)?;
+        }
+    }
+    for (item, location) in journal.items.iter().zip(locations).rev() {
+        if location != BatchRenameLocation::Source {
+            explorie_core::rename_noreplace(&item.temporary, &item.source)?;
+        }
+    }
+    Ok(())
+}
+
+fn batch_rename_identity(path: &Path) -> Option<BatchRenameIdentity> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    let kind = if metadata.file_type().is_symlink() {
+        2
+    } else if metadata.is_dir() {
+        1
+    } else if metadata.is_file() {
+        0
+    } else {
+        3
+    };
+    let modified_ns = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .and_then(|duration| u64::try_from(duration.as_nanos()).ok());
+    #[cfg(unix)]
+    let platform_id = {
+        use std::os::unix::fs::MetadataExt;
+        Some((metadata.dev(), metadata.ino()))
+    };
+    #[cfg(windows)]
+    let platform_id = {
+        use std::os::windows::fs::MetadataExt;
+        Some((
+            metadata.creation_time(),
+            u64::from(metadata.file_attributes()),
+        ))
+    };
+    #[cfg(not(any(unix, windows)))]
+    let platform_id = None;
+    Some(BatchRenameIdentity {
+        kind,
+        len: metadata.len(),
+        modified_ns,
+        platform_id,
+    })
+}
+
+fn recover_batch_rename_journal(path: &Path) -> io::Result<()> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let journal: BatchRenameJournal = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+    recover_batch_rename(&journal)?;
+    remove_batch_rename_journal(path)
+}
+
 fn batch_rename_impl(
     shared: &SharedState,
     items: Vec<BatchRenameItem>,
+    journal_path: &Path,
 ) -> io::Result<BatchRenameResult> {
     if items.is_empty() {
         return Err(io::Error::new(
@@ -717,22 +1105,73 @@ fn batch_rename_impl(
     }
 
     let transaction = Uuid::new_v4().simple().to_string();
-    let mut staged: Vec<(PathBuf, PathBuf, PathBuf)> = Vec::with_capacity(plan.len());
-    for (index, (source, target)) in plan.iter().enumerate() {
-        let parent = source.parent().expect("validated batch source parent");
-        let temporary = parent.join(format!(".explorie-rename-{transaction}-{index}"));
-        if let Err(error) = explorie_core::rename_noreplace(source, &temporary) {
-            let rollback = rollback_staged(&staged);
+    let staged: Vec<(PathBuf, PathBuf, PathBuf)> = plan
+        .iter()
+        .enumerate()
+        .map(|(index, (source, target))| {
+            let parent = source.parent().expect("validated batch source parent");
+            let temporary = parent.join(format!(".explorie-rename-{transaction}-{index}"));
+            (source.clone(), temporary, target.clone())
+        })
+        .collect();
+    let mut journal = BatchRenameJournal {
+        version: 2,
+        phase: BatchRenameJournalPhase::Staging { staged: 0 },
+        items: staged
+            .iter()
+            .map(|(source, temporary, target)| BatchRenameJournalItem {
+                source: source.clone(),
+                temporary: temporary.clone(),
+                target: target.clone(),
+                identity: batch_rename_identity(source),
+            })
+            .collect(),
+    };
+    write_batch_rename_journal(journal_path, &journal)?;
+
+    for (index, (source, temporary, _)) in staged.iter().enumerate() {
+        if let Err(error) = explorie_core::rename_noreplace(source, temporary) {
+            let rollback = recover_batch_rename(&journal)
+                .and_then(|()| remove_batch_rename_journal(journal_path));
             return Err(batch_rename_error("staging", error, rollback));
         }
-        staged.push((source.clone(), temporary, target.clone()));
+        journal.phase = BatchRenameJournalPhase::Staging { staged: index + 1 };
+        if let Err(error) = write_batch_rename_journal(journal_path, &journal) {
+            let rollback = recover_batch_rename(&journal)
+                .and_then(|()| remove_batch_rename_journal(journal_path));
+            return Err(batch_rename_error("journal update", error, rollback));
+        }
     }
 
+    journal.phase = BatchRenameJournalPhase::Committing { committed: 0 };
+    if let Err(error) = write_batch_rename_journal(journal_path, &journal) {
+        let rollback =
+            recover_batch_rename(&journal).and_then(|()| remove_batch_rename_journal(journal_path));
+        return Err(batch_rename_error("journal update", error, rollback));
+    }
     for (committed, (_, temporary, target)) in staged.iter().enumerate() {
         if let Err(error) = explorie_core::rename_noreplace(temporary, target) {
-            let rollback = rollback_batch_commit(&staged, committed);
+            let rollback = recover_batch_rename(&journal)
+                .and_then(|()| remove_batch_rename_journal(journal_path));
             return Err(batch_rename_error("commit", error, rollback));
         }
+        journal.phase = BatchRenameJournalPhase::Committing {
+            committed: committed + 1,
+        };
+        if let Err(error) = write_batch_rename_journal(journal_path, &journal) {
+            let rollback = recover_batch_rename(&journal)
+                .and_then(|()| remove_batch_rename_journal(journal_path));
+            return Err(batch_rename_error("journal update", error, rollback));
+        }
+    }
+
+    journal.phase = BatchRenameJournalPhase::Finished;
+    write_batch_rename_journal(journal_path, &journal)?;
+    if let Err(error) = remove_batch_rename_journal(journal_path) {
+        eprintln!(
+            "batch rename completed but its finished journal could not be removed at {}: {error}",
+            journal_path.display()
+        );
     }
 
     Ok(BatchRenameResult {
@@ -741,40 +1180,6 @@ fn batch_rename_impl(
             .map(|(before, _, after)| BatchRenamePair { before, after })
             .collect(),
     })
-}
-
-fn rollback_staged(staged: &[(PathBuf, PathBuf, PathBuf)]) -> io::Result<()> {
-    let mut first_error = None;
-    for (source, temporary, _) in staged.iter().rev() {
-        if let Err(error) = explorie_core::rename_noreplace(temporary, source)
-            && first_error.is_none()
-        {
-            first_error = Some(error);
-        }
-    }
-    first_error.map_or(Ok(()), Err)
-}
-
-fn rollback_batch_commit(
-    staged: &[(PathBuf, PathBuf, PathBuf)],
-    committed: usize,
-) -> io::Result<()> {
-    let mut first_error = None;
-    for (source, _, target) in staged[..committed].iter().rev() {
-        if let Err(error) = explorie_core::rename_noreplace(target, source)
-            && first_error.is_none()
-        {
-            first_error = Some(error);
-        }
-    }
-    for (source, temporary, _) in staged[committed..].iter().rev() {
-        if let Err(error) = explorie_core::rename_noreplace(temporary, source)
-            && first_error.is_none()
-        {
-            first_error = Some(error);
-        }
-    }
-    first_error.map_or(Ok(()), Err)
 }
 
 fn batch_rename_error(stage: &str, error: io::Error, rollback: io::Result<()>) -> io::Error {
@@ -946,7 +1351,11 @@ fn remove_job(shared: &SharedState, job_id: &str) {
         .cancellations
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .remove(job_id);
+        .remove(&file_cancellation_key(job_id));
+}
+
+fn file_cancellation_key(job_id: &str) -> String {
+    format!("file:{job_id}")
 }
 
 #[cfg(test)]
@@ -1094,6 +1503,126 @@ mod tests {
         assert!(!source.exists());
         assert_eq!(fs::read_to_string(target).unwrap(), "contents");
         assert_eq!(services.mutations.active_count(), 0);
+    }
+
+    #[test]
+    fn batch_rename_journal_recovers_an_interrupted_staging_pass() {
+        let temp = temp_dir();
+        let source = temp.path().join("before.txt");
+        let staged = temp.path().join(".explorie-rename-test");
+        let target = temp.path().join("after.txt");
+        fs::write(&source, "contents").unwrap();
+        let identity = batch_rename_identity(&source);
+        fs::rename(&source, &staged).unwrap();
+        let journal = BatchRenameJournal {
+            version: 2,
+            items: vec![BatchRenameJournalItem {
+                source: source.clone(),
+                temporary: staged.clone(),
+                target,
+                identity,
+            }],
+            phase: BatchRenameJournalPhase::Staging { staged: 1 },
+        };
+
+        recover_batch_rename(&journal).unwrap();
+
+        assert_eq!(fs::read_to_string(source).unwrap(), "contents");
+        assert!(!staged.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_batch_rename_journal_persists_replaces_and_removes_durably() {
+        let temp = temp_dir();
+        let journal_path = batch_rename_journal_path(temp.path());
+        let mut journal = BatchRenameJournal {
+            version: 2,
+            phase: BatchRenameJournalPhase::Staging { staged: 0 },
+            items: Vec::new(),
+        };
+
+        write_batch_rename_journal(&journal_path, &journal).unwrap();
+        assert!(journal_path.is_file());
+
+        journal.phase = BatchRenameJournalPhase::Finished;
+        write_batch_rename_journal(&journal_path, &journal).unwrap();
+        let persisted: BatchRenameJournal =
+            serde_json::from_slice(&fs::read(&journal_path).unwrap()).unwrap();
+        assert!(matches!(persisted.phase, BatchRenameJournalPhase::Finished));
+
+        remove_batch_rename_journal(&journal_path).unwrap();
+        assert!(!journal_path.exists());
+    }
+
+    #[test]
+    fn batch_rename_journal_recovers_a_partially_committed_swap() {
+        let temp = temp_dir();
+        let first = temp.path().join("first.txt");
+        let second = temp.path().join("second.txt");
+        let first_staged = temp.path().join(".explorie-rename-first");
+        let second_staged = temp.path().join(".explorie-rename-second");
+        fs::write(&first, "first contents").unwrap();
+        fs::write(&second, "second contents").unwrap();
+        fs::rename(&first, &first_staged).unwrap();
+        fs::rename(&second, &second_staged).unwrap();
+        fs::rename(&first_staged, &second).unwrap();
+        let journal = BatchRenameJournal {
+            version: 1,
+            items: vec![
+                BatchRenameJournalItem {
+                    source: first.clone(),
+                    temporary: first_staged.clone(),
+                    target: second.clone(),
+                    identity: None,
+                },
+                BatchRenameJournalItem {
+                    source: second.clone(),
+                    temporary: second_staged.clone(),
+                    target: first.clone(),
+                    identity: None,
+                },
+            ],
+            phase: BatchRenameJournalPhase::Committing { committed: 1 },
+        };
+
+        recover_batch_rename(&journal).unwrap();
+
+        assert_eq!(fs::read_to_string(first).unwrap(), "first contents");
+        assert_eq!(fs::read_to_string(second).unwrap(), "second contents");
+        assert!(!first_staged.exists());
+        assert!(!second_staged.exists());
+    }
+
+    #[test]
+    fn batch_rename_journal_refuses_to_move_a_replaced_staged_item() {
+        let temp = temp_dir();
+        let source = temp.path().join("before.txt");
+        let staged = temp.path().join(".explorie-rename-test");
+        let target = temp.path().join("after.txt");
+        fs::write(&source, "original").unwrap();
+        let identity = batch_rename_identity(&source);
+        fs::rename(&source, &staged).unwrap();
+        fs::write(&staged, "replacement with a different size").unwrap();
+        let journal = BatchRenameJournal {
+            version: 2,
+            items: vec![BatchRenameJournalItem {
+                source: source.clone(),
+                temporary: staged.clone(),
+                target,
+                identity,
+            }],
+            phase: BatchRenameJournalPhase::Staging { staged: 1 },
+        };
+
+        let error = recover_batch_rename(&journal).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!source.exists());
+        assert_eq!(
+            fs::read_to_string(staged).unwrap(),
+            "replacement with a different size"
+        );
     }
 
     #[test]

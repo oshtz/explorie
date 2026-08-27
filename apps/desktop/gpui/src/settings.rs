@@ -12,7 +12,7 @@ use explorie_native_services::{RemoteDriveProfile, validate_remote_drive_profile
 
 use crate::{EntryFilter, SortDirection, SortKey, ViewMode};
 
-const SETTINGS_VERSION: u32 = 1;
+const SETTINGS_VERSION: u32 = 2;
 const LEGACY_EXPORT_FILE: &str = "legacy-local-storage.json";
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -299,6 +299,15 @@ pub struct LegacyImportRecord {
     pub invalid_keys: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowPlacementSettings {
+    pub width: Option<f32>,
+    pub height: Option<f32>,
+    pub x: Option<f32>,
+    pub y: Option<f32>,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
@@ -306,6 +315,8 @@ pub struct AppSettings {
     pub view: ViewSettings,
     pub appearance: AppearanceSettings,
     pub behavior: BehaviorSettings,
+    #[serde(default)]
+    pub window_placement: WindowPlacementSettings,
     #[serde(default)]
     pub recent_commands: Vec<String>,
     #[serde(default)]
@@ -327,6 +338,7 @@ impl Default for AppSettings {
             view: ViewSettings::default(),
             appearance: AppearanceSettings::default(),
             behavior: BehaviorSettings::default(),
+            window_placement: WindowPlacementSettings::default(),
             recent_commands: Vec::new(),
             remote_profiles: Vec::new(),
             named_themes: BTreeMap::new(),
@@ -363,6 +375,18 @@ impl AppSettings {
         } else {
             default_sidebar_width()
         };
+        self.window_placement.width = self
+            .window_placement
+            .width
+            .filter(|value| value.is_finite())
+            .map(|value| value.clamp(520.0, 10_000.0));
+        self.window_placement.height = self
+            .window_placement
+            .height
+            .filter(|value| value.is_finite())
+            .map(|value| value.clamp(360.0, 10_000.0));
+        self.window_placement.x = self.window_placement.x.filter(|value| value.is_finite());
+        self.window_placement.y = self.window_placement.y.filter(|value| value.is_finite());
         self.appearance.list_row_height = self.appearance.list_row_height.clamp(26, 52);
         self.appearance.grid_min_width = self.appearance.grid_min_width.clamp(120, 260);
         self.appearance.icon_size = self.appearance.icon_size.clamp(10, 24);
@@ -704,6 +728,17 @@ fn normalize_recent_commands(commands: &mut Vec<String>) {
     *commands = normalized;
 }
 
+pub(crate) fn load_window_placement(config_dir: &Path) -> Option<WindowPlacementSettings> {
+    let bytes = fs::read(config_dir.join("settings-v1.json")).ok()?;
+    let (settings, _) = decode_settings(&bytes).ok()?;
+    let placement = settings.window_placement;
+    (placement.width.is_some()
+        || placement.height.is_some()
+        || placement.x.is_some()
+        || placement.y.is_some())
+    .then_some(placement)
+}
+
 fn valid_hex_color(value: &str) -> bool {
     value.len() == 7
         && value.starts_with('#')
@@ -786,14 +821,33 @@ impl SettingsStore {
         let legacy_path = config_dir.join(LEGACY_EXPORT_FILE);
         let mut save_initial = false;
         let (settings, warning) = match fs::read(&path) {
-            Ok(bytes) => match serde_json::from_slice::<AppSettings>(&bytes)
-                .map_err(|error| error.to_string())
-                .and_then(AppSettings::validate)
-            {
-                Ok(settings) => (settings, None),
+            Ok(bytes) => match decode_settings(&bytes) {
+                Ok((settings, false)) => (settings, None),
+                Ok((settings, true)) => {
+                    let backup = migration_copy_path(&path, 1);
+                    match fs::copy(&path, &backup) {
+                        Ok(_) => {
+                            save_initial = true;
+                            (
+                                settings,
+                                Some(format!(
+                                    "Settings were migrated to schema v{SETTINGS_VERSION}; the v1 source was preserved at {}",
+                                    backup.display()
+                                )),
+                            )
+                        }
+                        Err(error) => (
+                            settings,
+                            Some(format!(
+                                "Settings are using the v{SETTINGS_VERSION} schema in memory, but the v1 backup could not be created ({error}); the source file was left unchanged"
+                            )),
+                        ),
+                    }
+                }
                 Err(error) => {
                     let backup = preserved_copy_path(&path);
-                    let warning = match fs::copy(&path, &backup) {
+                    let preservation = fs::copy(&path, &backup);
+                    let warning = match &preservation {
                         Ok(_) => format!(
                             "Settings recovery used defaults; the invalid file was preserved at {}: {error}",
                             backup.display()
@@ -802,7 +856,7 @@ impl SettingsStore {
                             "Settings recovery used defaults; preserving the invalid file failed ({copy_error}): {error}"
                         ),
                     };
-                    save_initial = true;
+                    save_initial = preservation.is_ok();
                     (AppSettings::default(), Some(warning))
                 }
             },
@@ -917,6 +971,40 @@ impl SettingsStore {
     }
 }
 
+fn decode_settings(bytes: &[u8]) -> Result<(AppSettings, bool), String> {
+    let mut value =
+        serde_json::from_slice::<serde_json::Value>(bytes).map_err(|error| error.to_string())?;
+    let version = value
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "settings version is missing or invalid".to_string())?;
+    let migrated = match version {
+        1 => {
+            value["version"] = serde_json::Value::from(SETTINGS_VERSION);
+            true
+        }
+        version if version == u64::from(SETTINGS_VERSION) => false,
+        version => {
+            return Err(format!(
+                "unsupported settings version {version}; expected 1 or {SETTINGS_VERSION}"
+            ));
+        }
+    };
+    serde_json::from_value::<AppSettings>(value)
+        .map_err(|error| error.to_string())
+        .and_then(AppSettings::validate)
+        .map(|settings| (settings, migrated))
+}
+
+fn migration_copy_path(path: &Path, version: u32) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = path
+        .file_stem()
+        .unwrap_or(path.as_os_str())
+        .to_string_lossy();
+    parent.join(format!("{stem}.pre-migration-v{version}.json"))
+}
+
 fn find_legacy_profile() -> Option<PathBuf> {
     let root = dirs::data_local_dir()?;
     [root.join("com.omershatz.explorie"), root.join("explorie")]
@@ -987,7 +1075,11 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
 
 #[cfg(not(windows))]
 fn replace_file(temp: &Path, destination: &Path) -> io::Result<()> {
-    fs::rename(temp, destination)
+    fs::rename(temp, destination)?;
+    File::open(destination.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "settings path has no parent")
+    })?)?
+    .sync_all()
 }
 
 #[cfg(windows)]

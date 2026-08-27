@@ -11,9 +11,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak, mpsc};
 use std::task::{Context as TaskContext, Poll, Waker};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub const COALESCE_DELAY: Duration = Duration::from_millis(200);
+const MAX_CHANGED_PATHS: usize = 4_096;
 
 #[derive(Clone)]
 pub struct WatcherService {
@@ -50,10 +51,30 @@ struct WatchEventQueue {
 
 impl WatchEventQueue {
     fn publish(&self, event: WatcherEvent) {
-        self.events
+        let mut queue = self
+            .events
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push_back(event);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let merged = if event.state == WatcherState::Changed {
+            queue.back_mut().is_some_and(|pending| {
+                if pending.state != WatcherState::Changed
+                    || pending.registration_id != event.registration_id
+                {
+                    return false;
+                }
+                pending.paths.extend(event.paths.iter().cloned());
+                pending.paths.sort();
+                pending.paths.dedup();
+                pending.paths.truncate(MAX_CHANGED_PATHS);
+                true
+            })
+        } else {
+            false
+        };
+        if !merged {
+            queue.push_back(event);
+        }
+        drop(queue);
         if let Some(waker) = self
             .waker
             .lock()
@@ -387,8 +408,16 @@ fn coalescing_worker(
             events.publish(ServiceEvent::Watcher(event));
             return;
         }
+        bound_changed_paths(&mut changed, &watched_paths);
 
-        while let Ok(next) = receiver.recv_timeout(COALESCE_DELAY) {
+        let deadline = Instant::now() + COALESCE_DELAY;
+        loop {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            let Ok(next) = receiver.recv_timeout(remaining) else {
+                break;
+            };
             if cancelled.load(Ordering::Acquire) {
                 return;
             }
@@ -403,6 +432,7 @@ fn coalescing_worker(
                 events.publish(ServiceEvent::Watcher(event));
                 return;
             }
+            bound_changed_paths(&mut changed, &watched_paths);
         }
 
         if !cancelled.load(Ordering::Acquire) && !changed.is_empty() {
@@ -419,6 +449,14 @@ fn coalescing_worker(
         }
     }
     subscription_events.close();
+}
+
+fn bound_changed_paths(changed: &mut HashSet<PathBuf>, watched_paths: &[PathBuf]) {
+    if changed.len() <= MAX_CHANGED_PATHS {
+        return;
+    }
+    changed.clear();
+    changed.extend(watched_paths.iter().take(MAX_CHANGED_PATHS).cloned());
 }
 
 fn collect_event(
@@ -471,6 +509,35 @@ mod tests {
     use super::*;
     use crate::{NativeServices, ResourcePaths, ServiceEvent, WatcherState};
     use std::fs;
+
+    #[test]
+    fn watcher_storm_paths_collapse_to_the_watched_roots() {
+        let watched = vec![PathBuf::from("root")];
+        let mut changed = (0..=MAX_CHANGED_PATHS)
+            .map(|index| PathBuf::from(format!("root/item-{index}")))
+            .collect::<HashSet<_>>();
+        bound_changed_paths(&mut changed, &watched);
+        assert_eq!(changed, HashSet::from([PathBuf::from("root")]));
+    }
+
+    #[test]
+    fn slow_consumers_receive_one_merged_change_event() {
+        let queue = WatchEventQueue::default();
+        for path in ["root/first", "root/second"] {
+            queue.publish(WatcherEvent {
+                registration_id: 7,
+                state: WatcherState::Changed,
+                paths: vec![PathBuf::from(path)],
+                error: None,
+            });
+        }
+        let events = queue.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events.front().unwrap().paths,
+            [PathBuf::from("root/first"), PathBuf::from("root/second")]
+        );
+    }
 
     #[test]
     fn registrations_are_deduplicated_and_access_events_are_ignored() {

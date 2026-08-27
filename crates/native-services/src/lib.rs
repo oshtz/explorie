@@ -23,8 +23,10 @@ pub mod listing;
 pub mod metadata;
 pub mod mutations;
 pub mod preview;
+mod process;
 pub mod remote_drives;
 pub mod search;
+pub mod updater;
 pub mod video;
 pub mod watcher;
 
@@ -33,7 +35,7 @@ pub use archive::{ArchiveService, CompressRequest, CompressResult, ExtractReques
 pub use audio::{AudioBackend, AudioPlayback, AudioService, AudioStatus};
 pub use explorie_core::{
     ConflictPolicy, FileEntry, FileOperationKind, FileOperationProgress, FileOperationRequest,
-    FileOperationResult,
+    FileOperationResult, FileTreeSnapshot,
 };
 pub use image_metadata::{
     ImageGps, ImageMetadata, format_exif_date, is_image_metadata_path, parse_image_metadata,
@@ -48,8 +50,8 @@ pub use mutations::{
     PermanentDeleteResult, SafeMutationRequest,
 };
 pub use preview::{
-    HelperStatus, PdfPagePreview, PreviewArtifact, PreviewService, TextHighlight,
-    TextHighlightKind, TextPreview,
+    DetectedPreviewKind, HelperStatus, PdfPagePreview, PreviewArtifact, PreviewDetection,
+    PreviewService, TextHighlight, TextHighlightKind, TextPreview,
 };
 pub use remote_drives::{
     DisconnectResult, RemoteControlRequest, RemoteDriveBackend, RemoteDriveEnvironment,
@@ -57,7 +59,11 @@ pub use remote_drives::{
     RemoteDriveService, RemoteDriveState, RemoteDriveStatus, RemoteMountRequest,
     RemoteProcessStatus, validate_remote_drive_profile,
 };
-pub use search::{CombineMode, SearchCriteria, SearchResult, SearchService, SearchType};
+pub use search::{
+    CombineMode, SearchCriteria, SearchIndexHealth, SearchProgressEvent, SearchResult,
+    SearchService, SearchType,
+};
+pub use updater::{DownloadedUpdate, UpdateInfo, UpdateService};
 pub use video::{VideoBackend, VideoFrame, VideoPlayback, VideoService, VideoStatus};
 pub use watcher::{WatchSubscription, WatcherService};
 
@@ -268,10 +274,62 @@ struct ServiceEventQueue {
 
 impl ServiceEventQueue {
     fn publish(&self, event: ServiceEvent) {
-        self.events
+        let mut events = self
+            .events
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push_back(event);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut event = Some(event);
+        if let Some(ServiceEvent::FileOperation(incoming)) = event.as_ref()
+            && matches!(incoming.state, FileOperationState::Running)
+        {
+            for queued in events.iter_mut().rev() {
+                let ServiceEvent::FileOperation(pending) = queued else {
+                    continue;
+                };
+                if pending.job_id != incoming.job_id {
+                    continue;
+                }
+                if matches!(pending.state, FileOperationState::Running)
+                    && let Some(replacement) = event.take()
+                {
+                    *queued = replacement;
+                }
+                break;
+            }
+        }
+        if let Some(ServiceEvent::ArchiveProgress(incoming)) = event.as_ref() {
+            for queued in events.iter_mut().rev() {
+                let ServiceEvent::ArchiveProgress(pending) = queued else {
+                    continue;
+                };
+                if pending.operation_id == incoming.operation_id {
+                    if let Some(replacement) = event.take() {
+                        *queued = replacement;
+                    }
+                    break;
+                }
+            }
+        }
+        if let Some(ServiceEvent::SearchProgress(incoming)) = event.as_ref() {
+            for queued in events.iter_mut().rev() {
+                let ServiceEvent::SearchProgress(pending) = queued else {
+                    continue;
+                };
+                if pending.request_id == incoming.request_id
+                    && pending.entries.is_empty()
+                    && incoming.entries.is_empty()
+                {
+                    if let Some(replacement) = event.take() {
+                        *queued = replacement;
+                    }
+                    break;
+                }
+            }
+        }
+        if let Some(event) = event {
+            events.push_back(event);
+        }
+        drop(events);
         if let Some(waker) = self
             .waker
             .lock()
@@ -333,6 +391,7 @@ impl Future for ServiceNext<'_> {
 pub enum ServiceEvent {
     FileOperation(FileOperationEvent),
     ArchiveProgress(ArchiveProgressEvent),
+    SearchProgress(SearchProgressEvent),
     RemoteDriveStatus(RemoteDriveStatus),
     RemoteDriveExitBlocked(RemoteDriveExitBlocker),
     MutationIdle,
@@ -573,6 +632,7 @@ pub struct NativeServices {
     pub previews: preview::PreviewService,
     pub remotes: remote_drives::RemoteDriveService,
     pub search: search::SearchService,
+    pub updater: updater::UpdateService,
     pub integration: integration::IntegrationService,
     pub watcher: watcher::WatcherService,
 }
@@ -585,6 +645,18 @@ impl NativeServices {
 
     pub fn from_context(context: ServiceContext) -> Self {
         Self::from_context_with_backends(context, None, None, None, None, None)
+    }
+
+    /// Create a window-local service facade. Process-wide resources and
+    /// mutation/remote state remain shared, while preview playback and search
+    /// cancellation cannot interfere with another window.
+    pub fn fork_window_scope(&self) -> Self {
+        let mut services = self.clone();
+        services.audio = self.audio.fork_playback_scope();
+        services.video = self.video.fork_playback_scope();
+        services.previews = self.previews.fork_cancellation_scope();
+        services.search = self.search.fork_cancellation_scope();
+        services
     }
 
     /// Construct services with a host-provided remote-drive backend.
@@ -701,6 +773,7 @@ impl NativeServices {
                 }
             },
             search: search::SearchService::new(context.clone()),
+            updater: updater::UpdateService::new(context.clone()),
             integration: match (finder_tags_backend, platform_actions_backend) {
                 (Some(backend), None) => integration::IntegrationService::with_finder_tags_backend(
                     context.clone(),
@@ -803,6 +876,131 @@ mod tests {
     }
 
     #[test]
+    fn async_service_events_coalesce_progress_without_dropping_terminal_state() {
+        let queue = ServiceEventQueue::default();
+        let progress_event = |processed_bytes| {
+            ServiceEvent::FileOperation(FileOperationEvent {
+                job_id: "job".into(),
+                state: FileOperationState::Running,
+                progress: Some(explorie_core::FileOperationProgress {
+                    processed_entries: 0,
+                    total_entries: 1,
+                    processed_bytes,
+                    total_bytes: 10,
+                    current_path: Some(PathBuf::from("source")),
+                }),
+                result: None,
+                retryable_sources: Vec::new(),
+                error: None,
+            })
+        };
+        queue.publish(progress_event(1));
+        queue.publish(progress_event(5));
+        queue.publish(progress_event(9));
+        queue.publish(ServiceEvent::FileOperation(FileOperationEvent {
+            job_id: "job".into(),
+            state: FileOperationState::Completed,
+            progress: None,
+            result: Some(explorie_core::FileOperationResult {
+                processed_entries: 1,
+                processed_bytes: 10,
+                targets: vec![PathBuf::from("destination")],
+                target_snapshots: Vec::new(),
+            }),
+            retryable_sources: Vec::new(),
+            error: None,
+        }));
+
+        let events = queue
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[0],
+            ServiceEvent::FileOperation(FileOperationEvent {
+                state: FileOperationState::Running,
+                progress: Some(progress),
+                ..
+            }) if progress.processed_bytes == 9
+        ));
+        assert!(matches!(
+            &events[1],
+            ServiceEvent::FileOperation(FileOperationEvent {
+                state: FileOperationState::Completed,
+                ..
+            })
+        ));
+
+        drop(events);
+        queue.publish(ServiceEvent::ArchiveProgress(ArchiveProgressEvent {
+            operation_id: "archive".into(),
+            processed_bytes: 1,
+            total_bytes: 10,
+            current_path: "one".into(),
+        }));
+        queue.publish(ServiceEvent::ArchiveProgress(ArchiveProgressEvent {
+            operation_id: "archive".into(),
+            processed_bytes: 9,
+            total_bytes: 10,
+            current_path: "nine".into(),
+        }));
+        let events = queue
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(events.len(), 3);
+        assert!(matches!(
+            &events[2],
+            ServiceEvent::ArchiveProgress(ArchiveProgressEvent {
+                processed_bytes: 9,
+                ..
+            })
+        ));
+
+        let search_queue = ServiceEventQueue::default();
+        let entry = explorie_core::FileEntry {
+            id: uuid::Uuid::new_v4(),
+            path: PathBuf::from("result.txt"),
+            size: 1,
+            modified: std::time::UNIX_EPOCH,
+            hidden: false,
+            is_dir: false,
+            custom: HashMap::new(),
+            is_symlink: false,
+            is_junction: false,
+            link_target: None,
+            has_xattrs: false,
+        };
+        search_queue.publish(ServiceEvent::SearchProgress(SearchProgressEvent {
+            request_id: "search".into(),
+            phase: "results".into(),
+            indexed_entries: 128,
+            matched_entries: 1,
+            current_path: entry.path.clone(),
+            entries: vec![entry],
+        }));
+        search_queue.publish(ServiceEvent::SearchProgress(SearchProgressEvent {
+            request_id: "search".into(),
+            phase: "matching".into(),
+            indexed_entries: 512,
+            matched_entries: 1,
+            current_path: PathBuf::from("later.txt"),
+            entries: Vec::new(),
+        }));
+        let search_events = search_queue
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(search_events.len(), 2);
+        assert!(matches!(
+            &search_events[0],
+            ServiceEvent::SearchProgress(SearchProgressEvent { entries, .. })
+                if entries.len() == 1
+        ));
+    }
+
+    #[test]
     fn native_result_wire_names_match_existing_desktop_consumers() {
         let disk = serde_json::to_value(DiskInfo {
             mount_point: "C:\\".into(),
@@ -869,6 +1067,8 @@ mod tests {
             archive_path: PathBuf::from("bundle.zip"),
             output_dir: PathBuf::from("output"),
             password: Some(secret.into()),
+            allow_extended_limits: false,
+            operation_id: "extract-job".into(),
         };
         assert!(!format!("{extract:?}").contains(secret));
 

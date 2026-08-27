@@ -99,6 +99,12 @@ impl CustomFieldsEditor {
         }
     }
 
+    pub fn set_active_input(&mut self, input: CustomFieldInput) {
+        if let Some(draft) = &mut self.draft {
+            draft.active = input;
+        }
+    }
+
     pub fn proposed_fields(&self) -> Result<HashMap<String, Value>, String> {
         let draft = self
             .draft

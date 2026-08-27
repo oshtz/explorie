@@ -1,7 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use explorie_native_services::{
-    ImageMetadata, PdfPagePreview, PreviewArtifact, ServiceError, TextPreview,
+    DetectedPreviewKind, ImageMetadata, PdfPagePreview, PreviewArtifact, PreviewDetection,
+    ServiceError, TextPreview,
 };
 
 const TEXT_PREVIEW_BYTES: u64 = 512 * 1024;
@@ -51,7 +52,10 @@ pub enum PreviewContent {
     Image(PathBuf),
     Artifact(PreviewArtifact),
     Archive,
-    External,
+    Fallback {
+        detection: PreviewDetection,
+        error: Option<ServiceError>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -330,11 +334,19 @@ pub fn route(path: &Path, preview_executable_scripts: bool) -> PreviewRoute {
         .and_then(|extension| extension.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     if is_executable_script(path) && !preview_executable_scripts {
         PreviewRoute::BlockedScript
     } else if extension == "pdf" {
         PreviewRoute::Pdf
-    } else if matches!(extension.as_str(), "mp3" | "wav" | "flac" | "ogg" | "m4a") {
+    } else if matches!(
+        extension.as_str(),
+        "mp3" | "wav" | "flac" | "ogg" | "m4a" | "m4b" | "aac" | "aif" | "aiff" | "caf" | "alac"
+    ) {
         PreviewRoute::Audio
     } else if matches!(
         extension.as_str(),
@@ -392,6 +404,62 @@ pub fn route(path: &Path, preview_executable_scripts: bool) -> PreviewRoute {
             | "psm1"
             | "bat"
             | "cmd"
+            | "vue"
+            | "svelte"
+            | "astro"
+            | "graphql"
+            | "gql"
+            | "proto"
+            | "diff"
+            | "patch"
+            | "rst"
+            | "adoc"
+            | "asciidoc"
+            | "org"
+            | "tex"
+            | "bib"
+            | "properties"
+            | "gradle"
+            | "cmake"
+            | "kdl"
+            | "ron"
+            | "hcl"
+            | "tf"
+            | "tfvars"
+            | "ndjson"
+            | "jsonl"
+            | "xsl"
+            | "xslt"
+            | "fish"
+            | "lua"
+            | "dart"
+            | "zig"
+            | "r"
+            | "ex"
+            | "exs"
+            | "erl"
+            | "hrl"
+            | "fs"
+            | "fsx"
+            | "vb"
+            | "scala"
+            | "clj"
+            | "cljs"
+            | "groovy"
+    ) || matches!(
+        file_name.as_str(),
+        "dockerfile"
+            | "makefile"
+            | "cmakelists.txt"
+            | ".gitignore"
+            | ".gitattributes"
+            | ".editorconfig"
+            | ".npmrc"
+            | ".yarnrc"
+            | ".prettierrc"
+            | ".eslintrc"
+            | "license"
+            | "readme"
     ) {
         PreviewRoute::Text
     } else if matches!(
@@ -414,6 +482,9 @@ pub fn route(path: &Path, preview_executable_scripts: bool) -> PreviewRoute {
             | "mpeg"
             | "mpg"
             | "3gp"
+            | "ogv"
+            | "ts"
+            | "vob"
     ) {
         PreviewRoute::Video
     } else if matches!(
@@ -430,18 +501,70 @@ pub fn route(path: &Path, preview_executable_scripts: bool) -> PreviewRoute {
             | "rtf"
             | "heic"
             | "heif"
+            | "avif"
+            | "jxl"
+            | "jpegxl"
             | "tif"
             | "tiff"
             | "psd"
+            | "dng"
+            | "cr2"
+            | "cr3"
+            | "nef"
+            | "arw"
+            | "orf"
+            | "rw2"
+            | "raf"
+            | "svg"
+            | "svgz"
+            | "ico"
+            | "tga"
+            | "dds"
+            | "hdr"
+            | "pnm"
+            | "pbm"
+            | "pgm"
+            | "ppm"
+            | "pam"
+            | "qoi"
     ) {
         PreviewRoute::GeneratedArtifact
     } else if matches!(
         extension.as_str(),
-        "zip" | "tar" | "tgz" | "gz" | "7z" | "rar"
+        "zip" | "tar" | "tgz" | "gz" | "7z" | "rar" | "cbz" | "epub"
     ) {
         PreviewRoute::Archive
     } else {
         PreviewRoute::External
+    }
+}
+
+pub fn route_with_detection(
+    path: &Path,
+    preview_executable_scripts: bool,
+    detection: &PreviewDetection,
+) -> PreviewRoute {
+    let hinted = route(path, preview_executable_scripts);
+    if hinted == PreviewRoute::BlockedScript {
+        return hinted;
+    }
+    match detection.kind {
+        DetectedPreviewKind::Pdf => PreviewRoute::Pdf,
+        DetectedPreviewKind::Svg => PreviewRoute::GeneratedArtifact,
+        DetectedPreviewKind::Image => match detection.mime_type.as_deref() {
+            Some("image/png" | "image/jpeg" | "image/gif" | "image/bmp" | "image/webp") => {
+                PreviewRoute::DirectImage
+            }
+            _ => PreviewRoute::GeneratedArtifact,
+        },
+        DetectedPreviewKind::Audio => PreviewRoute::Audio,
+        DetectedPreviewKind::Video => PreviewRoute::Video,
+        DetectedPreviewKind::Text if hinted == PreviewRoute::External => PreviewRoute::Text,
+        DetectedPreviewKind::Archive if hinted != PreviewRoute::GeneratedArtifact => {
+            PreviewRoute::Archive
+        }
+        DetectedPreviewKind::Unknown => PreviewRoute::External,
+        _ => hinted,
     }
 }
 
@@ -466,11 +589,16 @@ mod tests {
         assert_eq!(route(Path::new("song.flac"), false), PreviewRoute::Audio);
         assert_eq!(route(Path::new("manual.pdf"), false), PreviewRoute::Pdf);
         assert_eq!(route(Path::new("component.tsx"), false), PreviewRoute::Text);
+        assert_eq!(route(Path::new("Dockerfile"), false), PreviewRoute::Text);
         assert_eq!(
             route(Path::new("photo.png"), false),
             PreviewRoute::DirectImage
         );
         assert_eq!(route(Path::new("clip.mp4"), false), PreviewRoute::Video);
+        assert_eq!(
+            route(Path::new("diagram.svg"), false),
+            PreviewRoute::GeneratedArtifact
+        );
         assert_eq!(
             route(Path::new("design.psd"), false),
             PreviewRoute::GeneratedArtifact
@@ -488,11 +616,98 @@ mod tests {
     #[test]
     fn every_legacy_text_extension_routes_to_the_native_reader() {
         for extension in [
-            "txt", "log", "csv", "ini", "cfg", "conf", "env", "json", "json5", "jsonc", "yaml",
-            "yml", "md", "markdown", "ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "pyw", "cs",
-            "csharp", "sql", "html", "htm", "xml", "css", "scss", "sass", "java", "go", "rs", "c",
-            "cpp", "cxx", "cc", "hpp", "hh", "rb", "php", "swift", "kt", "kts", "sh", "bash",
-            "zsh", "toml", "lock",
+            "txt",
+            "log",
+            "csv",
+            "ini",
+            "cfg",
+            "conf",
+            "env",
+            "json",
+            "json5",
+            "jsonc",
+            "yaml",
+            "yml",
+            "md",
+            "markdown",
+            "ts",
+            "tsx",
+            "js",
+            "jsx",
+            "mjs",
+            "cjs",
+            "py",
+            "pyw",
+            "cs",
+            "csharp",
+            "sql",
+            "html",
+            "htm",
+            "xml",
+            "css",
+            "scss",
+            "sass",
+            "java",
+            "go",
+            "rs",
+            "c",
+            "cpp",
+            "cxx",
+            "cc",
+            "hpp",
+            "hh",
+            "rb",
+            "php",
+            "swift",
+            "kt",
+            "kts",
+            "sh",
+            "bash",
+            "zsh",
+            "toml",
+            "lock",
+            "vue",
+            "svelte",
+            "astro",
+            "graphql",
+            "gql",
+            "proto",
+            "diff",
+            "patch",
+            "rst",
+            "adoc",
+            "asciidoc",
+            "org",
+            "tex",
+            "bib",
+            "properties",
+            "gradle",
+            "cmake",
+            "kdl",
+            "ron",
+            "hcl",
+            "tf",
+            "tfvars",
+            "ndjson",
+            "jsonl",
+            "xsl",
+            "xslt",
+            "fish",
+            "lua",
+            "dart",
+            "zig",
+            "r",
+            "ex",
+            "exs",
+            "erl",
+            "hrl",
+            "fs",
+            "fsx",
+            "vb",
+            "scala",
+            "clj",
+            "cljs",
+            "groovy",
         ] {
             assert_eq!(
                 route(Path::new(&format!("preview.{extension}")), false),
@@ -504,22 +719,41 @@ mod tests {
             route(Path::new("photo.webp"), false),
             PreviewRoute::DirectImage
         );
+        for name in [
+            "Dockerfile",
+            "Makefile",
+            "CMakeLists.txt",
+            ".gitignore",
+            ".editorconfig",
+            "LICENSE",
+        ] {
+            assert_eq!(route(Path::new(name), false), PreviewRoute::Text);
+        }
+    }
+
+    #[test]
+    fn vector_and_extended_raster_images_use_local_generated_previews() {
+        for extension in [
+            "svg", "svgz", "tif", "tiff", "ico", "tga", "dds", "hdr", "pnm", "pbm", "pgm", "ppm",
+            "pam", "qoi",
+        ] {
+            assert_eq!(
+                route(Path::new(&format!("image.{extension}")), false),
+                PreviewRoute::GeneratedArtifact,
+                "{extension} should use a local generated preview"
+            );
+        }
     }
 
     #[test]
     fn supported_audio_stays_embedded_and_unavailable_decoders_fall_back_locally() {
-        for extension in ["mp3", "wav", "flac", "ogg", "m4a"] {
+        for extension in ["mp3", "wav", "flac", "ogg", "m4a", "aac"] {
             assert_eq!(
                 route(Path::new(&format!("track.{extension}")), false),
                 PreviewRoute::Audio
             );
         }
-        for extension in ["aac", "wma"] {
-            assert_eq!(
-                route(Path::new(&format!("track.{extension}")), false),
-                PreviewRoute::External
-            );
-        }
+        assert_eq!(route(Path::new("track.wma"), false), PreviewRoute::External);
     }
 
     #[test]

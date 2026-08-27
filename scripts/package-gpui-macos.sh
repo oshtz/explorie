@@ -14,6 +14,9 @@ dmg_root="$bundle_root/dmg-root"
 dmg="$bundle_root/dmg/explorie_${version}_${target}.dmg"
 rclone="$assets/binaries/rclone-$target"
 helper="$assets/macos/build/explorie-mountd"
+icon_source="$assets/icons/icon.png"
+iconset="$bundle_root/explorie.iconset"
+generated_icon="$bundle_root/explorie.icns"
 
 case "$app:$dmg_root" in
   "$repository"/target/release/bundle/*:"$repository"/target/release/bundle/*) ;;
@@ -28,7 +31,7 @@ esac
 
 test -x "$binary"
 test -x "$rclone"
-test -f "$assets/icons/icon.icns"
+test -f "$icon_source"
 test -f "$assets/resources/rclone-COPYING"
 test -f "$assets/resources/pixelarticons-LICENSE.txt"
 test -f "$assets/macos/MountDaemon.m"
@@ -46,18 +49,40 @@ xcrun clang \
   "$assets/macos/MountDaemon.m" \
   -o "$helper"
 
-rm -rf "$app" "$dmg_root"
+rm -rf "$app" "$dmg_root" "$iconset"
+rm -f "$generated_icon"
 mkdir -p \
   "$app/Contents/MacOS" \
   "$app/Contents/Resources/licenses" \
   "$app/Contents/Library/LaunchDaemons" \
   "$bundle_root/dmg" \
-  "$dmg_root"
+  "$dmg_root" \
+  "$iconset"
+
+make_icon() {
+  local filename=$1
+  local pixels=$2
+  sips -s format png -z "$pixels" "$pixels" "$icon_source" \
+    --out "$iconset/$filename" >/dev/null
+}
+
+make_icon icon_16x16.png 16
+make_icon icon_16x16@2x.png 32
+make_icon icon_32x32.png 32
+make_icon icon_32x32@2x.png 64
+make_icon icon_128x128.png 128
+make_icon icon_128x128@2x.png 256
+make_icon icon_256x256.png 256
+make_icon icon_256x256@2x.png 512
+make_icon icon_512x512.png 512
+make_icon icon_512x512@2x.png 1024
+iconutil -c icns "$iconset" -o "$generated_icon"
+test -s "$generated_icon"
 
 install -m 755 "$binary" "$app/Contents/MacOS/explorie-gpui"
 install -m 755 "$rclone" "$app/Contents/MacOS/rclone"
 install -m 755 "$helper" "$app/Contents/Resources/explorie-mountd"
-install -m 644 "$assets/icons/icon.icns" "$app/Contents/Resources/icon.icns"
+install -m 644 "$generated_icon" "$app/Contents/Resources/icon.icns"
 install -m 644 "$assets/resources/rclone-COPYING" "$app/Contents/Resources/licenses/rclone-COPYING"
 install -m 644 \
   "$assets/resources/pixelarticons-LICENSE.txt" \
@@ -65,6 +90,8 @@ install -m 644 \
 install -m 644 \
   "$assets/macos/com.omershatz.explorie.mountd.plist" \
   "$app/Contents/Library/LaunchDaemons/com.omershatz.explorie.mountd.plist"
+rm -rf "$iconset"
+rm -f "$generated_icon"
 
 cat >"$app/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -79,6 +106,16 @@ cat >"$app/Contents/Info.plist" <<PLIST
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>CFBundleName</key><string>explorie</string>
   <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key><string>Folder</string>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>LSHandlerRank</key><string>Alternate</string>
+      <key>LSItemContentTypes</key>
+      <array><string>public.folder</string></array>
+    </dict>
+  </array>
   <key>CFBundleShortVersionString</key><string>$version</string>
   <key>CFBundleVersion</key><string>$version</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>

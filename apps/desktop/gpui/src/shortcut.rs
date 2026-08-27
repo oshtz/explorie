@@ -94,6 +94,7 @@ pub(crate) const EDITABLE_SHORTCUTS: &[ShortcutDefinition] = &[
     definition("view-list", "List view", "View", "secondary-1"),
     definition("view-grid", "Grid view", "View", "secondary-2"),
     definition("view-column", "Column view", "View", "secondary-3"),
+    definition("window-new", "New window", "Tabs", "secondary-n"),
     definition("tab-new", "New tab", "Tabs", "secondary-t"),
     definition("tab-close", "Close tab", "Tabs", "secondary-w"),
     definition("tab-next", "Next tab", "Tabs", "secondary-tab"),
@@ -171,19 +172,30 @@ pub(crate) fn binding_for(overrides: &BTreeMap<String, String>, id: &str) -> Opt
 }
 
 pub(crate) fn display_binding(binding: &str) -> String {
-    binding
+    let macos = cfg!(target_os = "macos");
+    let parts = binding
         .split('-')
         .map(|part| match part {
-            "secondary" => "Ctrl/Cmd".to_string(),
+            "secondary" if macos => "⌘".to_string(),
+            "secondary" => "Ctrl".to_string(),
+            "alt" if macos => "⌥".to_string(),
             "alt" => "Alt".to_string(),
+            "shift" if macos => "⇧".to_string(),
             "shift" => "Shift".to_string(),
+            "left" if macos => "←".to_string(),
             "left" => "Left".to_string(),
+            "right" if macos => "→".to_string(),
             "right" => "Right".to_string(),
+            "up" if macos => "↑".to_string(),
             "up" => "Up".to_string(),
+            "down" if macos => "↓".to_string(),
             "down" => "Down".to_string(),
+            "delete" if macos => "⌦".to_string(),
             "delete" => "Delete".to_string(),
+            "backspace" if macos => "⌫".to_string(),
             "backspace" => "Backspace".to_string(),
             "tab" => "Tab".to_string(),
+            "enter" if macos => "↩".to_string(),
             "enter" => "Enter".to_string(),
             "space" => "Space".to_string(),
             key if key.len() == 1 => key.to_ascii_uppercase(),
@@ -192,8 +204,8 @@ pub(crate) fn display_binding(binding: &str) -> String {
             }
             key => key.to_string(),
         })
-        .collect::<Vec<_>>()
-        .join(" + ")
+        .collect::<Vec<_>>();
+    parts.join(if macos { "" } else { " + " })
 }
 
 pub(crate) fn binding_from_keystroke(keystroke: &Keystroke) -> Option<String> {
@@ -351,6 +363,7 @@ pub fn application_key_bindings(overrides: &BTreeMap<String, String>) -> Vec<Key
             Some("browser"),
         ),
         KeyBinding::new("secondary-shift-s", ToggleFolderSizes, Some("browser")),
+        KeyBinding::new(key("window-new", "secondary-n"), NewWindow, Some("browser")),
         KeyBinding::new(key("tab-new", "secondary-t"), NewTab, Some("browser")),
         KeyBinding::new(key("tab-close", "secondary-w"), CloseTab, Some("browser")),
         KeyBinding::new(key("tab-next", "secondary-tab"), NextTab, Some("browser")),
@@ -480,6 +493,13 @@ mod tests {
             binding_from_keystroke(&key).as_deref(),
             Some("secondary-alt-b")
         );
-        assert_eq!(display_binding("secondary-alt-b"), "Ctrl/Cmd + Alt + B");
+        assert_eq!(
+            display_binding("secondary-alt-b"),
+            if cfg!(target_os = "macos") {
+                "⌘⌥B"
+            } else {
+                "Ctrl + Alt + B"
+            }
+        );
     }
 }

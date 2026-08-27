@@ -17,6 +17,8 @@ walkdir = "2.5"
 flate2 = "1.0"
 tar = "0.4"
 unrar = "0.5"
+unrar_sys = "0.5"
+widestring = "1"
 # Keep the established source-level crate name while using the maintained fork.
 sevenz-rust = { package = "sevenz-rust2", version = "=0.20.2", features = ["aes256", "compress"] }
 tracing = "0.1"

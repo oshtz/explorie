@@ -36,6 +36,7 @@ pub enum MutationPromptKind {
     ExtractPassword {
         archive_path: PathBuf,
         output_dir: PathBuf,
+        allow_extended_limits: bool,
     },
 }
 
@@ -83,22 +84,15 @@ impl MutationPrompt {
             MutationPromptKind::ArchiveName { .. } => {
                 "Choose format/compression below • Enter to continue • Esc to cancel"
             }
+            MutationPromptKind::ExtractPassword {
+                allow_extended_limits: true,
+                ..
+            } => "Enter to approve extended extraction limits • Esc to cancel",
             MutationPromptKind::ArchivePassword { .. }
             | MutationPromptKind::ExtractPassword { .. } => {
                 "Enter for no password or type one first • Esc to cancel"
             }
             _ => "Enter to apply • Esc to cancel",
-        }
-    }
-
-    pub fn display_input(&self) -> String {
-        if matches!(
-            self.kind,
-            MutationPromptKind::ArchivePassword { .. } | MutationPromptKind::ExtractPassword { .. }
-        ) {
-            "•".repeat(self.input.chars().count())
-        } else {
-            self.input.clone()
         }
     }
 }
@@ -143,9 +137,14 @@ mod tests {
             MutationPromptKind::ExtractPassword {
                 archive_path: PathBuf::from("bundle.zip"),
                 output_dir: PathBuf::from("output"),
+                allow_extended_limits: false,
             },
             "secret".to_string(),
         );
-        assert_eq!(password.display_input(), "••••••");
+        assert_eq!(password.input, "secret");
+        assert!(matches!(
+            password.kind,
+            MutationPromptKind::ExtractPassword { .. }
+        ));
     }
 }

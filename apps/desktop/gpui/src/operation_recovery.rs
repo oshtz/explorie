@@ -2,6 +2,7 @@ use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use explorie_native_services::{ConflictPolicy, FileOperationKind, FileOperationRequest};
 use serde::{Deserialize, Serialize};
@@ -67,7 +68,12 @@ struct JournalSnapshot {
     entries: Vec<JournalEntry>,
 }
 
+#[derive(Clone)]
 pub(crate) struct OperationRecoveryStore {
+    state: Arc<Mutex<OperationRecoveryState>>,
+}
+
+struct OperationRecoveryState {
     path: PathBuf,
     entries: Vec<JournalEntry>,
 }
@@ -112,14 +118,24 @@ impl OperationRecoveryStore {
             }
         };
         let interrupted = entries.iter().map(classify_entry).collect();
-        (Some(Self { path, entries }), interrupted, None)
+        (
+            Some(Self {
+                state: Arc::new(Mutex::new(OperationRecoveryState { path, entries })),
+            }),
+            interrupted,
+            None,
+        )
     }
 
-    pub(crate) fn record(&mut self, request: &FileOperationRequest) -> io::Result<Vec<String>> {
+    pub(crate) fn record(&self, request: &FileOperationRequest) -> io::Result<Vec<String>> {
         if request.kind == FileOperationKind::Trash {
             return Ok(Vec::new());
         }
-        let previous_len = self.entries.len();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous_len = state.entries.len();
         let ids = request
             .sources
             .iter()
@@ -127,37 +143,44 @@ impl OperationRecoveryStore {
                 let id = Uuid::new_v4().to_string();
                 let mut request = request.clone();
                 request.sources = vec![source.clone()];
-                self.entries.push(JournalEntry {
+                state.entries.push(JournalEntry {
                     id: id.clone(),
                     request,
                 });
                 id
             })
             .collect::<Vec<_>>();
-        if let Err(error) = self.persist() {
-            self.entries.truncate(previous_len);
+        if let Err(error) = state.persist() {
+            state.entries.truncate(previous_len);
             return Err(error);
         }
         Ok(ids)
     }
 
-    pub(crate) fn remove(&mut self, ids: &[String]) -> io::Result<()> {
+    pub(crate) fn remove(&self, ids: &[String]) -> io::Result<()> {
         if ids.is_empty() {
             return Ok(());
         }
-        let previous = self.entries.clone();
-        self.entries
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = state.entries.clone();
+        state
+            .entries
             .retain(|entry| !ids.iter().any(|id| id == &entry.id));
-        if self.entries.len() == previous.len() {
+        if state.entries.len() == previous.len() {
             return Ok(());
         }
-        if let Err(error) = self.persist() {
-            self.entries = previous;
+        if let Err(error) = state.persist() {
+            state.entries = previous;
             return Err(error);
         }
         Ok(())
     }
+}
 
+impl OperationRecoveryState {
     fn persist(&self) -> io::Result<()> {
         if self.entries.is_empty() {
             return match fs::remove_file(&self.path) {
@@ -351,7 +374,7 @@ mod tests {
         let (store, interrupted, warning) = OperationRecoveryStore::open(&root);
         assert!(warning.is_none());
         assert!(interrupted.is_empty());
-        let mut store = store.unwrap();
+        let store = store.unwrap();
         let mut operation = request(FileOperationKind::Copy, source.join("first"), destination);
         operation.sources.push(source.join("second"));
         let ids = store.record(&operation).unwrap();
@@ -453,7 +476,7 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("explorie-operation-trash-{}", Uuid::new_v4()));
         let (store, _, _) = OperationRecoveryStore::open(&root);
-        let mut store = store.unwrap();
+        let store = store.unwrap();
         let trash = FileOperationRequest {
             kind: FileOperationKind::Trash,
             sources: vec![root.join("item")],

@@ -163,6 +163,17 @@ impl AudioService {
         }
     }
 
+    /// Reuse the process-wide audio backend while keeping playback and
+    /// cancellation state private to one window.
+    pub fn fork_playback_scope(&self) -> Self {
+        Self {
+            context: self.context.clone(),
+            backend: Arc::clone(&self.backend),
+            active: Arc::new(Mutex::new(None)),
+            generation: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
     pub fn load(&self, path: PathBuf) -> BlockingTask<AudioStatus> {
         let generation = self
             .generation
@@ -175,6 +186,9 @@ impl AudioService {
         self.context.spawn_blocking(move || {
             validate_audio_path(&path)?;
             let playback = backend.open(&path)?;
+            let mut guard = active
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if current_generation.load(Ordering::Acquire) != generation {
                 playback.stop();
                 return Err(ServiceError::new(
@@ -182,9 +196,6 @@ impl AudioService {
                     "Audio load was superseded",
                 ));
             }
-            let mut guard = active
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
             *guard = Some(ActiveAudio {
                 path: path.clone(),
                 playback,
@@ -403,6 +414,16 @@ mod tests {
             ServiceContext::new(crate::ResourcePaths::test(root)),
             Arc::new(FixedBackend { playback }),
         )
+    }
+
+    #[test]
+    fn playback_forks_share_the_backend_but_not_window_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = fixture_service(directory.path(), Arc::new(FakePlayback::default()));
+        let fork = service.fork_playback_scope();
+        assert!(Arc::ptr_eq(&service.backend, &fork.backend));
+        assert!(!Arc::ptr_eq(&service.active, &fork.active));
+        assert!(!Arc::ptr_eq(&service.generation, &fork.generation));
     }
 
     #[test]

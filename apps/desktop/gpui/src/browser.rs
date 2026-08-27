@@ -1,12 +1,40 @@
+use std::borrow::Borrow;
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use explorie_core::FileEntry;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use serde_json::Value;
 
 const MAX_NAVIGATION_HISTORY: usize = 50;
+const MAX_FOLDER_VIEW_STATES: usize = 512;
+const MAX_STORED_SELECTION: usize = 1_000;
+const MAX_COLUMN_WIDTHS: usize = 64;
+const MAX_COLUMN_VIEW_WIDTHS: usize = 512;
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderViewState {
+    pub view_mode: ViewMode,
+    pub sort_key: SortKey,
+    pub sort_direction: SortDirection,
+    #[serde(default)]
+    pub selected: Vec<PathBuf>,
+    #[serde(default)]
+    pub scroll_index: usize,
+    #[serde(default = "default_grid_min_width")]
+    pub grid_min_width: u16,
+    #[serde(default)]
+    pub show_preview_panel: bool,
+    #[serde(default)]
+    pub column_widths: HashMap<String, u16>,
+}
+
+fn default_grid_min_width() -> u16 {
+    180
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -146,8 +174,8 @@ pub struct BrowserState {
     path: PathBuf,
     back: Vec<PathBuf>,
     forward: Vec<PathBuf>,
-    entries: Vec<FileEntry>,
-    visible_entries: Vec<FileEntry>,
+    entries: Vec<Arc<FileEntry>>,
+    visible_entries: Vec<Arc<FileEntry>>,
     selected: BTreeSet<PathBuf>,
     selection_cursor: Option<PathBuf>,
     selection_anchor: Option<PathBuf>,
@@ -158,6 +186,13 @@ pub struct BrowserState {
     sort_direction: SortDirection,
     view_mode: ViewMode,
     search_query: String,
+    folder_view_states: HashMap<PathBuf, FolderViewState>,
+    pending_selection: Vec<PathBuf>,
+    scroll_index: usize,
+    grid_min_width: u16,
+    show_preview_panel: bool,
+    column_widths: HashMap<String, u16>,
+    column_view_widths: HashMap<PathBuf, u16>,
 }
 
 impl BrowserState {
@@ -178,6 +213,13 @@ impl BrowserState {
             sort_direction: SortDirection::Ascending,
             view_mode: ViewMode::List,
             search_query: String::new(),
+            folder_view_states: HashMap::new(),
+            pending_selection: Vec::new(),
+            scroll_index: 0,
+            grid_min_width: default_grid_min_width(),
+            show_preview_panel: false,
+            column_widths: HashMap::new(),
+            column_view_widths: HashMap::new(),
         }
     }
 
@@ -186,6 +228,7 @@ impl BrowserState {
         browser.back.clear();
         browser.forward.clear();
         browser.clear_listing();
+        browser.restore_current_folder_view();
         browser
     }
 
@@ -224,13 +267,17 @@ impl BrowserState {
         self.path.parent().is_some()
     }
 
-    pub fn visible_entries(&self) -> &[FileEntry] {
+    pub fn visible_entries(&self) -> &[Arc<FileEntry>] {
         &self.visible_entries
+    }
+
+    pub fn entries(&self) -> &[Arc<FileEntry>] {
+        &self.entries
     }
 
     pub fn custom_columns(&self) -> Vec<String> {
         let normalized_query = self.search_query.to_lowercase();
-        collect_custom_columns(self.entries.iter().filter(|entry| {
+        collect_custom_columns(self.entries.iter().map(Arc::as_ref).filter(|entry| {
             (self.show_hidden || !entry.hidden)
                 && (self.show_system_files || !is_system_file(entry))
                 && match self.filter {
@@ -266,7 +313,7 @@ impl BrowserState {
         self.visible_entries
             .iter()
             .filter(|entry| self.selected.contains(&entry.path))
-            .cloned()
+            .map(|entry| entry.as_ref().clone())
             .collect()
     }
 
@@ -279,6 +326,7 @@ impl BrowserState {
         self.visible_entries
             .iter()
             .find(|entry| entry.path == selected)
+            .map(Arc::as_ref)
     }
 
     pub fn show_hidden(&self) -> bool {
@@ -307,6 +355,95 @@ impl BrowserState {
 
     pub fn set_view_mode(&mut self, view_mode: ViewMode) {
         self.view_mode = view_mode;
+    }
+
+    pub fn apply_common_preferences(
+        &mut self,
+        show_hidden: bool,
+        show_system_files: bool,
+        filter: EntryFilter,
+    ) {
+        self.show_hidden = show_hidden;
+        self.show_system_files = show_system_files;
+        self.filter = filter;
+        self.rebuild_visible_entries();
+    }
+
+    pub fn folder_view_states(&self) -> &HashMap<PathBuf, FolderViewState> {
+        &self.folder_view_states
+    }
+
+    pub fn has_current_folder_view_state(&self) -> bool {
+        self.folder_view_states.contains_key(&self.path)
+    }
+
+    pub fn restore_folder_view_states(&mut self, states: HashMap<PathBuf, FolderViewState>) {
+        self.folder_view_states = states
+            .into_iter()
+            .take(MAX_FOLDER_VIEW_STATES)
+            .map(|(path, mut state)| {
+                state.selected.truncate(MAX_STORED_SELECTION);
+                if state.column_widths.len() > MAX_COLUMN_WIDTHS {
+                    state.column_widths = state
+                        .column_widths
+                        .into_iter()
+                        .take(MAX_COLUMN_WIDTHS)
+                        .collect();
+                }
+                (path, state)
+            })
+            .collect();
+        self.restore_current_folder_view();
+    }
+
+    pub fn sync_folder_ui_state(
+        &mut self,
+        scroll_index: usize,
+        grid_min_width: u16,
+        show_preview_panel: bool,
+    ) {
+        self.scroll_index = scroll_index;
+        self.grid_min_width = grid_min_width;
+        self.show_preview_panel = show_preview_panel;
+        self.capture_current_folder_view();
+    }
+
+    pub fn folder_ui_state(&self) -> (usize, u16, bool) {
+        (
+            self.scroll_index,
+            self.grid_min_width,
+            self.show_preview_panel,
+        )
+    }
+
+    pub fn column_width(&self, key: &str) -> Option<u16> {
+        self.column_widths.get(key).copied()
+    }
+
+    pub fn set_column_width(&mut self, key: String, width: u16) {
+        self.column_widths.insert(key, width);
+    }
+
+    pub fn column_view_widths(&self) -> &HashMap<PathBuf, u16> {
+        &self.column_view_widths
+    }
+
+    pub fn restore_column_view_widths(&mut self, widths: HashMap<PathBuf, u16>) {
+        self.column_view_widths = widths.into_iter().take(MAX_COLUMN_VIEW_WIDTHS).collect();
+    }
+
+    pub fn column_view_width(&self, path: &Path) -> Option<u16> {
+        self.column_view_widths.get(path).copied()
+    }
+
+    pub fn set_column_view_width(&mut self, path: PathBuf, width: u16) {
+        if !self.column_view_widths.contains_key(&path)
+            && self.column_view_widths.len() >= MAX_COLUMN_VIEW_WIDTHS
+            && let Some(stale) = self.column_view_widths.keys().next().cloned()
+        {
+            self.column_view_widths.remove(&stale);
+        }
+        self.column_view_widths.insert(path, width);
     }
 
     pub fn apply_preferences(
@@ -355,10 +492,12 @@ impl BrowserState {
         if path == self.path {
             return false;
         }
+        self.capture_current_folder_view();
         self.back.push(std::mem::replace(&mut self.path, path));
         keep_newest_history(&mut self.back);
         self.forward.clear();
         self.clear_listing();
+        self.restore_current_folder_view();
         true
     }
 
@@ -366,9 +505,11 @@ impl BrowserState {
         let Some(path) = self.back.pop() else {
             return false;
         };
+        self.capture_current_folder_view();
         self.forward.push(std::mem::replace(&mut self.path, path));
         keep_newest_history(&mut self.forward);
         self.clear_listing();
+        self.restore_current_folder_view();
         true
     }
 
@@ -376,9 +517,11 @@ impl BrowserState {
         let Some(path) = self.forward.pop() else {
             return false;
         };
+        self.capture_current_folder_view();
         self.back.push(std::mem::replace(&mut self.path, path));
         keep_newest_history(&mut self.back);
         self.clear_listing();
+        self.restore_current_folder_view();
         true
     }
 
@@ -386,12 +529,14 @@ impl BrowserState {
         let Some(actual_index) = self.back.len().checked_sub(index + 1) else {
             return false;
         };
+        self.capture_current_folder_view();
         let mut skipped = self.back.split_off(actual_index);
         let target = skipped.remove(0);
         self.forward.push(std::mem::replace(&mut self.path, target));
         self.forward.extend(skipped.into_iter().rev());
         keep_newest_history(&mut self.forward);
         self.clear_listing();
+        self.restore_current_folder_view();
         true
     }
 
@@ -399,12 +544,14 @@ impl BrowserState {
         let Some(actual_index) = self.forward.len().checked_sub(index + 1) else {
             return false;
         };
+        self.capture_current_folder_view();
         let target = self.forward.remove(actual_index);
         let skipped = self.forward.split_off(actual_index);
         self.back.push(std::mem::replace(&mut self.path, target));
         self.back.extend(skipped.into_iter().rev());
         keep_newest_history(&mut self.back);
         self.clear_listing();
+        self.restore_current_folder_view();
         true
     }
 
@@ -421,8 +568,36 @@ impl BrowserState {
     }
 
     pub fn replace_entries(&mut self, entries: Vec<FileEntry>) {
-        self.entries = entries;
+        self.entries = entries.into_iter().map(Arc::new).collect();
         self.rebuild_visible_entries();
+        if !self.pending_selection.is_empty() {
+            let selection = std::mem::take(&mut self.pending_selection);
+            self.replace_selection(selection);
+        }
+    }
+
+    /// Append a progressive result batch without re-sorting every result seen
+    /// so far. The authoritative completion replaces and sorts the full set.
+    pub fn append_progressive_entries(&mut self, entries: Vec<FileEntry>) {
+        if entries.is_empty() {
+            return;
+        }
+        let normalized_query = self.search_query.to_lowercase();
+        self.entries.reserve(entries.len());
+        self.visible_entries.reserve(entries.len());
+        for entry in entries {
+            let entry = Arc::new(entry);
+            if entry_is_visible(
+                entry.as_ref(),
+                self.show_hidden,
+                self.show_system_files,
+                self.filter,
+                &normalized_query,
+            ) {
+                self.visible_entries.push(Arc::clone(&entry));
+            }
+            self.entries.push(entry);
+        }
     }
 
     pub fn toggle_hidden(&mut self) {
@@ -641,8 +816,62 @@ impl BrowserState {
         self.clear_selection();
     }
 
+    fn capture_current_folder_view(&mut self) {
+        if !self.folder_view_states.contains_key(&self.path)
+            && self.folder_view_states.len() >= MAX_FOLDER_VIEW_STATES
+            && let Some(stale) = self
+                .folder_view_states
+                .keys()
+                .find(|path| path.as_path() != self.path)
+                .cloned()
+        {
+            self.folder_view_states.remove(&stale);
+        }
+        let mut selected = if self.entries.is_empty() && !self.pending_selection.is_empty() {
+            self.pending_selection.clone()
+        } else {
+            self.selected.iter().cloned().collect()
+        };
+        selected.truncate(MAX_STORED_SELECTION);
+        let column_widths = self
+            .column_widths
+            .iter()
+            .take(MAX_COLUMN_WIDTHS)
+            .map(|(key, width)| (key.clone(), *width))
+            .collect();
+        self.folder_view_states.insert(
+            self.path.clone(),
+            FolderViewState {
+                view_mode: self.view_mode,
+                sort_key: self.sort_key.clone(),
+                sort_direction: self.sort_direction,
+                selected,
+                scroll_index: self.scroll_index,
+                grid_min_width: self.grid_min_width,
+                show_preview_panel: self.show_preview_panel,
+                column_widths,
+            },
+        );
+    }
+
+    fn restore_current_folder_view(&mut self) {
+        let Some(state) = self.folder_view_states.get(&self.path).cloned() else {
+            self.pending_selection.clear();
+            self.scroll_index = 0;
+            return;
+        };
+        self.view_mode = state.view_mode;
+        self.sort_key = state.sort_key;
+        self.sort_direction = state.sort_direction;
+        self.pending_selection = state.selected;
+        self.scroll_index = state.scroll_index;
+        self.grid_min_width = state.grid_min_width;
+        self.show_preview_panel = state.show_preview_panel;
+        self.column_widths = state.column_widths;
+    }
+
     fn rebuild_visible_entries(&mut self) {
-        self.visible_entries = filtered_sorted_entries(
+        self.visible_entries = filtered_sorted_entry_refs(
             &self.entries,
             self.show_hidden,
             self.show_system_files,
@@ -674,6 +903,33 @@ impl BrowserState {
     }
 }
 
+fn filtered_sorted_entry_refs(
+    entries: &[Arc<FileEntry>],
+    show_hidden: bool,
+    show_system_files: bool,
+    filter: EntryFilter,
+    sort_key: &SortKey,
+    sort_direction: SortDirection,
+    search_query: &str,
+) -> Vec<Arc<FileEntry>> {
+    let normalized_query = search_query.to_lowercase();
+    let mut visible = entries
+        .iter()
+        .filter(|entry| {
+            entry_is_visible(
+                entry.as_ref(),
+                show_hidden,
+                show_system_files,
+                filter,
+                &normalized_query,
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    sort_entries(&mut visible, sort_key, sort_direction);
+    visible
+}
+
 fn keep_newest_history(history: &mut Vec<PathBuf>) {
     if history.len() > MAX_NAVIGATION_HISTORY {
         history.drain(..history.len() - MAX_NAVIGATION_HISTORY);
@@ -692,45 +948,81 @@ pub fn filtered_sorted_entries(
     let normalized_query = search_query.to_lowercase();
     let mut visible: Vec<_> = entries
         .iter()
-        .filter(|entry| show_hidden || !entry.hidden)
-        .filter(|entry| show_system_files || !is_system_file(entry))
-        .filter(|entry| match filter {
-            EntryFilter::All => true,
-            EntryFilter::Folders => entry.is_dir,
-            EntryFilter::Files => !entry.is_dir,
-        })
         .filter(|entry| {
-            normalized_query.is_empty()
-                || file_name(entry).to_lowercase().contains(&normalized_query)
+            entry_is_visible(
+                entry,
+                show_hidden,
+                show_system_files,
+                filter,
+                &normalized_query,
+            )
         })
         .cloned()
         .collect();
 
-    visible.sort_by(|left, right| {
-        let directory_order = right.is_dir.cmp(&left.is_dir);
-        if directory_order != Ordering::Equal {
-            return directory_order;
-        }
-
-        let order = match sort_key {
-            SortKey::Name => file_name(left)
-                .to_lowercase()
-                .cmp(&file_name(right).to_lowercase()),
-            SortKey::Size => left.size.cmp(&right.size),
-            SortKey::Modified => left.modified.cmp(&right.modified),
-            SortKey::Custom(key) => compare_custom_fields(left, right, key),
-        };
-        let order = match sort_direction {
-            SortDirection::Ascending => order,
-            SortDirection::Descending => order.reverse(),
-        };
-        order.then_with(|| {
-            file_name(left)
-                .to_lowercase()
-                .cmp(&file_name(right).to_lowercase())
-        })
-    });
+    sort_entries(&mut visible, sort_key, sort_direction);
     visible
+}
+
+fn sort_entries<T: Borrow<FileEntry>>(
+    entries: &mut [T],
+    sort_key: &SortKey,
+    sort_direction: SortDirection,
+) {
+    if *sort_key == SortKey::Name {
+        entries.sort_by_cached_key(|entry| file_name(entry.borrow()).to_lowercase());
+        if sort_direction == SortDirection::Descending {
+            entries.reverse();
+        }
+        // This stable partition keeps folders first without recomputing names.
+        entries.sort_by_key(|entry| !entry.borrow().is_dir);
+        return;
+    }
+    entries.sort_by(|left, right| {
+        compare_entries(left.borrow(), right.borrow(), sort_key, sort_direction)
+    });
+}
+
+fn compare_entries(
+    left: &FileEntry,
+    right: &FileEntry,
+    sort_key: &SortKey,
+    sort_direction: SortDirection,
+) -> Ordering {
+    let directory_order = right.is_dir.cmp(&left.is_dir);
+    if directory_order != Ordering::Equal {
+        return directory_order;
+    }
+
+    let order = match sort_key {
+        SortKey::Name => file_name(left).cmp(&file_name(right)),
+        SortKey::Size => left.size.cmp(&right.size),
+        SortKey::Modified => left.modified.cmp(&right.modified),
+        SortKey::Custom(key) => compare_custom_fields(left, right, key),
+    };
+    let order = match sort_direction {
+        SortDirection::Ascending => order,
+        SortDirection::Descending => order.reverse(),
+    };
+    order.then_with(|| file_name(left).cmp(&file_name(right)))
+}
+
+fn entry_is_visible(
+    entry: &FileEntry,
+    show_hidden: bool,
+    show_system_files: bool,
+    filter: EntryFilter,
+    normalized_query: &str,
+) -> bool {
+    (show_hidden || !entry.hidden)
+        && (show_system_files || !is_system_file(entry))
+        && match filter {
+            EntryFilter::All => true,
+            EntryFilter::Folders => entry.is_dir,
+            EntryFilter::Files => !entry.is_dir,
+        }
+        && (normalized_query.is_empty()
+            || file_name(entry).to_lowercase().contains(normalized_query))
 }
 
 const CUSTOM_COLUMN_SCAN_LIMIT: usize = 500;
@@ -954,7 +1246,7 @@ mod tests {
             state
                 .visible_entries()
                 .iter()
-                .map(file_name)
+                .map(|entry| file_name(entry))
                 .collect::<Vec<_>>(),
             ["low.txt", "high.txt", "missing.txt"]
         );
@@ -963,7 +1255,7 @@ mod tests {
             state
                 .visible_entries()
                 .iter()
-                .map(file_name)
+                .map(|entry| file_name(entry))
                 .collect::<Vec<_>>(),
             ["missing.txt", "high.txt", "low.txt"]
         );

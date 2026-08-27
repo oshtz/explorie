@@ -89,6 +89,31 @@ jobs:
       - name: Build GPUI macOS application
         run: cargo build -p explorie-gpui --release --locked
 
+  test-rust-unix-safety:
+    name: Unix Safety Regression Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './ -> target'
+
+      - name: Install Linux native dependencies
+        run: sudo apt-get update && sudo apt-get install --yes libasound2-dev pkg-config
+
+      - name: Test real RAR extraction safety
+        run: cargo test -p explorie-core real_rar_fixture_extracts_and_enforces_budget_and_cancellation
+
+      - name: Test Unix journal and helper lifecycle safety
+        run: cargo test -p explorie-native-services unix_
+
   lint:
     name: Native Lint & Release Contracts
     runs-on: windows-latest

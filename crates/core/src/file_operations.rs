@@ -56,6 +56,32 @@ pub struct FileOperationResult {
     pub processed_entries: u64,
     pub processed_bytes: u64,
     pub targets: Vec<PathBuf>,
+    pub target_snapshots: Vec<FileTreeSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileTreeSnapshot {
+    entries: Vec<FileTreeEntrySnapshot>,
+}
+
+impl FileTreeSnapshot {
+    pub fn estimated_bytes(&self) -> usize {
+        self.entries.iter().fold(0, |total, entry| {
+            total
+                .saturating_add(std::mem::size_of::<FileTreeEntrySnapshot>())
+                .saturating_add(entry.relative.as_os_str().to_string_lossy().len())
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FileTreeEntrySnapshot {
+    relative: PathBuf,
+    is_directory: bool,
+    len: u64,
+    modified: Option<(u64, u32)>,
 }
 
 #[derive(Debug)]
@@ -183,9 +209,15 @@ pub fn perform_file_operation_report(
     tracker.emit(None);
 
     let mut targets = Vec::with_capacity(plans.len());
+    let mut target_snapshots = Vec::with_capacity(plans.len());
     for plan in &plans {
         if let Err(error) = check_cancelled(cancelled) {
-            return Err(tracked_operation_failure(error, &tracker, targets));
+            return Err(tracked_operation_failure(
+                error,
+                &tracker,
+                targets,
+                target_snapshots,
+            ));
         }
         let Some(file_name) = plan.source.file_name() else {
             return Err(tracked_operation_failure(
@@ -198,16 +230,31 @@ pub fn perform_file_operation_report(
                 ),
                 &tracker,
                 targets,
+                target_snapshots,
             ));
         };
         let requested_target = destination.join(file_name);
         let target = match resolve_target(&requested_target, request.conflict_policy) {
             Ok(target) => target,
-            Err(error) => return Err(tracked_operation_failure(error, &tracker, targets)),
+            Err(error) => {
+                return Err(tracked_operation_failure(
+                    error,
+                    &tracker,
+                    targets,
+                    target_snapshots,
+                ));
+            }
         };
         let same = match same_path(&plan.canonical, &target) {
             Ok(same) => same,
-            Err(error) => return Err(tracked_operation_failure(error, &tracker, targets)),
+            Err(error) => {
+                return Err(tracked_operation_failure(
+                    error,
+                    &tracker,
+                    targets,
+                    target_snapshots,
+                ));
+            }
         };
         if same {
             return Err(tracked_operation_failure(
@@ -217,6 +264,7 @@ pub fn perform_file_operation_report(
                 ),
                 &tracker,
                 targets,
+                target_snapshots,
             ));
         }
 
@@ -238,8 +286,14 @@ pub fn perform_file_operation_report(
             FileOperationKind::Trash => unreachable!(),
         };
         if let Err(error) = result {
-            return Err(tracked_operation_failure(error, &tracker, targets));
+            return Err(tracked_operation_failure(
+                error,
+                &tracker,
+                targets,
+                target_snapshots,
+            ));
         }
+        target_snapshots.push(file_tree_snapshot(plan));
         targets.push(target);
     }
 
@@ -248,6 +302,7 @@ pub fn perform_file_operation_report(
         processed_entries: tracker.progress.processed_entries,
         processed_bytes: tracker.progress.processed_bytes,
         targets,
+        target_snapshots,
     })
 }
 
@@ -258,6 +313,7 @@ fn empty_operation_failure(error: io::Error) -> FileOperationFailure {
             processed_entries: 0,
             processed_bytes: 0,
             targets: Vec::new(),
+            target_snapshots: Vec::new(),
         },
     }
 }
@@ -266,6 +322,7 @@ fn tracked_operation_failure<F: FnMut(FileOperationProgress)>(
     error: io::Error,
     tracker: &ProgressTracker<'_, F>,
     targets: Vec<PathBuf>,
+    target_snapshots: Vec<FileTreeSnapshot>,
 ) -> FileOperationFailure {
     FileOperationFailure {
         error,
@@ -273,6 +330,7 @@ fn tracked_operation_failure<F: FnMut(FileOperationProgress)>(
             processed_entries: tracker.progress.processed_entries,
             processed_bytes: tracker.progress.processed_bytes,
             targets,
+            target_snapshots,
         },
     }
 }
@@ -319,7 +377,30 @@ fn trash_sources(
         processed_entries: total_entries,
         processed_bytes: total_bytes,
         targets: Vec::new(),
+        target_snapshots: Vec::new(),
     })
+}
+
+fn file_tree_snapshot(plan: &SourcePlan) -> FileTreeSnapshot {
+    FileTreeSnapshot {
+        entries: plan
+            .entries
+            .iter()
+            .map(|entry| FileTreeEntrySnapshot {
+                relative: entry.relative.clone(),
+                is_directory: entry.kind == PlannedKind::Directory,
+                len: entry.len,
+                modified: entry
+                    .modified
+                    .and_then(|modified| modified.duration_since(SystemTime::UNIX_EPOCH).ok())
+                    .map(|duration| (duration.as_secs(), duration.subsec_nanos())),
+            })
+            .collect(),
+    }
+}
+
+pub fn path_matches_snapshot(path: &Path, expected: &FileTreeSnapshot) -> io::Result<bool> {
+    Ok(file_tree_snapshot(&plan_source(path)?) == *expected)
 }
 
 fn plan_source(source: &Path) -> io::Result<SourcePlan> {
@@ -1471,6 +1552,13 @@ mod tests {
                 .unwrap(),
             modified
         );
+        assert!(path_matches_snapshot(&result.targets[0], &result.target_snapshots[0]).unwrap());
+        fs::write(
+            destination.join("source/nested/data.txt"),
+            b"changed contents",
+        )
+        .unwrap();
+        assert!(!path_matches_snapshot(&result.targets[0], &result.target_snapshots[0]).unwrap());
     }
 
     #[test]
@@ -1498,6 +1586,7 @@ mod tests {
             failure.partial_result.targets,
             vec![destination.join("first.txt")]
         );
+        assert_eq!(failure.partial_result.target_snapshots.len(), 1);
         assert_eq!(fs::read(destination.join("first.txt")).unwrap(), b"first");
         assert_eq!(
             fs::read(destination.join("second.txt")).unwrap(),

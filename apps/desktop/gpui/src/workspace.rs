@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{EntryFilter, SortDirection, SortKey, ViewMode};
 
-const WORKSPACE_VERSION: u32 = 1;
+const WORKSPACE_VERSION: u32 = 2;
 const WORKSPACE_FILE: &str = "workspaces-v1.json";
 const MAX_WORKSPACES: usize = 1_000;
 const MAX_TABS: usize = 100;
@@ -481,14 +481,33 @@ impl WorkspaceStore {
         let path = config_dir.join(WORKSPACE_FILE);
         let mut save_initial = false;
         let (state, warning) = match fs::read(&path) {
-            Ok(bytes) => match serde_json::from_slice::<WorkspaceState>(&bytes)
-                .map_err(|error| error.to_string())
-                .and_then(WorkspaceState::validate)
-            {
-                Ok(state) => (state, None),
+            Ok(bytes) => match decode_workspaces(&bytes) {
+                Ok((state, false)) => (state, None),
+                Ok((state, true)) => {
+                    let backup = migration_copy_path(&path, 1);
+                    match fs::copy(&path, &backup) {
+                        Ok(_) => {
+                            save_initial = true;
+                            (
+                                state,
+                                Some(format!(
+                                    "Workspaces were migrated to schema v{WORKSPACE_VERSION}; the v1 source was preserved at {}",
+                                    backup.display()
+                                )),
+                            )
+                        }
+                        Err(error) => (
+                            state,
+                            Some(format!(
+                                "Workspaces are using the v{WORKSPACE_VERSION} schema in memory, but the v1 backup could not be created ({error}); the source file was left unchanged"
+                            )),
+                        ),
+                    }
+                }
                 Err(error) => {
                     let backup = preserved_copy_path(&path);
-                    let warning = match fs::copy(&path, &backup) {
+                    let preservation = fs::copy(&path, &backup);
+                    let warning = match &preservation {
                         Ok(_) => format!(
                             "Workspace recovery used an empty collection; the invalid file was preserved at {}: {error}",
                             backup.display()
@@ -497,7 +516,7 @@ impl WorkspaceStore {
                             "Workspace recovery used an empty collection; preserving the invalid file failed ({copy_error}): {error}"
                         ),
                     };
-                    save_initial = true;
+                    save_initial = preservation.is_ok();
                     (WorkspaceState::empty(), Some(warning))
                 }
             },
@@ -592,6 +611,40 @@ impl WorkspaceStore {
     }
 }
 
+fn decode_workspaces(bytes: &[u8]) -> Result<(WorkspaceState, bool), String> {
+    let mut value =
+        serde_json::from_slice::<serde_json::Value>(bytes).map_err(|error| error.to_string())?;
+    let version = value
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "workspace version is missing or invalid".to_string())?;
+    let migrated = match version {
+        1 => {
+            value["version"] = serde_json::Value::from(WORKSPACE_VERSION);
+            true
+        }
+        version if version == u64::from(WORKSPACE_VERSION) => false,
+        version => {
+            return Err(format!(
+                "unsupported workspace version {version}; expected 1 or {WORKSPACE_VERSION}"
+            ));
+        }
+    };
+    serde_json::from_value::<WorkspaceState>(value)
+        .map_err(|error| error.to_string())
+        .and_then(WorkspaceState::validate)
+        .map(|state| (state, migrated))
+}
+
+fn migration_copy_path(path: &Path, version: u32) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = path
+        .file_stem()
+        .unwrap_or(path.as_os_str())
+        .to_string_lossy();
+    parent.join(format!("{stem}.pre-migration-v{version}.json"))
+}
+
 impl Drop for WorkspaceStore {
     fn drop(&mut self) {
         self.flush();
@@ -641,7 +694,11 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
 
 #[cfg(not(windows))]
 fn replace_file(temp: &Path, destination: &Path) -> io::Result<()> {
-    fs::rename(temp, destination)
+    fs::rename(temp, destination)?;
+    File::open(destination.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "workspace path has no parent")
+    })?)?
+    .sync_all()
 }
 
 #[cfg(windows)]

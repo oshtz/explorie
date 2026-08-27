@@ -5,13 +5,14 @@ use std::num::{NonZeroU16, NonZeroU32};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use rodio::{DeviceSinkBuilder, Player, buffer::SamplesBuffer};
 use serde_json::Value;
 
+use crate::process::{ProcessError, run_with_timeout};
 use crate::{BlockingTask, ErrorCode, ServiceContext, ServiceError, ServiceResult};
 
 const FRAME_RATE: u64 = 15;
@@ -23,6 +24,10 @@ const AUDIO_SAMPLE_RATE: u32 = 48_000;
 const AUDIO_CHUNK_FRAMES: usize = 4_800;
 const MAX_QUEUED_AUDIO_CHUNKS: usize = 8;
 const DEFAULT_VOLUME: f32 = 0.8;
+const TOOL_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+const FRAME_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_PROBE_OUTPUT: usize = 1024 * 1024;
 
 /// One decoded BGRA frame. The byte buffer is reference-counted so polling
 /// never duplicates the multi-megabyte payload between the service and GPUI.
@@ -138,7 +143,7 @@ impl DecoderSession {
             "fps={FRAME_RATE},scale={}:{}",
             metadata.frame_width, metadata.frame_height
         );
-        let mut video_child = Command::new(ffmpeg)
+        let mut video_child = helper_command(ffmpeg)
             .args(["-nostdin", "-v", "error", "-ss", &seek, "-i"])
             .arg(path)
             .args([
@@ -184,7 +189,7 @@ impl DecoderSession {
             output.log_on_drop(false);
             let output_player = Arc::new(Player::connect_new(output.mixer()));
             output_player.set_volume(volume);
-            let child = Command::new(ffmpeg)
+            let child = helper_command(ffmpeg)
                 .args(["-nostdin", "-v", "error", "-ss", &seek, "-i"])
                 .arg(path)
                 .args([
@@ -542,6 +547,59 @@ pub struct VideoService {
     backend: Arc<dyn VideoBackend>,
     active: Arc<Mutex<Option<Arc<dyn VideoPlayback>>>>,
     generation: Arc<AtomicU64>,
+    command_sequence: Arc<CommandSequence>,
+}
+
+#[derive(Default)]
+struct CommandSequence {
+    next: AtomicU64,
+    serving: Mutex<u64>,
+    ready: Condvar,
+}
+
+impl CommandSequence {
+    fn issue(self: &Arc<Self>) -> CommandTurn {
+        CommandTurn {
+            sequence: Arc::clone(self),
+            ticket: self.next.fetch_add(1, Ordering::AcqRel),
+        }
+    }
+}
+
+struct CommandTurn {
+    sequence: Arc<CommandSequence>,
+    ticket: u64,
+}
+
+impl CommandTurn {
+    fn wait(&self) {
+        let mut serving = self
+            .sequence
+            .serving
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *serving != self.ticket {
+            serving = self
+                .sequence
+                .ready
+                .wait(serving)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+}
+
+impl Drop for CommandTurn {
+    fn drop(&mut self) {
+        let mut serving = self
+            .sequence
+            .serving
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *serving == self.ticket {
+            *serving = serving.wrapping_add(1);
+            self.sequence.ready.notify_all();
+        }
+    }
 }
 
 impl VideoService {
@@ -555,6 +613,19 @@ impl VideoService {
             backend,
             active: Arc::new(Mutex::new(None)),
             generation: Arc::new(AtomicU64::new(0)),
+            command_sequence: Arc::new(CommandSequence::default()),
+        }
+    }
+
+    /// Reuse the process-wide decoder backend while keeping playback,
+    /// sequencing, and cancellation state private to one window.
+    pub fn fork_playback_scope(&self) -> Self {
+        Self {
+            context: self.context.clone(),
+            backend: Arc::clone(&self.backend),
+            active: Arc::new(Mutex::new(None)),
+            generation: Arc::new(AtomicU64::new(0)),
+            command_sequence: Arc::new(CommandSequence::default()),
         }
     }
 
@@ -567,8 +638,13 @@ impl VideoService {
         let backend = Arc::clone(&self.backend);
         let active = Arc::clone(&self.active);
         let current_generation = Arc::clone(&self.generation);
+        let turn = self.command_sequence.issue();
         self.context.spawn_blocking(move || {
+            turn.wait();
             let playback = backend.open(&path)?;
+            let mut active = active
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if current_generation.load(Ordering::Acquire) != generation {
                 playback.stop();
                 return Err(ServiceError::new(
@@ -577,9 +653,7 @@ impl VideoService {
                 ));
             }
             let status = playback.status();
-            *active
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(playback);
+            *active = Some(playback);
             Ok(status)
         })
     }
@@ -617,8 +691,35 @@ impl VideoService {
         &self,
         operation: impl FnOnce(Arc<dyn VideoPlayback>) -> ServiceResult<VideoStatus> + Send + 'static,
     ) -> BlockingTask<VideoStatus> {
-        let active = self.active();
-        self.context.spawn_blocking(move || operation(active?))
+        let active = Arc::clone(&self.active);
+        let generation = Arc::clone(&self.generation);
+        let expected_generation = generation.load(Ordering::Acquire);
+        let turn = self.command_sequence.issue();
+        self.context.spawn_blocking(move || {
+            turn.wait();
+            let playback = {
+                let active = active
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if generation.load(Ordering::Acquire) != expected_generation {
+                    return Err(ServiceError::new(
+                        ErrorCode::Cancelled,
+                        "Video command was superseded",
+                    ));
+                }
+                active.clone().ok_or_else(|| {
+                    ServiceError::new(ErrorCode::InvalidInput, "No video preview is active")
+                })?
+            };
+            let result = operation(playback)?;
+            if generation.load(Ordering::Acquire) != expected_generation {
+                return Err(ServiceError::new(
+                    ErrorCode::Cancelled,
+                    "Video command was superseded",
+                ));
+            }
+            Ok(result)
+        })
     }
 
     fn active(&self) -> ServiceResult<Arc<dyn VideoPlayback>> {
@@ -686,38 +787,54 @@ fn validate_video_path(path: &Path) -> ServiceResult<()> {
 }
 
 fn available_tool(name: &str) -> Option<PathBuf> {
-    Command::new(name)
-        .arg("-version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .ok()?
-        .success()
-        .then(|| PathBuf::from(name))
+    run_with_timeout(
+        helper_command(name).arg("-version"),
+        TOOL_CHECK_TIMEOUT,
+        0,
+        0,
+    )
+    .ok()?
+    .status
+    .success()
+    .then(|| PathBuf::from(name))
 }
 
 fn probe_video(path: &Path, ffprobe: &Path) -> ServiceResult<VideoMetadata> {
-    let output = Command::new(ffprobe)
-        .args([
-            "-v",
-            "error",
-            "-show_entries",
-            "stream=codec_type,width,height:format=duration",
-            "-of",
-            "json",
-        ])
-        .arg(path)
-        .output()
-        .map_err(|error| {
-            ServiceError::new(
-                ErrorCode::HelperMissing,
-                format!("Unable to start ffprobe: {error}"),
-            )
-        })?;
+    let output = run_with_timeout(
+        helper_command(ffprobe)
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=codec_type,width,height:format=duration",
+                "-of",
+                "json",
+            ])
+            .arg(path),
+        PROBE_TIMEOUT,
+        MAX_PROBE_OUTPUT,
+        0,
+    )
+    .map_err(|error| match error {
+        ProcessError::Io(error) => ServiceError::new(
+            ErrorCode::HelperMissing,
+            format!("Unable to start ffprobe: {error}"),
+        ),
+        ProcessError::TimedOut => ServiceError::new(
+            ErrorCode::InvalidInput,
+            "FFmpeg timed out while inspecting this video.",
+        ),
+    })?;
     if !output.status.success() {
         return Err(ServiceError::new(
             ErrorCode::InvalidInput,
             "FFmpeg could not inspect this video.",
+        ));
+    }
+    if output.stdout_truncated {
+        return Err(ServiceError::new(
+            ErrorCode::InvalidInput,
+            "ffprobe returned more metadata than Explorie can safely process.",
         ));
     }
     let value: Value = serde_json::from_slice(&output.stdout).map_err(|error| {
@@ -784,34 +901,42 @@ fn extract_frame(
 ) -> ServiceResult<VideoFrame> {
     let seek = ffmpeg_time(position_ms);
     let scale = format!("scale={}:{}", metadata.frame_width, metadata.frame_height);
-    let output = Command::new(ffmpeg)
-        .args(["-nostdin", "-v", "error", "-ss", &seek, "-i"])
-        .arg(path)
-        .args([
-            "-map",
-            "0:v:0",
-            "-frames:v",
-            "1",
-            "-vf",
-            &scale,
-            "-pix_fmt",
-            "bgra",
-            "-f",
-            "rawvideo",
-            "pipe:1",
-        ])
-        .output()
-        .map_err(|error| {
-            ServiceError::new(
-                ErrorCode::HelperMissing,
-                format!("Unable to start FFmpeg frame decoder: {error}"),
-            )
-        })?;
     let expected =
         frame_byte_len(metadata.frame_width, metadata.frame_height).ok_or_else(|| {
             ServiceError::new(ErrorCode::InvalidInput, "Decoded video frame is too large")
         })?;
-    if !output.status.success() || output.stdout.len() != expected {
+    let output = run_with_timeout(
+        helper_command(ffmpeg)
+            .args(["-nostdin", "-v", "error", "-ss", &seek, "-i"])
+            .arg(path)
+            .args([
+                "-map",
+                "0:v:0",
+                "-frames:v",
+                "1",
+                "-vf",
+                &scale,
+                "-pix_fmt",
+                "bgra",
+                "-f",
+                "rawvideo",
+                "pipe:1",
+            ]),
+        FRAME_TIMEOUT,
+        expected.saturating_add(1),
+        0,
+    )
+    .map_err(|error| match error {
+        ProcessError::Io(error) => ServiceError::new(
+            ErrorCode::HelperMissing,
+            format!("Unable to start FFmpeg frame decoder: {error}"),
+        ),
+        ProcessError::TimedOut => ServiceError::new(
+            ErrorCode::InvalidInput,
+            "FFmpeg timed out while decoding this video frame.",
+        ),
+    })?;
+    if !output.status.success() || output.stdout_truncated || output.stdout.len() != expected {
         return Err(ServiceError::new(
             ErrorCode::InvalidInput,
             "FFmpeg could not decode a frame from this video.",
@@ -836,6 +961,16 @@ fn ffmpeg_time(position_ms: u64) -> String {
     format!("{}.{:03}", position_ms / 1_000, position_ms % 1_000)
 }
 
+fn helper_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut command = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    command
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -846,6 +981,8 @@ mod tests {
         status: Mutex<VideoStatus>,
         frame: Mutex<Option<VideoFrame>>,
         stopped: AtomicBool,
+        operations: Mutex<Vec<String>>,
+        seek_delay_ms: AtomicU64,
     }
 
     impl FakePlayback {
@@ -869,6 +1006,8 @@ mod tests {
                     bgra: vec![0; 16].into(),
                 })),
                 stopped: AtomicBool::new(false),
+                operations: Mutex::new(Vec::new()),
+                seek_delay_ms: AtomicU64::new(0),
             }
         }
     }
@@ -883,6 +1022,7 @@ mod tests {
         }
 
         fn play(&self) -> ServiceResult<VideoStatus> {
+            self.operations.lock().unwrap().push("play".to_string());
             let mut status = self.status.lock().unwrap();
             status.playing = true;
             status.finished = false;
@@ -890,12 +1030,21 @@ mod tests {
         }
 
         fn pause(&self) -> ServiceResult<VideoStatus> {
+            self.operations.lock().unwrap().push("pause".to_string());
             let mut status = self.status.lock().unwrap();
             status.playing = false;
             Ok(status.clone())
         }
 
         fn seek(&self, position: Duration) -> ServiceResult<VideoStatus> {
+            self.operations
+                .lock()
+                .unwrap()
+                .push(format!("seek:{}", position.as_millis()));
+            let delay = self.seek_delay_ms.load(Ordering::Acquire);
+            if delay > 0 {
+                thread::sleep(Duration::from_millis(delay));
+            }
             let mut status = self.status.lock().unwrap();
             status.position_ms = u64::try_from(position.as_millis()).unwrap();
             Ok(status.clone())
@@ -923,6 +1072,23 @@ mod tests {
             self.opened.lock().unwrap().push(Arc::clone(&playback));
             Ok(playback)
         }
+    }
+
+    #[test]
+    fn playback_forks_share_the_backend_but_not_window_state() {
+        let root = tempdir().unwrap();
+        let service = VideoService::with_backend(
+            ServiceContext::new(crate::ResourcePaths::test(root.path())),
+            Arc::new(FakeBackend::default()),
+        );
+        let fork = service.fork_playback_scope();
+        assert!(Arc::ptr_eq(&service.backend, &fork.backend));
+        assert!(!Arc::ptr_eq(&service.active, &fork.active));
+        assert!(!Arc::ptr_eq(&service.generation, &fork.generation));
+        assert!(!Arc::ptr_eq(
+            &service.command_sequence,
+            &fork.command_sequence
+        ));
     }
 
     #[test]
@@ -954,6 +1120,33 @@ mod tests {
                 .load(Ordering::Acquire)
         );
         assert_eq!(service.status().unwrap_err().code, ErrorCode::InvalidInput);
+    }
+
+    #[test]
+    fn asynchronous_video_commands_execute_in_submission_order() {
+        let root = tempdir().unwrap();
+        let backend = Arc::new(FakeBackend::default());
+        let service = VideoService::with_backend(
+            ServiceContext::new(crate::ResourcePaths::test(root.path())),
+            backend.clone(),
+        );
+        let path = root.path().join("ordered.mp4");
+        fs::write(&path, b"fixture").unwrap();
+        pollster::block_on(service.load(path)).unwrap();
+        let playback = backend.opened.lock().unwrap()[0].clone();
+        playback.seek_delay_ms.store(100, Ordering::Release);
+
+        let seek = service.seek(400);
+        let pause = service.pause();
+        let play = service.play();
+        pollster::block_on(seek).unwrap();
+        pollster::block_on(pause).unwrap();
+        pollster::block_on(play).unwrap();
+
+        assert_eq!(
+            *playback.operations.lock().unwrap(),
+            ["seek:400", "pause", "play"]
+        );
     }
 
     #[test]
