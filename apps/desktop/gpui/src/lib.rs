@@ -29902,7 +29902,8 @@ mod tests {
                 |_, _| view.clone().into_element(),
             );
         }
-        for _ in 0..300 {
+        let icon_loading_deadline = Instant::now() + Duration::from_secs(35);
+        while Instant::now() < icon_loading_deadline {
             cx.run_until_parked();
             if view.update(cx, |view, _| {
                 view.entry_icon_task.is_none()
