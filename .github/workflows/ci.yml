@@ -84,7 +84,9 @@ jobs:
           workspaces: './ -> target'
 
       - name: Test GPUI-native application on macOS
-        run: cargo test -p explorie-core -p explorie-native-services -p explorie-ffmpeg-wrapper -p explorie-cli -p explorie-gpui
+        run: |
+          cargo test -p explorie-core -p explorie-native-services -p explorie-ffmpeg-wrapper -p explorie-cli
+          cargo test -p explorie-gpui -- --test-threads=1
 
       - name: Build GPUI macOS application
         run: cargo build -p explorie-gpui --release --locked
