@@ -41,8 +41,16 @@ jobs:
           node scripts/prepare-rclone.mjs
           node scripts/prepare-winfsp.mjs
 
-      - name: Run GPUI-native tests with coverage
-        run: cargo llvm-cov --all-features --lcov --output-path lcov.info -p explorie-core -p explorie-native-services -p explorie-ffmpeg-wrapper -p explorie-cli -p explorie-gpui
+      - name: Run native service tests with coverage
+        run: |
+          cargo llvm-cov clean --workspace
+          cargo llvm-cov --all-features --no-report -p explorie-core -p explorie-native-services -p explorie-ffmpeg-wrapper -p explorie-cli
+
+      - name: Run GPUI tests serially with coverage
+        run: cargo llvm-cov --all-features --no-report -p explorie-gpui -- --test-threads=1
+
+      - name: Generate coverage report
+        run: cargo llvm-cov report --lcov --output-path lcov.info
 
       - name: Build GPUI Windows release
         run: cargo build -p explorie-gpui --release --locked
