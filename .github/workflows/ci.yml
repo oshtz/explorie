@@ -14,41 +14,10 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
 jobs:
-  test-rust:
-    name: Rust Tests & Windows Build
-    runs-on: windows-latest
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-
-      - name: Rust cache
-        uses: swatinem/rust-cache@v2
-        with:
-          workspaces: './ -> target'
-
-      - name: Prepare native dependencies
-        run: |
-          node scripts/prepare-rclone.mjs
-          node scripts/prepare-winfsp.mjs
-
-      - name: Run Windows tests serially
-        run: cargo test --workspace --all-features --no-fail-fast -- --test-threads=1
-
-      - name: Build GPUI Windows release
-        run: cargo build -p explorie-gpui --release --locked
-
-      - name: Smoke test GPUI Windows release
-        run: pwsh -NoProfile -File scripts/smoke-gpui-release.ps1
-
   coverage-rust:
     name: Rust Coverage
     runs-on: windows-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout repository
@@ -145,8 +114,9 @@ jobs:
         run: cargo test -p explorie-native-services unix_
 
   lint:
-    name: Native Lint & Release Contracts
+    name: Windows Tests, Lint & Release Contracts
     runs-on: windows-latest
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repository
@@ -161,7 +131,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '24'
           cache: 'pnpm'
           cache-dependency-path: pnpm-lock.yaml
 
@@ -170,6 +140,11 @@ jobs:
         with:
           toolchain: stable
           components: clippy, rustfmt
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './ -> target'
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -185,8 +160,24 @@ jobs:
       - name: GPUI-native Rust clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+      - name: Test native Rust crates on Windows
+        timeout-minutes: 15
+        run: cargo test -p explorie-core -p explorie-native-services -p explorie-ffmpeg-wrapper -p explorie-cli --no-fail-fast -- --test-threads=1
+
+      - name: Test GPUI application on Windows
+        timeout-minutes: 15
+        run: cargo test -p explorie-gpui -- --test-threads=1
+
       - name: Release workflow tests
         run: pnpm release:check:test
+
+      - name: Build GPUI Windows release
+        timeout-minutes: 20
+        run: cargo build -p explorie-gpui --release --locked
+
+      - name: Smoke test GPUI Windows release
+        timeout-minutes: 5
+        run: pwsh -NoProfile -File scripts/smoke-gpui-release.ps1
 
   security:
     name: Security Audit

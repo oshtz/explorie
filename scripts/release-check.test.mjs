@@ -399,10 +399,17 @@ test('workflows block audits and publish the exact attested draft assets', async
   assert.doesNotMatch(ci, /audit[^\n]*\|\| true/);
   assert.match(ci, /corepack pnpm@11\.13\.0 audit --audit-level=moderate/);
   assert.match(ci, /name: Security Audit[\s\S]*?node-version: '24'/);
-  assert.match(ci, /name: Rust Tests & Windows Build[\s\S]*?runs-on: windows-latest/);
   assert.match(
     ci,
-    /Run Windows tests serially[\s\S]*?cargo test --workspace --all-features --no-fail-fast -- --test-threads=1/
+    /name: Windows Tests, Lint & Release Contracts[\s\S]*?runs-on: windows-latest[\s\S]*?timeout-minutes: 45/
+  );
+  assert.match(
+    ci,
+    /Test native Rust crates on Windows[\s\S]*?timeout-minutes: 15[\s\S]*?cargo test -p explorie-core -p explorie-native-services -p explorie-ffmpeg-wrapper -p explorie-cli --no-fail-fast -- --test-threads=1/
+  );
+  assert.match(
+    ci,
+    /Test GPUI application on Windows[\s\S]*?timeout-minutes: 15[\s\S]*?cargo test -p explorie-gpui -- --test-threads=1/
   );
   assert.match(ci, /name: Rust Coverage[\s\S]*?runs-on: windows-latest/);
   assert.match(
@@ -437,8 +444,7 @@ test('workflows block audits and publish the exact attested draft assets', async
     /Build GPUI macOS application[\s\S]*?cargo build -p explorie-gpui --release --locked/
   );
   assert.doesNotMatch(ci, /tauri build/);
-  assert.match(ci, /name: Native Lint & Release Contracts[\s\S]*?runs-on: windows-latest/);
-  assert.equal((ci.match(/name: Prepare native dependencies/g) ?? []).length, 3);
+  assert.equal((ci.match(/name: Prepare native dependencies/g) ?? []).length, 2);
   assert.doesNotMatch(ci, /rclone-x86_64-unknown-linux-gnu/);
   assert.match(release, /gh release create/);
   assert.match(release, /run: pnpm release:check/);
