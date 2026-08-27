@@ -134,7 +134,7 @@ impl WorkspaceState {
         };
         self.workspaces.push(workspace);
         self.workspaces
-            .sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+            .sort_by_key(|workspace| std::cmp::Reverse(workspace.updated_at));
         self.workspaces.truncate(MAX_WORKSPACES);
         self.last_workspace_id = Some(id.clone());
         Ok(id)
@@ -150,7 +150,7 @@ impl WorkspaceState {
         workspace.name = name;
         workspace.updated_at = unix_ms();
         self.workspaces
-            .sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+            .sort_by_key(|workspace| std::cmp::Reverse(workspace.updated_at));
         Ok(())
     }
 
@@ -212,7 +212,7 @@ impl WorkspaceState {
             return Err("no valid workspaces found".to_string());
         }
         self.workspaces
-            .sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+            .sort_by_key(|workspace| std::cmp::Reverse(workspace.updated_at));
         Ok(imported)
     }
 
@@ -234,7 +234,7 @@ impl WorkspaceState {
             }
         }
         self.workspaces
-            .sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+            .sort_by_key(|workspace| std::cmp::Reverse(workspace.updated_at));
         if self
             .last_workspace_id
             .as_deref()
@@ -337,7 +337,7 @@ fn import_legacy(values: &BTreeMap<String, String>) -> Result<Option<WorkspaceSt
             workspaces.push(workspace);
         }
     }
-    workspaces.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    workspaces.sort_by_key(|workspace| std::cmp::Reverse(workspace.updated_at));
     let last_workspace_id = values
         .get("explorie:lastWorkspaceId")
         .filter(|id| workspaces.iter().any(|workspace| &workspace.id == *id))
