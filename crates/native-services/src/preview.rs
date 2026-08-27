@@ -2203,7 +2203,7 @@ mod tests {
             .unwrap();
         let stopped = (0..100).any(|_| {
             let alive = unsafe { libc::kill(descendant_pid, 0) } == 0
-                || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+                || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
             if alive {
                 std::thread::sleep(Duration::from_millis(10));
             }
