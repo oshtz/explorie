@@ -569,7 +569,7 @@ fn parse_image_magick_iptc_text(bytes: &[u8]) -> Option<ImageMetadata> {
         return None;
     }
     let mut raw = Vec::with_capacity(hex.len() / 2);
-    for pair in hex.as_bytes().chunks_exact(2) {
+    for pair in hex.as_bytes().as_chunks::<2>().0 {
         raw.push(u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?);
     }
     Some(parse_iptc(&raw))

@@ -288,8 +288,10 @@ fn read_audio_samples(mut stdout: impl Read, player: Arc<Player>, stop: Arc<Atom
             break;
         }
         let samples = bytes[..sample_bytes]
-            .chunks_exact(size_of::<f32>())
-            .map(|sample| f32::from_le_bytes(sample.try_into().expect("four-byte chunk")))
+            .as_chunks::<{ size_of::<f32>() }>()
+            .0
+            .iter()
+            .map(|sample| f32::from_le_bytes(*sample))
             .collect::<Vec<_>>();
         player.append(SamplesBuffer::new(channels, sample_rate, samples));
     }

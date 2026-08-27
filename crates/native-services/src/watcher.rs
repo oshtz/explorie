@@ -411,10 +411,7 @@ fn coalescing_worker(
         bound_changed_paths(&mut changed, &watched_paths);
 
         let deadline = Instant::now() + COALESCE_DELAY;
-        loop {
-            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                break;
-            };
+        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
             let Ok(next) = receiver.recv_timeout(remaining) else {
                 break;
             };

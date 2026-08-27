@@ -88,10 +88,7 @@ fn capture(mut reader: impl Read, limit: usize) -> CapturedOutput {
     let mut bytes = Vec::with_capacity(limit.min(64 * 1024));
     let mut truncated = false;
     let mut buffer = [0_u8; 8 * 1024];
-    loop {
-        let Ok(count) = reader.read(&mut buffer) else {
-            break;
-        };
+    while let Ok(count) = reader.read(&mut buffer) {
         if count == 0 {
             break;
         }
