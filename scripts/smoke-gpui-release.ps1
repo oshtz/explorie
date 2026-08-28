@@ -2,6 +2,7 @@
 param(
     [string]$Executable,
     [string]$BrowsePath,
+    [string]$ProfilePath,
     [int]$TimeoutSeconds = 25,
     [switch]$KeepProfile
 )
@@ -79,7 +80,14 @@ if (-not $smokeRoot.StartsWith($tempPrefix, [StringComparison]::OrdinalIgnoreCas
     throw "Smoke profile escaped the temporary directory: $smokeRoot"
 }
 
-$profile = Join-Path $smokeRoot 'profile'
+$profile = if ([string]::IsNullOrWhiteSpace($ProfilePath)) {
+    Join-Path $smokeRoot 'profile'
+} else {
+    [IO.Path]::GetFullPath($ProfilePath)
+}
+if (-not $profile.StartsWith($tempPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "Smoke profile escaped the temporary directory: $profile"
+}
 if ([string]::IsNullOrWhiteSpace($BrowsePath)) {
     $BrowsePath = Join-Path $smokeRoot 'browse'
     New-Item -ItemType Directory -Path $BrowsePath -Force | Out-Null
