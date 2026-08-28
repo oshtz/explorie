@@ -74,7 +74,7 @@ jobs:
           components: llvm-tools-preview
 
       - name: Rust cache
-        uses: swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: './ -> target'
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -124,7 +124,7 @@ jobs:
           toolchain: 1.98.0
 
       - name: Rust cache
-        uses: swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: './ -> target'
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -156,7 +156,7 @@ jobs:
           toolchain: 1.98.0
 
       - name: Rust cache
-        uses: swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: './ -> target'
           cache-targets: false
@@ -183,7 +183,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: '9.15.9'
           run_install: false
@@ -202,7 +202,7 @@ jobs:
           components: clippy, rustfmt
 
       - name: Rust cache
-        uses: swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: './ -> target'
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -250,7 +250,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: '9.15.9'
           run_install: false
