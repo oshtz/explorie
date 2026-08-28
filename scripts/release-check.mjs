@@ -27,15 +27,16 @@ export const DEFAULT_COMMANDS = [
     args: ['fmt', '--all', '--', '--check'],
   },
   {
-    display: 'cargo test --workspace --no-fail-fast',
+    display: 'cargo test --locked --workspace --no-fail-fast',
     command: 'cargo',
-    args: ['test', '--workspace', '--no-fail-fast'],
+    args: ['test', '--locked', '--workspace', '--no-fail-fast'],
   },
   {
-    display: 'cargo clippy --workspace --all-targets --all-features -- -D warnings',
+    display: 'cargo clippy --locked --workspace --all-targets --all-features -- -D warnings',
     command: 'cargo',
     args: [
       'clippy',
+      '--locked',
       '--workspace',
       '--all-targets',
       '--all-features',
@@ -50,9 +51,9 @@ export const DEFAULT_COMMANDS = [
     args: ['audit'],
   },
   {
-    display: 'corepack pnpm@11.13.0 audit --audit-level=moderate',
-    command: 'corepack',
-    args: ['pnpm@11.13.0', 'audit', '--audit-level=moderate'],
+    display: 'pnpm audit --audit-level=moderate',
+    command: 'pnpm',
+    args: ['audit', '--audit-level=moderate'],
   },
   {
     display: 'cargo build -p explorie-gpui --release --locked',

@@ -21,8 +21,19 @@ on:
         type: boolean
         required: true
         default: false
+      windows_sha256:
+        description: SHA-256 of the exact Windows installer tested on a real machine
+        type: string
+        required: false
+        default: ''
+      macos_sha256:
+        description: SHA-256 of the exact macOS DMG tested on a real machine
+        type: string
+        required: false
+        default: ''
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
@@ -31,59 +42,22 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
 jobs:
   validate:
     name: Validate release source
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 10
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: '9'
-          run_install: false
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '24'
-          cache: 'pnpm'
-          cache-dependency-path: pnpm-lock.yaml
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Rust cache
-        uses: swatinem/rust-cache@v2
-        with:
-          workspaces: './ -> target'
-
-      - name: Install cargo-audit
-        uses: taiki-e/install-action@cargo-audit
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Test release checks
-        run: pnpm release:check:test
-
-      - name: Run release checks
-        env:
-          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
-        run: pnpm release:check
-
       - name: Validate publication attestation
         if: inputs.publish == true
         shell: bash
+        env:
+          WINDOWS_SHA256: ${{ inputs.windows_sha256 }}
+          MACOS_SHA256: ${{ inputs.macos_sha256 }}
         run: |
+          set -euo pipefail
           if [ "$GITHUB_REF_TYPE" != "tag" ]; then
             echo "Publication must be dispatched from the validated version tag."
             exit 1
@@ -92,16 +66,10 @@ jobs:
             echo "Both candidate packages require real-machine filesystem-operation attestation."
             exit 1
           fi
-
-      - name: Upload release-check evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-check
-          path: |
-            .release-checks/latest.json
-            .release-checks/latest.md
-          if-no-files-found: warn
+          if ! [[ "$WINDOWS_SHA256" =~ ^[0-9a-fA-F]{64}$ ]] || ! [[ "$MACOS_SHA256" =~ ^[0-9a-fA-F]{64}$ ]]; then
+            echo "Publication requires the SHA-256 hashes of both exact tested artifacts."
+            exit 1
+          fi
 
       - name: Validate release state
         if: github.ref_type == 'tag'
@@ -111,6 +79,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           PUBLISH: ${{ inputs.publish || false }}
         run: |
+          set -euo pipefail
           state=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null || echo missing)
           if [ "$EVENT_NAME" = "push" ] && [ "$state" != "missing" ]; then
             echo "Release $GITHUB_REF_NAME already exists; refusing to replace it."
@@ -121,42 +90,85 @@ jobs:
             exit 1
           fi
 
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Verify tagged commit passed main CI
+        if: github.ref_type == 'tag'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "Release tags must point to a commit already present on main."
+            exit 1
+          fi
+          passed=$(gh run list \
+            --repo "$GITHUB_REPOSITORY" \
+            --workflow ci.yml \
+            --commit "$GITHUB_SHA" \
+            --event push \
+            --status success \
+            --limit 1 \
+            --json conclusion \
+            --jq 'length')
+          if [ "$passed" != "1" ]; then
+            echo "The tagged commit has no successful main-push CI run."
+            exit 1
+          fi
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          version: '9.15.9'
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: '24.19.0'
+
+      - name: Test release checks
+        run: pnpm release:check:test
+
+      - name: Validate version and source contract
+        env:
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        run: node scripts/release-check.mjs --preflight
+
   build-windows:
     name: Package Windows
     if: github.event_name == 'push' && github.ref_type == 'tag'
     needs: validate
     runs-on: windows-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: '9'
-          run_install: false
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
-          node-version: '20'
-          cache: 'pnpm'
-          cache-dependency-path: pnpm-lock.yaml
+          node-version: '20.20.2'
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.98.0
 
       - name: Rust cache
-        uses: swatinem/rust-cache@v2
+        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: './ -> target'
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Test native file operations on Windows
-        run: cargo test -p explorie-core
+        run: cargo test --locked -p explorie-core
 
       - name: Prepare native dependencies
         run: |
@@ -249,13 +261,22 @@ jobs:
           $installer = @(Get-ChildItem release-artifacts/windows/*-windows-x64-setup*.exe)
           if ($installer.Count -ne 1) { throw "Expected exactly one Windows installer." }
           $installDir = Join-Path $env:RUNNER_TEMP "explorie-installed"
-          $configDir = Join-Path $env:APPDATA "explorie"
-          $marker = Join-Path $configDir "installer-upgrade-smoke.txt"
-          New-Item -ItemType Directory -Path $configDir -Force | Out-Null
-          Set-Content -LiteralPath $marker -Value "preserve across upgrade" -Encoding utf8
+          $profile = Join-Path $env:RUNNER_TEMP "explorie-upgrade-profile"
+          New-Item -ItemType Directory -Path $profile -Force | Out-Null
+          $upgradeExpected = $false
           if ($env:PREVIOUS_INSTALLER) {
             $previous = Start-Process -FilePath $env:PREVIOUS_INSTALLER -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$installDir") -Wait -PassThru
             if ($previous.ExitCode -ne 0) { throw "Previous installer exited with code $($previous.ExitCode)." }
+            $previousApp = Join-Path $installDir "Explorie.exe"
+            if (-not (Test-Path -LiteralPath $previousApp -PathType Leaf)) { throw "Previous Explorie executable was not installed." }
+            pwsh -NoProfile -File scripts/smoke-gpui-release.ps1 -Executable $previousApp -ProfilePath $profile
+            if ($LASTEXITCODE -ne 0) { throw "Previous installed GPUI smoke check failed." }
+            $settingsPath = Join-Path $profile "settings-v1.json"
+            if (-not (Test-Path -LiteralPath $settingsPath -PathType Leaf)) { throw "Previous Explorie did not create real settings state." }
+            $settings = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json
+            $settings.appearance.theme = "light"
+            $settings | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $settingsPath -Encoding utf8
+            $upgradeExpected = $true
           }
           $install = Start-Process -FilePath $installer[0].FullName -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$installDir") -Wait -PassThru
           if ($install.ExitCode -ne 0) { throw "Installer exited with code $($install.ExitCode)." }
@@ -264,9 +285,12 @@ jobs:
           try {
             if (-not (Test-Path -LiteralPath $app -PathType Leaf)) { throw "Installed Explorie executable was not found." }
             if (-not (Test-Path -LiteralPath $rclone -PathType Leaf)) { throw "Installed rclone executable was not found." }
-            if ((Get-Content -LiteralPath $marker -Raw).Trim() -ne "preserve across upgrade") { throw "User data did not survive the installer upgrade." }
-            pwsh -NoProfile -File scripts/smoke-gpui-release.ps1 -Executable $app
+            pwsh -NoProfile -File scripts/smoke-gpui-release.ps1 -Executable $app -ProfilePath $profile
             if ($LASTEXITCODE -ne 0) { throw "Installed GPUI smoke check failed." }
+            if ($upgradeExpected) {
+              $preserved = Get-Content -LiteralPath (Join-Path $profile "settings-v1.json") -Raw | ConvertFrom-Json
+              if ($preserved.appearance.theme -ne "light") { throw "Real Explorie settings did not survive the installer upgrade." }
+            }
             $version = & $rclone version | Select-Object -First 1
             if ($version -ne "rclone v1.74.4") { throw "Unexpected installed rclone version: $version" }
           } finally {
@@ -275,11 +299,10 @@ jobs:
               $uninstall = Start-Process -FilePath $uninstaller -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART") -Wait -PassThru
               if ($uninstall.ExitCode -ne 0) { throw "Uninstaller exited with code $($uninstall.ExitCode)." }
             }
-            Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
           }
 
       - name: Upload Windows package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: explorie-windows
           path: release-artifacts/windows/*
@@ -290,28 +313,29 @@ jobs:
     if: github.event_name == 'push' && github.ref_type == 'tag'
     needs: validate
     runs-on: macos-latest
+    timeout-minutes: 45
+    environment: release-signing
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
-          node-version: '20'
+          node-version: '20.20.2'
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
+          toolchain: 1.98.0
           targets: aarch64-apple-darwin
 
       - name: Rust cache
-        uses: swatinem/rust-cache@v2
+        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: './ -> target'
-
-      - name: Test GPUI-native application on macOS
-        run: cargo test -p explorie-core -p explorie-native-services -p explorie-ffmpeg-wrapper -p explorie-cli -p explorie-gpui
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Verify CoreText glyphs reach the Metal renderer
         env:
@@ -320,7 +344,7 @@ jobs:
 
       - name: Upload macOS rendering proof
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: macos-render-probe
           path: target/macos-render-probe.png
@@ -337,27 +361,16 @@ jobs:
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          available=true
           for value in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
-            if [ -z "${!value}" ]; then available=false; fi
+            if [ -z "${!value}" ]; then
+              echo "Tagged releases require $value."
+              exit 1
+            fi
           done
-          if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "$available" != "true" ]; then
-            echo "Tagged releases require all Apple signing and notarization secrets."
-            exit 1
-          fi
-          if [ "$available" != "true" ]; then
-            echo "::warning::Manual macOS package will use an ad-hoc signature and will not be notarized."
-          fi
-          echo "available=$available" >> "$GITHUB_OUTPUT"
-          if [ "$available" = "true" ]; then
-            echo "identity=$APPLE_SIGNING_IDENTITY" >> "$GITHUB_OUTPUT"
-          else
-            echo "identity=-" >> "$GITHUB_OUTPUT"
-          fi
+          echo "identity=$APPLE_SIGNING_IDENTITY" >> "$GITHUB_OUTPUT"
 
       - name: Import Apple signing certificate
-        if: steps.signing.outputs.available == 'true'
-        uses: apple-actions/import-codesign-certs@v2
+        uses: apple-actions/import-codesign-certs@5142e029c445c10ffc7149d172e540235a065466 # v7
         with:
           p12-file-base64: ${{ secrets.APPLE_CERTIFICATE }}
           p12-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -421,7 +434,6 @@ jobs:
         shell: bash
         env:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_SIGNING_AVAILABLE: ${{ steps.signing.outputs.available }}
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -466,11 +478,9 @@ jobs:
           codesign -d --verbose=4 "$app" 2>&1 | grep -Fx 'Identifier=com.omershatz.explorie'
           codesign -d --verbose=4 "$helper" 2>&1 | grep -E 'flags=.*runtime'
           codesign -d --verbose=4 "$app" 2>&1 | grep -E 'flags=.*runtime'
-          if [ "$APPLE_SIGNING_AVAILABLE" = "true" ]; then
-            codesign -d --verbose=4 "$helper" 2>&1 | grep -Fx "TeamIdentifier=$APPLE_TEAM_ID"
-            codesign -d --verbose=4 "$rclone" 2>&1 | grep -Fx "TeamIdentifier=$APPLE_TEAM_ID"
-            codesign -d --verbose=4 "$app" 2>&1 | grep -Fx "TeamIdentifier=$APPLE_TEAM_ID"
-          fi
+          codesign -d --verbose=4 "$helper" 2>&1 | grep -Fx "TeamIdentifier=$APPLE_TEAM_ID"
+          codesign -d --verbose=4 "$rclone" 2>&1 | grep -Fx "TeamIdentifier=$APPLE_TEAM_ID"
+          codesign -d --verbose=4 "$app" 2>&1 | grep -Fx "TeamIdentifier=$APPLE_TEAM_ID"
 
           if [ "$GITHUB_REF_TYPE" = "tag" ]; then
             xcrun stapler validate "$app"
@@ -530,7 +540,7 @@ jobs:
           wait "$app_pid" || true
 
       - name: Upload macOS package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: explorie-macos
           path: release-artifacts/macos/*
@@ -541,12 +551,14 @@ jobs:
     if: github.event_name == 'push' && github.ref_type == 'tag'
     needs: [validate, build-windows, build-macos]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
+      actions: read
       contents: write
 
     steps:
       - name: Download candidate packages
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: explorie-*
           path: release-artifacts
@@ -558,6 +570,16 @@ jobs:
         run: |
           set -euo pipefail
           cd release-artifacts
+          version="${GITHUB_REF_NAME#v}"
+          windows="explorie-$version-windows-x64-setup-unsigned.exe"
+          macos="explorie-$version-macos-arm64.dmg"
+          for asset in "$windows" "$macos" SHA256SUMS-windows.txt SHA256SUMS-macos.txt; do
+            test -f "$asset"
+          done
+          if [ "$(find . -maxdepth 1 -type f | wc -l | tr -d ' ')" != "4" ]; then
+            echo "Candidate release must contain exactly the four documented assets."
+            exit 1
+          fi
           sha256sum --check SHA256SUMS-windows.txt
           sha256sum --check SHA256SUMS-macos.txt
           gh release create "$GITHUB_REF_NAME" ./* \
@@ -577,6 +599,8 @@ jobs:
       inputs.macos_real_machine_verified == true
     needs: validate
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: release-publish
     permissions:
       contents: write
 
@@ -584,6 +608,8 @@ jobs:
       - name: Download and verify draft assets
         env:
           GH_TOKEN: ${{ github.token }}
+          WINDOWS_ATTESTED_SHA256: ${{ inputs.windows_sha256 }}
+          MACOS_ATTESTED_SHA256: ${{ inputs.macos_sha256 }}
         run: |
           set -euo pipefail
           mkdir release-artifacts
@@ -593,17 +619,32 @@ jobs:
             --pattern 'SHA256SUMS-*' \
             --dir release-artifacts
           cd release-artifacts
+          version="${GITHUB_REF_NAME#v}"
+          windows="explorie-$version-windows-x64-setup-unsigned.exe"
+          macos="explorie-$version-macos-arm64.dmg"
+          for asset in "$windows" "$macos" SHA256SUMS-windows.txt SHA256SUMS-macos.txt; do
+            test -f "$asset"
+          done
+          if [ "$(find . -maxdepth 1 -type f | wc -l | tr -d ' ')" != "4" ]; then
+            echo "Draft release must contain exactly the four documented assets."
+            exit 1
+          fi
           sha256sum --check SHA256SUMS-windows.txt
           sha256sum --check SHA256SUMS-macos.txt
-          shopt -s nullglob
-          windows=(explorie-*-windows-x64-setup*.exe)
-          macos=(explorie-*-macos-arm64.dmg)
-          if [ "${#windows[@]}" -ne 1 ] || [ "${#macos[@]}" -ne 1 ]; then
-            echo "Draft release must contain exactly one Windows installer and one macOS DMG."
+          windows_actual=$(sha256sum "$windows" | cut -d' ' -f1)
+          macos_actual=$(sha256sum "$macos" | cut -d' ' -f1)
+          if [ "${windows_actual,,}" != "${WINDOWS_ATTESTED_SHA256,,}" ]; then
+            echo "The Windows draft asset is not the real-machine-tested artifact."
+            exit 1
+          fi
+          if [ "${macos_actual,,}" != "${MACOS_ATTESTED_SHA256,,}" ]; then
+            echo "The macOS draft asset is not the real-machine-tested artifact."
             exit 1
           fi
 
       - name: Publish the verified draft
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+        run: |
+          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          gh release verify "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY"
