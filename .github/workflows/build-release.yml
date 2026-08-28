@@ -362,6 +362,7 @@ jobs:
       - name: Notarize and staple macOS DMG
         shell: bash
         env:
+          APPLE_SIGNING_IDENTITY: ${{ steps.signing.outputs.identity }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
@@ -394,6 +395,8 @@ jobs:
             -ov \
             -format UDZO \
             "${dmgs[0]}"
+          codesign --force --sign "$APPLE_SIGNING_IDENTITY" --timestamp "${dmgs[0]}"
+          codesign --verify --verbose=2 "${dmgs[0]}"
           xcrun notarytool submit "${dmgs[0]}" \
             --apple-id "$APPLE_ID" \
             --password "$APPLE_PASSWORD" \
@@ -445,6 +448,7 @@ jobs:
           codesign --verify --strict --verbose=2 "$helper"
           codesign --verify --strict --verbose=2 "$rclone"
           codesign --verify --deep --strict --verbose=2 "$app"
+          codesign --verify --verbose=2 "${dmgs[0]}"
           codesign -d --verbose=4 "$helper" 2>&1 | grep -Fx 'Identifier=com.omershatz.explorie.mountd'
           codesign -d --verbose=4 "$app" 2>&1 | grep -Fx 'Identifier=com.omershatz.explorie'
           codesign -d --verbose=4 "$helper" 2>&1 | grep -E 'flags=.*runtime'
