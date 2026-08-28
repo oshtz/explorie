@@ -27,10 +27,10 @@ const expectedDisplays = [
   'pnpm prepare:native',
   'cargo metadata --locked --format-version 1',
   'cargo fmt --all -- --check',
-  'cargo test --workspace --no-fail-fast',
-  'cargo clippy --workspace --all-targets --all-features -- -D warnings',
+  'cargo test --locked --workspace --no-fail-fast',
+  'cargo clippy --locked --workspace --all-targets --all-features -- -D warnings',
   'cargo audit',
-  'corepack pnpm@11.13.0 audit --audit-level=moderate',
+  'pnpm audit --audit-level=moderate',
   'cargo build -p explorie-gpui --release --locked',
   'git diff --check',
 ];
@@ -163,10 +163,16 @@ test('DEFAULT_COMMANDS preserves exact display order and representative executio
   assert.equal(DEFAULT_COMMANDS[1].command, 'pnpm');
   assert.deepEqual(DEFAULT_COMMANDS[1].args, ['prepare:native']);
   assert.equal(DEFAULT_COMMANDS[4].command, 'cargo');
-  assert.deepEqual(DEFAULT_COMMANDS[4].args, ['test', '--workspace', '--no-fail-fast']);
+  assert.deepEqual(DEFAULT_COMMANDS[4].args, [
+    'test',
+    '--locked',
+    '--workspace',
+    '--no-fail-fast',
+  ]);
   assert.equal(DEFAULT_COMMANDS[5].command, 'cargo');
   assert.deepEqual(DEFAULT_COMMANDS[5].args, [
     'clippy',
+    '--locked',
     '--workspace',
     '--all-targets',
     '--all-features',
@@ -411,19 +417,24 @@ test('workflows block audits and publish the exact attested draft assets', async
 
   assert.doesNotMatch(ci, /playwright|vite|explorie-desktop|test-frontend|test-e2e/i);
   assert.doesNotMatch(ci, /audit[^\n]*\|\| true/);
-  assert.match(ci, /corepack pnpm@11\.13\.0 audit --audit-level=moderate/);
-  assert.match(ci, /name: Security Audit[\s\S]*?node-version: '24'/);
+  assert.match(ci, /pnpm audit --audit-level=moderate/);
+  assert.match(ci, /name: Security Audit[\s\S]*?node-version: '24\.19\.0'/);
+  assert.match(ci, /cancel-in-progress: \$\{\{ github\.event_name == 'pull_request' \}\}/);
+  assert.match(ci, /name: CI Gate/);
+  assert.match(ci, /name: Rust Coverage[\s\S]*?github\.event_name == 'push'/);
+  assert.match(ci, /cache-targets: false/);
+  assert.match(ci, /save-if: \$\{\{ github\.ref == 'refs\/heads\/main' \}\}/);
   assert.match(
     ci,
     /name: Windows Tests, Lint & Release Contracts[\s\S]*?runs-on: windows-latest[\s\S]*?timeout-minutes: 45/
   );
   assert.match(
     ci,
-    /Test native Rust crates on Windows[\s\S]*?timeout-minutes: 15[\s\S]*?cargo test -p explorie-core -p explorie-native-services -p explorie-ffmpeg-wrapper -p explorie-cli --no-fail-fast -- --test-threads=1/
+    /Test native Rust crates on Windows[\s\S]*?timeout-minutes: 15[\s\S]*?cargo test --locked -p explorie-core -p explorie-native-services -p explorie-ffmpeg-wrapper -p explorie-cli --no-fail-fast -- --test-threads=1/
   );
   assert.match(
     ci,
-    /Test GPUI application on Windows[\s\S]*?timeout-minutes: 15[\s\S]*?cargo test -p explorie-gpui -- --test-threads=1/
+    /Test GPUI application on Windows[\s\S]*?timeout-minutes: 15[\s\S]*?cargo test --locked -p explorie-gpui -- --test-threads=1/
   );
   assert.match(ci, /name: Rust Coverage[\s\S]*?runs-on: windows-latest/);
   assert.match(
@@ -451,7 +462,7 @@ test('workflows block audits and publish the exact attested draft assets', async
   );
   assert.match(
     ci,
-    /Test Unix journal and helper lifecycle safety[\s\S]*?cargo test -p explorie-native-services unix_/
+    /Test Unix journal and helper lifecycle safety[\s\S]*?cargo test --locked -p explorie-native-services unix_/
   );
   assert.match(
     ci,
@@ -461,20 +472,17 @@ test('workflows block audits and publish the exact attested draft assets', async
   assert.equal((ci.match(/name: Prepare native dependencies/g) ?? []).length, 2);
   assert.doesNotMatch(ci, /rclone-x86_64-unknown-linux-gnu/);
   assert.match(release, /gh release create/);
-  assert.match(release, /run: pnpm release:check/);
+  assert.match(release, /node scripts\/release-check\.mjs --preflight/);
   assert.match(
     release,
-    /name: Validate release source[\s\S]*?runs-on: windows-latest[\s\S]*?timeout-minutes: 45/
+    /name: Validate release source[\s\S]*?runs-on: windows-latest[\s\S]*?timeout-minutes: 10/
   );
-  assert.match(release, /name: Validate release source[\s\S]*?node-version: '24'/);
+  assert.match(release, /name: Validate release source[\s\S]*?node-version: '24\.19\.0'/);
   assert.match(
     release,
-    /name: Validate release source[\s\S]*?name: Setup pnpm[\s\S]*?pnpm\/action-setup@v4[\s\S]*?name: Setup Node\.js[\s\S]*?cache: 'pnpm'/
+    /name: Validate release source[\s\S]*?name: Setup pnpm[\s\S]*?pnpm\/action-setup@[0-9a-f]{40}[\s\S]*?name: Setup Node\.js/
   );
-  assert.match(
-    release,
-    /name: Validate release source[\s\S]*?name: Setup Rust[\s\S]*?name: Rust cache[\s\S]*?swatinem\/rust-cache@v2/
-  );
+  assert.match(release, /Verify tagged commit passed main CI[\s\S]*?git merge-base --is-ancestor[\s\S]*?gh run list/);
   assert.match(
     release,
     /Build GPUI Windows application[\s\S]*?cargo build -p explorie-gpui --release --locked/
@@ -494,8 +502,9 @@ test('workflows block audits and publish the exact attested draft assets', async
   );
   assert.match(
     macosUi,
-    /name: CoreText and Metal rendering[\s\S]*?runs-on: macos-latest[\s\S]*?macos_render_probe[\s\S]*?cargo test --locked -p explorie-gpui[\s\S]*?macos-render-probe\.png/
+    /name: CoreText and Metal rendering[\s\S]*?runs-on: macos-latest[\s\S]*?macos_render_probe[\s\S]*?macos-render-probe\.png/
   );
+  assert.doesNotMatch(macosUi, /cargo test/);
   assert.doesNotMatch(release, /tauri build/);
   assert.match(
     release,
@@ -519,8 +528,9 @@ test('workflows block audits and publish the exact attested draft assets', async
     release,
     /Download previous Windows installer when available[\s\S]*?SHA256SUMS-windows\.txt[\s\S]*?Get-FileHash[\s\S]*?previous-windows\.outputs\.path/
   );
-  assert.match(release, /User data did not survive the installer upgrade/);
-  assert.match(release, /scripts\/smoke-gpui-release\.ps1 -Executable \$app/);
+  assert.match(release, /Previous Explorie did not create real settings state/);
+  assert.match(release, /Real Explorie settings did not survive the installer upgrade/);
+  assert.match(release, /scripts\/smoke-gpui-release\.ps1 -Executable \$app -ProfilePath \$profile/);
   assert.match(release, /& \$rclone version[\s\S]*?Unexpected installed rclone version/);
   assert.match(release, /unins000\.exe[\s\S]*?\/VERYSILENT/);
   assert.doesNotMatch(release, /WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS|tauri\.localhost/);
@@ -534,7 +544,7 @@ test('workflows block audits and publish the exact attested draft assets', async
     release,
     /Notarize and staple macOS DMG[\s\S]*?app="target\/release\/bundle\/macos\/explorie\.app"[\s\S]*?notarytool submit "\$app_zip"[\s\S]*?stapler staple "\$app"/
   );
-  assert.doesNotMatch(release, /node scripts\/release-check\.mjs --preflight/);
+  assert.match(release, /node scripts\/release-check\.mjs --preflight/);
   assert.match(release, /--draft/);
   assert.match(release, /gh release download/);
   assert.match(release, /gh release edit .*--draft=false --latest/);
@@ -542,6 +552,12 @@ test('workflows block audits and publish the exact attested draft assets', async
   assert.match(release, /inputs\.publish == true/);
   assert.match(release, /inputs\.windows_real_machine_verified == true/);
   assert.match(release, /inputs\.macos_real_machine_verified == true/);
+  assert.match(release, /WINDOWS_ATTESTED_SHA256: \$\{\{ inputs\.windows_sha256 \}\}/);
+  assert.match(release, /MACOS_ATTESTED_SHA256: \$\{\{ inputs\.macos_sha256 \}\}/);
+  assert.match(release, /Windows draft asset is not the real-machine-tested artifact/);
+  assert.match(release, /macOS draft asset is not the real-machine-tested artifact/);
+  assert.match(release, /environment: release-signing/);
+  assert.match(release, /environment: release-publish/);
   assert.match(release, /if: github\.ref_type == 'tag'/);
   assert.match(release, /Release .* already exists; refusing to replace it/);
   assert.match(release, /must exist as a draft before publication/);
@@ -578,6 +594,8 @@ test('workflows block audits and publish the exact attested draft assets', async
   assert.match(release, /Contents\/MacOS\/explorie-gpui/);
   assert.match(release, /spctl --assess/);
   assert.doesNotMatch(release, /softprops\/action-gh-release|gh api -X DELETE/);
+  assert.match(release, /gh release verify "\$GITHUB_REF_NAME"/);
+  assert.doesNotMatch(`${ci}\n${release}\n${macosUi}`, /uses:[^\n]+@(v\d+|stable|cargo-)/);
   assert.match(updater, /api\.github\.com\/repos\/oshtz\/explorie\/releases\/latest/);
   assert.match(updater, /windows-x64-setup-unsigned\.exe/);
   assert.match(updater, /SHA256SUMS-windows\.txt/);

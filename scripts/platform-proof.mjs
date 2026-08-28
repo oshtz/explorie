@@ -51,7 +51,7 @@ async function initialize() {
   console.log(proofPath);
 }
 
-function validatePlatform(proof, platform, errors) {
+function validatePlatform(proof, platform, version, errors) {
   const candidate = proof[platform];
   if (!candidate || typeof candidate !== 'object') {
     errors.push(`${platform}: proof section is missing`);
@@ -61,6 +61,13 @@ function validatePlatform(proof, platform, errors) {
     if (typeof candidate[field] !== 'string' || candidate[field].trim() === '') {
       errors.push(`${platform}: ${field} is required`);
     }
+  }
+  const expectedArtifact =
+    platform === 'windows'
+      ? `explorie-${version}-windows-x64-setup-unsigned.exe`
+      : `explorie-${version}-macos-arm64.dmg`;
+  if (candidate.artifact !== expectedArtifact) {
+    errors.push(`${platform}: artifact must be ${expectedArtifact}`);
   }
   if (!/^[a-f0-9]{64}$/i.test(candidate.sha256 ?? '')) {
     errors.push(`${platform}: sha256 must be the tested artifact's 64-character digest`);
@@ -80,12 +87,14 @@ async function verify() {
   if (proof.candidateTag !== `v${version}`) {
     errors.push(`candidateTag: expected v${version}, got ${proof.candidateTag || '(empty)'}`);
   }
-  validatePlatform(proof, 'windows', errors);
-  validatePlatform(proof, 'macos', errors);
+  validatePlatform(proof, 'windows', version, errors);
+  validatePlatform(proof, 'macos', version, errors);
   if (errors.length > 0) {
     throw new Error(`Platform proof is incomplete:\n- ${errors.join('\n- ')}`);
   }
   console.log(`Platform proof is complete for v${version}.`);
+  console.log(`Windows tested SHA-256: ${proof.windows.sha256.toLowerCase()}`);
+  console.log(`macOS tested SHA-256: ${proof.macos.sha256.toLowerCase()}`);
 }
 
 const command = process.argv[2];

@@ -50,7 +50,7 @@ Current features:
 | ----------- | --------------------- | ---------------------------------------------------------------------- |
 | **Node.js** | 20.x LTS              | [nodejs.org](https://nodejs.org) or `winget install OpenJS.NodeJS.LTS` |
 | **pnpm**    | 9.x                   | `npm install -g pnpm` or `corepack enable`                             |
-| **Rust**    | stable (2024 edition) | [rustup.rs](https://rustup.rs)                                         |
+| **Rust**    | 1.98.0 (2024 edition) | [rustup.rs](https://rustup.rs)                                         |
 
 ### Optional Dependencies
 
@@ -190,9 +190,9 @@ pnpm release:check
 
 The command writes local evidence under `.release-checks/`, which is ignored by git. It requires a clean, version-aligned working tree; runs dependency audits, Rust formatting, the full workspace tests, strict clippy, and a locked GPUI release build; then verifies the executable under the workspace `target/release` directory.
 
-Windows installer builds check the latest published GitHub Release automatically. Updates use the exact versioned unsigned Inno Setup asset and refuse to install unless its size and SHA-256 match `SHA256SUMS-windows.txt`; failed checks leave the installed app untouched. Releases remain immutable and version-tag based. Bump the matching versions in the root package and GPUI Cargo manifest, then push a new `v<version>` tag. That tag builds the candidate packages once and attaches them to a draft release. After those exact assets pass the real-machine checklist below, manually dispatch the release workflow from that tag with the Windows and macOS attestations enabled. The dispatch verifies and publishes the existing draft without rebuilding it. Existing releases and assets are never replaced; failures are fixed in a new version.
+Windows installer builds check the latest published GitHub Release automatically. Updates use the exact versioned unsigned Inno Setup asset and refuse to install unless its size and SHA-256 match `SHA256SUMS-windows.txt`; failed checks leave the installed app untouched. Windows Authenticode signing is intentionally not part of the release contract. Releases remain immutable and version-tag based. Bump the matching versions in the root package and GPUI Cargo manifest, merge the candidate commit to `main`, and wait for its `CI Gate` to pass before pushing a new `v<version>` tag. That immutable tag builds the candidate packages once and attaches them to a draft release. After those exact assets pass the real-machine checklist below, manually dispatch the release workflow from that tag with the Windows and macOS attestations and the two tested artifact SHA-256 values. The protected publish job verifies those hashes against the existing draft before publishing it without rebuilding. Existing releases, assets, and tags are never replaced; failures are fixed in a new version.
 
-Protect `v*` tags and enable immutable releases in the GitHub repository settings before public distribution.
+Protect `v*` tags against update/deletion, require `CI Gate` on `main`, protect the `release-signing` and `release-publish` environments, and enable immutable releases in the GitHub repository settings before public distribution.
 
 macOS releases require these signing secrets:
 
@@ -213,7 +213,7 @@ Before creating a new tag, manually verify:
 - Remove or uninstall v0.1.0 before first running v0.2.6; the permanent `com.omershatz.explorie` identity intentionally starts a clean application lineage.
 - Install the Windows package, run `cargo test -p explorie-native-services integration::tests::windows_system_open_produces_a_real_shell_side_effect -- --exact --ignored` from an interactive Windows session, verify the System Integration toggle routes folder opens to Explorie and restores the prior handler when disabled or uninstalled, and confirm the unsigned warning is expected. Install the macOS package and verify signing/notarization plus both SHA-256 manifests.
 
-Create a per-candidate real-machine evidence file with `pnpm platform:proof:init`, fill in the exact artifact names and SHA-256 hashes, then mark each observed check. `pnpm platform:proof:verify` rejects missing Windows multi-window/DnD/mixed-DPI/crash/folder-handler proof and missing macOS multi-window/DnD/multi-monitor/crash/signing/notarization/Gatekeeper proof. The evidence stays under ignored `.release-checks/`; archive it alongside the candidate checksums before enabling the workflow attestations.
+Create a per-candidate real-machine evidence file with `pnpm platform:proof:init`, fill in the exact artifact names and SHA-256 hashes, then mark each observed check. `pnpm platform:proof:verify` rejects wrong artifact names, missing Windows multi-window/DnD/mixed-DPI/crash/folder-handler proof, and missing macOS multi-window/DnD/multi-monitor/crash/signing/notarization/Gatekeeper proof. It prints the two tested hashes to paste into the protected publication dispatch. The evidence stays under ignored `.release-checks/`; archive it alongside the candidate checksums before enabling the workflow attestations.
 
 ---
 

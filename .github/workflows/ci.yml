@@ -9,33 +9,78 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
 jobs:
+  changes:
+    name: Classify changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      native: ${{ steps.classify.outputs.native }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect native or release changes
+        id: classify
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          if [ -z "$BASE_SHA" ] || [[ "$BASE_SHA" =~ ^0+$ ]]; then
+            files=$(git diff-tree --root --no-commit-id --name-only -r "$HEAD_SHA")
+          else
+            files=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
+          fi
+
+          native=false
+          while IFS= read -r file; do
+            case "$file" in
+              *.md|.github/ISSUE_TEMPLATE/*|.github/pull_request_template.md) ;;
+              *) native=true; break ;;
+            esac
+          done <<< "$files"
+
+          echo "native=$native" >> "$GITHUB_OUTPUT"
+          echo "Native or release validation required: $native" >> "$GITHUB_STEP_SUMMARY"
+
   coverage-rust:
     name: Rust Coverage
+    needs: changes
+    if: needs.changes.outputs.native == 'true' && github.event_name == 'push'
     runs-on: windows-latest
     timeout-minutes: 30
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
-          toolchain: stable
+          toolchain: 1.98.0
           components: llvm-tools-preview
 
       - name: Rust cache
-        uses: swatinem/rust-cache@v2
+        uses: swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           workspaces: './ -> target'
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
+        uses: taiki-e/install-action@419f0f955ea0cf384c06ae25b10b8d3bcba087da # cargo-llvm-cov
 
       - name: Prepare native dependencies
         run: |
@@ -43,10 +88,10 @@ jobs:
           node scripts/prepare-winfsp.mjs
 
       - name: Generate native Rust coverage
-        run: cargo llvm-cov --all-features --lcov --output-path lcov.info -p explorie-core -p explorie-native-services -p explorie-ffmpeg-wrapper -p explorie-cli -- --test-threads=1 --skip windows_shell_icons_cover_regular_files_and_folders_and_reuse_cache
+        run: cargo llvm-cov --locked --all-features --lcov --output-path lcov.info -p explorie-core -p explorie-native-services -p explorie-ffmpeg-wrapper -p explorie-cli -- --test-threads=1 --skip windows_shell_icons_cover_regular_files_and_folders_and_reuse_cache
 
       - name: Upload coverage report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: rust-coverage
           path: lcov.info
@@ -64,109 +109,123 @@ jobs:
 
   test-rust-macos:
     name: macOS GPUI Tests & Build
+    needs: changes
+    if: needs.changes.outputs.native == 'true'
     runs-on: macos-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.98.0
 
       - name: Rust cache
-        uses: swatinem/rust-cache@v2
+        uses: swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           workspaces: './ -> target'
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Test GPUI-native application on macOS
         env:
           TMPDIR: ${{ runner.temp }}
         run: |
-          cargo test -p explorie-core -p explorie-native-services -p explorie-ffmpeg-wrapper -p explorie-cli
-          cargo test -p explorie-gpui -- --test-threads=1
+          cargo test --locked -p explorie-core -p explorie-native-services -p explorie-ffmpeg-wrapper -p explorie-cli
+          cargo test --locked -p explorie-gpui -- --test-threads=1
 
       - name: Build GPUI macOS application
         run: cargo build -p explorie-gpui --release --locked
 
   test-rust-unix-safety:
     name: Unix Safety Regression Tests
+    needs: changes
+    if: needs.changes.outputs.native == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.98.0
 
       - name: Rust cache
-        uses: swatinem/rust-cache@v2
+        uses: swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           workspaces: './ -> target'
+          cache-targets: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install Linux native dependencies
         run: sudo apt-get update && sudo apt-get install --yes libasound2-dev pkg-config
 
       - name: Test real RAR extraction safety
-        run: cargo test -p explorie-core real_rar_fixture_extracts_and_enforces_budget_and_cancellation
+        run: cargo test --locked -p explorie-core real_rar_fixture_extracts_and_enforces_budget_and_cancellation
 
       - name: Test Unix journal and helper lifecycle safety
-        run: cargo test -p explorie-native-services unix_
+        run: cargo test --locked -p explorie-native-services unix_
 
   lint:
     name: Windows Tests, Lint & Release Contracts
+    needs: changes
+    if: needs.changes.outputs.native == 'true'
     runs-on: windows-latest
     timeout-minutes: 45
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
         with:
-          version: '9'
+          version: '9.15.9'
           run_install: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: '24'
+          node-version: '24.19.0'
           cache: 'pnpm'
           cache-dependency-path: pnpm-lock.yaml
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
-          toolchain: stable
+          toolchain: 1.98.0
           components: clippy, rustfmt
 
       - name: Rust cache
-        uses: swatinem/rust-cache@v2
+        uses: swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           workspaces: './ -> target'
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        run: pnpm install --frozen-lockfile --ignore-scripts
 
       - name: Prepare native dependencies
-        run: |
-          node scripts/prepare-rclone.mjs
-          node scripts/prepare-winfsp.mjs
+        run: pnpm prepare:native
 
       - name: Rust format check
         run: cargo fmt --all -- --check
 
       - name: GPUI-native Rust clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
       - name: Test native Rust crates on Windows
         timeout-minutes: 15
-        run: cargo test -p explorie-core -p explorie-native-services -p explorie-ffmpeg-wrapper -p explorie-cli --no-fail-fast -- --test-threads=1
+        run: cargo test --locked -p explorie-core -p explorie-native-services -p explorie-ffmpeg-wrapper -p explorie-cli --no-fail-fast -- --test-threads=1
 
       - name: Test GPUI application on Windows
         timeout-minutes: 15
-        run: cargo test -p explorie-gpui -- --test-threads=1
+        run: cargo test --locked -p explorie-gpui -- --test-threads=1
 
       - name: Release workflow tests
         run: pnpm release:check:test
@@ -181,35 +240,28 @@ jobs:
 
   security:
     name: Security Audit
+    needs: changes
+    if: needs.changes.outputs.native == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
         with:
-          version: '9'
+          version: '9.15.9'
           run_install: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: '24'
-          cache: 'pnpm'
-          cache-dependency-path: pnpm-lock.yaml
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
+          node-version: '24.19.0'
 
       - name: Install cargo-audit
-        uses: taiki-e/install-action@cargo-audit
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        uses: taiki-e/install-action@aa7e9e10a2fd43c88f1948b7de4af2f4efd56483 # cargo-audit
 
       - name: Run cargo audit
         run: |
@@ -221,4 +273,31 @@ jobs:
         run: |
           set -o pipefail
           echo "## Node.js Security Audit" >> $GITHUB_STEP_SUMMARY
-          corepack pnpm@11.13.0 audit --audit-level=moderate 2>&1 | tee -a $GITHUB_STEP_SUMMARY
+          pnpm audit --audit-level=moderate 2>&1 | tee -a $GITHUB_STEP_SUMMARY
+
+  gate:
+    name: CI Gate
+    if: always()
+    needs: [changes, coverage-rust, test-rust-macos, test-rust-unix-safety, lint, security]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Require every applicable check
+        shell: bash
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          MACOS: ${{ needs.test-rust-macos.result }}
+          UNIX: ${{ needs.test-rust-unix-safety.result }}
+          WINDOWS: ${{ needs.lint.result }}
+          SECURITY: ${{ needs.security.result }}
+          COVERAGE: ${{ needs.coverage-rust.result }}
+        run: |
+          set -euo pipefail
+          for result in "$CHANGES" "$MACOS" "$UNIX" "$WINDOWS" "$SECURITY" "$COVERAGE"; do
+            if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
+              echo "A required CI job did not pass."
+              exit 1
+            fi
+          done
+          echo "Every applicable CI job passed or was intentionally skipped."
