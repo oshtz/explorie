@@ -46,7 +46,15 @@ use pathfinder_geometry::{
     vector::Vector2F,
 };
 use smallvec::SmallVec;
-use std::{borrow::Cow, char, convert::TryFrom, sync::Arc, sync::OnceLock};
+use std::{
+    borrow::Cow,
+    char,
+    convert::TryFrom,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use crate::open_type::apply_features_and_fallbacks;
 
@@ -522,6 +530,21 @@ impl MacTextSystemState {
                 // Convert from RGBA with premultiplied alpha to BGRA with straight alpha.
                 for pixel in bytes.chunks_exact_mut(4) {
                     swap_rgba_pa_to_bgra(pixel);
+                }
+            }
+
+            if std::env::var_os("EXPLORIE_RENDER_PROBE_OUTPUT").is_some() {
+                static PROBED_GLYPHS: AtomicUsize = AtomicUsize::new(0);
+                let probe_index = PROBED_GLYPHS.fetch_add(1, Ordering::Relaxed);
+                if probe_index < 12 {
+                    let nonzero_bytes = bytes.iter().filter(|byte| **byte > 0).count();
+                    eprintln!(
+                        "macOS glyph raster diagnostic #{probe_index}: font={:?} glyph={:?} size={bitmap_size:?} dilation={} nonzero={nonzero_bytes}/{}",
+                        params.font_id,
+                        params.glyph_id,
+                        params.dilation,
+                        bytes.len()
+                    );
                 }
             }
 
