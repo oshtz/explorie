@@ -11,18 +11,34 @@ use gpui::{
 struct RenderProbe;
 
 #[cfg(target_os = "macos")]
+const FONT_FAMILIES: [&str; 6] = [
+    MACOS_SYSTEM_FONT_FAMILY,
+    ".AppleSystemUIFont",
+    "Helvetica",
+    "Arial",
+    "Menlo",
+    "Georgia",
+];
+
+#[cfg(target_os = "macos")]
 impl Render for RenderProbe {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         div()
             .flex()
+            .flex_col()
             .size_full()
-            .items_center()
             .justify_center()
             .bg(rgb(0x101010))
-            .font_family(MACOS_SYSTEM_FONT_FAMILY)
-            .text_size(px(24.0))
-            .text_color(rgb(0xffffff))
-            .child("Explorie macOS text probe")
+            .children(FONT_FAMILIES.iter().map(|family| {
+                div()
+                    .flex()
+                    .h(px(36.0))
+                    .items_center()
+                    .font_family(*family)
+                    .text_size(px(20.0))
+                    .text_color(rgb(0xffffff))
+                    .child(format!("Explorie text — {family}"))
+            }))
     }
 }
 
@@ -34,7 +50,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Arc::new(ExplorieAssets),
         gpui_platform::current_headless_renderer,
     );
-    let window = cx.open_window(size(px(640.0), px(120.0)), |_, cx| cx.new(|_| RenderProbe))?;
+    let window = cx.open_window(size(px(640.0), px(240.0)), |_, cx| cx.new(|_| RenderProbe))?;
     cx.run_until_parked();
     let image = cx.capture_screenshot(window.into())?;
     let visible_text_pixels = image
@@ -46,6 +62,23 @@ fn main() -> Result<(), Box<dyn Error>> {
         .filter(|pixel| pixel[0] < 40 && pixel[1] < 40 && pixel[2] < 40 && pixel[3] > 0)
         .count();
     let total_pixels = image.width() as usize * image.height() as usize;
+    let row_height = image.height() as usize / FONT_FAMILIES.len();
+    let row_pixel_counts = FONT_FAMILIES
+        .iter()
+        .enumerate()
+        .map(|(index, family)| {
+            let start = index * row_height;
+            let end = start + row_height;
+            let count = image
+                .rows()
+                .skip(start)
+                .take(end - start)
+                .flatten()
+                .filter(|pixel| pixel[0] > 80 && pixel[1] > 80 && pixel[2] > 80 && pixel[3] > 0)
+                .count();
+            (*family, count)
+        })
+        .collect::<Vec<_>>();
 
     let output = std::env::var_os("EXPLORIE_RENDER_PROBE_OUTPUT")
         .map(PathBuf::from)
@@ -63,12 +96,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     if visible_text_pixels < 100 {
         return Err(format!(
-            "macOS Metal probe rendered only {visible_text_pixels} visible text pixels"
+            "macOS Metal probe rendered only {visible_text_pixels} visible text pixels; per-family counts: {row_pixel_counts:?}"
         )
         .into());
     }
     println!(
-        "macOS Metal text probe passed with {visible_text_pixels} visible pixels: {}",
+        "macOS Metal text probe passed with {visible_text_pixels} visible pixels ({row_pixel_counts:?}): {}",
         output.display()
     );
     Ok(())

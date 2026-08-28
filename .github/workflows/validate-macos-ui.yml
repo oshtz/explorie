@@ -40,13 +40,13 @@ jobs:
         with:
           workspaces: './ -> target'
 
-      - name: Test native macOS UI behavior
-        run: cargo test --locked -p explorie-gpui
-
       - name: Verify CoreText glyphs reach the Metal renderer
         env:
           EXPLORIE_RENDER_PROBE_OUTPUT: target/macos-render-probe.png
         run: cargo run --locked -p explorie-gpui --example macos_render_probe
+
+      - name: Test native macOS UI behavior
+        run: cargo test --locked -p explorie-gpui
 
       - name: Upload macOS rendering proof
         if: always()

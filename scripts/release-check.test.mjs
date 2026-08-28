@@ -496,7 +496,7 @@ test('workflows block audits and publish the exact attested draft assets', async
   );
   assert.match(
     macosUi,
-    /name: CoreText and Metal rendering[\s\S]*?runs-on: macos-latest[\s\S]*?cargo test --locked -p explorie-gpui[\s\S]*?macos_render_probe[\s\S]*?macos-render-probe\.png/
+    /name: CoreText and Metal rendering[\s\S]*?runs-on: macos-latest[\s\S]*?macos_render_probe[\s\S]*?cargo test --locked -p explorie-gpui[\s\S]*?macos-render-probe\.png/
   );
   assert.doesNotMatch(release, /tauri build/);
   assert.match(
