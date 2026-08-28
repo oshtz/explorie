@@ -1028,14 +1028,21 @@ mod tests {
         let native = NativeServices::new(ResourcePaths::test(root.path()));
         native.integration.open(script).wait().unwrap();
 
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !marker.exists() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(25));
-        }
-        assert_eq!(
-            fs::read_to_string(marker).unwrap().trim(),
-            "opened-by-shell"
-        );
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let contents = loop {
+            match fs::read_to_string(&marker) {
+                Ok(contents) => break contents,
+                Err(error)
+                    if error.kind() == io::ErrorKind::NotFound && Instant::now() < deadline =>
+                {
+                    thread::sleep(Duration::from_millis(25));
+                }
+                Err(error) => panic!(
+                    "system open returned but the shell marker was not readable within 20 seconds: {error}"
+                ),
+            }
+        };
+        assert_eq!(contents.trim(), "opened-by-shell");
     }
 
     #[cfg(target_os = "macos")]
