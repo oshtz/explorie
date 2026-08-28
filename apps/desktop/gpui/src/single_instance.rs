@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddrV4, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -137,10 +137,9 @@ fn listen(
                     let _ = sender.send(request);
                 }
             }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            Err(_) => {
                 thread::sleep(Duration::from_millis(10));
             }
-            Err(_) => break,
         }
     }
 }
@@ -148,12 +147,14 @@ fn listen(
 fn read_request(mut stream: TcpStream, expected_token: &str) -> Option<SingleInstanceRequest> {
     let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
     let mut bytes = Vec::new();
-    if Read::by_ref(&mut stream)
-        .take(MAX_REQUEST_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .is_err()
-        || bytes.len() as u64 > MAX_REQUEST_BYTES
-    {
+    let mut reader = io::BufReader::new(&mut stream).take(MAX_REQUEST_BYTES + 2);
+    if reader.read_until(b'\n', &mut bytes).is_err() {
+        return None;
+    }
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+    }
+    if bytes.len() as u64 > MAX_REQUEST_BYTES {
         return None;
     }
     let request = serde_json::from_slice::<WireRequest>(&bytes).ok()?;
@@ -197,13 +198,14 @@ fn forward_once(endpoint_path: &Path, launch_path: Option<&Path>) -> io::Result<
         token: endpoint.token,
         path: launch_path.map(|path| path.to_string_lossy().into_owned()),
     };
-    let bytes = serde_json::to_vec(&request)?;
+    let mut bytes = serde_json::to_vec(&request)?;
     if bytes.len() as u64 > MAX_REQUEST_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "launch request is too large",
         ));
     }
+    bytes.push(b'\n');
     stream.write_all(&bytes)?;
     stream.shutdown(Shutdown::Write)?;
     Ok(())
@@ -302,6 +304,8 @@ fn try_acquire_platform_guard() -> io::Result<Option<PlatformSingleInstanceGuard
 mod tests {
     use super::*;
 
+    const REQUEST_DELIVERY_TIMEOUT: Duration = Duration::from_secs(5);
+
     fn fixture_dir() -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "explorie-single-instance-{}-{}",
@@ -322,7 +326,9 @@ mod tests {
 
         forward_to_primary(&config_dir, Some(&directory)).unwrap();
         assert_eq!(
-            requests.recv_timeout(Duration::from_secs(1)).unwrap(),
+            requests
+                .recv_timeout(REQUEST_DELIVERY_TIMEOUT)
+                .expect("primary did not receive the directory launch request"),
             SingleInstanceRequest {
                 path: Some(directory.clone())
             }
@@ -330,7 +336,9 @@ mod tests {
 
         forward_to_primary(&config_dir, None).unwrap();
         assert_eq!(
-            requests.recv_timeout(Duration::from_secs(1)).unwrap(),
+            requests
+                .recv_timeout(REQUEST_DELIVERY_TIMEOUT)
+                .expect("primary did not receive the activation request"),
             SingleInstanceRequest { path: None }
         );
 
@@ -363,10 +371,41 @@ mod tests {
 
         forward_to_primary(&config_dir, Some(&missing)).unwrap();
         assert_eq!(
-            requests.recv_timeout(Duration::from_secs(1)).unwrap(),
+            requests
+                .recv_timeout(REQUEST_DELIVERY_TIMEOUT)
+                .expect("primary did not receive the sanitized launch request"),
             SingleInstanceRequest { path: None }
         );
 
+        drop(server);
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[test]
+    fn newline_framing_delivers_before_the_client_connection_closes() {
+        let config_dir = fixture_dir();
+        let (server, requests) = SingleInstanceServer::start(&config_dir).unwrap();
+        let endpoint = serde_json::from_slice::<EndpointDescriptor>(
+            &fs::read(config_dir.join(ENDPOINT_FILE)).unwrap(),
+        )
+        .unwrap();
+        let request = WireRequest {
+            token: endpoint.token,
+            path: None,
+        };
+        let mut bytes = serde_json::to_vec(&request).unwrap();
+        bytes.push(b'\n');
+        let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, endpoint.port)).unwrap();
+        stream.write_all(&bytes).unwrap();
+
+        assert_eq!(
+            requests
+                .recv_timeout(REQUEST_DELIVERY_TIMEOUT)
+                .expect("primary waited for connection close instead of the frame delimiter"),
+            SingleInstanceRequest { path: None }
+        );
+
+        drop(stream);
         drop(server);
         fs::remove_dir_all(config_dir).unwrap();
     }
