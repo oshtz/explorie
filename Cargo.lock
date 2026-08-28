@@ -1711,7 +1711,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1787,6 +1787,18 @@ name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
+
+[[package]]
+name = "dwrote"
+version = "0.11.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e1b35532432acc8b19ceed096e35dfa088d3ea037fe4f3c085f1f97f33b4d02"
+dependencies = [
+ "lazy_static",
+ "libc",
+ "winapi",
+ "wio",
+]
 
 [[package]]
 name = "dyn-clone"
@@ -1894,7 +1906,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1979,7 +1991,7 @@ version = "0.1.0"
 
 [[package]]
 name = "explorie-gpui"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "chrono",
  "cocoa 0.26.0",
@@ -2156,6 +2168,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "98de4bbd547a563b716d8dfa9aad1cb19bfab00f4fa09a6a4ed21dbcf44ce9c4"
 
 [[package]]
+name = "float-ord"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8ce81f49ae8a0482e4c55ea62ebbd7e5a686af544c00b9d090bba3ff9be97b3d"
+
+[[package]]
 name = "float_next_after"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2196,15 +2214,6 @@ name = "font-types"
 version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5b38ad915f6dadd993ced50848a8291a543bd41ca62bc10740d5e64e2ab4cfd7"
-dependencies = [
- "bytemuck",
-]
-
-[[package]]
-name = "font-types"
-version = "0.12.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e64eb721ca85a34323425f4041adc5d82704d3782d5f8f03793bc012419dce23"
 dependencies = [
  "bytemuck",
 ]
@@ -2266,6 +2275,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
+]
+
+[[package]]
+name = "freetype-sys"
+version = "0.20.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0e7edc5b9669349acfda99533e9e0bcf26a51862ab43b08ee7745c55d28eb134"
+dependencies = [
+ "cc",
+ "libc",
+ "pkg-config",
 ]
 
 [[package]]
@@ -2756,7 +2776,7 @@ dependencies = [
  "log",
  "presser",
  "thiserror 2.0.20",
- "windows 0.62.2",
+ "windows 0.56.0",
 ]
 
 [[package]]
@@ -2936,6 +2956,7 @@ dependencies = [
  "strum",
  "util",
  "uuid",
+ "zed-font-kit",
 ]
 
 [[package]]
@@ -3413,7 +3434,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core 0.56.0",
 ]
 
 [[package]]
@@ -4378,7 +4399,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4515,7 +4536,7 @@ version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "680998035259dcfcafe653688bf2aa6d3e2dc05e98be6ab46afb089dc84f1df8"
 dependencies = [
- "proc-macro-crate 3.5.0",
+ "proc-macro-crate 1.3.1",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -5741,7 +5762,7 @@ checksum = "7b634fabf032fab15307ffd272149b622260f55974d9fad689292a5d33df02e5"
 dependencies = [
  "bytemuck",
  "core_maths",
- "font-types 0.11.3",
+ "font-types",
 ]
 
 [[package]]
@@ -5751,18 +5772,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c4ed38b89c2c77ff968c524145ad65fb010f38af5c7a224b53b81d47ac2daa81"
 dependencies = [
  "bytemuck",
- "font-types 0.11.3",
-]
-
-[[package]]
-name = "read-fonts"
-version = "0.41.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "046a7d674daf459825b32f5062056d6882db0d2f5a479fbd76ccfc870ac18709"
-dependencies = [
- "bytemuck",
- "font-types 0.12.4",
- "once_cell",
+ "font-types",
 ]
 
 [[package]]
@@ -6006,7 +6016,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6019,7 +6029,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6467,16 +6477,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "skrifa"
-version = "0.44.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "819ab7d62b1d3e72d9d9dea5650bac30424f9111364bb94928dbf5ecad1baa68"
-dependencies = [
- "bytemuck",
- "read-fonts 0.41.0",
-]
-
-[[package]]
 name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6567,7 +6567,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -6746,7 +6746,7 @@ version = "0.2.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6c2499c2d826531388872b2268718aed907a39bd785ab0dcfe57fab26283f92e"
 dependencies = [
- "skrifa 0.44.0",
+ "skrifa 0.42.1",
  "yazi",
  "zeno",
 ]
@@ -7017,7 +7017,7 @@ dependencies = [
  "memchr",
  "ntapi",
  "rayon",
- "windows 0.57.0",
+ "windows 0.56.0",
 ]
 
 [[package]]
@@ -7090,7 +7090,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -7476,7 +7476,7 @@ checksum = "f2f6fb2847f6742cd76af783a2a2c49e9375d0a111c7bef6f71cd9e738c72d6e"
 dependencies = [
  "memoffset",
  "tempfile",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -8215,7 +8215,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -8243,16 +8243,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1de69df01bdf1ead2f4ac895dc77c9351aefff65b2f3db429a343f9cbf05e132"
 dependencies = [
  "windows-core 0.56.0",
- "windows-targets 0.52.6",
-]
-
-[[package]]
-name = "windows"
-version = "0.57.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12342cb4d8e3b046f3d80effd474a7a02447231330ef77d71daa6fbc40681143"
-dependencies = [
- "windows-core 0.57.0",
  "windows-targets 0.52.6",
 ]
 
@@ -8329,18 +8319,6 @@ checksum = "4698e52ed2d08f8658ab0c39512a7c00ee5fe2688c65f8c0a4f06750d729f2a6"
 dependencies = [
  "windows-implement 0.56.0",
  "windows-interface 0.56.0",
- "windows-result 0.1.2",
- "windows-targets 0.52.6",
-]
-
-[[package]]
-name = "windows-core"
-version = "0.57.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2ed2439a290666cd67ecce2b0ffaad89c2a56b976b736e6ece670297897832d"
-dependencies = [
- "windows-implement 0.57.0",
- "windows-interface 0.57.0",
  "windows-result 0.1.2",
  "windows-targets 0.52.6",
 ]
@@ -8430,17 +8408,6 @@ dependencies = [
 
 [[package]]
 name = "windows-implement"
-version = "0.57.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9107ddc059d5b6fbfbffdfa7a7fe3e22a226def0b2608f72e9d552763d3e1ad7"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "windows-implement"
 version = "0.58.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2bbd5b46c938e506ecbce286b6628a02171d56153ba733b6c741fc627ec9579b"
@@ -8477,17 +8444,6 @@ name = "windows-interface"
 version = "0.56.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "08990546bf4edef8f431fa6326e032865f27138718c587dc21bc0265bbcb57cc"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "windows-interface"
-version = "0.57.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "29bee4b38ea3cde66011baa44dba677c432a78593e202392d1e9070cf2a7fca7"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -8992,6 +8948,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d135d17ab770252ad95e9a872d365cf3090e3be864a34ab46f48555993efc904"
 
 [[package]]
+name = "wio"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d129932f4644ac2396cb456385cbf9e63b5b30c6e8dc4820bdca4eb082037a5"
+dependencies = [
+ "winapi",
+]
+
+[[package]]
 name = "wit-bindgen"
 version = "0.57.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9067,6 +9032,17 @@ name = "yazi"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e01738255b5a16e78bbb83e7fbba0a1e7dd506905cfc53f4622d89015a03fbb5"
+
+[[package]]
+name = "yeslogic-fontconfig-sys"
+version = "6.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d8b8abf912b9a29ff112e1671c97c33636903d13a69712037190e6805af4f76"
+dependencies = [
+ "dlib",
+ "once_cell",
+ "pkg-config",
+]
 
 [[package]]
 name = "yoke"
@@ -9195,6 +9171,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d1afec51604565183aeb5c54c20aeab286120d4e4460f7f76e3e8bb8c0d99473"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "zed-font-kit"
+version = "0.14.1-zed"
+source = "git+https://github.com/zed-industries/font-kit?rev=94b0f28166665e8fd2f53ff6d268a14955c82269#94b0f28166665e8fd2f53ff6d268a14955c82269"
+dependencies = [
+ "bitflags 2.13.1",
+ "byteorder",
+ "core-foundation 0.10.0",
+ "core-graphics 0.24.0",
+ "core-text",
+ "dirs 6.0.0",
+ "dwrote",
+ "float-ord",
+ "freetype-sys",
+ "lazy_static",
+ "libc",
+ "log",
+ "pathfinder_geometry",
+ "pathfinder_simd",
+ "walkdir",
+ "winapi",
+ "yeslogic-fontconfig-sys",
 ]
 
 [[package]]

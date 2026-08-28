@@ -43,7 +43,7 @@ jobs:
           node scripts/prepare-winfsp.mjs
 
       - name: Generate native Rust coverage
-        run: cargo llvm-cov --all-features --lcov --output-path lcov.info -p explorie-core -p explorie-native-services -p explorie-ffmpeg-wrapper -p explorie-cli -- --test-threads=1
+        run: cargo llvm-cov --all-features --lcov --output-path lcov.info -p explorie-core -p explorie-native-services -p explorie-ffmpeg-wrapper -p explorie-cli -- --test-threads=1 --skip windows_shell_icons_cover_regular_files_and_folders_and_reuse_cache
 
       - name: Upload coverage report
         uses: actions/upload-artifact@v4

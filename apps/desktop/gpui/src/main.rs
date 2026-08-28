@@ -5,14 +5,12 @@ use std::path::PathBuf;
 #[cfg(target_os = "macos")]
 use explorie_gpui::SingleInstanceRequest;
 use explorie_gpui::{
-    APP_IDENTIFIER, APP_NAME, DEFAULT_WINDOW_HEIGHT, DEFAULT_WINDOW_WIDTH, DirectoryWindow,
-    ExplorieAssets, MIN_WINDOW_HEIGHT, MIN_WINDOW_WIDTH, RecoveryMarker, WindowRuntime,
-    acquire_single_instance, initial_window_bounds, parse_startup_path,
+    APP_NAME, DEFAULT_WINDOW_HEIGHT, DEFAULT_WINDOW_WIDTH, DirectoryWindow, ExplorieAssets,
+    RecoveryMarker, WindowRuntime, acquire_single_instance, desktop_window_options,
+    initial_window_bounds, parse_startup_path,
 };
 use explorie_native_services::{NativeServices, ResourcePaths};
-use gpui::{
-    App, AppContext, Bounds, Focusable, TitlebarOptions, WindowBounds, WindowOptions, px, size,
-};
+use gpui::{App, AppContext, Bounds, Focusable, px, size};
 #[cfg(not(target_os = "windows"))]
 use gpui_platform::application;
 
@@ -115,18 +113,7 @@ fn main() {
             cx,
         );
         let bounds = initial_window_bounds(&config_dir, fallback_bounds, cx);
-        let options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
-            window_min_size: Some(size(px(MIN_WINDOW_WIDTH), px(MIN_WINDOW_HEIGHT))),
-            titlebar: Some(TitlebarOptions {
-                title: Some(APP_NAME.into()),
-                appears_transparent: cfg!(target_os = "windows"),
-                traffic_light_position: None,
-            }),
-            is_resizable: true,
-            app_id: Some(APP_IDENTIFIER.to_string()),
-            ..Default::default()
-        };
+        let options = desktop_window_options(bounds);
         let primary_path = path.clone();
         let primary_services = services.clone();
         let primary_runtime = window_runtime.clone();
@@ -175,18 +162,7 @@ fn main() {
                 size(px(DEFAULT_WINDOW_WIDTH), px(DEFAULT_WINDOW_HEIGHT)),
                 cx,
             );
-            let options = WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(fallback_bounds)),
-                window_min_size: Some(size(px(MIN_WINDOW_WIDTH), px(MIN_WINDOW_HEIGHT))),
-                titlebar: Some(TitlebarOptions {
-                    title: Some(APP_NAME.into()),
-                    appears_transparent: cfg!(target_os = "windows"),
-                    traffic_light_position: None,
-                }),
-                is_resizable: true,
-                app_id: Some(APP_IDENTIFIER.to_string()),
-                ..Default::default()
-            };
+            let options = desktop_window_options(fallback_bounds);
             let services = services.clone();
             let runtime = window_runtime.clone();
             let fallback_path = path.clone();

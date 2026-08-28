@@ -118,6 +118,19 @@ test('packaged native assets have a Tauri-independent authority', async () => {
   assert.doesNotMatch(macosPackage, /icons\/icon\.icns/);
 });
 
+test('macOS GPUI platform enables native font rendering', async () => {
+  const [workspace, manifest] = await Promise.all([
+    readFile(path.join(process.cwd(), 'Cargo.toml'), 'utf8'),
+    readFile(path.join(process.cwd(), 'apps/desktop/gpui/Cargo.toml'), 'utf8'),
+  ]);
+
+  assert.doesNotMatch(workspace, /gpui_macos = \{ path = "vendor\/gpui_macos" \}/);
+  assert.match(
+    manifest,
+    /\[target\.'cfg\(target_os = "macos"\)'\.dependencies\][\s\S]*?gpui_platform = \{[^}]*features = \["font-kit"\]/,
+  );
+});
+
 function sampleContext() {
   return {
     generatedAt: fixedDate.toISOString(),
@@ -385,9 +398,10 @@ test('runReleaseCheck stops before commands when release prerequisites fail', as
 });
 
 test('workflows block audits and publish the exact attested draft assets', async () => {
-  const [ci, release, mountDaemon, macosPackage, windowsPackage, windowsInstaller, updater] = await Promise.all([
+  const [ci, release, macosUi, mountDaemon, macosPackage, windowsPackage, windowsInstaller, updater] = await Promise.all([
     readFile(path.join(process.cwd(), '.github/workflows/ci.yml'), 'utf8'),
     readFile(path.join(process.cwd(), '.github/workflows/build-release.yml'), 'utf8'),
+    readFile(path.join(process.cwd(), '.github/workflows/validate-macos-ui.yml'), 'utf8'),
     readFile(path.join(process.cwd(), 'apps/desktop/native-assets/macos/MountDaemon.m'), 'utf8'),
     readFile(path.join(process.cwd(), 'scripts/package-gpui-macos.sh'), 'utf8'),
     readFile(path.join(process.cwd(), 'scripts/package-gpui-windows.ps1'), 'utf8'),
@@ -473,6 +487,14 @@ test('workflows block audits and publish the exact attested draft assets', async
   assert.match(
     release,
     /Build GPUI macOS app and DMG[\s\S]*?cargo build -p explorie-gpui --release --locked --target aarch64-apple-darwin[\s\S]*?scripts\/package-gpui-macos\.sh/
+  );
+  assert.match(
+    release,
+    /Verify CoreText glyphs reach the Metal renderer[\s\S]*?cargo run --locked -p explorie-gpui --example macos_render_probe/
+  );
+  assert.match(
+    macosUi,
+    /name: CoreText and Metal rendering[\s\S]*?runs-on: macos-latest[\s\S]*?macos_render_probe[\s\S]*?cargo test --locked -p explorie-gpui[\s\S]*?macos-render-probe\.png/
   );
   assert.doesNotMatch(release, /tauri build/);
   assert.match(
