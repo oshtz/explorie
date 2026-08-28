@@ -146,7 +146,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 );
                                 let glyph_count =
                                     line.runs.iter().map(|run| run.glyphs.len()).sum::<usize>();
-                                (*family, line.width(), glyph_count)
+                                let font_ids =
+                                    line.runs.iter().map(|run| run.font_id).collect::<Vec<_>>();
+                                (*family, line.width(), glyph_count, font_ids)
                             })
                             .collect::<Vec<_>>();
                         eprintln!("macOS text shaping diagnostics: {diagnostics:?}");

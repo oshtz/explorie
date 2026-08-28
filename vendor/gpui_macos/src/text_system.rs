@@ -429,13 +429,24 @@ impl MacTextSystemState {
     fn raster_bounds(&self, params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
         let font = &self.fonts[params.font_id.0];
         let scale = Transform2F::from_scale(params.scale_factor);
-        let bounds: Bounds<DevicePixels> = bounds_from_rect_i(font.raster_bounds(
+        let raw_bounds = font.raster_bounds(
             params.glyph_id.0,
             params.font_size.into(),
             scale,
             HintingOptions::None,
             font_kit::canvas::RasterizationOptions::GrayscaleAa,
-        )?);
+        );
+        if std::env::var_os("EXPLORIE_RENDER_PROBE_OUTPUT").is_some() {
+            static PROBED_BOUNDS: AtomicUsize = AtomicUsize::new(0);
+            let probe_index = PROBED_BOUNDS.fetch_add(1, Ordering::Relaxed);
+            if probe_index < 12 {
+                eprintln!(
+                    "macOS glyph bounds diagnostic #{probe_index}: font={:?} glyph={:?} result={raw_bounds:?}",
+                    params.font_id, params.glyph_id
+                );
+            }
+        }
+        let bounds: Bounds<DevicePixels> = bounds_from_rect_i(raw_bounds?);
 
         // Expand the bounds by 1 pixel on each side to give CG room for anti-aliasing.
         Ok(bounds.dilate(DevicePixels(1)))
