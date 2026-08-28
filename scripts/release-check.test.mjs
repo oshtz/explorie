@@ -530,6 +530,11 @@ test('workflows block audits and publish the exact attested draft assets', async
   );
   assert.match(release, /Previous Explorie did not create real settings state/);
   assert.match(release, /Real Explorie settings did not survive the installer upgrade/);
+  assert.match(
+    release,
+    /\$profile = Join-Path \(\[IO\.Path\]::GetTempPath\(\)\) "explorie-upgrade-profile"/
+  );
+  assert.doesNotMatch(release, /\$profile = Join-Path \$env:RUNNER_TEMP/);
   assert.match(release, /scripts\/smoke-gpui-release\.ps1 -Executable \$app -ProfilePath \$profile/);
   assert.match(release, /& \$rclone version[\s\S]*?Unexpected installed rclone version/);
   assert.match(release, /unins000\.exe[\s\S]*?\/VERYSILENT/);

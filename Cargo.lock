@@ -1991,7 +1991,7 @@ version = "0.1.0"
 
 [[package]]
 name = "explorie-gpui"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "chrono",
  "cocoa 0.26.0",
