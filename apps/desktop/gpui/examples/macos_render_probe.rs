@@ -1,11 +1,17 @@
 #[cfg(target_os = "macos")]
-use std::{error::Error, path::PathBuf, sync::Arc};
+use std::{
+    error::Error,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 #[cfg(target_os = "macos")]
 use explorie_gpui::{ExplorieAssets, MACOS_SYSTEM_FONT_FAMILY};
 #[cfg(target_os = "macos")]
 use gpui::{
-    AppContext, Context, HeadlessAppContext, Render, Window, div, prelude::*, px, rgb, size,
+    App, AppContext, Context, Render, Window, WindowBounds, WindowOptions, bounds, div, point,
+    prelude::*, px, rgb, size,
 };
 #[cfg(target_os = "macos")]
 struct RenderProbe;
@@ -43,16 +49,7 @@ impl Render for RenderProbe {
 }
 
 #[cfg(target_os = "macos")]
-fn main() -> Result<(), Box<dyn Error>> {
-    let platform = gpui_platform::current_platform(true);
-    let mut cx = HeadlessAppContext::with_platform(
-        platform.text_system(),
-        Arc::new(ExplorieAssets),
-        gpui_platform::current_headless_renderer,
-    );
-    let window = cx.open_window(size(px(640.0), px(240.0)), |_, cx| cx.new(|_| RenderProbe))?;
-    cx.run_until_parked();
-    let image = cx.capture_screenshot(window.into())?;
+fn validate_image(image: image::RgbaImage, output: PathBuf) -> Result<(), String> {
     let visible_text_pixels = image
         .pixels()
         .filter(|pixel| pixel[0] > 80 && pixel[1] > 80 && pixel[2] > 80 && pixel[3] > 0)
@@ -80,31 +77,81 @@ fn main() -> Result<(), Box<dyn Error>> {
         })
         .collect::<Vec<_>>();
 
-    let output = std::env::var_os("EXPLORIE_RENDER_PROBE_OUTPUT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("target/macos-render-probe.png"));
     if let Some(parent) = output.parent() {
-        std::fs::create_dir_all(parent)?;
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
-    image.save(&output)?;
+    image.save(&output).map_err(|error| error.to_string())?;
 
     if dark_background_pixels < total_pixels * 3 / 4 {
         return Err(format!(
             "macOS Metal probe did not render the expected dark surface ({dark_background_pixels}/{total_pixels} pixels)"
-        )
-        .into());
+        ));
     }
     if visible_text_pixels < 100 {
         return Err(format!(
             "macOS Metal probe rendered only {visible_text_pixels} visible text pixels; per-family counts: {row_pixel_counts:?}"
-        )
-        .into());
+        ));
     }
     println!(
         "macOS Metal text probe passed with {visible_text_pixels} visible pixels ({row_pixel_counts:?}): {}",
         output.display()
     );
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn main() -> Result<(), Box<dyn Error>> {
+    let output = std::env::var_os("EXPLORIE_RENDER_PROBE_OUTPUT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("target/macos-render-probe.png"));
+    let outcome = Arc::new(Mutex::new(None));
+    let task_outcome = outcome.clone();
+
+    gpui_platform::application()
+        .with_assets(ExplorieAssets)
+        .run(move |cx: &mut App| {
+            let window = match cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds(
+                        point(px(40.0), px(40.0)),
+                        size(px(640.0), px(240.0)),
+                    ))),
+                    focus: false,
+                    show: true,
+                    ..Default::default()
+                },
+                |_, cx| cx.new(|_| RenderProbe),
+            ) {
+                Ok(window) => window,
+                Err(error) => {
+                    *task_outcome.lock().expect("probe outcome lock poisoned") =
+                        Some(Err(error.to_string()));
+                    cx.quit();
+                    return;
+                }
+            };
+            cx.activate(true);
+            cx.spawn(async move |cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(500))
+                    .await;
+                let result = window
+                    .update(cx, |_, window, _| window.render_to_image())
+                    .map_err(|error| error.to_string())
+                    .and_then(|image| image.map_err(|error| error.to_string()))
+                    .and_then(|image| validate_image(image, output));
+                *task_outcome.lock().expect("probe outcome lock poisoned") = Some(result);
+                cx.update(|cx| cx.quit());
+            })
+            .detach();
+        });
+
+    outcome
+        .lock()
+        .expect("probe outcome lock poisoned")
+        .take()
+        .unwrap_or_else(|| Err("macOS render probe exited without a result".to_string()))
+        .map_err(Into::into)
 }
 
 #[cfg(not(target_os = "macos"))]
