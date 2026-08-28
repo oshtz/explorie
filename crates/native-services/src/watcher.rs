@@ -253,12 +253,14 @@ impl WatcherService {
 
         let events = self.context.events();
         let worker_paths = paths.clone();
+        let worker_path_aliases = canonical_watch_path_aliases(&paths);
         let worker_cancelled = Arc::clone(&cancelled);
         let worker_events = Arc::clone(&event_queue);
         thread::spawn(move || {
             coalescing_worker(
                 id,
                 worker_paths,
+                worker_path_aliases,
                 receiver,
                 events,
                 worker_events,
@@ -387,6 +389,7 @@ impl Drop for WatchSubscription {
 fn coalescing_worker(
     id: u64,
     watched_paths: Vec<PathBuf>,
+    path_aliases: Vec<(PathBuf, PathBuf)>,
     receiver: mpsc::Receiver<Result<Event, String>>,
     events: crate::ServiceEvents,
     subscription_events: Arc<WatchEventQueue>,
@@ -432,6 +435,7 @@ fn coalescing_worker(
             bound_changed_paths(&mut changed, &watched_paths);
         }
 
+        remap_canonical_backend_paths(&mut changed, &path_aliases);
         if !cancelled.load(Ordering::Acquire) && !changed.is_empty() {
             let mut paths: Vec<_> = changed.into_iter().collect();
             paths.sort();
@@ -446,6 +450,32 @@ fn coalescing_worker(
         }
     }
     subscription_events.close();
+}
+
+fn canonical_watch_path_aliases(watched_paths: &[PathBuf]) -> Vec<(PathBuf, PathBuf)> {
+    let mut aliases: Vec<_> = watched_paths
+        .iter()
+        .filter_map(|requested| {
+            let canonical = std::fs::canonicalize(requested).ok()?;
+            (canonical != *requested).then(|| (canonical, requested.clone()))
+        })
+        .collect();
+    aliases.sort_by_key(|(canonical, _)| std::cmp::Reverse(canonical.components().count()));
+    aliases
+}
+
+fn remap_canonical_backend_paths(changed: &mut HashSet<PathBuf>, aliases: &[(PathBuf, PathBuf)]) {
+    if aliases.is_empty() {
+        return;
+    }
+    for path in std::mem::take(changed) {
+        let mapped = aliases.iter().find_map(|(canonical, requested)| {
+            path.strip_prefix(canonical)
+                .ok()
+                .map(|suffix| requested.join(suffix))
+        });
+        changed.insert(mapped.unwrap_or(path));
+    }
 }
 
 fn bound_changed_paths(changed: &mut HashSet<PathBuf>, watched_paths: &[PathBuf]) {
@@ -515,6 +545,26 @@ mod tests {
             .collect::<HashSet<_>>();
         bound_changed_paths(&mut changed, &watched);
         assert_eq!(changed, HashSet::from([PathBuf::from("root")]));
+    }
+
+    #[test]
+    fn canonical_backend_paths_are_remapped_to_the_requested_watch_root() {
+        let mut changed = HashSet::from([
+            PathBuf::from("/private/var/folders/test/nested/changed.txt"),
+            PathBuf::from("/unrelated/file.txt"),
+        ]);
+        let aliases = vec![(
+            PathBuf::from("/private/var/folders/test"),
+            PathBuf::from("/var/folders/test"),
+        )];
+
+        remap_canonical_backend_paths(&mut changed, &aliases);
+
+        assert!(changed.contains(&PathBuf::from("/var/folders/test/nested/changed.txt")));
+        assert!(changed.contains(&PathBuf::from("/unrelated/file.txt")));
+        assert!(!changed.contains(&PathBuf::from(
+            "/private/var/folders/test/nested/changed.txt"
+        )));
     }
 
     #[test]
