@@ -26,15 +26,14 @@ use explorie_native_services::{
     UpdateInfo, VideoFrame, VideoStatus, WatcherEvent, WatcherState, format_exif_date,
     is_image_metadata_path, validate_remote_drive_profile,
 };
-#[cfg(target_os = "windows")]
-use gpui::WindowControlArea;
 use gpui::{
     AccessibleAction, AnyElement, App, AssetSource, Bounds, ClipboardItem, Context, ElementId,
     Entity, ExternalPaths, FocusHandle, Focusable, FontWeight, HighlightStyle, KeyDownEvent,
     ListAlignment, ListState, MouseButton, ObjectFit, Orientation, PathPromptOptions, Pixels,
     Render, RenderImage, Rgba, Role, ScrollHandle, ScrollStrategy, SharedString, StyledImage,
     StyledText, Task, TitlebarOptions, UniformListScrollHandle, Window, WindowAppearance,
-    WindowBounds, WindowOptions, deferred, div, img, list, prelude::*, px, rgb, svg, uniform_list,
+    WindowBounds, WindowControlArea, WindowOptions, deferred, div, img, list, point, prelude::*,
+    px, rgb, svg, uniform_list,
 };
 
 mod batch_rename;
@@ -197,6 +196,7 @@ gpui::actions!(
 
 pub const APP_IDENTIFIER: &str = "com.omershatz.explorie";
 pub const APP_NAME: &str = "explorie";
+pub const MACOS_SYSTEM_FONT_FAMILY: &str = ".SystemUIFont";
 pub const DEFAULT_WINDOW_WIDTH: f32 = 1024.0;
 pub const DEFAULT_WINDOW_HEIGHT: f32 = 768.0;
 pub const MIN_WINDOW_WIDTH: f32 = 800.0;
@@ -1356,15 +1356,36 @@ fn font_family(settings: &AppSettings) -> String {
             }
         }
         FontChoice::System => {
-            if cfg!(windows) {
+            if cfg!(target_os = "macos") {
+                MACOS_SYSTEM_FONT_FAMILY
+            } else if cfg!(windows) {
                 "Segoe UI"
             } else {
-                "SF Pro Text"
+                "sans-serif"
             }
         }
         FontChoice::Serif => "Georgia",
     }
     .to_string()
+}
+
+pub fn desktop_window_options(bounds: Bounds<Pixels>) -> WindowOptions {
+    WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        window_min_size: Some(gpui::size(px(MIN_WINDOW_WIDTH), px(MIN_WINDOW_HEIGHT))),
+        titlebar: Some(TitlebarOptions {
+            title: Some(APP_NAME.into()),
+            appears_transparent: cfg!(any(windows, target_os = "macos")),
+            traffic_light_position: if cfg!(target_os = "macos") {
+                Some(point(px(9.0), px(9.0)))
+            } else {
+                None
+            },
+        }),
+        is_resizable: true,
+        app_id: Some(APP_IDENTIFIER.to_string()),
+        ..Default::default()
+    }
 }
 
 pub fn parse_startup_path(args: impl IntoIterator<Item = OsString>) -> Option<PathBuf> {
@@ -3060,6 +3081,8 @@ pub struct DirectoryWindow {
     settings_confirmation_focus_pending: bool,
     control_surface: ControlSurface,
     toolbar_menu: ToolbarMenu,
+    #[cfg(target_os = "macos")]
+    title_bar_drag_pending: bool,
     overlay_return_focus: Option<FocusHandle>,
     overlay_focus_pending: bool,
     overlay_restore_pending: bool,
@@ -3480,6 +3503,8 @@ impl DirectoryWindow {
             settings_confirmation_focus_pending: false,
             control_surface: ControlSurface::Closed,
             toolbar_menu: ToolbarMenu::Closed,
+            #[cfg(target_os = "macos")]
+            title_bar_drag_pending: false,
             overlay_return_focus: None,
             overlay_focus_pending: false,
             overlay_restore_pending: false,
@@ -8035,18 +8060,7 @@ impl DirectoryWindow {
             gpui::size(px(DEFAULT_WINDOW_WIDTH), px(DEFAULT_WINDOW_HEIGHT)),
             cx,
         );
-        let options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(fallback_bounds)),
-            window_min_size: Some(gpui::size(px(MIN_WINDOW_WIDTH), px(MIN_WINDOW_HEIGHT))),
-            titlebar: Some(TitlebarOptions {
-                title: Some(APP_NAME.into()),
-                appears_transparent: cfg!(target_os = "windows"),
-                traffic_light_position: None,
-            }),
-            is_resizable: true,
-            app_id: Some(APP_IDENTIFIER.to_string()),
-            ..Default::default()
-        };
+        let options = desktop_window_options(fallback_bounds);
         let runtime_for_window = runtime.clone();
         let session_id_for_window = session_id.clone();
         let opened = cx.open_window(options, move |window, cx| {
@@ -17141,7 +17155,95 @@ impl DirectoryWindow {
             .into_any_element()
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    fn render_title_bar(&mut self, _: bool, cx: &mut Context<Self>) -> AnyElement {
+        let palette = self.palette;
+        let titlebar_height = 36.0 * palette.scale;
+        let traffic_light_padding = 78.0 * palette.scale;
+
+        div()
+            .id("title-bar")
+            .debug_selector(|| "title-bar".to_string())
+            .flex()
+            .items_center()
+            .w_full()
+            .h(px(titlebar_height))
+            .flex_none()
+            .bg(palette.topbar)
+            .text_color(palette.text)
+            .child(
+                div()
+                    .id("title-bar-drag-region")
+                    .debug_selector(|| "title-bar-drag-region".to_string())
+                    .window_control_area(WindowControlArea::Drag)
+                    .flex()
+                    .items_center()
+                    .w_full()
+                    .h_full()
+                    .on_mouse_down_out(cx.listener(|this, _, _, _| {
+                        this.title_bar_drag_pending = false;
+                    }))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, _| {
+                            this.title_bar_drag_pending = false;
+                        }),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, _| {
+                            this.title_bar_drag_pending = true;
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(|this, _, window, _| {
+                        if this.title_bar_drag_pending {
+                            this.title_bar_drag_pending = false;
+                            window.start_window_move();
+                        }
+                    }))
+                    .on_click(|event, window, _| {
+                        if event.click_count() == 2 {
+                            window.titlebar_double_click();
+                        }
+                    })
+                    .child(div().w(px(traffic_light_padding)).h_full().flex_none())
+                    .child(
+                        div()
+                            .flex()
+                            .flex_1()
+                            .items_center()
+                            .justify_center()
+                            .min_w_0()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .id("title-bar-app-icon")
+                                    .debug_selector(|| "title-bar-app-icon".to_string())
+                                    .w(px(22.0))
+                                    .h(px(22.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(
+                                        img("icons/titlebar-icon.png")
+                                            .w(px(22.0))
+                                            .h(px(22.0))
+                                            .object_fit(ObjectFit::Contain),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(APP_NAME),
+                            ),
+                    )
+                    .child(div().w(px(traffic_light_padding)).h_full().flex_none()),
+            )
+            .into_any_element()
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     fn render_title_bar(&mut self, _: bool, _: &mut Context<Self>) -> AnyElement {
         div().into_any_element()
     }
@@ -27876,6 +27978,33 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use uuid::Uuid;
 
+    #[test]
+    fn desktop_windows_use_platform_appropriate_native_chrome() {
+        let options = desktop_window_options(Bounds::default());
+        let titlebar = options.titlebar.expect("desktop titlebar options");
+        assert_eq!(titlebar.title.as_deref(), Some(APP_NAME));
+        assert_eq!(
+            titlebar.appears_transparent,
+            cfg!(any(windows, target_os = "macos"))
+        );
+        assert_eq!(
+            titlebar.traffic_light_position,
+            if cfg!(target_os = "macos") {
+                Some(point(px(9.0), px(9.0)))
+            } else {
+                None
+            }
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_system_font_uses_gpui_platform_alias() {
+        let mut settings = AppSettings::default();
+        settings.appearance.font = FontChoice::System;
+        assert_eq!(font_family(&settings), MACOS_SYSTEM_FONT_FAMILY);
+    }
+
     fn fixture_dir() -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "explorie-gpui-fixture-{}-{}",
@@ -28875,7 +29004,7 @@ mod tests {
 
         window.simulate_resize(gpui::size(px(800.0), px(600.0)));
         window.run_until_parked();
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         let content_top = {
             let title_bar = window.debug_bounds("title-bar").unwrap();
             let drag_region = window.debug_bounds("title-bar-drag-region").unwrap();
@@ -28888,6 +29017,7 @@ mod tests {
             assert_eq!(f32::from(app_icon.size.height), 22.0);
             assert!(app_icon.left() >= drag_region.left());
             assert!(app_icon.right() <= drag_region.right());
+            #[cfg(windows)]
             for selector in ["window-minimize", "window-maximize", "window-close"] {
                 let bounds = window.debug_bounds(selector).unwrap();
                 assert_eq!(f32::from(bounds.size.width), 44.0);
@@ -28896,7 +29026,7 @@ mod tests {
             }
             title_bar.bottom()
         };
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos")))]
         let content_top = {
             assert!(window.debug_bounds("title-bar").is_none());
             px(0.0)

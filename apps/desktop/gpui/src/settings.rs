@@ -12,7 +12,7 @@ use explorie_native_services::{RemoteDriveProfile, validate_remote_drive_profile
 
 use crate::{EntryFilter, SortDirection, SortKey, ViewMode};
 
-const SETTINGS_VERSION: u32 = 2;
+const SETTINGS_VERSION: u32 = 3;
 const LEGACY_EXPORT_FILE: &str = "legacy-local-storage.json";
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -259,7 +259,11 @@ impl Default for AppearanceSettings {
             ui_scale: 1.0,
             list_row_height: 34,
             grid_min_width: 140,
-            font: FontChoice::Mono,
+            font: if cfg!(target_os = "macos") {
+                FontChoice::System
+            } else {
+                FontChoice::Mono
+            },
             font_custom: String::new(),
             border_radius: 0,
             icon_size: 14,
@@ -821,45 +825,48 @@ impl SettingsStore {
         let legacy_path = config_dir.join(LEGACY_EXPORT_FILE);
         let mut save_initial = false;
         let (settings, warning) = match fs::read(&path) {
-            Ok(bytes) => match decode_settings(&bytes) {
-                Ok((settings, false)) => (settings, None),
-                Ok((settings, true)) => {
-                    let backup = migration_copy_path(&path, 1);
-                    match fs::copy(&path, &backup) {
-                        Ok(_) => {
-                            save_initial = true;
-                            (
+            Ok(bytes) => {
+                let source_version = settings_schema_version(&bytes).unwrap_or(1);
+                match decode_settings(&bytes) {
+                    Ok((settings, false)) => (settings, None),
+                    Ok((settings, true)) => {
+                        let backup = migration_copy_path(&path, source_version);
+                        match fs::copy(&path, &backup) {
+                            Ok(_) => {
+                                save_initial = true;
+                                (
+                                    settings,
+                                    Some(format!(
+                                        "Settings were migrated to schema v{SETTINGS_VERSION}; the v{source_version} source was preserved at {}",
+                                        backup.display()
+                                    )),
+                                )
+                            }
+                            Err(error) => (
                                 settings,
                                 Some(format!(
-                                    "Settings were migrated to schema v{SETTINGS_VERSION}; the v1 source was preserved at {}",
-                                    backup.display()
+                                    "Settings are using the v{SETTINGS_VERSION} schema in memory, but the v{source_version} backup could not be created ({error}); the source file was left unchanged"
                                 )),
-                            )
+                            ),
                         }
-                        Err(error) => (
-                            settings,
-                            Some(format!(
-                                "Settings are using the v{SETTINGS_VERSION} schema in memory, but the v1 backup could not be created ({error}); the source file was left unchanged"
-                            )),
-                        ),
+                    }
+                    Err(error) => {
+                        let backup = preserved_copy_path(&path);
+                        let preservation = fs::copy(&path, &backup);
+                        let warning = match &preservation {
+                            Ok(_) => format!(
+                                "Settings recovery used defaults; the invalid file was preserved at {}: {error}",
+                                backup.display()
+                            ),
+                            Err(copy_error) => format!(
+                                "Settings recovery used defaults; preserving the invalid file failed ({copy_error}): {error}"
+                            ),
+                        };
+                        save_initial = preservation.is_ok();
+                        (AppSettings::default(), Some(warning))
                     }
                 }
-                Err(error) => {
-                    let backup = preserved_copy_path(&path);
-                    let preservation = fs::copy(&path, &backup);
-                    let warning = match &preservation {
-                        Ok(_) => format!(
-                            "Settings recovery used defaults; the invalid file was preserved at {}: {error}",
-                            backup.display()
-                        ),
-                        Err(copy_error) => format!(
-                            "Settings recovery used defaults; preserving the invalid file failed ({copy_error}): {error}"
-                        ),
-                    };
-                    save_initial = preservation.is_ok();
-                    (AppSettings::default(), Some(warning))
-                }
-            },
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 match read_legacy(&legacy_path) {
                     Ok(Some(values)) => {
@@ -979,14 +986,26 @@ fn decode_settings(bytes: &[u8]) -> Result<(AppSettings, bool), String> {
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| "settings version is missing or invalid".to_string())?;
     let migrated = match version {
-        1 => {
+        1 | 2 => {
+            #[cfg(target_os = "macos")]
+            if value
+                .pointer("/appearance/font")
+                .and_then(serde_json::Value::as_str)
+                == Some("mono")
+                && value
+                    .pointer("/appearance/fontCustom")
+                    .and_then(serde_json::Value::as_str)
+                    .is_none_or(str::is_empty)
+            {
+                value["appearance"]["font"] = serde_json::Value::from("system");
+            }
             value["version"] = serde_json::Value::from(SETTINGS_VERSION);
             true
         }
         version if version == u64::from(SETTINGS_VERSION) => false,
         version => {
             return Err(format!(
-                "unsupported settings version {version}; expected 1 or {SETTINGS_VERSION}"
+                "unsupported settings version {version}; expected 1, 2, or {SETTINGS_VERSION}"
             ));
         }
     };
@@ -994,6 +1013,15 @@ fn decode_settings(bytes: &[u8]) -> Result<(AppSettings, bool), String> {
         .map_err(|error| error.to_string())
         .and_then(AppSettings::validate)
         .map(|settings| (settings, migrated))
+}
+
+fn settings_schema_version(bytes: &[u8]) -> Option<u32> {
+    serde_json::from_slice::<serde_json::Value>(bytes)
+        .ok()?
+        .get("version")?
+        .as_u64()?
+        .try_into()
+        .ok()
 }
 
 fn migration_copy_path(path: &Path, version: u32) -> PathBuf {
@@ -1178,6 +1206,19 @@ mod tests {
         let mut settings = AppSettings::default();
         settings.view.sidebar_width = 9_999.0;
         assert_eq!(settings.validate().unwrap().view.sidebar_width, 480.0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_v2_default_font_migrates_to_the_system_font() {
+        let mut value = serde_json::to_value(AppSettings::default()).unwrap();
+        value["version"] = serde_json::Value::from(2);
+        value["appearance"]["font"] = serde_json::Value::from("mono");
+        value["appearance"]["fontCustom"] = serde_json::Value::from("");
+
+        let (settings, migrated) = decode_settings(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(migrated);
+        assert_eq!(settings.appearance.font, FontChoice::System);
     }
 
     #[test]
