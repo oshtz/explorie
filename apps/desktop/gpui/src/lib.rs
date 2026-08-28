@@ -1283,6 +1283,13 @@ fn slider_fraction(bounds: Bounds<Pixels>, position_x: Pixels) -> f32 {
     ((f32::from(position_x) - f32::from(bounds.left())) / width).clamp(0.0, 1.0)
 }
 
+fn stepped_slider_fraction(index: usize, step_count: usize) -> f32 {
+    if step_count <= 1 {
+        return 0.0;
+    }
+    index.min(step_count - 1) as f32 / (step_count - 1) as f32
+}
+
 fn media_slider_track(value: f32, palette: UiPalette) -> gpui::Div {
     let value = value.clamp(0.0, 1.0);
     let thumb_size = 10.0 * palette.scale;
@@ -6144,6 +6151,7 @@ impl DirectoryWindow {
             .iter()
             .position(|value| (*value - current).abs() < f32::EPSILON)
             .unwrap_or(0);
+        let fraction = stepped_slider_fraction(current_index, values.len());
         let display = match kind {
             SettingsSlider::UiScale => format!("{current:.2}×"),
             _ => format!("{current:.0} px"),
@@ -6152,25 +6160,11 @@ impl DirectoryWindow {
             .iter()
             .enumerate()
             .map(|(index, _)| {
-                let filled = index <= current_index;
-                let selected = index == current_index;
                 div()
                     .id((id, index))
                     .flex_1()
                     .h_full()
-                    .items_center()
                     .cursor_pointer()
-                    .child(
-                        div()
-                            .w_full()
-                            .h(px(if selected { 12.0 } else { 4.0 } * palette.scale))
-                            .rounded_full()
-                            .bg(if filled {
-                                palette.accent
-                            } else {
-                                palette.border
-                            }),
-                    )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.set_settings_slider_index(kind, index, cx)
                     }))
@@ -6190,6 +6184,7 @@ impl DirectoryWindow {
                     .child(
                         div()
                             .id(id)
+                            .debug_selector(move || id.to_string())
                             .role(Role::Slider)
                             .aria_label(label)
                             .aria_numeric_value(f64::from(current))
@@ -6212,6 +6207,7 @@ impl DirectoryWindow {
                             .on_key_down(cx.listener(move |this, event, _, cx| {
                                 this.handle_settings_slider_key(kind, event, cx)
                             }))
+                            .relative()
                             .flex()
                             .items_center()
                             .gap(px(2.0))
@@ -6222,7 +6218,16 @@ impl DirectoryWindow {
                             .border_1()
                             .border_color(palette.border)
                             .focus(move |slider| slider.border_color(palette.accent))
-                            .children(steps),
+                            .child(
+                                div()
+                                    .absolute()
+                                    .debug_selector(move || format!("{id}-track"))
+                                    .left(px(8.0 * palette.scale))
+                                    .right(px(8.0 * palette.scale))
+                                    .top(px(9.0 * palette.scale))
+                                    .child(media_slider_track(fraction, palette)),
+                            )
+                            .child(div().absolute().inset_0().flex().px_2().children(steps)),
                     )
                     .child(
                         div()
@@ -27997,6 +28002,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn stepped_slider_fraction_spans_the_track_and_clamps_invalid_indexes() {
+        assert_eq!(stepped_slider_fraction(0, 5), 0.0);
+        assert_eq!(stepped_slider_fraction(2, 5), 0.5);
+        assert_eq!(stepped_slider_fraction(4, 5), 1.0);
+        assert_eq!(stepped_slider_fraction(20, 5), 1.0);
+        assert_eq!(stepped_slider_fraction(0, 1), 0.0);
+    }
+
+    #[test]
+    fn default_font_resolves_to_the_platform_monospace_family() {
+        assert_eq!(
+            font_family(&AppSettings::default()),
+            monospace_font_family()
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_system_font_uses_gpui_platform_alias() {
@@ -33965,6 +33987,14 @@ mod tests {
                 window.debug_bounds(control_selector).is_some(),
                 "settings tab {tab_index} did not expose {control_selector}"
             );
+            if tab_index == 2 {
+                let slider = window.debug_bounds("settings-ui-scale").unwrap();
+                let track = window.debug_bounds("settings-ui-scale-track").unwrap();
+                assert!(track.left() > slider.left());
+                assert!(track.right() < slider.right());
+                assert!(track.top() > slider.top());
+                assert!(track.bottom() < slider.bottom());
+            }
         }
 
         window.simulate_resize(gpui::size(px(800.0), px(600.0)));

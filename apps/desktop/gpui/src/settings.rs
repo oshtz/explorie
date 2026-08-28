@@ -12,7 +12,7 @@ use explorie_native_services::{RemoteDriveProfile, validate_remote_drive_profile
 
 use crate::{EntryFilter, SortDirection, SortKey, ViewMode};
 
-const SETTINGS_VERSION: u32 = 3;
+const SETTINGS_VERSION: u32 = 4;
 const LEGACY_EXPORT_FILE: &str = "legacy-local-storage.json";
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -259,11 +259,7 @@ impl Default for AppearanceSettings {
             ui_scale: 1.0,
             list_row_height: 34,
             grid_min_width: 140,
-            font: if cfg!(target_os = "macos") {
-                FontChoice::System
-            } else {
-                FontChoice::Mono
-            },
+            font: FontChoice::Mono,
             font_custom: String::new(),
             border_radius: 0,
             icon_size: 14,
@@ -987,17 +983,21 @@ fn decode_settings(bytes: &[u8]) -> Result<(AppSettings, bool), String> {
         .ok_or_else(|| "settings version is missing or invalid".to_string())?;
     let migrated = match version {
         1 | 2 => {
+            value["version"] = serde_json::Value::from(SETTINGS_VERSION);
+            true
+        }
+        3 => {
             #[cfg(target_os = "macos")]
             if value
                 .pointer("/appearance/font")
                 .and_then(serde_json::Value::as_str)
-                == Some("mono")
+                == Some("system")
                 && value
                     .pointer("/appearance/fontCustom")
                     .and_then(serde_json::Value::as_str)
                     .is_none_or(str::is_empty)
             {
-                value["appearance"]["font"] = serde_json::Value::from("system");
+                value["appearance"]["font"] = serde_json::Value::from("mono");
             }
             value["version"] = serde_json::Value::from(SETTINGS_VERSION);
             true
@@ -1005,7 +1005,7 @@ fn decode_settings(bytes: &[u8]) -> Result<(AppSettings, bool), String> {
         version if version == u64::from(SETTINGS_VERSION) => false,
         version => {
             return Err(format!(
-                "unsupported settings version {version}; expected 1, 2, or {SETTINGS_VERSION}"
+                "unsupported settings version {version}; expected 1, 2, 3, or {SETTINGS_VERSION}"
             ));
         }
     };
@@ -1208,9 +1208,14 @@ mod tests {
         assert_eq!(settings.validate().unwrap().view.sidebar_width, 480.0);
     }
 
+    #[test]
+    fn appearance_defaults_to_mono_on_every_desktop() {
+        assert_eq!(AppearanceSettings::default().font, FontChoice::Mono);
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_v2_default_font_migrates_to_the_system_font() {
+    fn macos_v2_mono_font_stays_mono() {
         let mut value = serde_json::to_value(AppSettings::default()).unwrap();
         value["version"] = serde_json::Value::from(2);
         value["appearance"]["font"] = serde_json::Value::from("mono");
@@ -1218,7 +1223,20 @@ mod tests {
 
         let (settings, migrated) = decode_settings(&serde_json::to_vec(&value).unwrap()).unwrap();
         assert!(migrated);
-        assert_eq!(settings.appearance.font, FontChoice::System);
+        assert_eq!(settings.appearance.font, FontChoice::Mono);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_v3_system_default_migrates_to_mono() {
+        let mut value = serde_json::to_value(AppSettings::default()).unwrap();
+        value["version"] = serde_json::Value::from(3);
+        value["appearance"]["font"] = serde_json::Value::from("system");
+        value["appearance"]["fontCustom"] = serde_json::Value::from("");
+
+        let (settings, migrated) = decode_settings(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(migrated);
+        assert_eq!(settings.appearance.font, FontChoice::Mono);
     }
 
     #[test]
