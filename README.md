@@ -211,7 +211,7 @@ Before creating a new tag, manually verify:
 - Reopen the app and confirm persisted settings.
 - Confirm Windows and macOS packaged-app behavior on real machines.
 - Remove or uninstall v0.1.0 before first running v0.2.6; the permanent `com.omershatz.explorie` identity intentionally starts a clean application lineage.
-- Install the Windows package, verify the System Integration toggle routes folder opens to Explorie and restores the prior handler when disabled or uninstalled, and confirm the unsigned warning is expected. Install the macOS package and verify signing/notarization plus both SHA-256 manifests.
+- Install the Windows package, run `cargo test -p explorie-native-services integration::tests::windows_system_open_produces_a_real_shell_side_effect -- --exact --ignored` from an interactive Windows session, verify the System Integration toggle routes folder opens to Explorie and restores the prior handler when disabled or uninstalled, and confirm the unsigned warning is expected. Install the macOS package and verify signing/notarization plus both SHA-256 manifests.
 
 Create a per-candidate real-machine evidence file with `pnpm platform:proof:init`, fill in the exact artifact names and SHA-256 hashes, then mark each observed check. `pnpm platform:proof:verify` rejects missing Windows multi-window/DnD/mixed-DPI/crash/folder-handler proof and missing macOS multi-window/DnD/multi-monitor/crash/signing/notarization/Gatekeeper proof. The evidence stays under ignored `.release-checks/`; archive it alongside the candidate checksums before enabling the workflow attestations.
 

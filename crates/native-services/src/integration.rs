@@ -1010,6 +1010,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    #[ignore = "requires an interactive Windows shell; run explicitly during real-machine release QA"]
     fn windows_system_open_produces_a_real_shell_side_effect() {
         use std::thread;
         use std::time::{Duration, Instant};

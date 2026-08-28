@@ -500,12 +500,31 @@ fn metadata_is_link(metadata: &fs::Metadata) -> bool {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn is_macos_system_root_alias(path: &Path) -> bool {
+    // macOS exposes these immutable, root-owned aliases for compatibility.
+    // Paths below them are ordinary local paths; all other link ancestors
+    // remain rejected, and a link used as the operation target is still rejected.
+    let expected = match path.to_str() {
+        Some("/etc") => Path::new("/private/etc"),
+        Some("/tmp") => Path::new("/private/tmp"),
+        Some("/var") => Path::new("/private/var"),
+        _ => return false,
+    };
+    fs::canonicalize(path).is_ok_and(|canonical| canonical == expected)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_macos_system_root_alias(_path: &Path) -> bool {
+    false
+}
+
 fn validate_no_link_ancestors(path: &Path) -> io::Result<()> {
     let mut ancestors: Vec<&Path> = path.ancestors().collect();
     ancestors.reverse();
     for ancestor in ancestors {
         let metadata = fs::symlink_metadata(ancestor)?;
-        if metadata_is_link(&metadata) {
+        if metadata_is_link(&metadata) && !is_macos_system_root_alias(ancestor) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
@@ -1412,6 +1431,30 @@ mod tests {
                 .wait()
                 .is_err()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mutations_reject_user_controlled_link_ancestors() {
+        use std::os::unix::fs::symlink;
+
+        let temp = temp_dir();
+        let real = temp.path().join("real");
+        let alias = temp.path().join("alias");
+        fs::create_dir(&real).unwrap();
+        fs::write(real.join("source.txt"), "keep").unwrap();
+        symlink(&real, &alias).unwrap();
+        let services = NativeServices::new(ResourcePaths::test(temp.path()));
+
+        let error = services
+            .mutations
+            .rename_path(alias.join("source.txt"), "renamed.txt".into())
+            .wait()
+            .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::InvalidInput);
+        assert_eq!(fs::read_to_string(real.join("source.txt")).unwrap(), "keep");
+        assert!(!real.join("renamed.txt").exists());
     }
 
     #[test]

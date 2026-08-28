@@ -588,7 +588,14 @@ mod tests {
             panic!("expected watcher event");
         };
         assert_eq!(event.state, WatcherState::Changed);
-        assert!(event.paths.iter().any(|path| path == &changed));
+        assert!(
+            event
+                .paths
+                .iter()
+                .any(|path| path == &changed || changed.starts_with(path)),
+            "recursive backends may report either the changed file or its changed ancestor: {:?}",
+            event.paths
+        );
     }
 
     #[test]

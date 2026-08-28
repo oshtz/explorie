@@ -37,6 +37,7 @@ jobs:
   validate:
     name: Validate release source
     runs-on: windows-latest
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repository
@@ -59,6 +60,11 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './ -> target'
 
       - name: Install cargo-audit
         uses: taiki-e/install-action@cargo-audit

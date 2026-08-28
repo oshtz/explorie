@@ -448,11 +448,18 @@ test('workflows block audits and publish the exact attested draft assets', async
   assert.doesNotMatch(ci, /rclone-x86_64-unknown-linux-gnu/);
   assert.match(release, /gh release create/);
   assert.match(release, /run: pnpm release:check/);
-  assert.match(release, /name: Validate release source[\s\S]*?runs-on: windows-latest/);
+  assert.match(
+    release,
+    /name: Validate release source[\s\S]*?runs-on: windows-latest[\s\S]*?timeout-minutes: 45/
+  );
   assert.match(release, /name: Validate release source[\s\S]*?node-version: '24'/);
   assert.match(
     release,
     /name: Validate release source[\s\S]*?name: Setup pnpm[\s\S]*?pnpm\/action-setup@v4[\s\S]*?name: Setup Node\.js[\s\S]*?cache: 'pnpm'/
+  );
+  assert.match(
+    release,
+    /name: Validate release source[\s\S]*?name: Setup Rust[\s\S]*?name: Rust cache[\s\S]*?swatinem\/rust-cache@v2/
   );
   assert.match(
     release,
