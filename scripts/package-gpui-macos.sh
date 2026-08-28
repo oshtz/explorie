@@ -150,4 +150,8 @@ hdiutil create \
   -format UDZO \
   "$dmg"
 test -s "$dmg"
+disk_image_signing=(--force --sign "$identity")
+if [ "$identity" != "-" ]; then disk_image_signing+=(--timestamp); fi
+codesign "${disk_image_signing[@]}" "$dmg"
+codesign --verify --verbose=2 "$dmg"
 printf '%s\n' "$dmg"

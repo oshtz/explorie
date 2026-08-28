@@ -477,7 +477,7 @@ test('workflows block audits and publish the exact attested draft assets', async
   assert.doesNotMatch(release, /tauri build/);
   assert.match(
     release,
-    /name: Notarize and staple macOS DMG[\s\S]*?xcrun notarytool submit[\s\S]*?--wait[\s\S]*?xcrun stapler staple/
+    /name: Notarize and staple macOS DMG[\s\S]*?hdiutil create[\s\S]*?codesign --force --sign "\$APPLE_SIGNING_IDENTITY" --timestamp "\$\{dmgs\[0\]\}"[\s\S]*?notarytool submit "\$\{dmgs\[0\]\}"[\s\S]*?stapler staple "\$\{dmgs\[0\]\}"/
   );
   assert.doesNotMatch(release, /Enigma Virtual Box|enigma-virtualbox|EVB_CONSOLE/);
   assert.doesNotMatch(release, /WebView2Loader\.dll/);
@@ -531,6 +531,11 @@ test('workflows block audits and publish the exact attested draft assets', async
   assert.match(release, /SHA256SUMS-windows\.txt/);
   assert.match(release, /SHA256SUMS-macos\.txt/);
   assert.match(release, /codesign --verify --deep --strict/);
+  assert.match(release, /codesign --verify --verbose=2 "\$\{dmgs\[0\]\}"/);
+  assert.match(
+    macosPackage,
+    /hdiutil create[\s\S]*?codesign "\$\{disk_image_signing\[@\]\}" "\$dmg"[\s\S]*?codesign --verify --verbose=2 "\$dmg"/
+  );
   assert.match(release, /Identifier=com\.omershatz\.explorie\.mountd/);
   assert.match(release, /Identifier=com\.omershatz\.explorie'/);
   assert.doesNotMatch(release, /com\.explorie/);

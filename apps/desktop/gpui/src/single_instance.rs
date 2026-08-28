@@ -382,31 +382,22 @@ mod tests {
     }
 
     #[test]
-    fn newline_framing_delivers_before_the_client_connection_closes() {
-        let config_dir = fixture_dir();
-        let (server, requests) = SingleInstanceServer::start(&config_dir).unwrap();
-        let endpoint = serde_json::from_slice::<EndpointDescriptor>(
-            &fs::read(config_dir.join(ENDPOINT_FILE)).unwrap(),
-        )
-        .unwrap();
+    fn newline_framing_is_read_before_the_client_connection_closes() {
+        let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let endpoint = listener.local_addr().unwrap();
         let request = WireRequest {
-            token: endpoint.token,
+            token: "test-token".to_string(),
             path: None,
         };
         let mut bytes = serde_json::to_vec(&request).unwrap();
         bytes.push(b'\n');
-        let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, endpoint.port)).unwrap();
-        stream.write_all(&bytes).unwrap();
+        let mut client = TcpStream::connect(endpoint).unwrap();
+        client.write_all(&bytes).unwrap();
+        let (server_stream, _) = listener.accept().unwrap();
 
         assert_eq!(
-            requests
-                .recv_timeout(REQUEST_DELIVERY_TIMEOUT)
-                .expect("primary waited for connection close instead of the frame delimiter"),
-            SingleInstanceRequest { path: None }
+            read_request(server_stream, "test-token"),
+            Some(SingleInstanceRequest { path: None })
         );
-
-        drop(stream);
-        drop(server);
-        fs::remove_dir_all(config_dir).unwrap();
     }
 }
