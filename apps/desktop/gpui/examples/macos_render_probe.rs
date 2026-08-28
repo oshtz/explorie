@@ -13,16 +13,16 @@ struct RenderProbe;
 #[cfg(target_os = "macos")]
 impl Render for RenderProbe {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div().relative().size_full().bg(rgb(0x101010)).child(
-            div()
-                .absolute()
-                .left(px(24.0))
-                .top(px(24.0))
-                .font_family(MACOS_SYSTEM_FONT_FAMILY)
-                .text_size(px(24.0))
-                .text_color(rgb(0xffffff))
-                .child("Explorie macOS text probe"),
-        )
+        div()
+            .flex()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .bg(rgb(0x101010))
+            .font_family(MACOS_SYSTEM_FONT_FAMILY)
+            .text_size(px(24.0))
+            .text_color(rgb(0xffffff))
+            .child("Explorie macOS text probe")
     }
 }
 
