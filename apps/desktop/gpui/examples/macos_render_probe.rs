@@ -1,17 +1,12 @@
 #[cfg(target_os = "macos")]
-use std::{
-    error::Error,
-    path::PathBuf,
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::{error::Error, path::PathBuf, time::Duration};
 
 #[cfg(target_os = "macos")]
 use explorie_gpui::{ExplorieAssets, MACOS_SYSTEM_FONT_FAMILY};
 #[cfg(target_os = "macos")]
 use gpui::{
-    App, AppContext, Context, Render, Window, WindowBounds, WindowOptions, bounds, div, point,
-    prelude::*, px, rgb, size,
+    App, AppContext, Context, Render, TextRun, Window, WindowBounds, WindowOptions, bounds, div,
+    font, point, prelude::*, px, rgb, size,
 };
 #[cfg(target_os = "macos")]
 struct RenderProbe;
@@ -104,8 +99,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     let output = std::env::var_os("EXPLORIE_RENDER_PROBE_OUTPUT")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("target/macos-render-probe.png"));
-    let outcome = Arc::new(Mutex::new(None));
-    let task_outcome = outcome.clone();
 
     gpui_platform::application()
         .with_assets(ExplorieAssets)
@@ -124,10 +117,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             ) {
                 Ok(window) => window,
                 Err(error) => {
-                    *task_outcome.lock().expect("probe outcome lock poisoned") =
-                        Some(Err(error.to_string()));
-                    cx.quit();
-                    return;
+                    eprintln!("failed to open native macOS probe window: {error}");
+                    std::process::exit(1);
                 }
             };
             cx.activate(true);
@@ -136,22 +127,48 @@ fn main() -> Result<(), Box<dyn Error>> {
                     .timer(Duration::from_millis(500))
                     .await;
                 let result = window
-                    .update(cx, |_, window, _| window.render_to_image())
+                    .update(cx, |_, window, _| {
+                        let diagnostics = FONT_FAMILIES
+                            .iter()
+                            .map(|family| {
+                                let text = format!("Explorie text — {family}");
+                                let run = TextRun {
+                                    len: text.len(),
+                                    font: font(*family),
+                                    color: rgb(0xffffff).into(),
+                                    ..Default::default()
+                                };
+                                let line = window.text_system().shape_line(
+                                    text.into(),
+                                    px(20.0),
+                                    &[run],
+                                    None,
+                                );
+                                let glyph_count =
+                                    line.runs.iter().map(|run| run.glyphs.len()).sum::<usize>();
+                                (*family, line.width(), glyph_count)
+                            })
+                            .collect::<Vec<_>>();
+                        eprintln!("macOS text shaping diagnostics: {diagnostics:?}");
+                        window.render_to_image()
+                    })
                     .map_err(|error| error.to_string())
                     .and_then(|image| image.map_err(|error| error.to_string()))
                     .and_then(|image| validate_image(image, output));
-                *task_outcome.lock().expect("probe outcome lock poisoned") = Some(result);
-                cx.update(|cx| cx.quit());
+                match result {
+                    Ok(()) => {
+                        cx.update(|cx| cx.quit());
+                    }
+                    Err(error) => {
+                        eprintln!("{error}");
+                        std::process::exit(1);
+                    }
+                }
             })
             .detach();
         });
 
-    outcome
-        .lock()
-        .expect("probe outcome lock poisoned")
-        .take()
-        .unwrap_or_else(|| Err("macOS render probe exited without a result".to_string()))
-        .map_err(Into::into)
+    Ok(())
 }
 
 #[cfg(not(target_os = "macos"))]
