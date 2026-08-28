@@ -56,6 +56,38 @@ pub struct FileOperationResult {
     pub processed_entries: u64,
     pub processed_bytes: u64,
     pub targets: Vec<PathBuf>,
+    pub target_snapshots: Vec<FileTreeSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileTreeSnapshot {
+    entries: Vec<FileTreeEntrySnapshot>,
+}
+
+impl FileTreeSnapshot {
+    pub fn estimated_bytes(&self) -> usize {
+        self.entries.iter().fold(0, |total, entry| {
+            total
+                .saturating_add(std::mem::size_of::<FileTreeEntrySnapshot>())
+                .saturating_add(entry.relative.as_os_str().to_string_lossy().len())
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FileTreeEntrySnapshot {
+    relative: PathBuf,
+    is_directory: bool,
+    len: u64,
+    modified: Option<(u64, u32)>,
+}
+
+#[derive(Debug)]
+pub struct FileOperationFailure {
+    pub error: io::Error,
+    pub partial_result: FileOperationResult,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,40 +148,51 @@ impl<F: FnMut(FileOperationProgress)> ProgressTracker<'_, F> {
 pub fn perform_file_operation(
     request: FileOperationRequest,
     cancelled: &AtomicBool,
-    mut on_progress: impl FnMut(FileOperationProgress),
+    on_progress: impl FnMut(FileOperationProgress),
 ) -> io::Result<FileOperationResult> {
+    perform_file_operation_report(request, cancelled, on_progress).map_err(|failure| failure.error)
+}
+
+pub fn perform_file_operation_report(
+    request: FileOperationRequest,
+    cancelled: &AtomicBool,
+    mut on_progress: impl FnMut(FileOperationProgress),
+) -> Result<FileOperationResult, FileOperationFailure> {
     if request.sources.is_empty() {
-        return Err(io::Error::new(
+        return Err(empty_operation_failure(io::Error::new(
             io::ErrorKind::InvalidInput,
             "at least one source is required",
-        ));
+        )));
     }
 
     if request.kind == FileOperationKind::Trash {
-        return trash_sources(request.sources, cancelled, on_progress);
+        return trash_sources(request.sources, cancelled, on_progress)
+            .map_err(empty_operation_failure);
     }
 
     let destination = request.destination.ok_or_else(|| {
-        io::Error::new(
+        empty_operation_failure(io::Error::new(
             io::ErrorKind::InvalidInput,
             "copy and move operations require a destination directory",
-        )
+        ))
     })?;
-    let destination_metadata = fs::symlink_metadata(&destination)?;
+    let destination_metadata =
+        fs::symlink_metadata(&destination).map_err(empty_operation_failure)?;
     if is_link_metadata(&destination_metadata) || !destination_metadata.is_dir() {
-        return Err(io::Error::new(
+        return Err(empty_operation_failure(io::Error::new(
             io::ErrorKind::InvalidInput,
             "destination must be a real directory",
-        ));
+        )));
     }
-    let destination_canonical = fs::canonicalize(&destination)?;
+    let destination_canonical = fs::canonicalize(&destination).map_err(empty_operation_failure)?;
 
     let plans: Vec<SourcePlan> = request
         .sources
         .iter()
         .map(|source| plan_source(source))
-        .collect::<io::Result<_>>()?;
-    validate_sources(&plans, &destination_canonical)?;
+        .collect::<io::Result<_>>()
+        .map_err(empty_operation_failure)?;
+    validate_sources(&plans, &destination_canonical).map_err(empty_operation_failure)?;
 
     let total_entries = plans.iter().map(|plan| plan.entries.len() as u64).sum();
     let total_bytes = plans.iter().map(|plan| plan.total_bytes).sum();
@@ -166,43 +209,91 @@ pub fn perform_file_operation(
     tracker.emit(None);
 
     let mut targets = Vec::with_capacity(plans.len());
+    let mut target_snapshots = Vec::with_capacity(plans.len());
     for plan in &plans {
-        check_cancelled(cancelled)?;
-        let file_name = plan.source.file_name().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "cannot operate on filesystem root {}",
-                    plan.source.display()
+        if let Err(error) = check_cancelled(cancelled) {
+            return Err(tracked_operation_failure(
+                error,
+                &tracker,
+                targets,
+                target_snapshots,
+            ));
+        }
+        let Some(file_name) = plan.source.file_name() else {
+            return Err(tracked_operation_failure(
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "cannot operate on filesystem root {}",
+                        plan.source.display()
+                    ),
                 ),
-            )
-        })?;
+                &tracker,
+                targets,
+                target_snapshots,
+            ));
+        };
         let requested_target = destination.join(file_name);
-        let target = resolve_target(&requested_target, request.conflict_policy)?;
-        if same_path(&plan.canonical, &target)? {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "source and destination are the same path",
+        let target = match resolve_target(&requested_target, request.conflict_policy) {
+            Ok(target) => target,
+            Err(error) => {
+                return Err(tracked_operation_failure(
+                    error,
+                    &tracker,
+                    targets,
+                    target_snapshots,
+                ));
+            }
+        };
+        let same = match same_path(&plan.canonical, &target) {
+            Ok(same) => same,
+            Err(error) => {
+                return Err(tracked_operation_failure(
+                    error,
+                    &tracker,
+                    targets,
+                    target_snapshots,
+                ));
+            }
+        };
+        if same {
+            return Err(tracked_operation_failure(
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "source and destination are the same path",
+                ),
+                &tracker,
+                targets,
+                target_snapshots,
             ));
         }
 
-        match request.kind {
+        let result = match request.kind {
             FileOperationKind::Copy => copy_plan(
                 plan,
                 &target,
                 request.conflict_policy,
                 cancelled,
                 &mut tracker,
-            )?,
+            ),
             FileOperationKind::Move => move_plan(
                 plan,
                 &target,
                 request.conflict_policy,
                 cancelled,
                 &mut tracker,
-            )?,
+            ),
             FileOperationKind::Trash => unreachable!(),
+        };
+        if let Err(error) = result {
+            return Err(tracked_operation_failure(
+                error,
+                &tracker,
+                targets,
+                target_snapshots,
+            ));
         }
+        target_snapshots.push(file_tree_snapshot(plan));
         targets.push(target);
     }
 
@@ -211,7 +302,37 @@ pub fn perform_file_operation(
         processed_entries: tracker.progress.processed_entries,
         processed_bytes: tracker.progress.processed_bytes,
         targets,
+        target_snapshots,
     })
+}
+
+fn empty_operation_failure(error: io::Error) -> FileOperationFailure {
+    FileOperationFailure {
+        error,
+        partial_result: FileOperationResult {
+            processed_entries: 0,
+            processed_bytes: 0,
+            targets: Vec::new(),
+            target_snapshots: Vec::new(),
+        },
+    }
+}
+
+fn tracked_operation_failure<F: FnMut(FileOperationProgress)>(
+    error: io::Error,
+    tracker: &ProgressTracker<'_, F>,
+    targets: Vec<PathBuf>,
+    target_snapshots: Vec<FileTreeSnapshot>,
+) -> FileOperationFailure {
+    FileOperationFailure {
+        error,
+        partial_result: FileOperationResult {
+            processed_entries: tracker.progress.processed_entries,
+            processed_bytes: tracker.progress.processed_bytes,
+            targets,
+            target_snapshots,
+        },
+    }
 }
 
 fn trash_sources(
@@ -256,7 +377,30 @@ fn trash_sources(
         processed_entries: total_entries,
         processed_bytes: total_bytes,
         targets: Vec::new(),
+        target_snapshots: Vec::new(),
     })
+}
+
+fn file_tree_snapshot(plan: &SourcePlan) -> FileTreeSnapshot {
+    FileTreeSnapshot {
+        entries: plan
+            .entries
+            .iter()
+            .map(|entry| FileTreeEntrySnapshot {
+                relative: entry.relative.clone(),
+                is_directory: entry.kind == PlannedKind::Directory,
+                len: entry.len,
+                modified: entry
+                    .modified
+                    .and_then(|modified| modified.duration_since(SystemTime::UNIX_EPOCH).ok())
+                    .map(|duration| (duration.as_secs(), duration.subsec_nanos())),
+            })
+            .collect(),
+    }
+}
+
+pub fn path_matches_snapshot(path: &Path, expected: &FileTreeSnapshot) -> io::Result<bool> {
+    Ok(file_tree_snapshot(&plan_source(path)?) == *expected)
 }
 
 fn plan_source(source: &Path) -> io::Result<SourcePlan> {
@@ -1408,6 +1552,56 @@ mod tests {
                 .unwrap(),
             modified
         );
+        assert!(path_matches_snapshot(&result.targets[0], &result.target_snapshots[0]).unwrap());
+        fs::write(
+            destination.join("source/nested/data.txt"),
+            b"changed contents",
+        )
+        .unwrap();
+        assert!(!path_matches_snapshot(&result.targets[0], &result.target_snapshots[0]).unwrap());
+    }
+
+    #[test]
+    fn partial_batch_failure_reports_completed_targets_for_unresolved_retry() {
+        let temp = tempdir().unwrap();
+        let first = temp.path().join("first.txt");
+        let second = temp.path().join("second.txt");
+        let destination = temp.path().join("destination");
+        fs::create_dir(&destination).unwrap();
+        fs::write(&first, b"first").unwrap();
+        fs::write(&second, b"second").unwrap();
+        fs::write(destination.join("second.txt"), b"existing").unwrap();
+        let request = FileOperationRequest {
+            kind: FileOperationKind::Copy,
+            sources: vec![first.clone(), second.clone()],
+            destination: Some(destination.clone()),
+            conflict_policy: ConflictPolicy::Error,
+        };
+
+        let failure =
+            perform_file_operation_report(request.clone(), &AtomicBool::new(false), |_| {})
+                .unwrap_err();
+        assert_eq!(failure.error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            failure.partial_result.targets,
+            vec![destination.join("first.txt")]
+        );
+        assert_eq!(failure.partial_result.target_snapshots.len(), 1);
+        assert_eq!(fs::read(destination.join("first.txt")).unwrap(), b"first");
+        assert_eq!(
+            fs::read(destination.join("second.txt")).unwrap(),
+            b"existing"
+        );
+
+        fs::remove_file(destination.join("second.txt")).unwrap();
+        let completed_sources = failure.partial_result.targets.len();
+        let retry = FileOperationRequest {
+            sources: request.sources[completed_sources..].to_vec(),
+            ..request
+        };
+        let result = perform_file_operation(retry, &AtomicBool::new(false), |_| {}).unwrap();
+        assert_eq!(result.targets, vec![destination.join("second.txt")]);
+        assert_eq!(fs::read(destination.join("second.txt")).unwrap(), b"second");
     }
 
     #[test]

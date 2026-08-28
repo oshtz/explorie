@@ -12,7 +12,7 @@ on:
         required: true
         default: false
       windows_real_machine_verified:
-        description: Windows portable launch, unsigned warning, remote drives, and disposable filesystem operations passed
+        description: Windows installer, folder-handler toggle/reversal, remote drives, and disposable filesystem operations passed
         type: boolean
         required: true
         default: false
@@ -44,12 +44,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: '9'
-          run_install: false
-
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -65,9 +59,6 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
-
-      - name: Install Chromium
-        run: pnpm exec playwright install --with-deps chromium
 
       - name: Test release checks
         run: pnpm release:check:test
@@ -155,19 +146,17 @@ jobs:
       - name: Test native file operations on Windows
         run: cargo test -p explorie-core
 
-      - name: Check Windows signing prerequisites
-        id: signing
-        shell: pwsh
-        env:
-          CERTIFICATE: ${{ secrets.WINDOWS_CODESIGN_CERTIFICATE }}
-          CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_PASSWORD }}
+      - name: Prepare native dependencies
         run: |
-          $available = [bool]$env:CERTIFICATE -and [bool]$env:CERTIFICATE_PASSWORD
-          if (-not $available) { Write-Warning "The Windows portable executable will be unsigned." }
-          "available=$($available.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          node scripts/prepare-rclone.mjs
+          node scripts/prepare-winfsp.mjs
 
-      - name: Build application executable
-        run: pnpm --filter explorie-desktop exec -- tauri build --no-bundle --ci -- --locked
+      - name: Build GPUI Windows application
+        shell: pwsh
+        run: |
+          cargo build -p explorie-gpui --release --locked
+          if ($LASTEXITCODE -ne 0) { throw "GPUI release build failed." }
+          Copy-Item -LiteralPath "apps/desktop/native-assets/binaries/rclone-x86_64-pc-windows-msvc.exe" -Destination "target/release/rclone.exe" -Force
 
       - name: Verify bundled native dependencies
         shell: pwsh
@@ -176,7 +165,7 @@ jobs:
           if (-not (Test-Path -LiteralPath $rclone -PathType Leaf)) { throw "Bundled rclone executable was not built." }
           $version = & $rclone version | Select-Object -First 1
           if ($version -ne "rclone v1.74.4") { throw "Unexpected bundled rclone version: $version" }
-          $winfsp = "apps/desktop/frontend/src-tauri/resources/winfsp-2.1.25156.msi"
+          $winfsp = "apps/desktop/native-assets/resources/winfsp-2.1.25156.msi"
           if (-not (Test-Path -LiteralPath $winfsp -PathType Leaf)) { throw "Bundled WinFsp installer was not prepared." }
           $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $winfsp).Hash.ToLowerInvariant()
           if ($hash -ne "073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a") { throw "WinFsp installer hash mismatch." }
@@ -185,177 +174,96 @@ jobs:
             throw "WinFsp installer signature is invalid."
           }
 
-      - name: Locate Windows signing tool
-        if: steps.signing.outputs.available == 'true'
-        id: signtool
+      - name: Build Windows installer
         shell: pwsh
         run: |
-          $tool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" |
-            Sort-Object FullName -Descending |
-            Select-Object -First 1
-          if (-not $tool) { throw "signtool.exe was not found." }
-          "path=$($tool.FullName)" >> $env:GITHUB_OUTPUT
-
-      - name: Sign application executable
-        if: steps.signing.outputs.available == 'true'
-        shell: pwsh
-        env:
-          CERTIFICATE: ${{ secrets.WINDOWS_CODESIGN_CERTIFICATE }}
-          CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_PASSWORD }}
-          SIGNTOOL: ${{ steps.signtool.outputs.path }}
-        run: |
-          $certificatePath = Join-Path $env:RUNNER_TEMP "explorie-codesign.pfx"
-          [IO.File]::WriteAllBytes($certificatePath, [Convert]::FromBase64String($env:CERTIFICATE))
-          foreach ($executable in @("target/release/explorie-desktop.exe", "target/release/rclone.exe")) {
-            & $env:SIGNTOOL sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $certificatePath /p $env:CERTIFICATE_PASSWORD $executable
-            if ($LASTEXITCODE -ne 0) { throw "Executable signing failed: $executable" }
-            & $env:SIGNTOOL verify /pa /v $executable
-            if ($LASTEXITCODE -ne 0) { throw "Executable signature verification failed: $executable" }
-          }
-          Remove-Item -LiteralPath $certificatePath -Force
-
-      - name: Restore Enigma Virtual Box installer cache
-        uses: actions/cache@v4
-        with:
-          path: ${{ runner.tool_cache }}/enigma-virtual-box/enigmavb.exe
-          key: enigma-virtual-box-AB743F5E3DD927A288E126BBB053D367F270592E89378C9A06B7F3B15FA1EE35
-
-      - name: Install Enigma Virtual Box
-        shell: pwsh
-        run: |
-          $cache = Join-Path $env:RUNNER_TOOL_CACHE "enigma-virtual-box"
-          $installer = Join-Path $cache "enigmavb.exe"
-          $expectedHash = "AB743F5E3DD927A288E126BBB053D367F270592E89378C9A06B7F3B15FA1EE35"
-          New-Item -ItemType Directory -Force -Path $cache | Out-Null
-
-          if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
-            for ($attempt = 1; $attempt -le 3; $attempt++) {
-              try {
-                Invoke-WebRequest -Uri "https://www.enigmaprotector.com/assets/files/enigmavb.exe" -OutFile $installer -UseBasicParsing -MaximumRedirection 5
-                break
-              } catch {
-                if ($attempt -eq 3) { throw }
-                Start-Sleep -Seconds 2
-              }
-            }
-          }
-          $hash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash
-          if ($hash -ne $expectedHash) { throw "Enigma Virtual Box installer hash mismatch." }
-          $signature = Get-AuthenticodeSignature -LiteralPath $installer
-          if ($signature.Status -ne "Valid" -or $signature.SignerCertificate.Subject -notmatch "enigmaprotector\.com") {
-            throw "Enigma Virtual Box installer signature is invalid."
-          }
-
-          $install = Start-Process -FilePath $installer -ArgumentList @("/VERYSILENT", "/NORESTART") -Wait -PassThru
-          if ($install.ExitCode -ne 0) { throw "Enigma Virtual Box installation failed with exit code $($install.ExitCode)." }
-          $console = @(
-            "C:\Program Files (x86)\Enigma Virtual Box\enigmavbconsole.exe",
-            "C:\Program Files\Enigma Virtual Box\enigmavbconsole.exe"
+          $iscc = @(
+            "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
+            "C:\Program Files\Inno Setup 6\ISCC.exe"
           ) | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
-          if (-not $console) { throw "enigmavbconsole.exe was not found after installation." }
-          "EVB_CONSOLE=$console" >> $env:GITHUB_ENV
+          if (-not $iscc) { throw "The runner image does not provide Inno Setup 6." }
+          pwsh -NoProfile -File scripts/package-gpui-windows.ps1 -IsccPath $iscc
+          if ($LASTEXITCODE -ne 0) { throw "Windows installer packaging failed." }
 
-      - name: Build Windows portable executable
+      - name: Stage unsigned Windows installer and checksum
         shell: pwsh
         run: |
-          $input = "target/release/explorie-desktop.exe"
-          $rclone = "target/release/rclone.exe"
-          $winfsp = "apps/desktop/frontend/src-tauri/resources/winfsp-2.1.25156.msi"
-          if (-not (Test-Path -LiteralPath $input -PathType Leaf)) { throw "Application executable was not found." }
-          if (-not (Test-Path -LiteralPath $rclone -PathType Leaf)) { throw "rclone executable was not found." }
-
-          $staging = Join-Path $env:RUNNER_TEMP "explorie-evb"
-          New-Item -ItemType Directory -Force -Path $staging, "$staging/installers", "$staging/licenses" | Out-Null
-          Copy-Item -LiteralPath $rclone -Destination "$staging/rclone.exe"
-          Copy-Item -LiteralPath $winfsp -Destination "$staging/installers/winfsp-2.1.25156.msi"
-          Copy-Item -LiteralPath "apps/desktop/frontend/src-tauri/resources/rclone-COPYING" -Destination "$staging/licenses/rclone-COPYING"
-          Copy-Item -LiteralPath "apps/desktop/frontend/src-tauri/resources/winfsp-NOTICE.txt" -Destination "$staging/licenses/winfsp-NOTICE.txt"
-
-          $project = Join-Path $env:RUNNER_TEMP "explorie.evb"
-          $output = "target/release/explorie-portable.exe"
-          pnpm --package=@insco/enigma-virtualbox@1.3.4 dlx enigmavirtualbox generate $staging `
-            --input $input `
-            --output $output `
-            --project-name $project `
-            --evbOptions.shareVirtualSystem False `
-            --evbOptions.allowRunningOfVirtualExeFiles True `
-            --evbOptions.mapExecutableWithTemporaryFile True
-          if ($LASTEXITCODE -ne 0) { throw "Enigma Virtual Box project generation failed." }
-          $projectText = [IO.File]::ReadAllText($project, [Text.Encoding]::GetEncoding(1252))
-          $rcloneAction = [regex]::new('(?s)(<Name>rclone\.exe</Name>.*?<Action>)0(</Action>)')
-          $updatedProject = $rcloneAction.Replace($projectText, '${1}1${2}', 1)
-          if ($updatedProject -eq $projectText) { throw "Failed to set the rclone extraction action." }
-          [IO.File]::WriteAllText($project, $updatedProject, [Text.Encoding]::GetEncoding(1252))
-          & $env:EVB_CONSOLE $project
-          if ($LASTEXITCODE -ne 0) { throw "Enigma Virtual Box packaging failed." }
-          if (-not (Test-Path -LiteralPath $output -PathType Leaf)) { throw "Portable executable was not created." }
-          if ((Get-Item -LiteralPath $output).Length -le (Get-Item -LiteralPath $input).Length) {
-            throw "Portable executable does not contain the staged resources."
+          $version = (Get-Content package.json | ConvertFrom-Json).version
+          $installer = "release-artifacts/windows/explorie-$version-windows-x64-setup.exe"
+          if ((Get-AuthenticodeSignature -LiteralPath $installer).Status -ne "NotSigned") {
+            throw "Unsigned installer has an unexpected Authenticode status."
           }
+          $unsigned = "release-artifacts/windows/explorie-$version-windows-x64-setup-unsigned.exe"
+          Move-Item -LiteralPath $installer -Destination $unsigned
+          $installer = $unsigned
 
-      - name: Sign and stage Windows portable executable
+          $staging = "release-artifacts/windows"
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $installer).Hash.ToLowerInvariant()
+          "$hash *$(Split-Path $installer -Leaf)" | Set-Content -Encoding ascii (Join-Path $staging "SHA256SUMS-windows.txt")
+
+      - name: Download previous Windows installer when available
+        id: previous-windows
         shell: pwsh
         env:
-          CERTIFICATE: ${{ secrets.WINDOWS_CODESIGN_CERTIFICATE }}
-          CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_PASSWORD }}
-          SIGNTOOL: ${{ steps.signtool.outputs.path }}
-          SIGNING_AVAILABLE: ${{ steps.signing.outputs.available }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          $portable = "target/release/explorie-portable.exe"
-          if ($env:SIGNING_AVAILABLE -eq "true") {
-            $certificatePath = Join-Path $env:RUNNER_TEMP "explorie-codesign.pfx"
-            [IO.File]::WriteAllBytes($certificatePath, [Convert]::FromBase64String($env:CERTIFICATE))
-            & $env:SIGNTOOL sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $certificatePath /p $env:CERTIFICATE_PASSWORD $portable
-            if ($LASTEXITCODE -ne 0) { throw "Portable executable signing failed." }
-            & $env:SIGNTOOL verify /pa /v $portable
-            if ($LASTEXITCODE -ne 0) { throw "Portable executable signature verification failed." }
-            Remove-Item -LiteralPath $certificatePath -Force
-          } elseif ((Get-AuthenticodeSignature -LiteralPath $portable).Status -ne "NotSigned") {
-            throw "Unsigned portable executable has an unexpected Authenticode status."
+          $release = gh api "repos/$env:GITHUB_REPOSITORY/releases/latest" | ConvertFrom-Json
+          $assets = @($release.assets | Where-Object { $_.name -like "explorie-*-windows-x64-setup-unsigned.exe" })
+          if ($assets.Count -gt 1) { throw "The latest release has multiple Windows installer assets." }
+          if ($assets.Count -eq 1) {
+            $checksums = @($release.assets | Where-Object { $_.name -eq "SHA256SUMS-windows.txt" })
+            if ($checksums.Count -ne 1) { throw "The previous Windows installer has no unique checksum manifest." }
+            $destination = Join-Path $env:RUNNER_TEMP $assets[0].name
+            $checksumPath = Join-Path $env:RUNNER_TEMP "SHA256SUMS-windows-previous.txt"
+            Invoke-WebRequest -Uri $assets[0].browser_download_url -OutFile $destination
+            Invoke-WebRequest -Uri $checksums[0].browser_download_url -OutFile $checksumPath
+            $escapedName = [Regex]::Escape($assets[0].name)
+            $checksumPattern = '^([0-9a-fA-F]{64})\s+\*?' + $escapedName + '$'
+            $entries = @(Get-Content -LiteralPath $checksumPath | Where-Object { $_ -match $checksumPattern })
+            if ($entries.Count -ne 1) { throw "The previous installer checksum entry is missing or ambiguous." }
+            $expected = ([Regex]::Match($entries[0], "^[0-9a-fA-F]{64}")).Value.ToLowerInvariant()
+            $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $destination).Hash.ToLowerInvariant()
+            if ($actual -ne $expected) { throw "The previous Windows installer checksum does not match." }
+            "path=$destination" >> $env:GITHUB_OUTPUT
+          } else {
+            Write-Output "No previous Windows installer exists; this release will establish the upgrade baseline."
           }
 
-          $version = (Get-Content package.json | ConvertFrom-Json).version
-          $staging = "release-artifacts/windows"
-          New-Item -ItemType Directory -Force $staging | Out-Null
-          $suffix = if ($env:SIGNING_AVAILABLE -eq "true") { "" } else { "-unsigned" }
-          $asset = Join-Path $staging "explorie-$version-windows-x64-portable$suffix.exe"
-          Copy-Item -LiteralPath $portable -Destination $asset
-          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $asset).Hash.ToLowerInvariant()
-          "$hash *$(Split-Path $asset -Leaf)" | Set-Content -Encoding ascii (Join-Path $staging "SHA256SUMS-windows.txt")
-
-      - name: Smoke test Windows portable executable
+      - name: Smoke test Windows installer
         shell: pwsh
+        env:
+          PREVIOUS_INSTALLER: ${{ steps.previous-windows.outputs.path }}
         run: |
-          $portable = @(Get-ChildItem release-artifacts/windows/*-windows-x64-portable*.exe)
-          if ($portable.Count -ne 1) { throw "Expected exactly one portable executable." }
-          $debugPort = 9331
-          $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = "--remote-debugging-port=$debugPort"
-          $app = Start-Process -FilePath $portable[0].FullName -WorkingDirectory $portable[0].DirectoryName -PassThru
-          $rclone = Join-Path $portable[0].DirectoryName "rclone.exe"
+          $installer = @(Get-ChildItem release-artifacts/windows/*-windows-x64-setup*.exe)
+          if ($installer.Count -ne 1) { throw "Expected exactly one Windows installer." }
+          $installDir = Join-Path $env:RUNNER_TEMP "explorie-installed"
+          $configDir = Join-Path $env:APPDATA "explorie"
+          $marker = Join-Path $configDir "installer-upgrade-smoke.txt"
+          New-Item -ItemType Directory -Path $configDir -Force | Out-Null
+          Set-Content -LiteralPath $marker -Value "preserve across upgrade" -Encoding utf8
+          if ($env:PREVIOUS_INSTALLER) {
+            $previous = Start-Process -FilePath $env:PREVIOUS_INSTALLER -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$installDir") -Wait -PassThru
+            if ($previous.ExitCode -ne 0) { throw "Previous installer exited with code $($previous.ExitCode)." }
+          }
+          $install = Start-Process -FilePath $installer[0].FullName -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$installDir") -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "Installer exited with code $($install.ExitCode)." }
+          $app = Join-Path $installDir "Explorie.exe"
+          $rclone = Join-Path $installDir "rclone.exe"
           try {
-            $webviewReady = $false
-            for ($attempt = 0; $attempt -lt 40; $attempt++) {
-              Start-Sleep -Milliseconds 500
-              $app.Refresh()
-              if ($app.HasExited) { throw "Portable application exited during launch smoke test." }
-              try {
-                $targets = @(Invoke-RestMethod -Uri "http://127.0.0.1:$debugPort/json/list" -TimeoutSec 1)
-              } catch {
-                continue
-              }
-              if ($targets | Where-Object { $_.type -eq "page" -and $_.url -eq "http://tauri.localhost/" }) {
-                $webviewReady = $true
-                break
-              }
-            }
-            if (-not $webviewReady) { throw "Portable application did not load the Tauri page in WebView2." }
-            if (-not (Test-Path -LiteralPath $rclone -PathType Leaf)) { throw "Portable application did not extract rclone." }
-            & $rclone version | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw "Extracted rclone failed its version check." }
+            if (-not (Test-Path -LiteralPath $app -PathType Leaf)) { throw "Installed Explorie executable was not found." }
+            if (-not (Test-Path -LiteralPath $rclone -PathType Leaf)) { throw "Installed rclone executable was not found." }
+            if ((Get-Content -LiteralPath $marker -Raw).Trim() -ne "preserve across upgrade") { throw "User data did not survive the installer upgrade." }
+            pwsh -NoProfile -File scripts/smoke-gpui-release.ps1 -Executable $app
+            if ($LASTEXITCODE -ne 0) { throw "Installed GPUI smoke check failed." }
+            $version = & $rclone version | Select-Object -First 1
+            if ($version -ne "rclone v1.74.4") { throw "Unexpected installed rclone version: $version" }
           } finally {
-            $app.Refresh()
-            if (-not $app.HasExited) { Stop-Process -Id $app.Id -Force }
-            Remove-Item -LiteralPath $rclone -Force -ErrorAction SilentlyContinue
+            $uninstaller = Join-Path $installDir "unins000.exe"
+            if (Test-Path -LiteralPath $uninstaller -PathType Leaf) {
+              $uninstall = Start-Process -FilePath $uninstaller -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART") -Wait -PassThru
+              if ($uninstall.ExitCode -ne 0) { throw "Uninstaller exited with code $($uninstall.ExitCode)." }
+            }
+            Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
           }
 
       - name: Upload Windows package
@@ -375,32 +283,23 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: '9'
-          run_install: false
-
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'pnpm'
-          cache-dependency-path: pnpm-lock.yaml
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
 
       - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:
           workspaces: './ -> target'
 
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Test native file operations on macOS
-        run: cargo test -p explorie-core
+      - name: Test GPUI-native application on macOS
+        run: cargo test -p explorie-core -p explorie-native-services -p explorie-ffmpeg-wrapper -p explorie-cli -p explorie-gpui
 
       - name: Check Apple signing prerequisites
         id: signing
@@ -438,13 +337,15 @@ jobs:
           p12-file-base64: ${{ secrets.APPLE_CERTIFICATE }}
           p12-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
 
-      - name: Build macOS app and DMG
+      - name: Build GPUI macOS app and DMG
         env:
           APPLE_SIGNING_IDENTITY: ${{ steps.signing.outputs.identity }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: pnpm --filter explorie-desktop exec -- tauri build --bundles dmg --ci -- --locked
+          EXPLORIE_MACOS_TARGET: aarch64-apple-darwin
+        run: |
+          node scripts/prepare-rclone.mjs aarch64-apple-darwin
+          cargo build -p explorie-gpui --release --locked --target aarch64-apple-darwin
+          bash scripts/package-gpui-macos.sh
 
       - name: Notarize and staple macOS DMG
         shell: bash
@@ -455,11 +356,32 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
+          app="target/release/bundle/macos/explorie.app"
+          app_zip="$RUNNER_TEMP/explorie-notarization.zip"
+          test -d "$app"
+          ditto -c -k --keepParent "$app" "$app_zip"
+          xcrun notarytool submit "$app_zip" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+          xcrun stapler staple "$app"
+
           dmgs=(target/release/bundle/dmg/*.dmg)
           if [ "${#dmgs[@]}" -ne 1 ]; then
             echo "Expected exactly one DMG, found ${#dmgs[@]}."
             exit 1
           fi
+          dmg_root="target/release/bundle/dmg-root"
+          rm -rf "$dmg_root/explorie.app"
+          ditto "$app" "$dmg_root/explorie.app"
+          rm -f "${dmgs[0]}"
+          hdiutil create \
+            -volname explorie \
+            -srcfolder "$dmg_root" \
+            -ov \
+            -format UDZO \
+            "${dmgs[0]}"
           xcrun notarytool submit "${dmgs[0]}" \
             --apple-id "$APPLE_ID" \
             --password "$APPLE_PASSWORD" \
@@ -498,10 +420,12 @@ jobs:
           helper="$app/Contents/Resources/explorie-mountd"
           rclone="$app/Contents/MacOS/rclone"
           rclone_license="$app/Contents/Resources/licenses/rclone-COPYING"
+          pixelarticons_license="$app/Contents/Resources/licenses/pixelarticons-LICENSE.txt"
           helper_plist="$app/Contents/Library/LaunchDaemons/com.omershatz.explorie.mountd.plist"
           test -x "$helper"
           test -x "$rclone"
           test -f "$rclone_license"
+          test -f "$pixelarticons_license"
           test -f "$helper_plist"
           test "$("$rclone" version | head -n 1)" = 'rclone v1.74.4'
           /usr/libexec/PlistBuddy -c 'Print :BundleProgram' "$helper_plist" | grep -Fx 'Contents/Resources/explorie-mountd'
@@ -557,7 +481,7 @@ jobs:
           cleanup
           trap - EXIT
 
-          binary="$installed_app/Contents/MacOS/explorie-desktop"
+          binary="$installed_app/Contents/MacOS/explorie-gpui"
           rclone="$installed_app/Contents/MacOS/rclone"
           if [ ! -x "$binary" ]; then
             echo "Installed application executable was not found."
@@ -643,10 +567,10 @@ jobs:
           sha256sum --check SHA256SUMS-windows.txt
           sha256sum --check SHA256SUMS-macos.txt
           shopt -s nullglob
-          windows=(explorie-*-windows-x64-portable*.exe)
+          windows=(explorie-*-windows-x64-setup*.exe)
           macos=(explorie-*-macos-arm64.dmg)
           if [ "${#windows[@]}" -ne 1 ] || [ "${#macos[@]}" -ne 1 ]; then
-            echo "Draft release must contain exactly one Windows portable executable and one macOS DMG."
+            echo "Draft release must contain exactly one Windows installer and one macOS DMG."
             exit 1
           fi
 

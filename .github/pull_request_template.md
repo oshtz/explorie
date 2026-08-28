@@ -4,18 +4,15 @@
 
 ## Testing
 
-- [ ] `pnpm --filter explorie-desktop test`
-- [ ] `pnpm --filter explorie-desktop exec tsc --noEmit`
-- [ ] `pnpm lint:ts`
-- [ ] `pnpm format:check`
-- [ ] `cargo fmt --all --check`
-- [ ] `cargo test --workspace`
+- [ ] `cargo test --workspace --no-fail-fast`
 - [ ] `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- [ ] `cargo fmt --all --check`
+- [ ] `node --test scripts/release-check.test.mjs`
 
 ## Release Impact
 
 - [ ] User-facing behavior changed
-- [ ] Native/Tauri permissions changed
+- [ ] Native filesystem, process, or platform permissions changed
 - [ ] File operation behavior changed
 - [ ] Signing/notarization or release workflow changed
 - [ ] Documentation updated or not needed

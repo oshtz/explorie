@@ -42,13 +42,13 @@ export function nativeTarget(platform = process.platform, arch = process.arch) {
 }
 
 export async function prepareRclone(
-  target = process.env.TAURI_ENV_TARGET_TRIPLE ?? nativeTarget()
+  target = process.env.CARGO_BUILD_TARGET ?? nativeTarget()
 ) {
   const asset = RCLONE_TARGETS[target];
   if (!asset) throw new Error(`Unsupported rclone sidecar target: ${target}`);
 
   const repository = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-  const binaries = path.join(repository, 'apps', 'desktop', 'frontend', 'src-tauri', 'binaries');
+  const binaries = path.join(repository, 'apps', 'desktop', 'native-assets', 'binaries');
   const destination = path.join(
     binaries,
     `rclone-${target}${asset.executable.endsWith('.exe') ? '.exe' : ''}`

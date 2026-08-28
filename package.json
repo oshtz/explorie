@@ -1,6 +1,6 @@
 {
   "name": "explorie",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "private": true,
   "description": "Ridiculously fast, fully-hackable file manager.",
   "repository": "https://github.com/oshtz/explorie",
@@ -12,66 +12,33 @@
   "scripts": {
     "dev": "pnpm run desktop:dev",
     "dev:watch": "pnpm run desktop:dev:watch",
-    "desktop:dev": "pnpm --filter explorie-desktop tauri:dev",
-    "desktop:dev:watch": "pnpm --filter explorie-desktop tauri:dev:watch",
-    "desktop:web": "pnpm --filter explorie-desktop dev",
-    "desktop:build": "pnpm --filter explorie-desktop tauri:build",
-    "rust:watch": "cargo watch -w crates -x check -x \"test --workspace\"",
+    "desktop:dev": "cargo run -p explorie-gpui",
+    "desktop:dev:watch": "cargo watch -w apps/desktop/gpui -w crates -x \"run -p explorie-gpui\"",
+    "desktop:build": "cargo build -p explorie-gpui --release --locked",
+    "desktop:package:windows": "pwsh -NoProfile -File scripts/package-gpui-windows.ps1",
+    "desktop:smoke:release:windows": "pwsh -NoProfile -File scripts/smoke-gpui-release.ps1",
+    "prepare:native": "node scripts/prepare-rclone.mjs && node scripts/prepare-winfsp.mjs",
+    "rust:watch": "cargo watch -w apps/desktop/gpui -w apps/cli -w crates -x \"check -p explorie-gpui -p explorie-cli -p explorie-core -p explorie-native-services -p explorie-ffmpeg-wrapper\" -x \"test -p explorie-gpui -p explorie-cli -p explorie-core -p explorie-native-services -p explorie-ffmpeg-wrapper\"",
     "rust:check": "cargo check --workspace",
     "lint": "cargo fmt --all --check && cargo clippy --workspace --all-targets --all-features -- -D warnings",
-    "lint:ts": "eslint apps/desktop/frontend/src",
-    "lint:ts:fix": "eslint apps/desktop/frontend/src --fix",
     "release:check": "node scripts/release-check.mjs",
     "release:check:test": "node --test scripts/release-check.test.mjs",
-    "test": "cargo test --workspace && pnpm exec playwright test",
-    "test:rust": "cargo test --workspace",
-    "test:unit": "pnpm --filter explorie-desktop test",
+    "platform:proof:init": "node scripts/platform-proof.mjs init",
+    "platform:proof:verify": "node scripts/platform-proof.mjs verify",
+    "benchmark:progressive-results": "node scripts/benchmark-progressive-results.mjs",
+    "benchmark:large-folder": "node scripts/benchmark-large-folder.mjs",
+    "test": "cargo test --workspace --no-fail-fast",
+    "test:rust": "cargo test --workspace --no-fail-fast",
     "format": "cargo fmt --all",
-    "format:ts": "prettier --write \"apps/desktop/frontend/src/**/*.{ts,tsx,css}\"",
-    "format:check": "prettier --check \"apps/desktop/frontend/src/**/*.{ts,tsx,css}\"",
-    "typecheck": "pnpm --filter explorie-desktop exec tsc --noEmit",
     "prepare": "husky"
   },
   "devDependencies": {
-    "@playwright/test": "^1.61.1",
-    "@tauri-apps/cli": "^2.11.4",
-    "@types/node": "^22.14.1",
-    "@typescript-eslint/eslint-plugin": "^8.63.0",
-    "@typescript-eslint/parser": "^8.63.0",
-    "eslint": "^9.39.4",
-    "eslint-plugin-react": "^7.35.0",
-    "eslint-plugin-react-hooks": "^7.1.1",
     "husky": "^9.1.6",
-    "lint-staged": "^15.2.10",
-    "prettier": "^3.3.3"
+    "lint-staged": "^15.2.10"
   },
   "lint-staged": {
-    "apps/desktop/frontend/src/**/*.{ts,tsx}": [
-      "eslint --fix",
-      "prettier --write"
-    ],
-    "apps/desktop/frontend/src/**/*.css": [
-      "prettier --write"
-    ],
     "**/*.rs": [
       "cargo fmt --"
     ]
-  },
-  "pnpm": {
-    "overrides": {
-      "@babel/core@<8": "7.29.6",
-      "ajv@<7": "6.14.0",
-      "brace-expansion@<2": "1.1.18",
-      "brace-expansion@>=2 <3": "2.1.4",
-      "brace-expansion@>=4 <6": "5.0.9",
-      "flatted@<4": "3.4.2",
-      "form-data@<5": "4.0.6",
-      "js-yaml@<5": "4.3.1",
-      "minimatch@<4": "3.1.4",
-      "minimatch@>=9 <10": "9.0.7",
-      "picomatch@>=4 <5": "4.0.4",
-      "ws@<9": "8.21.0",
-      "yaml@<3": "2.8.3"
-    }
   }
 }

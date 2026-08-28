@@ -1,0 +1,290 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
+use std::path::PathBuf;
+
+#[cfg(target_os = "macos")]
+use explorie_gpui::SingleInstanceRequest;
+use explorie_gpui::{
+    APP_IDENTIFIER, APP_NAME, DEFAULT_WINDOW_HEIGHT, DEFAULT_WINDOW_WIDTH, DirectoryWindow,
+    ExplorieAssets, MIN_WINDOW_HEIGHT, MIN_WINDOW_WIDTH, RecoveryMarker, WindowRuntime,
+    acquire_single_instance, initial_window_bounds, parse_startup_path,
+};
+use explorie_native_services::{NativeServices, ResourcePaths};
+use gpui::{
+    App, AppContext, Bounds, Focusable, TitlebarOptions, WindowBounds, WindowOptions, px, size,
+};
+#[cfg(not(target_os = "windows"))]
+use gpui_platform::application;
+
+#[cfg(target_os = "windows")]
+fn application() -> gpui::Application {
+    gpui::Application::with_platform(std::rc::Rc::new(
+        gpui_windows::WindowsPlatform::new(false)
+            .expect("failed to initialize the Windows GPUI platform"),
+    ))
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn main() {
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        if let Some(enabled) = system_integration_command(std::env::args_os()) {
+            if let Err(error) =
+                explorie_native_services::integration::set_system_integration(enabled)
+            {
+                eprintln!("unable to update folder-open integration: {error}");
+                std::process::exit(1);
+            }
+            return;
+        }
+    }
+    let explicit_path = parse_startup_path(std::env::args_os());
+    let startup_path_is_explicit = explicit_path.is_some();
+    let services = native_services();
+    let Some(instance) =
+        acquire_single_instance(&services.resources().config_dir, explicit_path.as_deref())
+            .expect("unable to acquire or contact app instance")
+    else {
+        return;
+    };
+    let _instance = instance.guard;
+    let single_instance_requests = instance.requests;
+    let path = explicit_path
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let recovery_marker = RecoveryMarker::begin(&services.resources().config_dir)
+        .map_err(|error| eprintln!("native recovery tracking unavailable: {error}"))
+        .ok();
+    let previous_session_unclean = recovery_marker
+        .as_ref()
+        .is_some_and(RecoveryMarker::previous_session_unclean);
+    let config_dir = services.resources().config_dir.clone();
+    let (window_runtime, restored_window_sessions) = WindowRuntime::open(&config_dir);
+
+    #[cfg(target_os = "macos")]
+    let (open_url_tx, open_url_rx) = std::sync::mpsc::channel();
+    let application = application().with_assets(ExplorieAssets);
+    #[cfg(target_os = "macos")]
+    application.on_open_urls(move |urls| {
+        for url in urls {
+            if let Some(path) = path_from_open_url(&url) {
+                let _ = open_url_tx.send(SingleInstanceRequest { path: Some(path) });
+            }
+        }
+    });
+
+    application.run(move |cx: &mut App| {
+        let quitting_runtime = window_runtime.clone();
+        cx.on_app_quit(move |_| {
+            quitting_runtime.mark_quitting();
+            async {}
+        })
+        .detach();
+        let shutdown_remotes = services.remotes.clone();
+        let shutdown_audio = services.audio.clone();
+        let shutdown_video = services.video.clone();
+        cx.on_app_quit(move |_| {
+            shutdown_audio.stop();
+            shutdown_video.stop();
+            async {}
+        })
+        .detach();
+        cx.on_app_quit(move |_| {
+            let task = shutdown_remotes.disconnect_all();
+            async move {
+                if let Err(error) = task.await {
+                    eprintln!("unable to stop remote drives during shutdown: {error}");
+                }
+            }
+        })
+        .detach();
+        if let Some(marker) = recovery_marker.clone() {
+            cx.on_app_quit(move |_| {
+                let marker = marker.clone();
+                async move {
+                    if let Err(error) = marker.clear() {
+                        eprintln!("unable to clear native recovery marker: {error}");
+                    }
+                }
+            })
+            .detach();
+        }
+        let fallback_bounds = Bounds::centered(
+            None,
+            size(px(DEFAULT_WINDOW_WIDTH), px(DEFAULT_WINDOW_HEIGHT)),
+            cx,
+        );
+        let bounds = initial_window_bounds(&config_dir, fallback_bounds, cx);
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            window_min_size: Some(size(px(MIN_WINDOW_WIDTH), px(MIN_WINDOW_HEIGHT))),
+            titlebar: Some(TitlebarOptions {
+                title: Some(APP_NAME.into()),
+                appears_transparent: cfg!(target_os = "windows"),
+                traffic_light_position: None,
+            }),
+            is_resizable: true,
+            app_id: Some(APP_IDENTIFIER.to_string()),
+            ..Default::default()
+        };
+        let primary_path = path.clone();
+        let primary_services = services.clone();
+        let primary_runtime = window_runtime.clone();
+        cx.open_window(options, move |window, cx| {
+            window.set_window_title(APP_NAME);
+            let view = cx.new(|cx| {
+                let mut view = DirectoryWindow::restore_window_session(
+                    primary_path,
+                    startup_path_is_explicit,
+                    primary_services,
+                    Some(primary_runtime),
+                    "primary".to_string(),
+                    cx,
+                );
+                view.install_shortcut_bindings(cx);
+                view.start_listing(cx);
+                view.start_watching(cx);
+                view.start_system_locations(cx);
+                view.start_service_events(cx);
+                view.start_preview_helpers(cx);
+                view.start_system_integration_status(cx);
+                view.start_remote_drives(cx);
+                #[cfg(windows)]
+                view.start_update_check(false, cx);
+                if previous_session_unclean {
+                    view.announce_unclean_recovery(cx);
+                }
+                view
+            });
+            view.update(cx, |view, cx| {
+                view.start_single_instance_requests(single_instance_requests, window, cx);
+                #[cfg(target_os = "macos")]
+                view.start_single_instance_requests(open_url_rx, window, cx);
+            });
+            let close_view = view.clone();
+            window.on_window_should_close(cx, move |_, cx| {
+                close_view.update(cx, |view, cx| view.request_window_close(cx))
+            });
+            window.focus(&view.focus_handle(cx), cx);
+            view
+        })
+        .expect("unable to open explorie window");
+        for session_id in restored_window_sessions {
+            let fallback_bounds = Bounds::centered(
+                None,
+                size(px(DEFAULT_WINDOW_WIDTH), px(DEFAULT_WINDOW_HEIGHT)),
+                cx,
+            );
+            let options = WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(fallback_bounds)),
+                window_min_size: Some(size(px(MIN_WINDOW_WIDTH), px(MIN_WINDOW_HEIGHT))),
+                titlebar: Some(TitlebarOptions {
+                    title: Some(APP_NAME.into()),
+                    appears_transparent: cfg!(target_os = "windows"),
+                    traffic_light_position: None,
+                }),
+                is_resizable: true,
+                app_id: Some(APP_IDENTIFIER.to_string()),
+                ..Default::default()
+            };
+            let services = services.clone();
+            let runtime = window_runtime.clone();
+            let fallback_path = path.clone();
+            if let Err(error) = cx.open_window(options, move |window, cx| {
+                window.set_window_title(APP_NAME);
+                let view = cx.new(|cx| {
+                    let mut view = DirectoryWindow::restore_window_session(
+                        fallback_path,
+                        false,
+                        services,
+                        Some(runtime),
+                        session_id,
+                        cx,
+                    );
+                    view.install_shortcut_bindings(cx);
+                    view.start_listing(cx);
+                    view.start_watching(cx);
+                    view.start_system_locations(cx);
+                    view.start_service_events(cx);
+                    view.start_preview_helpers(cx);
+                    view.start_system_integration_status(cx);
+                    view.start_remote_drives(cx);
+                    view
+                });
+                let close_view = view.clone();
+                window.on_window_should_close(cx, move |_, cx| {
+                    close_view.update(cx, |view, cx| view.request_window_close(cx))
+                });
+                window.focus(&view.focus_handle(cx), cx);
+                view
+            }) {
+                eprintln!("unable to restore Explorie window: {error}");
+            }
+        }
+        cx.activate(true);
+    });
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn system_integration_command(args: impl IntoIterator<Item = std::ffi::OsString>) -> Option<bool> {
+    args.into_iter()
+        .skip(1)
+        .find_map(|argument| match argument.to_str() {
+            Some("--register-folder-handler") => Some(true),
+            Some("--unregister-folder-handler") => Some(false),
+            _ => None,
+        })
+}
+
+#[cfg(target_os = "macos")]
+fn path_from_open_url(url: &str) -> Option<PathBuf> {
+    let raw = url.strip_prefix("file://")?;
+    let raw = raw.strip_prefix("localhost").unwrap_or(raw);
+    if !raw.starts_with('/') {
+        return None;
+    }
+    let bytes = raw.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let high = *bytes.get(index + 1)?;
+            let low = *bytes.get(index + 2)?;
+            decoded.push((hex_value(high)? << 4) | hex_value(low)?);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok().map(PathBuf::from)
+}
+
+#[cfg(target_os = "macos")]
+fn hex_value(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn native_services() -> NativeServices {
+    let resources = ResourcePaths::default().with_app_version(env!("CARGO_PKG_VERSION"));
+    let resources = std::env::var_os("EXPLORIE_TEST_CONFIG_DIR")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .map_or(resources.clone(), |path| {
+            resources
+                .with_config_dir(&path)
+                .with_cache_dir(path.join("cache"))
+        });
+    NativeServices::new(resources)
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn main() {
+    eprintln!("{APP_NAME} has no Linux product target");
+}

@@ -24,19 +24,14 @@ const {
 
 const expectedDisplays = [
   'pnpm install --frozen-lockfile --ignore-scripts',
-  'pnpm --filter explorie-desktop prepare:native',
-  'pnpm --filter explorie-desktop exec tsc --noEmit',
-  'pnpm lint:ts',
-  'pnpm format:check',
+  'pnpm prepare:native',
   'cargo metadata --locked --format-version 1',
   'cargo fmt --all -- --check',
-  'cargo test --workspace',
+  'cargo test --workspace --no-fail-fast',
   'cargo clippy --workspace --all-targets --all-features -- -D warnings',
   'cargo audit',
-  'pnpm --filter explorie-desktop test',
   'corepack pnpm@11.13.0 audit --audit-level=moderate',
-  'pnpm exec playwright test',
-  'pnpm --filter explorie-desktop exec -- tauri build --no-bundle -- --locked',
+  'cargo build -p explorie-gpui --release --locked',
   'git diff --check',
 ];
 
@@ -63,13 +58,72 @@ test('WinFsp installer is pinned for on-demand Windows remote drives', () => {
   assert.match(WINFSP_SHA256, /^[0-9a-f]{64}$/);
 });
 
+test('root desktop commands make GPUI the only executable desktop authority', async () => {
+  const rootPackage = JSON.parse(await readFile(path.join(process.cwd(), 'package.json'), 'utf8'));
+
+  assert.equal(rootPackage.scripts['desktop:dev'], 'cargo run -p explorie-gpui');
+  assert.equal(
+    rootPackage.scripts['desktop:build'],
+    'cargo build -p explorie-gpui --release --locked'
+  );
+  assert.equal(
+    rootPackage.scripts['desktop:smoke:release:windows'],
+    'pwsh -NoProfile -File scripts/smoke-gpui-release.ps1'
+  );
+  assert.equal(rootPackage.scripts['desktop:legacy:dev'], undefined);
+  assert.equal(rootPackage.scripts['desktop:legacy:build'], undefined);
+  assert.equal(rootPackage.devDependencies['@tauri-apps/cli'], undefined);
+  assert.equal(rootPackage.devDependencies['@playwright/test'], undefined);
+
+  const nodeLock = await readFile(path.join(process.cwd(), 'pnpm-lock.yaml'), 'utf8');
+  assert.doesNotMatch(nodeLock, /@tauri-apps|playwright|react|vite|vitest/);
+
+  for (const removedPath of [
+    'pnpm-workspace.yaml',
+    'playwright.config.ts',
+    'tests/e2e.spec.ts',
+    'eslint.config.mjs',
+    'apps/desktop/frontend/package.json',
+  ]) {
+    await assert.rejects(readFile(path.join(process.cwd(), removedPath), 'utf8'), {
+      code: 'ENOENT',
+    });
+  }
+});
+
+test('packaged native assets have a Tauri-independent authority', async () => {
+  const paths = [
+    'scripts/prepare-rclone.mjs',
+    'scripts/prepare-winfsp.mjs',
+    'crates/native-services/build.rs',
+    'apps/desktop/gpui/build.rs',
+    'scripts/package-gpui-macos.sh',
+  ];
+  const sources = await Promise.all(
+    paths.map((relativePath) => readFile(path.join(process.cwd(), relativePath), 'utf8'))
+  );
+
+  for (const source of sources) {
+    assert.match(source, /native-assets/);
+    assert.doesNotMatch(source, /frontend[\\/]src-tauri[\\/](?:binaries|resources|icons|macos)/);
+  }
+
+  const windowsResources = sources[paths.indexOf('apps/desktop/gpui/build.rs')];
+  const macosPackage = sources[paths.indexOf('scripts/package-gpui-macos.sh')];
+  assert.match(windowsResources, /native-assets[\\/]icons[\\/]icon\.png/);
+  assert.match(windowsResources, /VERSIONINFO/);
+  assert.match(windowsResources, /ProductVersion/);
+  assert.match(macosPackage, /icons\/icon\.png/);
+  assert.doesNotMatch(windowsResources, /native-assets[\\/]icons[\\/]icon\.ico/);
+  assert.doesNotMatch(macosPackage, /icons\/icon\.icns/);
+});
+
 function sampleContext() {
   return {
     generatedAt: fixedDate.toISOString(),
     releaseTag: null,
     rootPackageVersion: '0.1.0',
-    desktopPackageVersion: '0.1.0',
-    tauriPackageVersion: '0.1.0',
+    gpuiPackageVersion: '0.1.0',
     branch: 'codex/release-confidence-pack',
     shortCommit: 'abc1234',
     dirtyBefore: false,
@@ -82,9 +136,8 @@ function sampleContext() {
       pnpm: '9.0.0',
       rustc: 'rustc 1.87.0',
       cargo: 'cargo 1.87.0',
-      tauri: '2.5.0',
     },
-    expectedArtifacts: ['target/release/explorie-desktop.exe'],
+    expectedArtifacts: ['target/release/explorie-gpui.exe'],
   };
 }
 
@@ -95,17 +148,11 @@ test('DEFAULT_COMMANDS preserves exact display order and representative executio
   );
 
   assert.equal(DEFAULT_COMMANDS[1].command, 'pnpm');
-  assert.deepEqual(DEFAULT_COMMANDS[1].args, ['--filter', 'explorie-desktop', 'prepare:native']);
-  assert.equal(DEFAULT_COMMANDS[2].command, 'pnpm');
-  assert.deepEqual(DEFAULT_COMMANDS[2].args, [
-    '--filter',
-    'explorie-desktop',
-    'exec',
-    'tsc',
-    '--noEmit',
-  ]);
-  assert.equal(DEFAULT_COMMANDS[8].command, 'cargo');
-  assert.deepEqual(DEFAULT_COMMANDS[8].args, [
+  assert.deepEqual(DEFAULT_COMMANDS[1].args, ['prepare:native']);
+  assert.equal(DEFAULT_COMMANDS[4].command, 'cargo');
+  assert.deepEqual(DEFAULT_COMMANDS[4].args, ['test', '--workspace', '--no-fail-fast']);
+  assert.equal(DEFAULT_COMMANDS[5].command, 'cargo');
+  assert.deepEqual(DEFAULT_COMMANDS[5].args, [
     'clippy',
     '--workspace',
     '--all-targets',
@@ -114,39 +161,22 @@ test('DEFAULT_COMMANDS preserves exact display order and representative executio
     '-D',
     'warnings',
   ]);
-  assert.equal(DEFAULT_COMMANDS[13].command, 'pnpm');
-  assert.deepEqual(DEFAULT_COMMANDS[13].args, [
-    '--filter',
-    'explorie-desktop',
-    'exec',
-    '--',
-    'tauri',
+  assert.equal(DEFAULT_COMMANDS[8].command, 'cargo');
+  assert.deepEqual(DEFAULT_COMMANDS[8].args, [
     'build',
-    '--no-bundle',
-    '--',
+    '-p',
+    'explorie-gpui',
+    '--release',
     '--locked',
   ]);
-  assert.equal(DEFAULT_COMMANDS[14].command, 'git');
-  assert.deepEqual(DEFAULT_COMMANDS[14].args, ['diff', '--check']);
+  assert.equal(DEFAULT_COMMANDS[9].command, 'git');
+  assert.deepEqual(DEFAULT_COMMANDS[9].args, ['diff', '--check']);
 });
 
-test('Playwright release command uses an isolated strict dev server port', () => {
-  const command = DEFAULT_COMMANDS.find(
-    (candidate) => candidate.display === 'pnpm exec playwright test'
-  );
-
-  assert.deepEqual(command.env, {
-    CI: '1',
-    PLAYWRIGHT_BASE_URL: 'http://127.0.0.1:47173',
-    PLAYWRIGHT_WEB_COMMAND:
-      'pnpm --filter explorie-desktop exec vite --host 127.0.0.1 --port 47173 --strictPort',
-  });
-});
-
-test('getExpectedArtifacts uses the actual desktop Tauri workspace layout', () => {
-  assert.deepEqual(getExpectedArtifacts('win32'), ['target/release/explorie-desktop.exe']);
-  assert.deepEqual(getExpectedArtifacts('darwin'), ['target/release/explorie-desktop']);
-  assert.deepEqual(getExpectedArtifacts('linux'), ['target/release/explorie-desktop']);
+test('getExpectedArtifacts uses the native GPUI desktop artifact', () => {
+  assert.deepEqual(getExpectedArtifacts('win32'), ['target/release/explorie-gpui.exe']);
+  assert.deepEqual(getExpectedArtifacts('darwin'), ['target/release/explorie-gpui']);
+  assert.deepEqual(getExpectedArtifacts('linux'), ['target/release/explorie-gpui']);
 });
 
 test('validateReleaseContext requires a clean, version-aligned source and matching tag', () => {
@@ -160,13 +190,13 @@ test('validateReleaseContext requires a clean, version-aligned source and matchi
       {
         ...sampleContext(),
         dirtyBefore: true,
-        desktopPackageVersion: '0.2.0',
+        gpuiPackageVersion: '0.2.0',
       },
       { tag: 'v0.3.0' }
     ),
     [
       'Working tree is dirty.',
-      'Version mismatch: 0.1.0, 0.2.0, 0.1.0.',
+      'Version mismatch: 0.1.0, 0.2.0.',
       'Release tag v0.3.0 does not match package version v0.1.0.',
     ]
   );
@@ -174,11 +204,11 @@ test('validateReleaseContext requires a clean, version-aligned source and matchi
 
 test('verifyExpectedArtifacts checks the actual workspace target path', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'release-artifact-test-'));
-  const artifact = path.join(directory, 'target', 'release', 'explorie-desktop.exe');
+  const artifact = path.join(directory, 'target', 'release', 'explorie-gpui.exe');
 
   try {
     assert.deepEqual(await verifyExpectedArtifacts({ rootDir: directory, platform: 'win32' }), [
-      'Release artifact is missing: target/release/explorie-desktop.exe',
+      'Release artifact is missing: target/release/explorie-gpui.exe',
     ]);
     await mkdir(path.dirname(artifact), { recursive: true });
     await writeFile(artifact, 'binary');
@@ -229,7 +259,7 @@ test('renderMarkdownReport includes status, branch, expected artifacts, and comm
 
   assert.match(markdown, /Status: pass/);
   assert.match(markdown, /Branch: codex\/release-confidence-pack/);
-  assert.match(markdown, /target\/release\/explorie-desktop\.exe/);
+  assert.match(markdown, /target\/release\/explorie-gpui\.exe/);
   assert.match(markdown, /pnpm install --frozen-lockfile --ignore-scripts/);
 });
 
@@ -355,56 +385,122 @@ test('runReleaseCheck stops before commands when release prerequisites fail', as
 });
 
 test('workflows block audits and publish the exact attested draft assets', async () => {
-  const [ci, release, mountDaemon] = await Promise.all([
+  const [ci, release, mountDaemon, macosPackage, windowsPackage, windowsInstaller, updater] = await Promise.all([
     readFile(path.join(process.cwd(), '.github/workflows/ci.yml'), 'utf8'),
     readFile(path.join(process.cwd(), '.github/workflows/build-release.yml'), 'utf8'),
-    readFile(
-      path.join(process.cwd(), 'apps/desktop/frontend/src-tauri/macos/MountDaemon.m'),
-      'utf8'
-    ),
+    readFile(path.join(process.cwd(), 'apps/desktop/native-assets/macos/MountDaemon.m'), 'utf8'),
+    readFile(path.join(process.cwd(), 'scripts/package-gpui-macos.sh'), 'utf8'),
+    readFile(path.join(process.cwd(), 'scripts/package-gpui-windows.ps1'), 'utf8'),
+    readFile(path.join(process.cwd(), 'apps/desktop/gpui/installer/windows/explorie.iss'), 'utf8'),
+    readFile(path.join(process.cwd(), 'crates/native-services/src/updater.rs'), 'utf8'),
   ]);
 
-  assert.match(ci, /--port 47173 --strictPort/);
+  assert.doesNotMatch(ci, /playwright|vite|explorie-desktop|test-frontend|test-e2e/i);
   assert.doesNotMatch(ci, /audit[^\n]*\|\| true/);
   assert.match(ci, /corepack pnpm@11\.13\.0 audit --audit-level=moderate/);
   assert.match(ci, /name: Security Audit[\s\S]*?node-version: '24'/);
-  assert.match(ci, /name: Rust Tests & Coverage[\s\S]*?runs-on: windows-latest/);
-  assert.match(ci, /name: macOS Core Tests & Tauri Build[\s\S]*?runs-on: macos-latest/);
-  assert.match(ci, /Build macOS application[\s\S]*?tauri build --no-bundle --ci -- --locked/);
-  assert.match(ci, /name: Lint & Type Check[\s\S]*?runs-on: windows-latest/);
+  assert.match(
+    ci,
+    /name: Windows Tests, Lint & Release Contracts[\s\S]*?runs-on: windows-latest[\s\S]*?timeout-minutes: 45/
+  );
+  assert.match(
+    ci,
+    /Test native Rust crates on Windows[\s\S]*?timeout-minutes: 15[\s\S]*?cargo test -p explorie-core -p explorie-native-services -p explorie-ffmpeg-wrapper -p explorie-cli --no-fail-fast -- --test-threads=1/
+  );
+  assert.match(
+    ci,
+    /Test GPUI application on Windows[\s\S]*?timeout-minutes: 15[\s\S]*?cargo test -p explorie-gpui -- --test-threads=1/
+  );
+  assert.match(ci, /name: Rust Coverage[\s\S]*?runs-on: windows-latest/);
+  assert.match(
+    ci,
+    /Generate native Rust coverage[\s\S]*?cargo llvm-cov[\s\S]*?-p explorie-cli -- --test-threads=1/
+  );
+  assert.doesNotMatch(
+    ci,
+    /Generate native Rust coverage\s+run:[^\n]*explorie-gpui/
+  );
+  assert.match(
+    ci,
+    /Build GPUI Windows release[\s\S]*?cargo build -p explorie-gpui --release --locked/
+  );
+  assert.match(ci, /Smoke test GPUI Windows release[\s\S]*?scripts\/smoke-gpui-release\.ps1/);
+  assert.match(ci, /name: macOS GPUI Tests & Build[\s\S]*?runs-on: macos-latest/);
+  assert.match(ci, /name: Unix Safety Regression Tests[\s\S]*?runs-on: ubuntu-latest/);
+  assert.match(
+    ci,
+    /Install Linux native dependencies[\s\S]*?libasound2-dev[\s\S]*?pkg-config/
+  );
+  assert.match(
+    ci,
+    /Test real RAR extraction safety[\s\S]*?real_rar_fixture_extracts_and_enforces_budget_and_cancellation/
+  );
+  assert.match(
+    ci,
+    /Test Unix journal and helper lifecycle safety[\s\S]*?cargo test -p explorie-native-services unix_/
+  );
+  assert.match(
+    ci,
+    /Build GPUI macOS application[\s\S]*?cargo build -p explorie-gpui --release --locked/
+  );
+  assert.doesNotMatch(ci, /tauri build/);
   assert.equal((ci.match(/name: Prepare native dependencies/g) ?? []).length, 2);
   assert.doesNotMatch(ci, /rclone-x86_64-unknown-linux-gnu/);
   assert.match(release, /gh release create/);
   assert.match(release, /run: pnpm release:check/);
   assert.match(release, /name: Validate release source[\s\S]*?runs-on: windows-latest/);
   assert.match(release, /name: Validate release source[\s\S]*?node-version: '24'/);
-  assert.match(release, /exec -- tauri build --no-bundle --ci -- --locked/);
-  assert.match(release, /exec -- tauri build --bundles dmg --ci -- --locked/);
+  assert.match(
+    release,
+    /Build GPUI Windows application[\s\S]*?cargo build -p explorie-gpui --release --locked/
+  );
+  assert.match(
+    release,
+    /native-assets\/binaries\/rclone-x86_64-pc-windows-msvc\.exe" -Destination "target\/release\/rclone\.exe"/
+  );
+  assert.doesNotMatch(release, /tauri build --no-bundle/);
+  assert.match(
+    release,
+    /Build GPUI macOS app and DMG[\s\S]*?cargo build -p explorie-gpui --release --locked --target aarch64-apple-darwin[\s\S]*?scripts\/package-gpui-macos\.sh/
+  );
+  assert.doesNotMatch(release, /tauri build/);
   assert.match(
     release,
     /name: Notarize and staple macOS DMG[\s\S]*?xcrun notarytool submit[\s\S]*?--wait[\s\S]*?xcrun stapler staple/
   );
-  assert.match(release, /Restore Enigma Virtual Box installer cache/);
-  assert.match(release, /Install Enigma Virtual Box/);
-  assert.match(release, /@insco\/enigma-virtualbox@1\.3\.4/);
+  assert.doesNotMatch(release, /Enigma Virtual Box|enigma-virtualbox|EVB_CONSOLE/);
   assert.doesNotMatch(release, /WebView2Loader\.dll/);
-  assert.match(release, /--evbOptions\.shareVirtualSystem False/);
-  assert.match(release, /--evbOptions\.allowRunningOfVirtualExeFiles True/);
-  assert.match(release, /rclone\\\.exe[\s\S]*?Failed to set the rclone extraction action/);
+  assert.match(release, /Build Windows installer[\s\S]*?package-gpui-windows\.ps1/);
+  assert.match(release, /Inno Setup 6\\ISCC\.exe/);
+  assert.match(windowsPackage, /explorie-gpui-/);
+  assert.match(windowsPackage, /explorie\\\.ico/);
+  assert.match(windowsInstaller, /PrivilegesRequired=lowest/);
+  assert.match(windowsInstaller, /DefaultDirName=\{localappdata\}\\Programs\\Explorie/);
+  assert.match(windowsInstaller, /--unregister-folder-handler/);
+  assert.match(windowsInstaller, /RelaunchRequested[\s\S]*?\/RELAUNCHEXPLORIE/);
   assert.match(
     release,
-    /Copy-Item -LiteralPath \$rclone -Destination "\$staging\/rclone\.exe"[\s\S]*?\$staging\/installers\/winfsp-2\.1\.25156\.msi/
+    /Smoke test Windows installer[\s\S]*?\/VERYSILENT[\s\S]*?Explorie\.exe[\s\S]*?rclone\.exe/
   );
-  assert.match(release, /Smoke test Windows portable executable/);
-  assert.match(release, /--remote-debugging-port=\$debugPort[\s\S]*?http:\/\/tauri\.localhost\//);
-  assert.match(release, /& \$rclone version[\s\S]*?Extracted rclone failed its version check/);
-  assert.doesNotMatch(release, /Build NSIS installer|--bundles nsis|Smoke test Windows installer/);
+  assert.match(
+    release,
+    /Download previous Windows installer when available[\s\S]*?SHA256SUMS-windows\.txt[\s\S]*?Get-FileHash[\s\S]*?previous-windows\.outputs\.path/
+  );
+  assert.match(release, /User data did not survive the installer upgrade/);
+  assert.match(release, /scripts\/smoke-gpui-release\.ps1 -Executable \$app/);
+  assert.match(release, /& \$rclone version[\s\S]*?Unexpected installed rclone version/);
+  assert.match(release, /unins000\.exe[\s\S]*?\/VERYSILENT/);
+  assert.doesNotMatch(release, /WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS|tauri\.localhost/);
+  assert.doesNotMatch(release, /Build NSIS installer|--bundles nsis/);
   assert.match(release, /Smoke test macOS DMG/);
   assert.match(
     release,
     /name: Verify and stage macOS package[\s\S]*?hdiutil attach "\$\{dmgs\[0\]\}"[\s\S]*?app="\$\{apps\[0\]\}"/
   );
-  assert.doesNotMatch(release, /app="target\/release\/bundle\/macos\/explorie\.app"/);
+  assert.match(
+    release,
+    /Notarize and staple macOS DMG[\s\S]*?app="target\/release\/bundle\/macos\/explorie\.app"[\s\S]*?notarytool submit "\$app_zip"[\s\S]*?stapler staple "\$app"/
+  );
   assert.doesNotMatch(release, /node scripts\/release-check\.mjs --preflight/);
   assert.match(release, /--draft/);
   assert.match(release, /gh release download/);
@@ -416,13 +512,13 @@ test('workflows block audits and publish the exact attested draft assets', async
   assert.match(release, /if: github\.ref_type == 'tag'/);
   assert.match(release, /Release .* already exists; refusing to replace it/);
   assert.match(release, /must exist as a draft before publication/);
-  assert.match(release, /explorie-\$version-windows-x64-portable\$suffix\.exe/);
-  assert.doesNotMatch(release, /windows-x64-setup/);
-  assert.match(release, /The Windows portable executable will be unsigned/);
+  assert.match(release, /explorie-\$version-windows-x64-setup-unsigned\.exe/);
+  assert.doesNotMatch(release, /windows-x64-portable/);
+  assert.match(release, /Stage unsigned Windows installer and checksum/);
+  assert.doesNotMatch(release, /WINDOWS_CODESIGN|SIGNTOOL|signtool\.exe/);
   assert.match(release, /explorie-\$version-macos-arm64\.dmg/);
   assert.match(release, /SHA256SUMS-windows\.txt/);
   assert.match(release, /SHA256SUMS-macos\.txt/);
-  assert.match(release, /SIGNTOOL verify \/pa \/v/);
   assert.match(release, /codesign --verify --deep --strict/);
   assert.match(release, /Identifier=com\.omershatz\.explorie\.mountd/);
   assert.match(release, /Identifier=com\.omershatz\.explorie'/);
@@ -432,21 +528,32 @@ test('workflows block audits and publish the exact attested draft assets', async
   assert.match(release, /Contents\/Resources\/explorie-mountd/);
   assert.match(release, /Contents\/MacOS\/rclone/);
   assert.match(release, /rclone v1\.74\.4/);
-  assert.match(release, /rclone-COPYING/);
+  assert.match(`${release}\n${windowsInstaller}`, /rclone-COPYING/);
   assert.match(release, /winfsp-2\.1\.25156\.msi/);
-  assert.match(release, /winfsp-NOTICE/);
+  assert.match(windowsInstaller, /winfsp-NOTICE/);
+  assert.match(`${release}\n${windowsInstaller}`, /pixelarticons-LICENSE/);
   assert.match(release, /NAVIMATICS/);
   assert.match(
     release,
     /Contents\/Library\/LaunchDaemons\/com\.omershatz\.explorie\.mountd\.plist/
   );
-  assert.match(release, /Contents\/MacOS\/explorie-desktop/);
+  assert.match(release, /Contents\/MacOS\/explorie-gpui/);
   assert.match(release, /spctl --assess/);
   assert.doesNotMatch(release, /softprops\/action-gh-release|gh api -X DELETE/);
-  assert.doesNotMatch(release, /apply_update|app\.zip|updater/i);
+  assert.match(updater, /api\.github\.com\/repos\/oshtz\/explorie\/releases\/latest/);
+  assert.match(updater, /windows-x64-setup-unsigned\.exe/);
+  assert.match(updater, /SHA256SUMS-windows\.txt/);
+  assert.match(updater, /failed its SHA-256 integrity check/);
+  assert.match(updater, /\/RELAUNCHEXPLORIE/);
+  assert.match(updater, /rejects_portable_fallbacks_missing_checksums_and_foreign_urls/);
   assert.match(mountDaemon, /kSecGuestAttributePid/);
   assert.match(mountDaemon, /connection\.processIdentifier/);
   assert.doesNotMatch(mountDaemon, /\.auditToken/);
+  assert.match(macosPackage, /CFBundleIdentifier<\/key><string>com\.omershatz\.explorie/);
+  assert.match(macosPackage, /codesign --verify --deep --strict/);
+  assert.match(macosPackage, /hdiutil create/);
+  assert.match(macosPackage, /Contents\/Resources\/explorie-mountd/);
+  assert.match(macosPackage, /Contents\/MacOS\/rclone/);
 });
 
 test('writeReleaseReports writes timestamped and latest JSON/Markdown files', async () => {

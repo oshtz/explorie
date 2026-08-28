@@ -1,7 +1,10 @@
 use serde::{Deserialize, Serialize};
+use std::ffi::CString;
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use uuid::Uuid;
 use walkdir::{DirEntry, WalkDir};
 use zip::write::SimpleFileOptions;
@@ -9,6 +12,156 @@ use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 // Re-export Password for 7z operations
 pub use sevenz_rust::Password as SevenZPassword;
+
+#[derive(Clone, Copy, Debug)]
+pub struct ExtractionLimits {
+    pub max_entries: usize,
+    pub max_entry_bytes: u64,
+    pub max_total_bytes: u64,
+    pub max_expansion_ratio: u64,
+    /// Maximum bytes that may be written based on free space at extraction start.
+    /// This remains in force when the user explicitly opts into extended limits.
+    pub max_available_bytes: u64,
+}
+
+impl Default for ExtractionLimits {
+    fn default() -> Self {
+        Self {
+            max_entries: 100_000,
+            max_entry_bytes: 1024 * 1024 * 1024,
+            max_total_bytes: 8 * 1024 * 1024 * 1024,
+            max_expansion_ratio: 10_000,
+            max_available_bytes: u64::MAX,
+        }
+    }
+}
+
+impl ExtractionLimits {
+    /// Higher limits used only after an explicit user confirmation.
+    pub fn extended() -> Self {
+        Self {
+            max_entries: 1_000_000,
+            max_entry_bytes: 8 * 1024 * 1024 * 1024,
+            max_total_bytes: 32 * 1024 * 1024 * 1024,
+            max_expansion_ratio: 100_000,
+            max_available_bytes: u64::MAX,
+        }
+    }
+}
+
+struct ExtractionBudget<'a> {
+    cancelled: &'a AtomicBool,
+    limits: ExtractionLimits,
+    effective_total_limit: u64,
+    available_total_limit: u64,
+    entries: usize,
+    total_bytes: u64,
+    entry_bytes: u64,
+}
+
+impl<'a> ExtractionBudget<'a> {
+    fn new(
+        archive_path: &Path,
+        limits: ExtractionLimits,
+        cancelled: &'a AtomicBool,
+    ) -> io::Result<Self> {
+        let compressed_bytes = fs::metadata(archive_path)?.len().max(1);
+        let ratio_limit = compressed_bytes
+            .saturating_mul(limits.max_expansion_ratio)
+            .max(64 * 1024 * 1024);
+        Ok(Self {
+            cancelled,
+            limits,
+            effective_total_limit: limits.max_total_bytes.min(ratio_limit),
+            available_total_limit: limits.max_available_bytes,
+            entries: 0,
+            total_bytes: 0,
+            entry_bytes: 0,
+        })
+    }
+
+    fn begin_entry(&mut self, declared_size: u64) -> io::Result<()> {
+        self.check_cancelled()?;
+        self.entries = self.entries.saturating_add(1);
+        self.entry_bytes = 0;
+        if self.entries > self.limits.max_entries {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Archive extraction exceeds the safety limit of {} entries",
+                    self.limits.max_entries
+                ),
+            ));
+        }
+        if self.total_bytes.saturating_add(declared_size) > self.available_total_limit {
+            return Err(insufficient_extraction_space());
+        }
+        if declared_size > self.limits.max_entry_bytes
+            || self.total_bytes.saturating_add(declared_size) > self.effective_total_limit
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Archive extraction exceeds the configured safety limit",
+            ));
+        }
+        Ok(())
+    }
+
+    fn add_bytes(&mut self, bytes: u64) -> io::Result<()> {
+        self.check_cancelled()?;
+        self.entry_bytes = self.entry_bytes.saturating_add(bytes);
+        self.total_bytes = self.total_bytes.saturating_add(bytes);
+        if self.total_bytes > self.available_total_limit {
+            return Err(insufficient_extraction_space());
+        }
+        if self.entry_bytes > self.limits.max_entry_bytes
+            || self.total_bytes > self.effective_total_limit
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Archive extraction exceeded the configured safety limit",
+            ));
+        }
+        Ok(())
+    }
+
+    fn check_cancelled(&self) -> io::Result<()> {
+        if self.cancelled.load(Ordering::Acquire) {
+            Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "archive extraction cancelled",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn insufficient_extraction_space() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::StorageFull,
+        "Archive extraction would consume the disk space reserved for safe operation",
+    )
+}
+
+fn copy_with_extraction_budget<R: Read + ?Sized, W: Write + ?Sized>(
+    reader: &mut R,
+    writer: &mut W,
+    budget: &mut ExtractionBudget<'_>,
+) -> io::Result<u64> {
+    let mut buffer = [0_u8; 128 * 1024];
+    let mut written = 0_u64;
+    loop {
+        budget.check_cancelled()?;
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            return Ok(written);
+        }
+        budget.add_bytes(count as u64)?;
+        writer.write_all(&buffer[..count])?;
+        written = written.saturating_add(count as u64);
+    }
+}
 
 /// Supported archive formats
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1216,8 +1369,11 @@ fn add_file_to_tar<W: Write>(
 
 /// Extract a ZIP archive to a directory
 pub fn extract_zip_archive(archive_path: &Path, output_dir: &Path) -> io::Result<u64> {
+    let cancelled = AtomicBool::new(false);
+    let limits = ExtractionLimits::default();
     with_staged_extraction(output_dir, |staging| {
-        extract_zip_archive_into(archive_path, staging, None)
+        let mut budget = ExtractionBudget::new(archive_path, limits, &cancelled)?;
+        extract_zip_archive_into(archive_path, staging, None, &mut budget)
     })
 }
 
@@ -1225,6 +1381,7 @@ fn extract_zip_archive_into(
     archive_path: &Path,
     output_dir: &Path,
     password: Option<&str>,
+    budget: &mut ExtractionBudget<'_>,
 ) -> io::Result<u64> {
     let file = File::open(archive_path)?;
     let reader = BufReader::new(file);
@@ -1237,6 +1394,7 @@ fn extract_zip_archive_into(
         } else {
             archive.by_index(i)?
         };
+        budget.begin_entry(file.size())?;
         let name = file.name().to_string();
         let entry_path = Path::new(&name);
         let out_path = ensure_safe_extraction_path(output_dir, entry_path)?;
@@ -1262,7 +1420,11 @@ fn extract_zip_archive_into(
                 .create(true)
                 .truncate(true)
                 .open(&out_path)?;
-            total_bytes = total_bytes.saturating_add(io::copy(&mut file, &mut out_file)?);
+            total_bytes = total_bytes.saturating_add(copy_with_extraction_budget(
+                &mut file,
+                &mut out_file,
+                budget,
+            )?);
             out_file.flush()?;
         }
     }
@@ -1272,20 +1434,28 @@ fn extract_zip_archive_into(
 
 /// Extract a TAR archive (optionally gzipped) to a directory
 pub fn extract_tar_archive(archive_path: &Path, output_dir: &Path, gzip: bool) -> io::Result<u64> {
+    let cancelled = AtomicBool::new(false);
+    let limits = ExtractionLimits::default();
     with_staged_extraction(output_dir, |staging| {
-        extract_tar_archive_into(archive_path, staging, gzip)
+        let mut budget = ExtractionBudget::new(archive_path, limits, &cancelled)?;
+        extract_tar_archive_into(archive_path, staging, gzip, &mut budget)
     })
 }
 
-fn extract_tar_archive_into(archive_path: &Path, output_dir: &Path, gzip: bool) -> io::Result<u64> {
+fn extract_tar_archive_into(
+    archive_path: &Path,
+    output_dir: &Path,
+    gzip: bool,
+    budget: &mut ExtractionBudget<'_>,
+) -> io::Result<u64> {
     let file = File::open(archive_path)?;
     let total_bytes = if gzip {
         let decoder = flate2::read::GzDecoder::new(BufReader::new(file));
         let mut archive = tar::Archive::new(decoder);
-        extract_tar_entries(&mut archive, output_dir)?
+        extract_tar_entries(&mut archive, output_dir, budget)?
     } else {
         let mut archive = tar::Archive::new(BufReader::new(file));
-        extract_tar_entries(&mut archive, output_dir)?
+        extract_tar_entries(&mut archive, output_dir, budget)?
     };
 
     Ok(total_bytes)
@@ -1294,12 +1464,14 @@ fn extract_tar_archive_into(archive_path: &Path, output_dir: &Path, gzip: bool) 
 fn extract_tar_entries<R: Read>(
     archive: &mut tar::Archive<R>,
     output_dir: &Path,
+    budget: &mut ExtractionBudget<'_>,
 ) -> io::Result<u64> {
     let mut total_bytes: u64 = 0;
 
     for entry in archive.entries()? {
         let mut entry = entry?;
         let path = entry.path()?.into_owned();
+        budget.begin_entry(entry.size())?;
         validate_archive_entry_path(&path)?;
         let entry_type = entry.header().entry_type();
         if !entry_type.is_file() && !entry_type.is_dir() {
@@ -1311,14 +1483,28 @@ fn extract_tar_entries<R: Read>(
                 ),
             ));
         }
-        ensure_safe_extraction_path(output_dir, &path)?;
-        if !entry.unpack_in(output_dir)? {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Invalid archive: path traversal attempt detected",
-            ));
+        let output_path = ensure_safe_extraction_path(output_dir, &path)?;
+        if entry_type.is_dir() {
+            fs::create_dir_all(&output_path)?;
+        } else {
+            if let Some(parent) = output_path.parent() {
+                fs::create_dir_all(parent)?;
+                ensure_no_link_ancestors(parent)?;
+            }
+            let mut output = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&output_path)?;
+            copy_with_extraction_budget(&mut entry, &mut output, budget)?;
+            output.flush()?;
+            #[cfg(unix)]
+            if let Ok(mode) = entry.header().mode() {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&output_path, fs::Permissions::from_mode(mode & 0o777))?;
+            }
         }
-        total_bytes += entry.size();
+        total_bytes = budget.total_bytes;
     }
 
     Ok(total_bytes)
@@ -1423,8 +1609,11 @@ pub fn extract_rar_archive(
     output_dir: &Path,
     password: Option<&str>,
 ) -> io::Result<u64> {
+    let cancelled = AtomicBool::new(false);
+    let limits = ExtractionLimits::default();
     with_staged_extraction(output_dir, |staging| {
-        extract_rar_archive_into(archive_path, staging, password)
+        let mut budget = ExtractionBudget::new(archive_path, limits, &cancelled)?;
+        extract_rar_archive_into(archive_path, staging, password, &mut budget)
     })
 }
 
@@ -1432,35 +1621,74 @@ fn extract_rar_archive_into(
     archive_path: &Path,
     output_dir: &Path,
     password: Option<&str>,
+    budget: &mut ExtractionBudget<'_>,
 ) -> io::Result<u64> {
-    let archive = if let Some(pwd) = password {
-        unrar::Archive::with_password(archive_path, pwd)
-    } else {
-        unrar::Archive::new(archive_path)
-    };
-
-    let mut archive = archive.open_for_processing().map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Failed to open RAR: {:?}", e),
-        )
+    #[cfg(any(target_os = "linux", target_os = "netbsd"))]
+    let archive_name = CString::new(archive_path.as_os_str().as_encoded_bytes()).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "RAR path contains a null byte")
     })?;
+    #[cfg(any(target_os = "linux", target_os = "netbsd"))]
+    let mut open_data =
+        unrar_sys::OpenArchiveDataEx::new(archive_name.as_ptr(), unrar_sys::RAR_OM_EXTRACT);
 
-    let mut total_bytes: u64 = 0;
+    #[cfg(not(any(target_os = "linux", target_os = "netbsd")))]
+    let archive_name = widestring::WideCString::from_os_str(archive_path).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "RAR path contains a null byte")
+    })?;
+    #[cfg(not(any(target_os = "linux", target_os = "netbsd")))]
+    let mut open_data =
+        unrar_sys::OpenArchiveDataEx::new(archive_name.as_ptr().cast(), unrar_sys::RAR_OM_EXTRACT);
 
-    while let Some(header) = archive.read_header().map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Failed to read RAR header: {:?}", e),
-        )
-    })? {
-        let filename = header.entry().filename.clone();
-        let size = header.entry().unpacked_size;
-        let is_directory = header.entry().is_directory();
-        let attributes = header.entry().file_attr;
+    // The UnRAR C API fills this structure even though unrar_sys exposes a const pointer.
+    #[allow(clippy::unnecessary_mut_passed)]
+    let handle = unsafe { unrar_sys::RAROpenArchiveEx(&mut open_data) };
+    if handle.is_null() || open_data.open_result != unrar_sys::ERAR_SUCCESS as u32 {
+        return Err(rar_error("open", open_data.open_result as i32));
+    }
+    let handle = RarHandle(handle);
+    let password = password
+        .map(|password| {
+            CString::new(password).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "RAR password contains a null byte",
+                )
+            })
+        })
+        .transpose()?;
+    if let Some(password) = password.as_ref() {
+        unsafe { unrar_sys::RARSetPassword(handle.0, password.as_ptr()) };
+    }
+
+    loop {
+        budget.check_cancelled()?;
+        let mut header = unrar_sys::HeaderDataEx::default();
+        // The UnRAR C API fills this structure even though unrar_sys exposes a const pointer.
+        #[allow(clippy::unnecessary_mut_passed)]
+        let result = unsafe { unrar_sys::RARReadHeaderEx(handle.0, &mut header) };
+        if result == unrar_sys::ERAR_END_ARCHIVE {
+            break;
+        }
+        if result != unrar_sys::ERAR_SUCCESS {
+            return Err(rar_error("read header", result));
+        }
+
+        let filename = unsafe {
+            widestring::WideCString::from_ptr_truncate(
+                header.filename_w.as_ptr().cast(),
+                header.filename_w.len(),
+            )
+        };
+        let filename = PathBuf::from(filename.to_os_string());
+        let size = ((header.unp_size_high as u64) << 32) | header.unp_size as u64;
+        budget.begin_entry(size)?;
+        let is_directory = header.flags & unrar_sys::RHDF_DIRECTORY != 0;
+        let attributes = header.file_attr;
         let unix_kind = attributes & 0o170000;
         const WINDOWS_REPARSE_ATTRIBUTE: u32 = 0x400;
-        let is_link = unix_kind == 0o120000 || attributes & WINDOWS_REPARSE_ATTRIBUTE != 0;
+        let is_link = header.redir_type != 0
+            || unix_kind == 0o120000
+            || attributes & WINDOWS_REPARSE_ATTRIBUTE != 0;
         if is_link {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1474,17 +1702,50 @@ fn extract_rar_archive_into(
 
         if is_directory {
             fs::create_dir_all(&entry_path)?;
-            archive = header.skip().map_err(|error| {
-                io::Error::other(format!("Failed to process RAR directory: {error:?}"))
-            })?;
+            let result = unsafe {
+                unrar_sys::RARProcessFileW(handle.0, unrar_sys::RAR_SKIP, ptr::null(), ptr::null())
+            };
+            if result != unrar_sys::ERAR_SUCCESS {
+                return Err(rar_error("process directory", result));
+            }
         } else {
             if let Some(parent) = entry_path.parent() {
                 fs::create_dir_all(parent)?;
                 ensure_no_link_ancestors(parent)?;
             }
-            archive = header.extract_to(&entry_path).map_err(|error| {
-                io::Error::other(format!("Failed to extract RAR entry: {error:?}"))
-            })?;
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&entry_path)?;
+            let mut context = RarWriteContext {
+                writer: &mut file,
+                cancelled: budget.cancelled,
+                entry_bytes: budget.entry_bytes,
+                total_bytes: budget.total_bytes,
+                max_entry_bytes: budget.limits.max_entry_bytes,
+                max_total_bytes: budget.effective_total_limit,
+                max_available_bytes: budget.available_total_limit,
+                error: None,
+            };
+            unsafe {
+                unrar_sys::RARSetCallback(
+                    handle.0,
+                    Some(rar_stream_callback),
+                    (&mut context as *mut RarWriteContext) as unrar_sys::LPARAM,
+                )
+            };
+            let result = unsafe {
+                unrar_sys::RARProcessFileW(handle.0, unrar_sys::RAR_TEST, ptr::null(), ptr::null())
+            };
+            if let Some(error) = context.error.take() {
+                return Err(error);
+            }
+            if result != unrar_sys::ERAR_SUCCESS {
+                return Err(rar_error("extract entry", result));
+            }
+            budget.entry_bytes = context.entry_bytes;
+            budget.total_bytes = context.total_bytes;
+            file.flush()?;
             let metadata = fs::symlink_metadata(&entry_path)?;
             if metadata_is_link_or_reparse(&metadata)
                 || !metadata.is_file()
@@ -1498,12 +1759,122 @@ fn extract_rar_archive_into(
                     ),
                 ));
             }
+            if metadata.len() != budget.entry_bytes {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "RAR entry size changed while extracting {}",
+                        filename.display()
+                    ),
+                ));
+            }
         }
-
-        total_bytes = total_bytes.saturating_add(size);
     }
 
-    Ok(total_bytes)
+    Ok(budget.total_bytes)
+}
+
+struct RarHandle(*const unrar_sys::Handle);
+
+impl Drop for RarHandle {
+    fn drop(&mut self) {
+        unsafe { unrar_sys::RARCloseArchive(self.0) };
+    }
+}
+
+struct RarWriteContext<'a> {
+    writer: &'a mut File,
+    cancelled: &'a AtomicBool,
+    entry_bytes: u64,
+    total_bytes: u64,
+    max_entry_bytes: u64,
+    max_total_bytes: u64,
+    max_available_bytes: u64,
+    error: Option<io::Error>,
+}
+
+extern "C" fn rar_stream_callback(
+    message: unrar_sys::UINT,
+    user_data: unrar_sys::LPARAM,
+    data: unrar_sys::LPARAM,
+    size: unrar_sys::LPARAM,
+) -> i32 {
+    if user_data == 0 {
+        return 1;
+    }
+    if matches!(
+        message,
+        unrar_sys::UCM_NEEDPASSWORD | unrar_sys::UCM_NEEDPASSWORDW
+    ) {
+        let context = unsafe { &mut *(user_data as *mut RarWriteContext<'_>) };
+        context.error = Some(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "RAR password is required or incorrect",
+        ));
+        return -1;
+    }
+    if message != unrar_sys::UCM_PROCESSDATA {
+        return 1;
+    }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let context = unsafe { &mut *(user_data as *mut RarWriteContext<'_>) };
+        if context.cancelled.load(Ordering::Acquire) {
+            context.error = Some(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "archive extraction cancelled",
+            ));
+            return -1;
+        }
+        if data == 0 || size < 0 {
+            context.error = Some(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "RAR returned an invalid data chunk",
+            ));
+            return -1;
+        }
+        let bytes = size as u64;
+        let next_entry_bytes = context.entry_bytes.saturating_add(bytes);
+        let next_total_bytes = context.total_bytes.saturating_add(bytes);
+        if next_total_bytes > context.max_available_bytes {
+            context.error = Some(insufficient_extraction_space());
+            return -1;
+        }
+        if next_entry_bytes > context.max_entry_bytes || next_total_bytes > context.max_total_bytes
+        {
+            context.error = Some(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Archive extraction exceeded the configured safety limit",
+            ));
+            return -1;
+        }
+        let chunk = unsafe { std::slice::from_raw_parts(data as *const u8, size as usize) };
+        if let Err(error) = context.writer.write_all(chunk) {
+            context.error = Some(error);
+            return -1;
+        }
+        context.entry_bytes = next_entry_bytes;
+        context.total_bytes = next_total_bytes;
+        1
+    }))
+    .unwrap_or(-1)
+}
+
+fn rar_error(action: &str, code: i32) -> io::Error {
+    let description = match code {
+        unrar_sys::ERAR_NO_MEMORY => "not enough memory",
+        unrar_sys::ERAR_BAD_DATA => "corrupt data or checksum mismatch",
+        unrar_sys::ERAR_BAD_ARCHIVE | unrar_sys::ERAR_UNKNOWN_FORMAT => "invalid RAR archive",
+        unrar_sys::ERAR_EOPEN => "could not open archive or volume",
+        unrar_sys::ERAR_ECREATE | unrar_sys::ERAR_EWRITE => "could not write output",
+        unrar_sys::ERAR_ECLOSE | unrar_sys::ERAR_EREAD => "archive I/O failed",
+        unrar_sys::ERAR_MISSING_PASSWORD => "password required",
+        unrar_sys::ERAR_BAD_PASSWORD => "incorrect password",
+        _ => "unknown UnRAR error",
+    };
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("Failed to {action} RAR: {description} (code {code})"),
+    )
 }
 
 /// List contents of a RAR archive
@@ -1563,16 +1934,14 @@ pub fn list_rar_contents(archive_path: &Path) -> io::Result<ArchiveInfo> {
 pub fn create_7z_archive(
     sources: &[PathBuf],
     output_path: &Path,
-    _password: Option<&str>,
+    password: Option<&str>,
 ) -> io::Result<u64> {
     ensure_output_outside_sources(sources, output_path)?;
     with_atomic_archive_output(output_path, |output_file| {
         let mut total_bytes: u64 = 0;
-        let mut sz = sevenz_rust::SevenZWriter::new(output_file)
+        let mut sz = sevenz_rust::ArchiveWriter::new(output_file)
             .map_err(|error| io::Error::other(format!("Failed to create 7z: {error:?}")))?;
-        sz.set_content_methods(vec![sevenz_rust::SevenZMethodConfiguration::new(
-            sevenz_rust::SevenZMethod::LZMA2,
-        )]);
+        configure_7z_writer(&mut sz, password);
 
         for source in sources {
             match classify_source(source)? {
@@ -1594,17 +1963,15 @@ pub fn create_7z_archive(
 pub fn create_7z_archive_with_progress(
     sources: &[PathBuf],
     output_path: &Path,
-    _password: Option<&str>,
+    password: Option<&str>,
     progress: &mut impl FnMut(&Path, u64),
 ) -> io::Result<u64> {
     ensure_output_outside_sources(sources, output_path)?;
     with_atomic_archive_output(output_path, |output_file| {
         let mut total_bytes: u64 = 0;
-        let mut sz = sevenz_rust::SevenZWriter::new(output_file)
+        let mut sz = sevenz_rust::ArchiveWriter::new(output_file)
             .map_err(|error| io::Error::other(format!("Failed to create 7z: {error:?}")))?;
-        sz.set_content_methods(vec![sevenz_rust::SevenZMethodConfiguration::new(
-            sevenz_rust::SevenZMethod::LZMA2,
-        )]);
+        configure_7z_writer(&mut sz, password);
 
         for source in sources {
             match classify_source(source)? {
@@ -1628,8 +1995,23 @@ pub fn create_7z_archive_with_progress(
     })
 }
 
+fn configure_7z_writer<W: Write + io::Seek>(
+    writer: &mut sevenz_rust::ArchiveWriter<W>,
+    password: Option<&str>,
+) {
+    if let Some(password) = password.filter(|password| !password.is_empty()) {
+        writer.set_content_methods(vec![
+            sevenz_rust::encoder_options::AesEncoderOptions::new(SevenZPassword::from(password))
+                .into(),
+            sevenz_rust::EncoderMethod::LZMA2.into(),
+        ]);
+    } else {
+        writer.set_content_methods(vec![sevenz_rust::EncoderMethod::LZMA2.into()]);
+    }
+}
+
 fn add_directory_to_7z_with_progress<W: Write + io::Seek>(
-    sz: &mut sevenz_rust::SevenZWriter<W>,
+    sz: &mut sevenz_rust::ArchiveWriter<W>,
     dir_path: &Path,
     progress: &mut impl FnMut(&Path, u64),
 ) -> io::Result<u64> {
@@ -1653,7 +2035,7 @@ fn add_directory_to_7z_with_progress<W: Write + io::Seek>(
 }
 
 fn add_file_to_7z_with_progress<W: Write + io::Seek>(
-    sz: &mut sevenz_rust::SevenZWriter<W>,
+    sz: &mut sevenz_rust::ArchiveWriter<W>,
     file_path: &Path,
     archive_name: &str,
     progress: &mut impl FnMut(&Path, u64),
@@ -1664,7 +2046,7 @@ fn add_file_to_7z_with_progress<W: Write + io::Seek>(
 }
 
 fn add_directory_to_7z<W: Write + io::Seek>(
-    sz: &mut sevenz_rust::SevenZWriter<W>,
+    sz: &mut sevenz_rust::ArchiveWriter<W>,
     dir_path: &Path,
 ) -> io::Result<u64> {
     let mut total_bytes: u64 = 0;
@@ -1687,7 +2069,7 @@ fn add_directory_to_7z<W: Write + io::Seek>(
 }
 
 fn add_file_to_7z<W: Write + io::Seek>(
-    sz: &mut sevenz_rust::SevenZWriter<W>,
+    sz: &mut sevenz_rust::ArchiveWriter<W>,
     file_path: &Path,
     archive_name: &str,
 ) -> io::Result<u64> {
@@ -1695,9 +2077,7 @@ fn add_file_to_7z<W: Write + io::Seek>(
     let metadata = file.metadata()?;
     let size = metadata.len();
 
-    let mut entry = sevenz_rust::SevenZArchiveEntry::new();
-    entry.name = archive_name.to_string();
-    entry.has_stream = true;
+    let mut entry = sevenz_rust::ArchiveEntry::new_file(archive_name);
     entry.size = size;
     sz.push_archive_entry(entry, Some(&mut file))
         .map_err(|e| io::Error::other(format!("Failed to add file to 7z: {:?}", e)))?;
@@ -1711,8 +2091,11 @@ pub fn extract_7z_archive(
     output_dir: &Path,
     password: Option<&str>,
 ) -> io::Result<u64> {
+    let cancelled = AtomicBool::new(false);
+    let limits = ExtractionLimits::default();
     with_staged_extraction(output_dir, |staging| {
-        extract_7z_archive_into(archive_path, staging, password)
+        let mut budget = ExtractionBudget::new(archive_path, limits, &cancelled)?;
+        extract_7z_archive_into(archive_path, staging, password, &mut budget)
     })
 }
 
@@ -1720,14 +2103,14 @@ fn extract_7z_archive_into(
     archive_path: &Path,
     output_dir: &Path,
     password: Option<&str>,
+    budget: &mut ExtractionBudget<'_>,
 ) -> io::Result<u64> {
     let file = File::open(archive_path)?;
-    let len = file.metadata()?.len();
     let reader = BufReader::new(file);
     let password = password
         .map(SevenZPassword::from)
         .unwrap_or_else(SevenZPassword::empty);
-    let mut archive = sevenz_rust::SevenZReader::new(reader, len, password).map_err(|error| {
+    let mut archive = sevenz_rust::ArchiveReader::new(reader, password).map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("Failed to open 7z: {error:?}"),
@@ -1737,30 +2120,38 @@ fn extract_7z_archive_into(
 
     archive
         .for_each_entries(|entry, reader| {
+            budget
+                .begin_entry(entry.size)
+                .map_err(|error| sevenz_rust::Error::Io(error, "".into()))?;
             if entry.is_anti_item() {
-                return Err(sevenz_rust::Error::other(format!(
-                    "Unsupported 7z anti-item: {}",
-                    entry.name()
-                )));
+                return Err(sevenz_rust::Error::Other(
+                    format!("Unsupported 7z anti-item: {}", entry.name()).into(),
+                ));
             }
             let entry_path = Path::new(entry.name());
             let output_path = ensure_safe_extraction_path(output_dir, entry_path)
-                .map_err(sevenz_rust::Error::io)?;
+                .map_err(|error| sevenz_rust::Error::Io(error, "".into()))?;
             if entry.is_directory() {
-                fs::create_dir_all(&output_path).map_err(sevenz_rust::Error::io)?;
+                fs::create_dir_all(&output_path)
+                    .map_err(|error| sevenz_rust::Error::Io(error, "".into()))?;
             } else {
                 if let Some(parent) = output_path.parent() {
-                    fs::create_dir_all(parent).map_err(sevenz_rust::Error::io)?;
-                    ensure_no_link_ancestors(parent).map_err(sevenz_rust::Error::io)?;
+                    fs::create_dir_all(parent)
+                        .map_err(|error| sevenz_rust::Error::Io(error, "".into()))?;
+                    ensure_no_link_ancestors(parent)
+                        .map_err(|error| sevenz_rust::Error::Io(error, "".into()))?;
                 }
                 let mut output = OpenOptions::new()
                     .write(true)
                     .create(true)
                     .truncate(true)
                     .open(&output_path)
-                    .map_err(sevenz_rust::Error::io)?;
-                let written = io::copy(reader, &mut output).map_err(sevenz_rust::Error::io)?;
-                output.flush().map_err(sevenz_rust::Error::io)?;
+                    .map_err(|error| sevenz_rust::Error::Io(error, "".into()))?;
+                let written = copy_with_extraction_budget(reader, &mut output, budget)
+                    .map_err(|error| sevenz_rust::Error::Io(error, "".into()))?;
+                output
+                    .flush()
+                    .map_err(|error| sevenz_rust::Error::Io(error, "".into()))?;
                 total_bytes = total_bytes.saturating_add(written);
             }
             Ok(true)
@@ -1778,10 +2169,9 @@ fn extract_7z_archive_into(
 /// List contents of a 7Z archive
 pub fn list_7z_contents(archive_path: &Path) -> io::Result<ArchiveInfo> {
     let file = File::open(archive_path)?;
-    let len = file.metadata()?.len();
     let reader = BufReader::new(file);
-    let archive = sevenz_rust::SevenZReader::new(reader, len, sevenz_rust::Password::empty())
-        .map_err(|e| {
+    let archive =
+        sevenz_rust::ArchiveReader::new(reader, sevenz_rust::Password::empty()).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("Failed to open 7z: {:?}", e),
@@ -1848,23 +2238,47 @@ pub fn extract_archive_with_password(
     output_dir: &Path,
     password: Option<&str>,
 ) -> io::Result<u64> {
-    match ArchiveFormat::from_path(archive_path) {
-        Some(ArchiveFormat::Zip) => {
-            if password.is_some() {
-                extract_zip_archive_with_password(archive_path, output_dir, password)
-            } else {
-                extract_zip_archive(archive_path, output_dir)
+    let cancelled = AtomicBool::new(false);
+    extract_archive_with_password_and_limits(
+        archive_path,
+        output_dir,
+        password,
+        ExtractionLimits::default(),
+        &cancelled,
+    )
+}
+
+pub fn extract_archive_with_password_and_limits(
+    archive_path: &Path,
+    output_dir: &Path,
+    password: Option<&str>,
+    limits: ExtractionLimits,
+    cancelled: &AtomicBool,
+) -> io::Result<u64> {
+    with_staged_extraction(output_dir, |staging| {
+        let mut budget = ExtractionBudget::new(archive_path, limits, cancelled)?;
+        match ArchiveFormat::from_path(archive_path) {
+            Some(ArchiveFormat::Zip) => {
+                extract_zip_archive_into(archive_path, staging, password, &mut budget)
             }
+            Some(ArchiveFormat::TarGz) => {
+                extract_tar_archive_into(archive_path, staging, true, &mut budget)
+            }
+            Some(ArchiveFormat::Tar) => {
+                extract_tar_archive_into(archive_path, staging, false, &mut budget)
+            }
+            Some(ArchiveFormat::Rar) => {
+                extract_rar_archive_into(archive_path, staging, password, &mut budget)
+            }
+            Some(ArchiveFormat::SevenZ) => {
+                extract_7z_archive_into(archive_path, staging, password, &mut budget)
+            }
+            None => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Unsupported archive format",
+            )),
         }
-        Some(ArchiveFormat::TarGz) => extract_tar_archive(archive_path, output_dir, true),
-        Some(ArchiveFormat::Tar) => extract_tar_archive(archive_path, output_dir, false),
-        Some(ArchiveFormat::Rar) => extract_rar_archive(archive_path, output_dir, password),
-        Some(ArchiveFormat::SevenZ) => extract_7z_archive(archive_path, output_dir, password),
-        None => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Unsupported archive format",
-        )),
-    }
+    })
 }
 
 /// Extract a password-protected ZIP archive to a directory
@@ -1873,8 +2287,11 @@ pub fn extract_zip_archive_with_password(
     output_dir: &Path,
     password: Option<&str>,
 ) -> io::Result<u64> {
+    let cancelled = AtomicBool::new(false);
+    let limits = ExtractionLimits::default();
     with_staged_extraction(output_dir, |staging| {
-        extract_zip_archive_into(archive_path, staging, password)
+        let mut budget = ExtractionBudget::new(archive_path, limits, &cancelled)?;
+        extract_zip_archive_into(archive_path, staging, password, &mut budget)
     })
 }
 
@@ -2262,9 +2679,8 @@ pub fn archive_needs_password(archive_path: &Path) -> io::Result<bool> {
         Some(ArchiveFormat::SevenZ) => {
             // For 7z, try opening without password; if it fails, assume password needed
             let file = File::open(archive_path)?;
-            let len = file.metadata()?.len();
             let reader = BufReader::new(file);
-            match sevenz_rust::SevenZReader::new(reader, len, sevenz_rust::Password::empty()) {
+            match sevenz_rust::ArchiveReader::new(reader, sevenz_rust::Password::empty()) {
                 Ok(_) => Ok(false),
                 Err(_) => Ok(true), // Assume password needed if can't open
             }
@@ -2285,6 +2701,13 @@ mod tests {
     use super::*;
     use std::io::{Cursor, Write};
     use tempfile::TempDir;
+
+    const RAR_VERSION_FIXTURE: &[u8] = &[
+        82, 97, 114, 33, 26, 7, 0, 207, 144, 115, 0, 0, 13, 0, 0, 0, 0, 0, 0, 0, 15, 12, 116, 32,
+        128, 39, 0, 21, 0, 0, 0, 11, 0, 0, 0, 3, 69, 243, 125, 198, 164, 138, 7, 71, 29, 51, 7, 0,
+        164, 129, 0, 0, 86, 69, 82, 83, 73, 79, 78, 12, 0, 143, 236, 138, 69, 204, 35, 200, 72, 8,
+        131, 98, 254, 95, 221, 92, 83, 136, 240, 114, 196, 61, 123, 0, 64, 7, 0,
+    ];
 
     fn assert_no_staging_paths(parent: &Path) {
         let staging_paths: Vec<_> = fs::read_dir(parent)
@@ -2386,6 +2809,50 @@ mod tests {
         let extracted_file = extract_dir.join("source/secret.txt");
         let content = fs::read_to_string(&extracted_file).unwrap();
         assert_eq!(content, "Top secret");
+    }
+
+    #[test]
+    fn seven_z_round_trip_supports_listing_and_passwords() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("hello.txt"), b"Hello from 7z").unwrap();
+
+        let archive_path = temp.path().join("plain.7z");
+        create_7z_archive(std::slice::from_ref(&source), &archive_path, None).unwrap();
+
+        let info = list_7z_contents(&archive_path).unwrap();
+        assert_eq!(info.format, "7z");
+        assert_eq!(info.entry_count, 1);
+        assert_eq!(info.entries[0].path, "source/hello.txt");
+        assert_eq!(info.entries[0].size, 13);
+
+        let extracted = temp.path().join("plain-extracted");
+        extract_7z_archive(&archive_path, &extracted, None).unwrap();
+        assert_eq!(
+            fs::read(extracted.join("source/hello.txt")).unwrap(),
+            b"Hello from 7z"
+        );
+
+        let protected_path = temp.path().join("protected.7z");
+        create_7z_archive(
+            std::slice::from_ref(&source),
+            &protected_path,
+            Some("password123"),
+        )
+        .unwrap();
+        assert!(archive_needs_password(&protected_path).unwrap());
+
+        let wrong = temp.path().join("wrong-password");
+        assert!(extract_7z_archive(&protected_path, &wrong, Some("wrong")).is_err());
+        assert!(!wrong.exists());
+
+        let protected_extracted = temp.path().join("protected-extracted");
+        extract_7z_archive(&protected_path, &protected_extracted, Some("password123")).unwrap();
+        assert_eq!(
+            fs::read(protected_extracted.join("source/hello.txt")).unwrap(),
+            b"Hello from 7z"
+        );
     }
 
     #[test]
@@ -2573,6 +3040,226 @@ mod tests {
     }
 
     #[test]
+    fn extraction_budget_failure_preserves_existing_destination() {
+        let temp = TempDir::new().unwrap();
+        let archive_path = temp.path().join("budget.zip");
+        let output = temp.path().join("output");
+        fs::create_dir(&output).unwrap();
+        fs::write(output.join("sentinel.txt"), b"preserved").unwrap();
+        let file = File::create(&archive_path).unwrap();
+        let mut archive = ZipWriter::new(file);
+        archive
+            .start_file("too-large.txt", SimpleFileOptions::default())
+            .unwrap();
+        archive.write_all(b"more than four bytes").unwrap();
+        archive.finish().unwrap();
+        let cancelled = AtomicBool::new(false);
+
+        let result = extract_archive_with_password_and_limits(
+            &archive_path,
+            &output,
+            None,
+            ExtractionLimits {
+                max_entries: 10,
+                max_entry_bytes: 4,
+                max_total_bytes: 4,
+                max_expansion_ratio: u64::MAX,
+                max_available_bytes: u64::MAX,
+            },
+            &cancelled,
+        );
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(output.join("sentinel.txt")).unwrap(), b"preserved");
+        assert!(!output.join("too-large.txt").exists());
+        assert_no_staging_paths(temp.path());
+    }
+
+    #[test]
+    fn free_space_budget_is_not_bypassed_by_extended_limits() {
+        let temp = TempDir::new().unwrap();
+        let archive_path = temp.path().join("space.zip");
+        let output = temp.path().join("output");
+        let file = File::create(&archive_path).unwrap();
+        let mut archive = ZipWriter::new(file);
+        archive
+            .start_file("too-large.txt", SimpleFileOptions::default())
+            .unwrap();
+        archive.write_all(b"more than four bytes").unwrap();
+        archive.finish().unwrap();
+        let cancelled = AtomicBool::new(false);
+        let mut limits = ExtractionLimits::extended();
+        limits.max_available_bytes = 4;
+
+        let error = extract_archive_with_password_and_limits(
+            &archive_path,
+            &output,
+            None,
+            limits,
+            &cancelled,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::StorageFull);
+        assert!(!output.exists());
+        assert_no_staging_paths(temp.path());
+    }
+
+    #[test]
+    fn real_rar_fixture_extracts_and_enforces_budget_and_cancellation() {
+        let temp = TempDir::new().unwrap();
+        let archive_path = temp.path().join("version.rar");
+        fs::write(&archive_path, RAR_VERSION_FIXTURE).unwrap();
+
+        let output = temp.path().join("output");
+        let cancelled = AtomicBool::new(false);
+        extract_archive_with_password_and_limits(
+            &archive_path,
+            &output,
+            None,
+            ExtractionLimits::default(),
+            &cancelled,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(output.join("VERSION")).unwrap(),
+            "unrar-0.4.0"
+        );
+
+        let limited_output = temp.path().join("limited");
+        let error = extract_archive_with_password_and_limits(
+            &archive_path,
+            &limited_output,
+            None,
+            ExtractionLimits {
+                max_entries: 1,
+                max_entry_bytes: 4,
+                max_total_bytes: 4,
+                max_expansion_ratio: u64::MAX,
+                max_available_bytes: u64::MAX,
+            },
+            &cancelled,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!limited_output.exists());
+
+        let cancelled_output = temp.path().join("cancelled");
+        let cancelled = AtomicBool::new(true);
+        let error = extract_archive_with_password_and_limits(
+            &archive_path,
+            &cancelled_output,
+            None,
+            ExtractionLimits::default(),
+            &cancelled,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(!cancelled_output.exists());
+        assert_no_staging_paths(temp.path());
+    }
+
+    #[test]
+    fn rar_stream_callback_stops_before_over_budget_data_is_written() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("output.bin");
+        let mut file = File::create(&path).unwrap();
+        let cancelled = AtomicBool::new(false);
+        let chunk = b"five!";
+        let mut context = RarWriteContext {
+            writer: &mut file,
+            cancelled: &cancelled,
+            entry_bytes: 0,
+            total_bytes: 0,
+            max_entry_bytes: 4,
+            max_total_bytes: 4,
+            max_available_bytes: u64::MAX,
+            error: None,
+        };
+
+        let result = rar_stream_callback(
+            unrar_sys::UCM_PROCESSDATA,
+            (&mut context as *mut RarWriteContext) as unrar_sys::LPARAM,
+            chunk.as_ptr() as unrar_sys::LPARAM,
+            chunk.len() as unrar_sys::LPARAM,
+        );
+
+        assert_eq!(result, -1);
+        assert_eq!(context.entry_bytes, 0);
+        assert_eq!(
+            context.error.as_ref().unwrap().kind(),
+            io::ErrorKind::InvalidData
+        );
+        drop(context);
+        assert_eq!(fs::metadata(path).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn rar_stream_callback_observes_cancellation_before_writing() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("output.bin");
+        let mut file = File::create(&path).unwrap();
+        let cancelled = AtomicBool::new(true);
+        let chunk = b"data";
+        let mut context = RarWriteContext {
+            writer: &mut file,
+            cancelled: &cancelled,
+            entry_bytes: 0,
+            total_bytes: 0,
+            max_entry_bytes: u64::MAX,
+            max_total_bytes: u64::MAX,
+            max_available_bytes: u64::MAX,
+            error: None,
+        };
+
+        let result = rar_stream_callback(
+            unrar_sys::UCM_PROCESSDATA,
+            (&mut context as *mut RarWriteContext) as unrar_sys::LPARAM,
+            chunk.as_ptr() as unrar_sys::LPARAM,
+            chunk.len() as unrar_sys::LPARAM,
+        );
+
+        assert_eq!(result, -1);
+        assert_eq!(
+            context.error.as_ref().unwrap().kind(),
+            io::ErrorKind::Interrupted
+        );
+        drop(context);
+        assert_eq!(fs::metadata(path).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn cancelled_extraction_preserves_existing_destination() {
+        let temp = TempDir::new().unwrap();
+        let archive_path = temp.path().join("cancelled.zip");
+        let output = temp.path().join("output");
+        fs::create_dir(&output).unwrap();
+        fs::write(output.join("sentinel.txt"), b"preserved").unwrap();
+        let file = File::create(&archive_path).unwrap();
+        let mut archive = ZipWriter::new(file);
+        archive
+            .start_file("new.txt", SimpleFileOptions::default())
+            .unwrap();
+        archive.write_all(b"new contents").unwrap();
+        archive.finish().unwrap();
+        let cancelled = AtomicBool::new(true);
+
+        let error = extract_archive_with_password_and_limits(
+            &archive_path,
+            &output,
+            None,
+            ExtractionLimits::default(),
+            &cancelled,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(fs::read(output.join("sentinel.txt")).unwrap(), b"preserved");
+        assert!(!output.join("new.txt").exists());
+        assert_no_staging_paths(temp.path());
+    }
+
+    #[test]
     fn successful_zip_extraction_merges_after_full_staging() {
         let temp = TempDir::new().unwrap();
         let archive_path = temp.path().join("merge.zip");
@@ -2607,10 +3294,8 @@ mod tests {
         fs::write(output.join("sentinel.txt"), b"preserved").unwrap();
 
         let file = File::create(&archive_path).unwrap();
-        let mut archive = sevenz_rust::SevenZWriter::new(file).unwrap();
-        let mut entry = sevenz_rust::SevenZArchiveEntry::new();
-        entry.name = "../escape.txt".to_string();
-        entry.has_stream = true;
+        let mut archive = sevenz_rust::ArchiveWriter::new(file).unwrap();
+        let mut entry = sevenz_rust::ArchiveEntry::new_file("../escape.txt");
         entry.size = 7;
         archive
             .push_archive_entry(entry, Some(Cursor::new(b"escaped")))
