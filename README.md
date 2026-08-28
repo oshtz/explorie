@@ -198,9 +198,9 @@ macOS releases require these signing secrets:
 
 - macOS: base64-encoded P12 in `APPLE_CERTIFICATE`, plus `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID`.
 
-The v0.2.8 workflow publishes an explicitly named unsigned per-user Windows x64 installer, a signed/notarized macOS arm64 DMG, and platform SHA-256 manifests. Windows packages intentionally remain unsigned, so SmartScreen or antivirus warnings are expected. CI installs, launch-smokes, and uninstalls the Windows package; publication additionally requires explicit proof that both candidates passed disposable filesystem operations on real machines.
+The release workflow publishes an explicitly named unsigned per-user Windows x64 installer, a signed/notarized macOS arm64 DMG, and platform SHA-256 manifests. Windows packages intentionally remain unsigned, so SmartScreen or antivirus warnings are expected. CI installs, launch-smokes, and uninstalls the Windows package; publication additionally requires explicit proof that both candidates passed disposable filesystem operations on real machines.
 
-The v0.2.8 draft contains `explorie-0.2.8-windows-x64-setup-unsigned.exe`, `explorie-0.2.8-macos-arm64.dmg`, `SHA256SUMS-windows.txt`, and `SHA256SUMS-macos.txt`.
+Each `v<version>` draft contains `explorie-<version>-windows-x64-setup-unsigned.exe`, `explorie-<version>-macos-arm64.dmg`, `SHA256SUMS-windows.txt`, and `SHA256SUMS-macos.txt`.
 
 Before creating a new tag, manually verify:
 
