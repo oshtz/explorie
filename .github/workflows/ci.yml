@@ -274,7 +274,7 @@ jobs:
           node-version: '24.19.0'
 
       - name: Install cargo-audit
-        uses: taiki-e/install-action@aa7e9e10a2fd43c88f1948b7de4af2f4efd56483 # cargo-audit
+        uses: taiki-e/install-action@419f0f955ea0cf384c06ae25b10b8d3bcba087da # cargo-audit
 
       - name: Run cargo audit
         run: |
