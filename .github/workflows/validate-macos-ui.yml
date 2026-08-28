@@ -1,14 +1,6 @@
 name: Validate macOS UI
 
 on:
-  pull_request:
-    paths:
-      - '.github/workflows/build-release.yml'
-      - '.github/workflows/validate-macos-ui.yml'
-      - 'apps/desktop/gpui/**'
-      - 'crates/native-services/**'
-      - 'Cargo.lock'
-      - 'Cargo.toml'
   workflow_dispatch:
 
 permissions:

@@ -135,6 +135,20 @@ jobs:
           cargo test --locked -p explorie-core -p explorie-native-services -p explorie-ffmpeg-wrapper -p explorie-cli
           cargo test --locked -p explorie-gpui -- --test-threads=1
 
+      - name: Verify CoreText glyphs reach the Metal renderer
+        env:
+          EXPLORIE_RENDER_PROBE_OUTPUT: target/macos-render-probe.png
+        run: cargo run --locked -p explorie-gpui --example macos_render_probe
+
+      - name: Upload macOS rendering proof
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: macos-render-probe
+          path: target/macos-render-probe.png
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: Build GPUI macOS application
         run: cargo build -p explorie-gpui --release --locked
 
