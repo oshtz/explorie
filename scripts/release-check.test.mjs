@@ -452,6 +452,10 @@ test('workflows block audits and publish the exact attested draft assets', async
   assert.match(release, /name: Validate release source[\s\S]*?node-version: '24'/);
   assert.match(
     release,
+    /name: Validate release source[\s\S]*?name: Setup pnpm[\s\S]*?pnpm\/action-setup@v4[\s\S]*?name: Setup Node\.js[\s\S]*?cache: 'pnpm'/
+  );
+  assert.match(
+    release,
     /Build GPUI Windows application[\s\S]*?cargo build -p explorie-gpui --release --locked/
   );
   assert.match(
