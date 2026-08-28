@@ -118,19 +118,17 @@ test('packaged native assets have a Tauri-independent authority', async () => {
   assert.doesNotMatch(macosPackage, /icons\/icon\.icns/);
 });
 
-test('macOS glyph fix stays scoped to the pinned GPUI backend', async () => {
-  const [workspace, manifest, provenance, textSystem] = await Promise.all([
+test('macOS GPUI platform enables native font rendering', async () => {
+  const [workspace, manifest] = await Promise.all([
     readFile(path.join(process.cwd(), 'Cargo.toml'), 'utf8'),
-    readFile(path.join(process.cwd(), 'vendor/gpui_macos/Cargo.toml'), 'utf8'),
-    readFile(path.join(process.cwd(), 'vendor/gpui_macos/UPSTREAM.md'), 'utf8'),
-    readFile(path.join(process.cwd(), 'vendor/gpui_macos/src/text_system.rs'), 'utf8'),
+    readFile(path.join(process.cwd(), 'apps/desktop/gpui/Cargo.toml'), 'utf8'),
   ]);
 
-  assert.match(workspace, /gpui_macos = \{ path = "vendor\/gpui_macos" \}/);
-  assert.match(manifest, /1d029c5ff5654fb1b1e8caf4462993c8ee13a133/);
-  assert.match(provenance, /20a93f6195ca8e9f0a748038317a5efe1be3e482/);
-  assert.match(textSystem, /postscript_names_seen/);
-  assert.match(textSystem, /skipping duplicate font/);
+  assert.doesNotMatch(workspace, /gpui_macos = \{ path = "vendor\/gpui_macos" \}/);
+  assert.match(
+    manifest,
+    /\[target\.'cfg\(target_os = "macos"\)'\.dependencies\][\s\S]*?gpui_platform = \{[^}]*features = \["font-kit"\]/,
+  );
 });
 
 function sampleContext() {
