@@ -54,6 +54,7 @@ Source: "{#ResourceDir}\winfsp-2.1.25156.msi"; DestDir: "{app}\installers"; Flag
 Source: "{#ResourceDir}\rclone-COPYING"; DestDir: "{app}\licenses"; Flags: ignoreversion
 Source: "{#ResourceDir}\winfsp-NOTICE.txt"; DestDir: "{app}\licenses"; Flags: ignoreversion
 Source: "{#ResourceDir}\pixelarticons-LICENSE.txt"; DestDir: "{app}\licenses"; Flags: ignoreversion
+Source: "{#ResourceDir}\assimp-LICENSE.txt"; DestDir: "{app}\licenses"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\Explorie"; Filename: "{app}\Explorie.exe"; WorkingDir: "{app}"

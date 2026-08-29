@@ -1,3 +1,5 @@
+use crate::model_preview::{ModelCamera, ModelPreview, ModelPreviewCache};
+use crate::rich_preview::{self, RichPreview};
 use crate::{
     BlockingTask, ErrorCode, HelperStatusEvent, ServiceContext, ServiceError, ServiceEvent,
     ServiceResult,
@@ -141,6 +143,7 @@ pub struct PreviewService {
     artifact_lock: Arc<Mutex<()>>,
     pdf_lock: Arc<Mutex<()>>,
     helper_generation: Arc<AtomicU64>,
+    model_cache: ModelPreviewCache,
 }
 
 impl PreviewService {
@@ -153,6 +156,7 @@ impl PreviewService {
             artifact_lock: Arc::new(Mutex::new(())),
             pdf_lock: Arc::new(Mutex::new(())),
             helper_generation: Arc::new(AtomicU64::new(0)),
+            model_cache: ModelPreviewCache::default(),
         }
     }
 
@@ -167,6 +171,7 @@ impl PreviewService {
             artifact_lock: Arc::clone(&self.artifact_lock),
             pdf_lock: Arc::clone(&self.pdf_lock),
             helper_generation: Arc::new(AtomicU64::new(0)),
+            model_cache: self.model_cache.clone(),
         }
     }
 
@@ -228,6 +233,7 @@ impl PreviewService {
 
     pub fn thumbnail(&self, path: PathBuf, max_size: u32) -> BlockingTask<Option<PathBuf>> {
         let cache = self.cache_dir();
+        let model_cache = self.model_cache.clone();
         let cache_gate = Arc::clone(&self.cache_gate);
         let thumbnail_locks = Arc::clone(&self.thumbnail_locks);
         let lane = thumbnail_lock_index(&path, max_size);
@@ -238,7 +244,11 @@ impl PreviewService {
             let _thumbnail_guard = thumbnail_locks[lane]
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            get_file_thumbnail(&path, max_size, &cache)
+            if is_model_preview_path(&path) {
+                get_model_thumbnail(&path, max_size, &cache, &model_cache)
+            } else {
+                get_file_thumbnail(&path, max_size, &cache)
+            }
         })
     }
 
@@ -279,6 +289,33 @@ impl PreviewService {
     pub fn image_metadata(&self, path: PathBuf) -> BlockingTask<ImageMetadata> {
         self.context
             .spawn_blocking(move || image_metadata::load_image_metadata(&path))
+    }
+
+    pub fn model(
+        &self,
+        path: PathBuf,
+        camera: ModelCamera,
+        width: u32,
+        height: u32,
+    ) -> BlockingTask<ModelPreview> {
+        let cache = self.model_cache.clone();
+        self.context
+            .spawn_blocking(move || cache.render(&path, camera, width, height))
+    }
+
+    pub fn rich(&self, path: PathBuf) -> BlockingTask<RichPreview> {
+        let cache = self.cache_dir();
+        let cache_gate = Arc::clone(&self.cache_gate);
+        let artifact_lock = Arc::clone(&self.artifact_lock);
+        self.context.spawn_blocking(move || {
+            let _cache_guard = cache_gate
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _artifact_guard = artifact_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            rich_preview::preview(&path, &cache)
+        })
     }
 
     pub fn cache_dir(&self) -> PathBuf {
@@ -1350,6 +1387,61 @@ fn get_file_thumbnail(path: &Path, max_size: u32, cache: &Path) -> ServiceResult
             "Native thumbnailer produced an empty image",
         ));
     }
+    prune_thumbnail_cache(cache);
+    Ok(Some(output))
+}
+
+fn is_model_preview_path(path: &Path) -> bool {
+    matches!(
+        extension(path).as_str(),
+        "glb" | "gltf" | "obj" | "stl" | "ply" | "3mf" | "fbx"
+    )
+}
+
+fn get_model_thumbnail(
+    path: &Path,
+    max_size: u32,
+    cache: &Path,
+    model_cache: &ModelPreviewCache,
+) -> ServiceResult<Option<PathBuf>> {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return Ok(None);
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Ok(None);
+    }
+    let max_size = max_size.clamp(64, 512);
+    let output = cache_output(cache, path, &format!("thumbnail-{max_size}"), "png");
+    if output.metadata().is_ok_and(|metadata| metadata.len() > 0) {
+        return Ok(Some(output));
+    }
+    fs::create_dir_all(cache).map_err(ServiceError::from)?;
+    let rendered = model_cache.render(path, ModelCamera::default(), max_size, max_size)?;
+    let temporary = output.with_extension(format!("png.{}.tmp", uuid::Uuid::new_v4()));
+    let result = image::save_buffer_with_format(
+        &temporary,
+        &rendered.frame.rgba,
+        rendered.frame.width,
+        rendered.frame.height,
+        image::ColorType::Rgba8,
+        image::ImageFormat::Png,
+    )
+    .map_err(|error| {
+        ServiceError::new(
+            ErrorCode::Internal,
+            format!("Unable to encode model thumbnail: {error}"),
+        )
+    })
+    .and_then(|()| {
+        if output.exists() {
+            fs::remove_file(&output).map_err(ServiceError::from)?;
+        }
+        fs::rename(&temporary, &output).map_err(ServiceError::from)
+    });
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result?;
     prune_thumbnail_cache(cache);
     Ok(Some(output))
 }

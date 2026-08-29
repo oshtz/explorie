@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use explorie_native_services::{
-    DetectedPreviewKind, ImageMetadata, PdfPagePreview, PreviewArtifact, PreviewDetection,
-    ServiceError, TextPreview,
+    DetectedPreviewKind, ImageMetadata, ModelPreview, PdfPagePreview, PreviewArtifact,
+    PreviewDetection, RichPreview, ServiceError, TextPreview,
 };
 
 const TEXT_PREVIEW_BYTES: u64 = 512 * 1024;
@@ -16,6 +16,8 @@ pub enum PreviewRoute {
     BlockedScript,
     DirectImage,
     GeneratedArtifact,
+    Model,
+    Rich,
     Archive,
     External,
 }
@@ -51,6 +53,8 @@ pub enum PreviewContent {
     BlockedScript,
     Image(PathBuf),
     Artifact(PreviewArtifact),
+    Model(ModelPreview),
+    Rich(RichPreview),
     Archive,
     Fallback {
         detection: PreviewDetection,
@@ -305,7 +309,7 @@ pub fn cache_backed_preview_path(
     let path = state.path()?;
     matches!(
         route(path, preview_executable_scripts),
-        PreviewRoute::Pdf | PreviewRoute::GeneratedArtifact
+        PreviewRoute::Pdf | PreviewRoute::GeneratedArtifact | PreviewRoute::Rich
     )
     .then_some(path)
 }
@@ -345,7 +349,47 @@ pub fn route(path: &Path, preview_executable_scripts: bool) -> PreviewRoute {
         PreviewRoute::Pdf
     } else if matches!(
         extension.as_str(),
-        "mp3" | "wav" | "flac" | "ogg" | "m4a" | "m4b" | "aac" | "aif" | "aiff" | "caf" | "alac"
+        "glb" | "gltf" | "obj" | "stl" | "ply" | "3mf" | "fbx"
+    ) {
+        PreviewRoute::Model
+    } else if matches!(
+        extension.as_str(),
+        "ttf"
+            | "otf"
+            | "woff"
+            | "woff2"
+            | "eml"
+            | "epub"
+            | "cbz"
+            | "sqlite"
+            | "sqlite3"
+            | "db"
+            | "parquet"
+            | "arrow"
+            | "feather"
+            | "ipc"
+            | "md"
+            | "markdown"
+            | "html"
+            | "htm"
+            | "xhtml"
+    ) {
+        PreviewRoute::Rich
+    } else if matches!(
+        extension.as_str(),
+        "mp3"
+            | "wav"
+            | "flac"
+            | "ogg"
+            | "opus"
+            | "oga"
+            | "m4a"
+            | "m4b"
+            | "aac"
+            | "aif"
+            | "aiff"
+            | "caf"
+            | "alac"
     ) {
         PreviewRoute::Audio
     } else if matches!(
@@ -362,8 +406,6 @@ pub fn route(path: &Path, preview_executable_scripts: bool) -> PreviewRoute {
             | "jsonc"
             | "yaml"
             | "yml"
-            | "md"
-            | "markdown"
             | "ts"
             | "tsx"
             | "js"
@@ -375,8 +417,6 @@ pub fn route(path: &Path, preview_executable_scripts: bool) -> PreviewRoute {
             | "cs"
             | "csharp"
             | "sql"
-            | "html"
-            | "htm"
             | "xml"
             | "css"
             | "scss"
@@ -531,7 +571,7 @@ pub fn route(path: &Path, preview_executable_scripts: bool) -> PreviewRoute {
         PreviewRoute::GeneratedArtifact
     } else if matches!(
         extension.as_str(),
-        "zip" | "tar" | "tgz" | "gz" | "7z" | "rar" | "cbz" | "epub"
+        "zip" | "tar" | "tgz" | "gz" | "7z" | "rar"
     ) {
         PreviewRoute::Archive
     } else {
@@ -546,6 +586,9 @@ pub fn route_with_detection(
 ) -> PreviewRoute {
     let hinted = route(path, preview_executable_scripts);
     if hinted == PreviewRoute::BlockedScript {
+        return hinted;
+    }
+    if matches!(hinted, PreviewRoute::Model | PreviewRoute::Rich) {
         return hinted;
     }
     match detection.kind {
@@ -587,6 +630,10 @@ mod tests {
     fn routes_native_and_helper_backed_preview_types() {
         assert_eq!(route(Path::new("code.rs"), false), PreviewRoute::Text);
         assert_eq!(route(Path::new("song.flac"), false), PreviewRoute::Audio);
+        assert_eq!(route(Path::new("scene.glb"), false), PreviewRoute::Model);
+        assert_eq!(route(Path::new("message.eml"), false), PreviewRoute::Rich);
+        assert_eq!(route(Path::new("book.epub"), false), PreviewRoute::Rich);
+        assert_eq!(route(Path::new("data.parquet"), false), PreviewRoute::Rich);
         assert_eq!(route(Path::new("manual.pdf"), false), PreviewRoute::Pdf);
         assert_eq!(route(Path::new("component.tsx"), false), PreviewRoute::Text);
         assert_eq!(route(Path::new("Dockerfile"), false), PreviewRoute::Text);
@@ -614,6 +661,24 @@ mod tests {
     }
 
     #[test]
+    fn structured_archives_and_models_keep_their_specific_route_after_detection() {
+        let archive = PreviewDetection {
+            kind: DetectedPreviewKind::Archive,
+            description: "ZIP archive".to_string(),
+            mime_type: Some("application/zip".to_string()),
+            byte_sample: None,
+        };
+        assert_eq!(
+            route_with_detection(Path::new("book.epub"), false, &archive),
+            PreviewRoute::Rich
+        );
+        assert_eq!(
+            route_with_detection(Path::new("part.3mf"), false, &archive),
+            PreviewRoute::Model
+        );
+    }
+
+    #[test]
     fn every_legacy_text_extension_routes_to_the_native_reader() {
         for extension in [
             "txt",
@@ -628,8 +693,6 @@ mod tests {
             "jsonc",
             "yaml",
             "yml",
-            "md",
-            "markdown",
             "ts",
             "tsx",
             "js",
@@ -641,8 +704,6 @@ mod tests {
             "cs",
             "csharp",
             "sql",
-            "html",
-            "htm",
             "xml",
             "css",
             "scss",
@@ -747,7 +808,7 @@ mod tests {
 
     #[test]
     fn supported_audio_stays_embedded_and_unavailable_decoders_fall_back_locally() {
-        for extension in ["mp3", "wav", "flac", "ogg", "m4a", "aac"] {
+        for extension in ["mp3", "wav", "flac", "ogg", "opus", "oga", "m4a", "aac"] {
             assert_eq!(
                 route(Path::new(&format!("track.{extension}")), false),
                 PreviewRoute::Audio

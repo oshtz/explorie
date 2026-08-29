@@ -34,6 +34,7 @@ test -x "$rclone"
 test -f "$icon_source"
 test -f "$assets/resources/rclone-COPYING"
 test -f "$assets/resources/pixelarticons-LICENSE.txt"
+test -f "$assets/resources/assimp-LICENSE.txt"
 test -f "$assets/macos/MountDaemon.m"
 test -f "$assets/macos/com.omershatz.explorie.mountd.plist"
 
@@ -87,6 +88,9 @@ install -m 644 "$assets/resources/rclone-COPYING" "$app/Contents/Resources/licen
 install -m 644 \
   "$assets/resources/pixelarticons-LICENSE.txt" \
   "$app/Contents/Resources/licenses/pixelarticons-LICENSE.txt"
+install -m 644 \
+  "$assets/resources/assimp-LICENSE.txt" \
+  "$app/Contents/Resources/licenses/assimp-LICENSE.txt"
 install -m 644 \
   "$assets/macos/com.omershatz.explorie.mountd.plist" \
   "$app/Contents/Library/LaunchDaemons/com.omershatz.explorie.mountd.plist"

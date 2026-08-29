@@ -26,6 +26,7 @@ foreach ($required in @(
     (Join-Path $build "explorie-gpui.exe"),
     (Join-Path $build "rclone.exe"),
     (Join-Path $resources "winfsp-2.1.25156.msi"),
+    (Join-Path $resources "assimp-LICENSE.txt"),
     $definition
 )) {
     if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {

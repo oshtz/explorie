@@ -638,6 +638,7 @@ test('workflows block audits and publish the exact attested draft assets', async
   assert.match(release, /winfsp-2\.1\.25156\.msi/);
   assert.match(windowsInstaller, /winfsp-NOTICE/);
   assert.match(`${release}\n${windowsInstaller}`, /pixelarticons-LICENSE/);
+  assert.match(`${release}\n${windowsInstaller}`, /assimp-LICENSE/);
   assert.match(release, /NAVIMATICS/);
   assert.match(
     release,
