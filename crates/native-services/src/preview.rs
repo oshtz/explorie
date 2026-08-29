@@ -1369,6 +1369,9 @@ fn generate_external_image_thumbnail(
     output: &Path,
     max_size: u32,
 ) -> ServiceResult<()> {
+    if extension(input) == "psd" {
+        return render_psd_preview(input, output, max_size);
+    }
     let tool = first_available_tool(&["magick"], "--version").ok_or_else(|| {
         ServiceError::new(
             ErrorCode::HelperMissing,
@@ -1780,6 +1783,18 @@ fn convert_image_preview(
     helper_generation: &AtomicU64,
     ticket: u64,
 ) -> ServiceResult<PreviewArtifact> {
+    if extension(path) == "psd" {
+        fs::create_dir_all(cache).map_err(ServiceError::from)?;
+        let output = cache_output(cache, path, "image", "png");
+        render_psd_preview(path, &output, IMAGE_PREVIEW_DIMENSION)?;
+        prune_generated_artifact_cache(cache, &output);
+        return Ok(PreviewArtifact {
+            kind: "image".into(),
+            path: output,
+            mime_type: "image/png".into(),
+            tool: "Explorie PSD decoder".into(),
+        });
+    }
     let tool = first_available_tool(&["magick"], "--version").ok_or_else(|| {
         ServiceError::new(
             ErrorCode::HelperMissing,
@@ -1788,11 +1803,7 @@ fn convert_image_preview(
     })?;
     fs::create_dir_all(cache).map_err(ServiceError::from)?;
     let output = cache_output(cache, path, "image", "png");
-    let input = if extension(path) == "psd" {
-        format!("{}[0]", path.to_string_lossy())
-    } else {
-        path.to_string_lossy().into_owned()
-    };
+    let input = path.to_string_lossy().into_owned();
     let status = run_helper_with_cancellation(
         command(&tool)
             .arg(input)
@@ -1817,6 +1828,56 @@ fn convert_image_preview(
         mime_type: "image/png".into(),
         tool,
     })
+}
+
+fn render_psd_preview(input: &Path, output: &Path, max_dimension: u32) -> ServiceResult<()> {
+    validate_preview_image(input, MAX_IMAGE_PREVIEW_BYTES)?;
+    if output.metadata().is_ok_and(|metadata| metadata.len() > 0) {
+        return Ok(());
+    }
+    let bytes = fs::read(input).map_err(ServiceError::from)?;
+    let document = psd::Psd::from_bytes(&bytes).map_err(|error| {
+        ServiceError::new(
+            ErrorCode::InvalidInput,
+            format!("Unable to parse Photoshop document: {error}"),
+        )
+    })?;
+    let width = document.width();
+    let height = document.height();
+    let decoded_bytes = u64::from(width)
+        .saturating_mul(u64::from(height))
+        .saturating_mul(4);
+    if width == 0
+        || height == 0
+        || width > MAX_IMAGE_DECODE_DIMENSION
+        || height > MAX_IMAGE_DECODE_DIMENSION
+        || decoded_bytes > MAX_IMAGE_DECODE_BYTES
+    {
+        return Err(ServiceError::new(
+            ErrorCode::Unsupported,
+            "Photoshop document dimensions are too large to preview safely",
+        ));
+    }
+    let pixels = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| document.rgba()))
+        .map_err(|_| {
+            ServiceError::new(
+                ErrorCode::InvalidInput,
+                "Unable to decode Photoshop document pixels",
+            )
+        })?;
+    let image = image::RgbaImage::from_raw(width, height, pixels).ok_or_else(|| {
+        ServiceError::new(
+            ErrorCode::InvalidInput,
+            "Photoshop document returned invalid pixel data",
+        )
+    })?;
+    let max_dimension = max_dimension
+        .clamp(64, IMAGE_PREVIEW_DIMENSION)
+        .min(width.max(height));
+    image::DynamicImage::ImageRgba8(image)
+        .thumbnail(max_dimension, max_dimension)
+        .save_with_format(output, image::ImageFormat::Png)
+        .map_err(|error| ServiceError::new(ErrorCode::Internal, error.to_string()))
 }
 
 fn prune_generated_artifact_cache(cache: &Path, protected: &Path) {
@@ -2034,6 +2095,27 @@ mod tests {
         image::RgbaImage::from_pixel(width, height, image::Rgba(color))
             .save(path)
             .unwrap();
+    }
+
+    fn minimal_psd(width: u32, height: u32, color: [u8; 4]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"8BPS");
+        bytes.extend_from_slice(&1_u16.to_be_bytes());
+        bytes.extend_from_slice(&[0; 6]);
+        bytes.extend_from_slice(&4_u16.to_be_bytes());
+        bytes.extend_from_slice(&height.to_be_bytes());
+        bytes.extend_from_slice(&width.to_be_bytes());
+        bytes.extend_from_slice(&8_u16.to_be_bytes());
+        bytes.extend_from_slice(&3_u16.to_be_bytes());
+        bytes.extend_from_slice(&0_u32.to_be_bytes());
+        bytes.extend_from_slice(&0_u32.to_be_bytes());
+        bytes.extend_from_slice(&0_u32.to_be_bytes());
+        bytes.extend_from_slice(&0_u16.to_be_bytes());
+        let pixel_count = usize::try_from(u64::from(width) * u64::from(height)).unwrap();
+        for channel in color {
+            bytes.extend(std::iter::repeat_n(channel, pixel_count));
+        }
+        bytes
     }
 
     fn minimal_pdf(page_count: usize) -> Vec<u8> {
@@ -2432,6 +2514,23 @@ mod tests {
             assert_eq!(artifact.mime_type, "image/png");
             assert_eq!(image::image_dimensions(artifact.path).unwrap(), (320, 180));
         }
+    }
+
+    #[test]
+    fn photoshop_previews_and_thumbnails_decode_without_external_helpers() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("design.psd");
+        fs::write(&source, minimal_psd(320, 180, [40, 120, 220, 255])).unwrap();
+        let service = PreviewService::new(ServiceContext::new(ResourcePaths::test(temp.path())));
+
+        let artifact = service.artifact(source.clone()).wait().unwrap();
+        assert_eq!(artifact.kind, "image");
+        assert_eq!(artifact.mime_type, "image/png");
+        assert_eq!(artifact.tool, "Explorie PSD decoder");
+        assert_eq!(image::image_dimensions(artifact.path).unwrap(), (320, 180));
+
+        let thumbnail = service.thumbnail(source, 128).wait().unwrap().unwrap();
+        assert_eq!(image::image_dimensions(thumbnail).unwrap(), (128, 72));
     }
 
     #[test]
