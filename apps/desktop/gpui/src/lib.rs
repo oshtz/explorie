@@ -29,11 +29,11 @@ use explorie_native_services::{
 use gpui::{
     AccessibleAction, AnyElement, App, AssetSource, Bounds, ClipboardItem, Context, ElementId,
     Entity, ExternalPaths, FocusHandle, Focusable, FontWeight, HighlightStyle, KeyDownEvent,
-    ListAlignment, ListState, MouseButton, ObjectFit, Orientation, PathPromptOptions, Pixels,
-    Render, RenderImage, Rgba, Role, ScrollHandle, ScrollStrategy, SharedString, StyledImage,
-    StyledText, Task, TitlebarOptions, UniformListScrollHandle, Window, WindowAppearance,
-    WindowBounds, WindowControlArea, WindowOptions, deferred, div, img, list, point, prelude::*,
-    px, rgb, svg, uniform_list,
+    KeyUpEvent, ListAlignment, ListState, MouseButton, ObjectFit, Orientation, PathPromptOptions,
+    Pixels, Render, RenderImage, Rgba, Role, ScrollHandle, ScrollStrategy, SharedString,
+    StyledImage, StyledText, Task, TitlebarOptions, UniformListScrollHandle, Window,
+    WindowAppearance, WindowBounds, WindowControlArea, WindowOptions, deferred, div, img, list,
+    point, prelude::*, px, rgb, svg, uniform_list,
 };
 
 mod batch_rename;
@@ -3153,6 +3153,9 @@ pub struct DirectoryWindow {
     quick_look_info_open: bool,
     quick_look_index_open: bool,
     quick_look_paths: Vec<PathBuf>,
+    quick_look_tracks_selection: bool,
+    quick_look_space_down: bool,
+    quick_look_space_closes_on_release: bool,
     preview_tab: PreviewTab,
     preview_generation: u64,
     preview_task: Option<Task<()>>,
@@ -3579,6 +3582,9 @@ impl DirectoryWindow {
             quick_look_info_open: false,
             quick_look_index_open: false,
             quick_look_paths: Vec::new(),
+            quick_look_tracks_selection: false,
+            quick_look_space_down: false,
+            quick_look_space_closes_on_release: false,
             preview_tab: PreviewTab::Preview,
             preview_generation: 0,
             preview_task: None,
@@ -9494,6 +9500,8 @@ impl DirectoryWindow {
     }
 
     fn open_quick_look(&mut self, path: PathBuf, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        let selected_paths = self.effective_selected_paths();
+        self.quick_look_tracks_selection = selected_paths.len() == 1 && selected_paths[0] == path;
         self.quick_look_open = true;
         self.quick_look_info_open = false;
         self.quick_look_index_open = false;
@@ -9574,7 +9582,7 @@ impl DirectoryWindow {
         let Some(target) = target else {
             return;
         };
-        if !self.quick_look_open {
+        if !self.quick_look_open || self.quick_look_tracks_selection {
             self.browser.select(target.clone());
             if let Some(index) = self
                 .browser
@@ -10160,6 +10168,7 @@ impl DirectoryWindow {
         self.quick_look_info_open = false;
         self.quick_look_index_open = false;
         self.quick_look_paths.clear();
+        self.quick_look_tracks_selection = false;
         self.audio_autoplay_after_load = false;
         self.stop_media_preview();
         self.preview_generation = self.preview_generation.wrapping_add(1);
@@ -10186,10 +10195,10 @@ impl DirectoryWindow {
         self.quick_look_info_open = false;
         self.quick_look_index_open = false;
         self.quick_look_paths.clear();
+        self.quick_look_tracks_selection = false;
         if self.settings.view.show_preview_panel {
             let selected_path = self
-                .browser
-                .selected_entries()
+                .effective_selected_entries()
                 .into_iter()
                 .filter(|entry| !entry.is_dir)
                 .map(|entry| entry.path)
@@ -10220,8 +10229,7 @@ impl DirectoryWindow {
     }
 
     fn sync_pinned_preview(&mut self, cx: &mut Context<Self>) {
-        if self.browser.view_mode() != ViewMode::Column
-            && !self.settings.view.show_preview_panel
+        if !self.settings.view.show_preview_panel
             && matches!(self.preview_state, PreviewState::Closed)
         {
             return;
@@ -12388,9 +12396,8 @@ impl DirectoryWindow {
                 || self.settings.view.show_preview_panel
             {
                 self.sync_pinned_preview(cx);
-            } else {
-                cx.notify();
             }
+            cx.notify();
         }
     }
 
@@ -13146,6 +13153,36 @@ impl DirectoryWindow {
         }
     }
 
+    fn is_plain_space(keystroke: &gpui::Keystroke) -> bool {
+        keystroke.key == "space"
+            && !keystroke.modifiers.control
+            && !keystroke.modifiers.alt
+            && !keystroke.modifiers.platform
+            && !keystroke.modifiers.shift
+    }
+
+    fn handle_quick_look_space_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        if !self.quick_look_space_down {
+            self.quick_look_space_down = true;
+            self.quick_look_space_closes_on_release = self.quick_look_open;
+            if !event.is_held && !self.quick_look_space_closes_on_release {
+                self.toggle_quick_look_selected(cx);
+            }
+        }
+        cx.stop_propagation();
+    }
+
+    fn handle_key_up(&mut self, event: &KeyUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if Self::is_plain_space(&event.keystroke) && self.quick_look_space_down {
+            self.quick_look_space_down = false;
+            let close_quick_look = std::mem::take(&mut self.quick_look_space_closes_on_release);
+            if close_quick_look {
+                self.close_quick_look(cx);
+            }
+            cx.stop_propagation();
+        }
+    }
+
     fn handle_search_key(
         &mut self,
         event: &KeyDownEvent,
@@ -13160,17 +13197,10 @@ impl DirectoryWindow {
         {
             return;
         }
-        let is_plain_space = event.keystroke.key == "space"
-            && !event.keystroke.modifiers.control
-            && !event.keystroke.modifiers.alt
-            && !event.keystroke.modifiers.platform
-            && !event.keystroke.modifiers.shift;
+        let is_plain_space = Self::is_plain_space(&event.keystroke);
         if self.quick_look_open {
             if is_plain_space {
-                if !event.is_held {
-                    self.toggle_quick_look_selected(cx);
-                }
-                cx.stop_propagation();
+                self.handle_quick_look_space_down(event, cx);
                 return;
             }
             let is_audio = matches!(
@@ -13335,10 +13365,7 @@ impl DirectoryWindow {
             return;
         }
         if is_plain_space {
-            if !event.is_held {
-                self.toggle_quick_look_selected(cx);
-            }
-            cx.stop_propagation();
+            self.handle_quick_look_space_down(event, cx);
             return;
         }
         if !self.search_active {
@@ -20280,6 +20307,8 @@ impl DirectoryWindow {
             .when(compact_settings, |backdrop| backdrop.p_2())
             .when(!compact_settings, |backdrop| backdrop.p_3())
             .bg(with_alpha(rgb(0x000000), 0.58))
+            .occlude()
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
             .child(
                 div()
                     .id("settings-panel")
@@ -25657,6 +25686,11 @@ impl DirectoryWindow {
                             let accessibility_view = cx.entity().downgrade();
                             let row_content = div()
                                 .id(("column-entry-drag-source", column_index * 1_000_000 + index))
+                                .when(selected, |row| {
+                                    row.debug_selector(move || {
+                                        format!("column-entry-selected-{column_index}-{index}")
+                                    })
+                                })
                                 .flex()
                                 .flex_1()
                                 .min_w_0()
@@ -26020,7 +26054,10 @@ impl DirectoryWindow {
             );
         }
 
-        if !matches!(self.preview_state, PreviewState::Closed) && !self.quick_look_open {
+        if self.settings.view.show_preview_panel
+            && !matches!(self.preview_state, PreviewState::Closed)
+            && !self.quick_look_open
+        {
             rendered_columns.push(self.render_preview_panel(true, false, true, cx));
         }
         let rendered_column_count = rendered_columns.len();
@@ -26042,7 +26079,7 @@ impl DirectoryWindow {
             }
         }
 
-        div()
+        let mut column_results = div()
             .id("column-results")
             .flex()
             .flex_1()
@@ -26057,8 +26094,9 @@ impl DirectoryWindow {
                     window.focus(&this.focus_handle, cx);
                     this.open_empty_context_menu(event.position, cx);
                 }),
-            )
-            .into_any_element()
+            );
+        column_results.style().restrict_scroll_to_axis = Some(true);
+        column_results.into_any_element()
     }
 }
 
@@ -26479,8 +26517,10 @@ impl Render for DirectoryWindow {
         let operation_panel = self.render_operation_panel(status.is_some(), cx);
         let archive_inspection = self.render_archive_inspection(cx);
         let preview_open = !matches!(self.preview_state, PreviewState::Closed);
-        let inspector_preview_open =
-            preview_open && !self.quick_look_open && self.browser.view_mode() != ViewMode::Column;
+        let inspector_preview_open = self.settings.view.show_preview_panel
+            && preview_open
+            && !self.quick_look_open
+            && self.browser.view_mode() != ViewMode::Column;
         let preview_as_side_panel = inspector_preview_open && logical_main_width >= 708.0;
         self.listing_viewport_width = (main_area_width
             - 16.0 * self.palette.scale
@@ -26725,6 +26765,7 @@ impl Render for DirectoryWindow {
                 cx.stop_propagation();
             }))
             .on_key_down(cx.listener(Self::handle_search_key))
+            .capture_key_up(cx.listener(Self::handle_key_up))
             .on_action(cx.listener(|this, _: &GoBack, _, cx| this.go_back(cx)))
             .on_action(cx.listener(|this, _: &GoForward, _, cx| this.go_forward(cx)))
             .on_action(cx.listener(|this, _: &GoUp, _, cx| this.go_up(cx)))
@@ -28394,6 +28435,27 @@ mod tests {
             )
             .as_bytes(),
         );
+        bytes
+    }
+
+    fn minimal_psd(width: u32, height: u32, color: [u8; 4]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"8BPS");
+        bytes.extend_from_slice(&1_u16.to_be_bytes());
+        bytes.extend_from_slice(&[0; 6]);
+        bytes.extend_from_slice(&4_u16.to_be_bytes());
+        bytes.extend_from_slice(&height.to_be_bytes());
+        bytes.extend_from_slice(&width.to_be_bytes());
+        bytes.extend_from_slice(&8_u16.to_be_bytes());
+        bytes.extend_from_slice(&3_u16.to_be_bytes());
+        bytes.extend_from_slice(&0_u32.to_be_bytes());
+        bytes.extend_from_slice(&0_u32.to_be_bytes());
+        bytes.extend_from_slice(&0_u32.to_be_bytes());
+        bytes.extend_from_slice(&0_u16.to_be_bytes());
+        let pixel_count = usize::try_from(u64::from(width) * u64::from(height)).unwrap();
+        for channel in color {
+            bytes.extend(std::iter::repeat_n(channel, pixel_count));
+        }
         bytes
     }
 
@@ -32926,7 +32988,17 @@ mod tests {
         window.simulate_resize(gpui::size(px(800.0), px(600.0)));
         window.run_until_parked();
 
-        window.simulate_keystrokes("space");
+        window.update(|window, cx| {
+            let result = window.dispatch_event(
+                gpui::PlatformInput::KeyDown(KeyDownEvent {
+                    keystroke: Keystroke::parse("space").unwrap(),
+                    is_held: false,
+                    prefer_character_input: false,
+                }),
+                cx,
+            );
+            assert!(!result.propagate);
+        });
         for _ in 0..200 {
             window.run_until_parked();
             if window.debug_bounds("quick-look-modal").is_some()
@@ -32957,7 +33029,16 @@ mod tests {
         });
 
         window.update(|window, cx| {
-            let result = window.dispatch_event(
+            let duplicate = window.dispatch_event(
+                gpui::PlatformInput::KeyDown(KeyDownEvent {
+                    keystroke: Keystroke::parse("space").unwrap(),
+                    is_held: false,
+                    prefer_character_input: false,
+                }),
+                cx,
+            );
+            assert!(!duplicate.propagate);
+            let held = window.dispatch_event(
                 gpui::PlatformInput::KeyDown(KeyDownEvent {
                     keystroke: Keystroke::parse("space").unwrap(),
                     is_held: true,
@@ -32965,7 +33046,14 @@ mod tests {
                 }),
                 cx,
             );
-            assert!(!result.propagate);
+            assert!(!held.propagate);
+            let released = window.dispatch_event(
+                gpui::PlatformInput::KeyUp(gpui::KeyUpEvent {
+                    keystroke: Keystroke::parse("space").unwrap(),
+                }),
+                cx,
+            );
+            assert!(!released.propagate);
         });
         window.run_until_parked();
         view.update(window, |view, _| {
@@ -32986,7 +33074,7 @@ mod tests {
         }
         view.update(window, |view, _| {
             assert!(view.quick_look_open);
-            assert_eq!(view.browser.selected_path(), Some(first.as_path()));
+            assert_eq!(view.browser.selected_path(), Some(second.as_path()));
             assert_eq!(view.preview_navigation(&second).0, 2);
         });
 
@@ -32995,12 +33083,31 @@ mod tests {
         window.run_until_parked();
         assert!(window.debug_bounds("quick-look-info-drawer").is_some());
 
-        window.simulate_keystrokes("space");
+        window.update(|window, cx| {
+            let pressed = window.dispatch_event(
+                gpui::PlatformInput::KeyDown(KeyDownEvent {
+                    keystroke: Keystroke::parse("space").unwrap(),
+                    is_held: false,
+                    prefer_character_input: false,
+                }),
+                cx,
+            );
+            assert!(!pressed.propagate);
+            let released = window.dispatch_event(
+                gpui::PlatformInput::KeyUp(gpui::KeyUpEvent {
+                    keystroke: Keystroke::parse("space").unwrap(),
+                }),
+                cx,
+            );
+            assert!(!released.propagate);
+        });
         window.run_until_parked();
         view.update(window, |view, _| {
             assert!(!view.quick_look_open);
             assert!(!view.quick_look_info_open);
             assert!(matches!(view.preview_state, PreviewState::Closed));
+            assert_eq!(view.browser.path(), directory.as_path());
+            assert_eq!(view.browser.selected_path(), Some(second.as_path()));
         });
         assert!(window.debug_bounds("quick-look-backdrop").is_none());
 
@@ -33125,6 +33232,7 @@ mod tests {
         });
         view.update(window, |view, cx| {
             view.browser.set_view_mode(ViewMode::Column);
+            view.settings.view.show_preview_panel = true;
             view.browser.replace_entries(entries.clone());
             view.columns = ColumnState::new(&directory);
             assert!(view.columns.apply_listed(&directory, entries));
@@ -33273,6 +33381,7 @@ mod tests {
             view.browser
                 .replace_entries(vec![absolute_entry(file.clone())]);
             view.browser.select(file.clone());
+            view.settings.view.show_preview_panel = true;
             view.preview_selected(cx);
         });
         for _ in 0..200 {
@@ -33430,6 +33539,7 @@ mod tests {
             view.browser
                 .replace_entries(vec![metadata_entry(file.clone())]);
             view.browser.select(file.clone());
+            view.settings.view.show_preview_panel = true;
             view.preview_selected(cx);
         });
         for _ in 0..200 {
@@ -34488,6 +34598,168 @@ mod tests {
     }
 
     #[gpui::test]
+    fn settings_scroll_does_not_reach_the_listing_behind_the_modal(cx: &mut TestAppContext) {
+        let entries = (0..100)
+            .map(|index| absolute_entry(PathBuf::from(format!("sample/{index:03}.txt"))))
+            .collect::<Vec<_>>();
+        let (view, window) = cx.add_window_view(|window, cx| {
+            let mut view =
+                DirectoryWindow::new(PathBuf::from("sample"), NativeServices::default(), cx);
+            view.browser.replace_entries(entries);
+            view.state = ListingState::Ready;
+            view.settings_panel_open = true;
+            view.settings_tab = SettingsTab::Appearance;
+            window.focus(&view.focus_handle, cx);
+            view
+        });
+        window.simulate_resize(gpui::size(px(800.0), px(600.0)));
+        window.run_until_parked();
+
+        let listing_scroll = view.update(window, |view, _| {
+            view.scroll_handle.0.borrow().base_handle.clone()
+        });
+        listing_scroll.set_offset(gpui::point(px(0.0), px(0.0)));
+        let settings = window.debug_bounds("settings-active-section").unwrap();
+        window.simulate_event(gpui::ScrollWheelEvent {
+            position: settings.center(),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.0), px(-120.0))),
+            ..Default::default()
+        });
+
+        assert_eq!(listing_scroll.offset().y, px(0.0));
+    }
+
+    #[gpui::test]
+    fn column_vertical_scroll_does_not_move_the_horizontal_strip(cx: &mut TestAppContext) {
+        let root = PathBuf::from("column-scroll");
+        let child = root.join("child");
+        let leaf = child.join("leaf");
+        let mut child_entry = absolute_entry(child.clone());
+        child_entry.is_dir = true;
+        let mut leaf_entry = absolute_entry(leaf.clone());
+        leaf_entry.is_dir = true;
+        let leaf_entries = (0..100)
+            .map(|index| absolute_entry(leaf.join(format!("{index:03}.txt"))))
+            .collect::<Vec<_>>();
+        let (view, window) = cx.add_window_view(|window, cx| {
+            let mut view = DirectoryWindow::new(leaf.clone(), NativeServices::default(), cx);
+            view.browser.set_view_mode(ViewMode::Column);
+            view.browser.replace_entries(leaf_entries.clone());
+            view.columns = ColumnState::new(&leaf);
+            assert!(view.columns.apply_listed(&root, vec![child_entry]));
+            assert!(view.columns.apply_listed(&child, vec![leaf_entry]));
+            assert!(view.columns.apply_listed(&leaf, leaf_entries));
+            view.column_scroll_handles = view
+                .columns
+                .columns()
+                .iter()
+                .map(|_| UniformListScrollHandle::new())
+                .collect();
+            view.column_scroll_to_leaf_attempts = 0;
+            view.state = ListingState::Ready;
+            window.focus(&view.focus_handle, cx);
+            view
+        });
+        window.simulate_resize(gpui::size(px(800.0), px(600.0)));
+        window.run_until_parked();
+
+        let strip = view.update(window, |view, _| view.column_strip_scroll.clone());
+        assert!(strip.max_offset().x > px(0.0));
+        let start_x = px(-(f32::from(strip.max_offset().x) / 2.0));
+        strip.set_offset(gpui::point(start_x, px(0.0)));
+        let column_bounds = window.debug_bounds("column-marquee-surface-2").unwrap();
+        window.simulate_event(gpui::ScrollWheelEvent {
+            position: column_bounds.center(),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.0), px(-120.0))),
+            ..Default::default()
+        });
+
+        assert_eq!(strip.offset().x, start_x);
+    }
+
+    #[gpui::test]
+    fn column_keyboard_navigation_repaints_the_selection_indicator(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            cx.bind_keys([KeyBinding::new("down", SelectNext, Some("browser"))]);
+        });
+        let root = PathBuf::from("column-keyboard");
+        let first = absolute_entry(root.join("a.txt"));
+        let second = absolute_entry(root.join("b.txt"));
+        let entries = vec![first.clone(), second.clone()];
+        let (view, window) = cx.add_window_view(|window, cx| {
+            let mut view = DirectoryWindow::new(root.clone(), NativeServices::default(), cx);
+            view.browser.set_view_mode(ViewMode::Column);
+            view.browser.replace_entries(entries.clone());
+            view.browser.select(first.path.clone());
+            view.columns = ColumnState::new(&root);
+            assert!(view.columns.apply_listed(&root, entries));
+            view.column_scroll_handles = vec![UniformListScrollHandle::new()];
+            view.sync_column_selection_from_browser();
+            view.settings.view.show_preview_panel = false;
+            view.preview_state = PreviewState::Closed;
+            view.state = ListingState::Ready;
+            window.focus(&view.focus_handle, cx);
+            view
+        });
+        window.simulate_resize(gpui::size(px(800.0), px(600.0)));
+        window.run_until_parked();
+        assert!(window.debug_bounds("column-entry-selected-0-0").is_some());
+
+        window.simulate_keystrokes("down");
+        window.run_until_parked();
+
+        view.update(window, |view, _| {
+            assert_eq!(view.browser.selected_path(), Some(second.path.as_path()));
+            assert!(view.column_selection.contains(&second.path));
+        });
+        assert!(window.debug_bounds("column-entry-selected-0-0").is_none());
+        assert!(window.debug_bounds("column-entry-selected-0-1").is_some());
+    }
+
+    #[gpui::test]
+    fn quick_look_decodes_photoshop_documents_to_images(cx: &mut TestAppContext) {
+        let directory = fixture_dir();
+        let source = directory.join("design.psd");
+        fs::write(&source, minimal_psd(320, 180, [40, 120, 220, 255])).unwrap();
+        let services = NativeServices::new(ResourcePaths::test(&directory));
+        let (view, window) = cx.add_window_view(|window, cx| {
+            let mut view = DirectoryWindow::new(directory.clone(), services, cx);
+            view.browser
+                .replace_entries(vec![metadata_entry(source.clone())]);
+            view.browser.select(source.clone());
+            view.state = ListingState::Ready;
+            view.open_quick_look(source.clone(), vec![source.clone()], cx);
+            window.focus(&view.focus_handle, cx);
+            view
+        });
+        for _ in 0..200 {
+            window.run_until_parked();
+            if view.update(window, |view, _| {
+                matches!(view.preview_state, PreviewState::Ready { .. })
+            }) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        view.update(window, |view, _| match &view.preview_state {
+            PreviewState::Ready {
+                path,
+                content: PreviewContent::Image(preview),
+            } => {
+                assert_eq!(path, &source);
+                assert_eq!(
+                    preview.extension().and_then(|value| value.to_str()),
+                    Some("png")
+                );
+                assert!(preview.is_file());
+            }
+            state => panic!("PSD Quick Look did not produce an image: {state:?}"),
+        });
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[gpui::test]
     fn shortcut_rebinding_rejects_conflicts_dispatches_live_and_survives_restart(
         cx: &mut TestAppContext,
     ) {
@@ -35503,6 +35775,43 @@ mod tests {
             view.sync_pinned_preview(cx);
             assert!(matches!(view.preview_state, PreviewState::Closed));
         });
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[gpui::test]
+    fn hidden_preview_panel_stays_hidden_when_preview_content_is_loaded(cx: &mut TestAppContext) {
+        let directory = fixture_dir();
+        let file = directory.join("preview.txt");
+        fs::write(&file, "preview content").unwrap();
+        let services = NativeServices::new(ResourcePaths::test(&directory));
+        let (view, window) = cx.add_window_view(|window, cx| {
+            let view = DirectoryWindow::new(directory.clone(), services, cx);
+            window.focus(&view.focus_handle(cx), cx);
+            view
+        });
+        view.update(window, |view, cx| {
+            view.browser
+                .replace_entries(vec![absolute_entry(file.clone())]);
+            view.browser.select(file.clone());
+            view.settings.view.show_preview_panel = false;
+            view.start_preview(file.clone(), cx);
+        });
+        window.simulate_resize(gpui::size(px(1_000.0), px(700.0)));
+        for _ in 0..200 {
+            window.run_until_parked();
+            if view.update(window, |view, _| {
+                matches!(view.preview_state, PreviewState::Ready { .. })
+            }) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        assert!(window.debug_bounds("preview-panel").is_none());
+        view.update(window, |view, cx| view.set_view_mode(ViewMode::Column, cx));
+        window.run_until_parked();
+        assert!(window.debug_bounds("preview-panel").is_none());
+
         fs::remove_dir_all(directory).unwrap();
     }
 

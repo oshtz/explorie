@@ -1991,7 +1991,7 @@ version = "0.1.0"
 
 [[package]]
 name = "explorie-gpui"
-version = "0.2.13"
+version = "0.2.14"
 dependencies = [
  "chrono",
  "cocoa 0.26.0",
@@ -2032,6 +2032,7 @@ dependencies = [
  "open",
  "png 0.18.1",
  "pollster 0.2.5",
+ "psd",
  "regex",
  "resvg",
  "rodio",
@@ -5485,6 +5486,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "psd"
+version = "0.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9a25f9b8cfffd65d911baf31a033239f7a0facb755faa2481575b70db5dc9195"
+dependencies = [
+ "thiserror 1.0.69",
 ]
 
 [[package]]
