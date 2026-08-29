@@ -2403,7 +2403,6 @@ enum ContextMenuAction {
     Cut,
     Trash,
     Reveal,
-    QuickLook,
     OpenWithChooser,
     ToggleOpenWith,
     OpenWithApp(String),
@@ -2418,7 +2417,7 @@ impl ContextMenuAction {
     fn label(&self, count: usize, favorite: bool, expanded: bool) -> String {
         match self {
             Self::Open => "Open".to_string(),
-            Self::Preview => "Preview".to_string(),
+            Self::Preview => "Quick Look".to_string(),
             Self::Rename => "Rename".to_string(),
             Self::BatchRename => format!("Batch Rename ({count})"),
             Self::Copy if count > 1 => format!("Copy ({count})"),
@@ -2430,7 +2429,6 @@ impl ContextMenuAction {
             Self::Reveal if cfg!(target_os = "macos") => "Show in Finder".to_string(),
             Self::Reveal if cfg!(windows) => "Show in Explorer".to_string(),
             Self::Reveal => "Show in File Manager".to_string(),
-            Self::QuickLook => "Quick Look".to_string(),
             Self::OpenWithChooser => "Open with…".to_string(),
             Self::ToggleOpenWith if expanded => "Open With  ▾".to_string(),
             Self::ToggleOpenWith => "Open With  ›".to_string(),
@@ -2449,7 +2447,7 @@ impl ContextMenuAction {
     fn icon_name(&self) -> &'static str {
         match self {
             Self::Open => "arrow-right",
-            Self::Preview | Self::QuickLook => "eye",
+            Self::Preview => "eye",
             Self::Rename | Self::BatchRename => "edit",
             Self::Copy => "copy",
             Self::Cut => "cut",
@@ -2487,7 +2485,6 @@ impl ContextMenuAction {
             Self::Cut => "cut",
             Self::Trash => "delete",
             Self::Reveal => "reveal",
-            Self::QuickLook => "quick-look",
             Self::OpenWithChooser => "open-with",
             Self::ToggleOpenWith => "open-with-toggle",
             Self::OpenWithApp(_) => "open-with-app",
@@ -3151,6 +3148,8 @@ pub struct DirectoryWindow {
     pending_preview_refresh: Option<PathBuf>,
     quick_look_open: bool,
     quick_look_info_open: bool,
+    quick_look_index_open: bool,
+    quick_look_paths: Vec<PathBuf>,
     preview_tab: PreviewTab,
     preview_generation: u64,
     preview_task: Option<Task<()>>,
@@ -3573,6 +3572,8 @@ impl DirectoryWindow {
             pending_preview_refresh: None,
             quick_look_open: false,
             quick_look_info_open: false,
+            quick_look_index_open: false,
+            quick_look_paths: Vec::new(),
             preview_tab: PreviewTab::Preview,
             preview_generation: 0,
             preview_task: None,
@@ -5952,6 +5953,10 @@ impl DirectoryWindow {
         event: &gpui::MouseDownEvent,
         cx: &mut Context<Self>,
     ) {
+        if event.click_count >= 2 {
+            self.auto_fit_column_view_width(path, cx);
+            return;
+        }
         self.column_view_resize = Some(ColumnViewResize {
             path,
             start_x: f32::from(event.position.x),
@@ -5959,6 +5964,31 @@ impl DirectoryWindow {
         });
         cx.stop_propagation();
         cx.notify();
+    }
+
+    fn auto_fit_column_view_width(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let Some(column) = self
+            .columns
+            .columns()
+            .iter()
+            .find(|column| column.path() == path)
+        else {
+            return;
+        };
+        let title_width = path_label(&path).chars().count() as f32 * 7.5 + 92.0;
+        let content_width = column
+            .visible_entries(&self.browser)
+            .into_iter()
+            .map(|entry| {
+                let name = file_name(&entry).chars().count() as f32 * 7.2;
+                let detail = entry_detail(&entry, self.calculate_folder_sizes, false)
+                    .chars()
+                    .count() as f32
+                    * 6.2;
+                name + detail + if entry.is_dir { 70.0 } else { 52.0 }
+            })
+            .fold(title_width, f32::max);
+        self.set_column_view_width(path, content_width, true, cx);
     }
 
     fn set_column_view_width(
@@ -9436,11 +9466,33 @@ impl DirectoryWindow {
             self.close_quick_look(cx);
             return;
         }
-        let Some(path) = self.selected_preview_path(cx) else {
+        let selected = self
+            .effective_selected_entries()
+            .into_iter()
+            .filter(|entry| !entry.is_dir)
+            .map(|entry| entry.path)
+            .collect::<Vec<_>>();
+        let Some(path) = selected.first().cloned() else {
+            self.status_message = Some("Select one or more files to preview".to_string());
+            cx.notify();
             return;
         };
+        let paths = if selected.len() > 1 {
+            selected
+        } else {
+            self.preview_files_for(&path)
+        };
+        self.open_quick_look(path, paths, cx);
+    }
+
+    fn open_quick_look(&mut self, path: PathBuf, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
         self.quick_look_open = true;
         self.quick_look_info_open = false;
+        self.quick_look_index_open = false;
+        self.quick_look_paths = paths;
+        if !self.quick_look_paths.contains(&path) {
+            self.quick_look_paths.insert(0, path.clone());
+        }
         if self.preview_state.path() == Some(path.as_path()) {
             cx.notify();
         } else {
@@ -9448,6 +9500,7 @@ impl DirectoryWindow {
         }
     }
 
+    #[cfg(test)]
     fn selected_preview_path(&mut self, cx: &mut Context<Self>) -> Option<PathBuf> {
         let entries = self.effective_selected_entries();
         if entries.len() != 1 || entries[0].is_dir {
@@ -9462,13 +9515,11 @@ impl DirectoryWindow {
         &self,
         current: &Path,
     ) -> (usize, usize, Option<PathBuf>, Option<PathBuf>) {
-        let files = self
-            .browser
-            .visible_entries()
-            .iter()
-            .filter(|entry| !entry.is_dir)
-            .map(|entry| entry.path.clone())
-            .collect::<Vec<_>>();
+        let files = if self.quick_look_open && !self.quick_look_paths.is_empty() {
+            self.quick_look_paths.clone()
+        } else {
+            self.preview_files_for(current)
+        };
         let Some(index) = files.iter().position(|path| path == current) else {
             return (1, 1, None, None);
         };
@@ -9482,6 +9533,30 @@ impl DirectoryWindow {
         )
     }
 
+    fn preview_files_for(&self, current: &Path) -> Vec<PathBuf> {
+        if self.browser.view_mode() == ViewMode::Column
+            && let Some(column) = self.columns.columns().iter().find(|column| {
+                column
+                    .visible_entries(&self.browser)
+                    .iter()
+                    .any(|entry| entry.path == current)
+            })
+        {
+            return column
+                .visible_entries(&self.browser)
+                .into_iter()
+                .filter(|entry| !entry.is_dir)
+                .map(|entry| entry.path)
+                .collect();
+        }
+        self.browser
+            .visible_entries()
+            .iter()
+            .filter(|entry| !entry.is_dir)
+            .map(|entry| entry.path.clone())
+            .collect()
+    }
+
     fn navigate_preview(&mut self, offset: isize, cx: &mut Context<Self>) {
         let Some(current) = self.preview_state.path().map(Path::to_path_buf) else {
             return;
@@ -9491,16 +9566,19 @@ impl DirectoryWindow {
         let Some(target) = target else {
             return;
         };
-        self.browser.select(target.clone());
-        if let Some(index) = self
-            .browser
-            .visible_entries()
-            .iter()
-            .position(|entry| entry.path == target)
-        {
-            self.reveal_selected(index);
+        if !self.quick_look_open {
+            self.browser.select(target.clone());
+            if let Some(index) = self
+                .browser
+                .visible_entries()
+                .iter()
+                .position(|entry| entry.path == target)
+            {
+                self.reveal_selected(index);
+            }
+            self.set_column_selection(target.clone());
         }
-        self.set_column_selection(target.clone());
+        self.quick_look_index_open = false;
         self.start_preview(target, cx);
     }
 
@@ -10072,6 +10150,8 @@ impl DirectoryWindow {
         self.text_preview.reset();
         self.quick_look_open = false;
         self.quick_look_info_open = false;
+        self.quick_look_index_open = false;
+        self.quick_look_paths.clear();
         self.audio_autoplay_after_load = false;
         self.stop_media_preview();
         self.preview_generation = self.preview_generation.wrapping_add(1);
@@ -10096,6 +10176,8 @@ impl DirectoryWindow {
         }
         self.quick_look_open = false;
         self.quick_look_info_open = false;
+        self.quick_look_index_open = false;
+        self.quick_look_paths.clear();
         if self.settings.view.show_preview_panel {
             let selected_path = self
                 .browser
@@ -10121,14 +10203,26 @@ impl DirectoryWindow {
         }
     }
 
+    fn toggle_quick_look_index(&mut self, cx: &mut Context<Self>) {
+        if self.quick_look_open && self.quick_look_paths.len() > 1 {
+            self.quick_look_index_open = !self.quick_look_index_open;
+            self.quick_look_info_open = false;
+            cx.notify();
+        }
+    }
+
     fn sync_pinned_preview(&mut self, cx: &mut Context<Self>) {
-        if !self.settings.view.show_preview_panel
+        if self.browser.view_mode() != ViewMode::Column
+            && !self.settings.view.show_preview_panel
             && matches!(self.preview_state, PreviewState::Closed)
         {
             return;
         }
         let entries = self.effective_selected_entries();
         if entries.len() == 1 && !entries[0].is_dir {
+            if self.browser.view_mode() == ViewMode::Column {
+                self.column_scroll_to_leaf_attempts = 3;
+            }
             self.start_preview(entries[0].path.clone(), cx);
         } else {
             self.services.previews.cancel_artifact();
@@ -11076,31 +11170,8 @@ impl DirectoryWindow {
         let Some(path) = self.preview_state.path().map(Path::to_path_buf) else {
             return;
         };
-        self.quick_look_item(path, cx);
-    }
-
-    fn quick_look_item(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        let task = self.services.integration.quick_look(path.clone());
-        let generation =
-            self.begin_integration_action(format!("Opening Quick Look for {}…", path.display()));
-        let task = cx.spawn(async move |this, cx| {
-            let result = task.await;
-            let _ = this.update(cx, |view, cx| {
-                let status = match result {
-                    Ok(()) => None,
-                    Err(error) => {
-                        view.record_error("Quick Look failed", error.to_string());
-                        Some(format!("Unable to Quick Look {}: {error}", path.display()))
-                    }
-                };
-                if view.integration_generation == generation {
-                    view.status_message = status;
-                }
-                cx.notify();
-            });
-        });
-        self.push_integration_task(task);
-        cx.notify();
+        let paths = self.preview_files_for(&path);
+        self.open_quick_look(path, paths, cx);
     }
 
     fn cycle_archive_format(&mut self, cx: &mut Context<Self>) {
@@ -12185,7 +12256,7 @@ impl DirectoryWindow {
     }
 
     fn select_next(&mut self, cx: &mut Context<Self>) {
-        if !matches!(self.preview_state, PreviewState::Closed) {
+        if self.quick_look_open {
             self.navigate_preview(1, cx);
             return;
         }
@@ -12198,7 +12269,7 @@ impl DirectoryWindow {
     }
 
     fn select_previous(&mut self, cx: &mut Context<Self>) {
-        if !matches!(self.preview_state, PreviewState::Closed) {
+        if self.quick_look_open {
             self.navigate_preview(-1, cx);
             return;
         }
@@ -12247,7 +12318,8 @@ impl DirectoryWindow {
         if let Some(index) = selected {
             self.reveal_selected(index);
             self.sync_column_selection_from_browser();
-            if extend
+            if self.browser.view_mode() == ViewMode::Column
+                || extend
                 || !matches!(self.preview_state, PreviewState::Closed)
                 || self.settings.view.show_preview_panel
             {
@@ -12288,7 +12360,6 @@ impl DirectoryWindow {
         if count == 1 {
             actions.push((ContextMenuAction::Reveal, true));
             if !menu.target_is_dir && cfg!(target_os = "macos") {
-                actions.push((ContextMenuAction::QuickLook, false));
                 if !menu.open_with_apps.is_empty() {
                     actions.push((ContextMenuAction::ToggleOpenWith, false));
                     if menu.open_with_expanded {
@@ -12464,7 +12535,8 @@ impl DirectoryWindow {
             }
             ContextMenuAction::Preview => {
                 if let Some(path) = target {
-                    self.start_preview(path, cx);
+                    let paths = self.preview_files_for(&path);
+                    self.open_quick_look(path, paths, cx);
                 }
             }
             ContextMenuAction::Rename => {
@@ -12485,11 +12557,6 @@ impl DirectoryWindow {
             ContextMenuAction::Reveal => {
                 if let Some(path) = target {
                     self.reveal_item(path, cx);
-                }
-            }
-            ContextMenuAction::QuickLook => {
-                if let Some(path) = target {
-                    self.quick_look_item(path, cx);
                 }
             }
             ContextMenuAction::OpenWithChooser => {
@@ -12980,7 +13047,10 @@ impl DirectoryWindow {
     }
 
     fn column_left(&mut self, cx: &mut Context<Self>) {
-        if !matches!(self.preview_state, PreviewState::Closed) {
+        if self.quick_look_open
+            || (self.browser.view_mode() != ViewMode::Column
+                && !matches!(self.preview_state, PreviewState::Closed))
+        {
             self.navigate_preview(-1, cx);
             return;
         }
@@ -12992,7 +13062,10 @@ impl DirectoryWindow {
     }
 
     fn column_right(&mut self, cx: &mut Context<Self>) {
-        if !matches!(self.preview_state, PreviewState::Closed) {
+        if self.quick_look_open
+            || (self.browser.view_mode() != ViewMode::Column
+                && !matches!(self.preview_state, PreviewState::Closed))
+        {
             self.navigate_preview(1, cx);
             return;
         }
@@ -13039,19 +13112,32 @@ impl DirectoryWindow {
                 }
             );
             match event.keystroke.key.as_str() {
-                "escape" | "space" => self.close_quick_look(cx),
+                "escape" if self.quick_look_index_open => self.toggle_quick_look_index(cx),
+                "escape" => self.close_quick_look(cx),
+                "space" if !event.is_held => self.close_quick_look(cx),
+                "enter"
+                    if event.keystroke.modifiers.platform && self.quick_look_paths.len() > 1 =>
+                {
+                    self.toggle_quick_look_index(cx)
+                }
+                "enter" if !event.is_held => {
+                    if let Some(path) = self.preview_state.path().map(Path::to_path_buf) {
+                        self.open_entry(path, false, cx);
+                        self.close_quick_look(cx);
+                    }
+                }
                 "left" | "up" => self.navigate_preview(-1, cx),
                 "right" | "down" => self.navigate_preview(1, cx),
-                "k" if is_audio => self.toggle_audio_playback(cx),
+                "k" if is_audio && !event.is_held => self.toggle_audio_playback(cx),
                 "j" if is_audio => self.skip_audio(-10_000, cx),
                 "l" if is_audio => self.skip_audio(10_000, cx),
-                "m" if is_audio => self.toggle_audio_mute(cx),
+                "m" if is_audio && !event.is_held => self.toggle_audio_mute(cx),
                 "home" if is_audio => self.seek_audio_fraction(0.0, cx),
                 "end" if is_audio => self.seek_audio_fraction(1.0, cx),
-                "k" if is_video => self.toggle_video_playback(cx),
+                "k" if is_video && !event.is_held => self.toggle_video_playback(cx),
                 "j" if is_video => self.skip_video(-10_000, cx),
                 "l" if is_video => self.skip_video(10_000, cx),
-                "m" if is_video => self.toggle_video_mute(cx),
+                "m" if is_video && !event.is_held => self.toggle_video_mute(cx),
                 "home" if is_video => self.seek_video_fraction(0.0, cx),
                 "end" if is_video => self.seek_video_fraction(1.0, cx),
                 _ => {}
@@ -13109,10 +13195,16 @@ impl DirectoryWindow {
         if !self.file_conflict_prompts.is_empty() {
             match event.keystroke.key.as_str() {
                 "escape" => self.cancel_all_file_conflicts(cx),
-                "enter" | "s" => self.resolve_file_conflict(FileConflictChoice::Skip, cx),
-                "r" => self.resolve_file_conflict(FileConflictChoice::Replace, cx),
-                "k" => self.resolve_file_conflict(FileConflictChoice::KeepBoth, cx),
-                "a" => self.toggle_file_conflict_apply_to_all(cx),
+                "enter" | "s" if !event.is_held => {
+                    self.resolve_file_conflict(FileConflictChoice::Skip, cx)
+                }
+                "r" if !event.is_held => {
+                    self.resolve_file_conflict(FileConflictChoice::Replace, cx)
+                }
+                "k" if !event.is_held => {
+                    self.resolve_file_conflict(FileConflictChoice::KeepBoth, cx)
+                }
+                "a" if !event.is_held => self.toggle_file_conflict_apply_to_all(cx),
                 _ => {}
             }
             cx.stop_propagation();
@@ -21620,13 +21712,11 @@ impl DirectoryWindow {
                         .on_click(cx.listener(|this, _, _, cx| this.open_previewed_with(cx))),
                 )
             })
-            .when(std::env::consts::OS == "macos", |actions| {
-                actions.child(
-                    toolbar_button("metadata-quick-look", "Quick Look", self.palette.control)
-                        .debug_selector(|| "metadata-quick-look".to_string())
-                        .on_click(cx.listener(|this, _, _, cx| this.quick_look_previewed_item(cx))),
-                )
-            });
+            .child(
+                toolbar_button("metadata-quick-look", "Quick Look", self.palette.control)
+                    .debug_selector(|| "metadata-quick-look".to_string())
+                    .on_click(cx.listener(|this, _, _, cx| this.quick_look_previewed_item(cx))),
+            );
         let finder_tags = self.render_finder_tags(path, cx);
         let photo_metadata = self.render_photo_metadata(path, cx);
         div()
@@ -21934,6 +22024,7 @@ impl DirectoryWindow {
         &mut self,
         side_panel: bool,
         quick_look: bool,
+        column_preview: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let state = self.preview_state.clone();
@@ -23291,6 +23382,7 @@ impl DirectoryWindow {
         let has_next = next.is_some();
         if quick_look {
             let file_name = path_label(&path);
+            let open_path = path.clone();
             let entry = self
                 .browser
                 .visible_entries()
@@ -23353,6 +23445,82 @@ impl DirectoryWindow {
                 "Hide file info"
             } else {
                 "Show file info"
+            };
+            let index_items = self
+                .quick_look_paths
+                .clone()
+                .into_iter()
+                .enumerate()
+                .map(|(index, item_path)| {
+                    let selected = item_path == path;
+                    let label = path_label(&item_path);
+                    div()
+                        .id(("quick-look-index-item", index))
+                        .debug_selector(move || format!("quick-look-index-item-{index}"))
+                        .role(Role::Button)
+                        .aria_label(format!("Preview {label}"))
+                        .aria_selected(selected)
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .gap_2()
+                        .w(px(156.0))
+                        .h(px(112.0))
+                        .p_3()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(if selected {
+                            self.palette.accent
+                        } else {
+                            self.palette.border
+                        })
+                        .bg(if selected {
+                            self.palette.selected
+                        } else {
+                            self.palette.surface
+                        })
+                        .hover(|item| item.bg(self.palette.hover))
+                        .cursor_pointer()
+                        .child(toolbar_icon(
+                            "file",
+                            28.0,
+                            if selected {
+                                self.palette.accent
+                            } else {
+                                self.palette.muted
+                            },
+                        ))
+                        .child(
+                            div()
+                                .w_full()
+                                .truncate()
+                                .text_center()
+                                .text_xs()
+                                .child(label),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.quick_look_index_open = false;
+                            this.start_preview(item_path.clone(), cx);
+                        }))
+                        .into_any_element()
+                })
+                .collect::<Vec<_>>();
+            let quick_look_body = if self.quick_look_index_open {
+                div()
+                    .id("quick-look-index-sheet")
+                    .debug_selector(|| "quick-look-index-sheet".to_string())
+                    .flex()
+                    .flex_wrap()
+                    .items_start()
+                    .justify_center()
+                    .content_start()
+                    .gap_3()
+                    .p_4()
+                    .children(index_items)
+                    .into_any_element()
+            } else {
+                body
             };
             return div()
                 .id("quick-look-backdrop")
@@ -23509,6 +23677,42 @@ impl DirectoryWindow {
                                         .gap_2()
                                         .child(
                                             compact_toolbar_button(
+                                                "quick-look-index",
+                                                "Index sheet",
+                                                "grid",
+                                                self.palette,
+                                                self.quick_look_index_open,
+                                                total > 1,
+                                            )
+                                            .when(
+                                                total > 1,
+                                                |button| {
+                                                    button.on_click(cx.listener(
+                                                        |this, _, _, cx| {
+                                                            this.toggle_quick_look_index(cx)
+                                                        },
+                                                    ))
+                                                },
+                                            ),
+                                        )
+                                        .child(
+                                            compact_toolbar_button(
+                                                "quick-look-open",
+                                                "Open",
+                                                "arrow-right",
+                                                self.palette,
+                                                false,
+                                                true,
+                                            )
+                                            .on_click(
+                                                cx.listener(move |this, _, _, cx| {
+                                                    this.open_entry(open_path.clone(), false, cx);
+                                                    this.close_quick_look(cx);
+                                                }),
+                                            ),
+                                        )
+                                        .child(
+                                            compact_toolbar_button(
                                                 "quick-look-info",
                                                 info_label,
                                                 "info",
@@ -23550,7 +23754,7 @@ impl DirectoryWindow {
                                 .overflow_scroll()
                                 .p_3()
                                 .bg(self.palette.window)
-                                .child(body),
+                                .child(quick_look_body),
                         )
                         .when(self.quick_look_info_open, |modal| {
                             modal.child(
@@ -23611,14 +23815,25 @@ impl DirectoryWindow {
             })
             .collect();
         div()
-            .id("preview-panel")
-            .debug_selector(|| "preview-panel".to_string())
+            .id(if column_preview {
+                "column-preview"
+            } else {
+                "preview-panel"
+            })
+            .debug_selector(move || {
+                if column_preview {
+                    "column-preview".to_string()
+                } else {
+                    "preview-panel".to_string()
+                }
+            })
             .flex()
             .flex_col()
             .border_color(self.palette.border)
             .bg(self.palette.panel)
             .when(side_panel, |panel| {
                 panel
+                    .flex_shrink_0()
                     .w(px(360.0 * self.palette.scale))
                     .min_w(px(280.0 * self.palette.scale))
                     .h_full()
@@ -23687,17 +23902,19 @@ impl DirectoryWindow {
                             })
                             .child(path_label(&path)),
                     )
-                    .child(
-                        compact_toolbar_button(
-                            "close-preview",
-                            "Close preview",
-                            "close",
-                            self.palette,
-                            false,
-                            true,
+                    .when(!column_preview, |navigation| {
+                        navigation.child(
+                            compact_toolbar_button(
+                                "close-preview",
+                                "Close preview",
+                                "close",
+                                self.palette,
+                                false,
+                                true,
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| this.close_preview(cx))),
                         )
-                        .on_click(cx.listener(|this, _, _, cx| this.close_preview(cx))),
-                    )
+                    })
                     .border_b_1()
                     .border_color(self.palette.border),
             )
@@ -25400,6 +25617,8 @@ impl DirectoryWindow {
                                                 this.navigate_to(pointer_path.clone(), cx);
                                             } else if event.click_count >= 2 {
                                                 this.open_entry(pointer_path.clone(), false, cx);
+                                            } else {
+                                                this.sync_pinned_preview(cx);
                                             }
                                             cx.stop_propagation();
                                             cx.notify();
@@ -25438,6 +25657,8 @@ impl DirectoryWindow {
                                                         accessibility_path.clone(),
                                                         cx,
                                                     );
+                                                } else {
+                                                    this.sync_pinned_preview(cx);
                                                 }
                                                 cx.notify();
                                             })
@@ -25711,7 +25932,12 @@ impl DirectoryWindow {
             );
         }
 
-        if self.column_scroll_to_leaf_attempts > 0 && column_count > 0 {
+        if !matches!(self.preview_state, PreviewState::Closed) && !self.quick_look_open {
+            rendered_columns.push(self.render_preview_panel(true, false, true, cx));
+        }
+        let rendered_column_count = rendered_columns.len();
+
+        if self.column_scroll_to_leaf_attempts > 0 && rendered_column_count > 0 {
             let max_offset = self.column_strip_scroll.max_offset().x;
             if max_offset > px(0.0) {
                 let offset = self.column_strip_scroll.offset();
@@ -25719,7 +25945,8 @@ impl DirectoryWindow {
                     .set_offset(gpui::point(-max_offset, offset.y));
                 self.column_scroll_to_leaf_attempts = 0;
             } else {
-                self.column_strip_scroll.scroll_to_item(column_count - 1);
+                self.column_strip_scroll
+                    .scroll_to_item(rendered_column_count - 1);
                 self.column_scroll_to_leaf_attempts -= 1;
                 if self.column_scroll_to_leaf_attempts > 0 {
                     cx.notify();
@@ -26164,7 +26391,8 @@ impl Render for DirectoryWindow {
         let operation_panel = self.render_operation_panel(status.is_some(), cx);
         let archive_inspection = self.render_archive_inspection(cx);
         let preview_open = !matches!(self.preview_state, PreviewState::Closed);
-        let inspector_preview_open = preview_open && !self.quick_look_open;
+        let inspector_preview_open =
+            preview_open && !self.quick_look_open && self.browser.view_mode() != ViewMode::Column;
         let preview_as_side_panel = inspector_preview_open && logical_main_width >= 708.0;
         self.listing_viewport_width = (main_area_width
             - 16.0 * self.palette.scale
@@ -26175,12 +26403,12 @@ impl Render for DirectoryWindow {
             })
         .max(1.0);
         let side_preview =
-            preview_as_side_panel.then(|| self.render_preview_panel(true, false, cx));
+            preview_as_side_panel.then(|| self.render_preview_panel(true, false, false, cx));
         let bottom_preview = (inspector_preview_open && !preview_as_side_panel)
-            .then(|| self.render_preview_panel(false, false, cx));
+            .then(|| self.render_preview_panel(false, false, false, cx));
         let quick_look = self
             .quick_look_open
-            .then(|| self.render_preview_panel(false, true, cx));
+            .then(|| self.render_preview_panel(false, true, false, cx));
         let mutation_prompt = self.render_mutation_prompt(cx);
         let tabs = self.render_tabs(cx);
         let header = if self.browser.view_mode() == ViewMode::List {
@@ -28326,7 +28554,6 @@ mod tests {
     enum RecordedPlatformAction {
         Open(PathBuf),
         Reveal(PathBuf),
-        QuickLook(PathBuf),
         OpenWith(PathBuf, String),
         AppsForFile(PathBuf),
     }
@@ -28367,13 +28594,6 @@ mod tests {
 
         fn reveal(&self, path: &Path) -> std::io::Result<()> {
             self.record("reveal", RecordedPlatformAction::Reveal(path.to_path_buf()))
-        }
-
-        fn quick_look(&self, path: &Path) -> std::io::Result<()> {
-            self.record(
-                "quick_look",
-                RecordedPlatformAction::QuickLook(path.to_path_buf()),
-            )
         }
 
         fn open_with(&self, path: &Path, app_name: &str) -> std::io::Result<()> {
@@ -31022,6 +31242,19 @@ mod tests {
         }
         window.simulate_resize(gpui::size(px(800.0), px(600.0)));
         window.run_until_parked();
+        window.update(|window, cx| {
+            window.dispatch_event(
+                gpui::PlatformInput::KeyDown(KeyDownEvent {
+                    keystroke: Keystroke::parse("a").unwrap(),
+                    is_held: true,
+                    prefer_character_input: false,
+                }),
+                cx,
+            );
+        });
+        view.update(window, |view, _| {
+            assert!(!view.file_conflict_prompts.front().unwrap().apply_to_all)
+        });
         let apply_all = window.debug_bounds("conflict-apply-all").unwrap().center();
         window.simulate_click(apply_all, gpui::Modifiers::default());
         view.update(window, |view, _| {
@@ -32635,6 +32868,24 @@ mod tests {
             assert_eq!(view.preview_navigation(&first).0, 1);
         });
 
+        window.update(|window, cx| {
+            let result = window.dispatch_event(
+                gpui::PlatformInput::KeyDown(KeyDownEvent {
+                    keystroke: Keystroke::parse("space").unwrap(),
+                    is_held: true,
+                    prefer_character_input: false,
+                }),
+                cx,
+            );
+            assert!(!result.propagate);
+        });
+        window.run_until_parked();
+        view.update(window, |view, _| {
+            assert!(view.quick_look_open);
+            assert_eq!(view.browser.path(), directory.as_path());
+            assert_eq!(view.browser.selected_path(), Some(first.as_path()));
+        });
+
         window.simulate_keystrokes("right");
         for _ in 0..200 {
             window.run_until_parked();
@@ -32647,7 +32898,7 @@ mod tests {
         }
         view.update(window, |view, _| {
             assert!(view.quick_look_open);
-            assert_eq!(view.browser.selected_path(), Some(second.as_path()));
+            assert_eq!(view.browser.selected_path(), Some(first.as_path()));
             assert_eq!(view.preview_navigation(&second).0, 2);
         });
 
@@ -32688,6 +32939,134 @@ mod tests {
         window.simulate_click(outside, gpui::Modifiers::default());
         window.run_until_parked();
         view.update(window, |view, _| assert!(!view.quick_look_open));
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[gpui::test]
+    fn quick_look_preserves_multi_selection_and_uses_it_as_the_navigation_set(
+        cx: &mut TestAppContext,
+    ) {
+        let directory = fixture_dir();
+        let first = directory.join("alpha.txt");
+        let skipped = directory.join("between.txt");
+        let last = directory.join("omega.txt");
+        fs::write(&first, "alpha preview").unwrap();
+        fs::write(&skipped, "not selected").unwrap();
+        fs::write(&last, "omega preview").unwrap();
+        let services = NativeServices::new(ResourcePaths::test(&directory));
+        let (view, window) = cx.add_window_view(|window, cx| {
+            let view = DirectoryWindow::new(directory.clone(), services, cx);
+            window.focus(&view.focus_handle(cx), cx);
+            view
+        });
+        view.update(window, |view, cx| {
+            view.install_shortcut_bindings(cx);
+            view.browser.replace_entries(vec![
+                absolute_entry(first.clone()),
+                absolute_entry(skipped.clone()),
+                absolute_entry(last.clone()),
+            ]);
+            view.browser
+                .replace_selection(vec![first.clone(), last.clone()]);
+            view.toggle_quick_look_selected(cx);
+        });
+        window.simulate_resize(gpui::size(px(900.0), px(640.0)));
+        for _ in 0..200 {
+            window.run_until_parked();
+            if window.debug_bounds("quick-look-index").is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        view.update(window, |view, _| {
+            assert_eq!(view.quick_look_paths, vec![first.clone(), last.clone()]);
+            assert_eq!(view.browser.selection_count(), 2);
+            assert_eq!(view.preview_navigation(&first).1, 2);
+        });
+        let index = window.debug_bounds("quick-look-index").unwrap().center();
+        window.simulate_click(index, gpui::Modifiers::default());
+        window.run_until_parked();
+        assert!(window.debug_bounds("quick-look-index-sheet").is_some());
+        assert!(window.debug_bounds("quick-look-index-item-0").is_some());
+        assert!(window.debug_bounds("quick-look-index-item-1").is_some());
+
+        window.simulate_keystrokes("escape");
+        window.run_until_parked();
+        view.update(window, |view, _| assert!(view.quick_look_open));
+        assert!(window.debug_bounds("quick-look-index-sheet").is_none());
+
+        window.simulate_keystrokes("right");
+        for _ in 0..200 {
+            window.run_until_parked();
+            if view.update(window, |view, _| {
+                view.preview_state.path() == Some(last.as_path())
+            }) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        view.update(window, |view, _| {
+            assert_eq!(view.browser.selection_count(), 2);
+            assert!(view.browser.is_selected(&first));
+            assert!(view.browser.is_selected(&last));
+        });
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[gpui::test]
+    fn column_view_owns_a_terminal_preview_without_stealing_hierarchy_navigation(
+        cx: &mut TestAppContext,
+    ) {
+        let directory = fixture_dir();
+        let first = directory.join("a-very-long-file-name-for-auto-fit.txt");
+        let second = directory.join("second.txt");
+        fs::write(&first, "first preview").unwrap();
+        fs::write(&second, "second preview").unwrap();
+        let entries = vec![
+            absolute_entry(first.clone()),
+            absolute_entry(second.clone()),
+        ];
+        let services = NativeServices::new(ResourcePaths::test(&directory));
+        let (view, window) = cx.add_window_view(|window, cx| {
+            let view = DirectoryWindow::new(directory.clone(), services, cx);
+            window.focus(&view.focus_handle(cx), cx);
+            view
+        });
+        view.update(window, |view, cx| {
+            view.browser.set_view_mode(ViewMode::Column);
+            view.browser.replace_entries(entries.clone());
+            view.columns = ColumnState::new(&directory);
+            assert!(view.columns.apply_listed(&directory, entries));
+            view.browser.select(first.clone());
+            view.set_column_selection(first.clone());
+            view.sync_pinned_preview(cx);
+            view.auto_fit_column_view_width(directory.clone(), cx);
+        });
+        window.simulate_resize(gpui::size(px(1100.0), px(720.0)));
+        for _ in 0..200 {
+            window.run_until_parked();
+            if window.debug_bounds("column-preview").is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        assert!(window.debug_bounds("column-preview").is_some());
+        assert!(window.debug_bounds("preview-panel").is_none());
+        view.update(window, |view, cx| {
+            assert!(
+                view.browser
+                    .column_view_width(&directory)
+                    .is_some_and(|width| f32::from(width) > DEFAULT_COLUMN_VIEW_WIDTH)
+            );
+            assert_eq!(view.preview_state.path(), Some(first.as_path()));
+            view.column_right(cx);
+            assert_eq!(view.preview_state.path(), Some(first.as_path()));
+            assert_eq!(view.browser.path(), directory.as_path());
+        });
 
         fs::remove_dir_all(directory).unwrap();
     }
@@ -33010,19 +33389,7 @@ mod tests {
                 .center();
             window.simulate_click(point, gpui::Modifiers::default());
         }
-        #[cfg(target_os = "macos")]
-        {
-            let point = window
-                .debug_bounds("metadata-quick-look")
-                .expect("Quick Look should render on macOS")
-                .center();
-            window.simulate_click(point, gpui::Modifiers::default());
-        }
-        let expected_successes = if cfg!(any(windows, target_os = "macos")) {
-            3
-        } else {
-            2
-        };
+        let expected_successes = if cfg!(windows) { 3 } else { 2 };
         for _ in 0..200 {
             window.run_until_parked();
             if backend.state.lock().unwrap().actions.len() >= expected_successes {
@@ -33035,8 +33402,6 @@ mod tests {
                 file.clone(),
                 String::new(),
             ))
-        } else if cfg!(target_os = "macos") {
-            Some(RecordedPlatformAction::QuickLook(file.clone()))
         } else {
             None
         };
@@ -33046,6 +33411,24 @@ mod tests {
         if let Some(expected) = expected_third {
             assert_eq!(actions[2], expected);
         }
+        let native_action_count = actions.len();
+        drop(actions);
+
+        let quick_look = window
+            .debug_bounds("metadata-quick-look")
+            .expect("Explorie Quick Look should render on every platform")
+            .center();
+        window.simulate_click(quick_look, gpui::Modifiers::default());
+        window.run_until_parked();
+        view.update(window, |view, cx| {
+            assert!(view.quick_look_open);
+            assert_eq!(
+                backend.state.lock().unwrap().actions.len(),
+                native_action_count
+            );
+            view.settings.view.show_preview_panel = true;
+            view.close_quick_look(cx);
+        });
 
         view.update(window, |view, _| {
             view.settings.behavior.enable_error_reporting = true;
@@ -33175,6 +33558,7 @@ mod tests {
                 "{selector} should render for one file"
             );
         }
+        assert!(window.debug_bounds("context-menu-quick-look").is_none());
         #[cfg(windows)]
         assert!(window.debug_bounds("context-menu-open-with").is_some());
         #[cfg(target_os = "macos")]
@@ -33195,7 +33579,6 @@ mod tests {
                 gpui::size(px(1200.0), px(720.0)),
                 |_, _| view.clone().into_element(),
             );
-            assert!(window.debug_bounds("context-menu-quick-look").is_some());
             assert!(
                 window
                     .debug_bounds("context-menu-open-with-toggle")
