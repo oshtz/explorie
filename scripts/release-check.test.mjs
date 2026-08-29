@@ -404,15 +404,34 @@ test('runReleaseCheck stops before commands when release prerequisites fail', as
 });
 
 test('workflows block audits and publish the exact attested draft assets', async () => {
-  const [ci, release, macosUi, mountDaemon, macosPackage, windowsPackage, windowsInstaller, updater] = await Promise.all([
+  const [
+    ci,
+    release,
+    macosUi,
+    mountDaemon,
+    installCleanupBridge,
+    nativeServicesBuild,
+    integration,
+    desktopMain,
+    macosPackage,
+    windowsPackage,
+    windowsInstaller,
+    updater,
+    platformProof,
+  ] = await Promise.all([
     readFile(path.join(process.cwd(), '.github/workflows/ci.yml'), 'utf8'),
     readFile(path.join(process.cwd(), '.github/workflows/build-release.yml'), 'utf8'),
     readFile(path.join(process.cwd(), '.github/workflows/validate-macos-ui.yml'), 'utf8'),
     readFile(path.join(process.cwd(), 'apps/desktop/native-assets/macos/MountDaemon.m'), 'utf8'),
+    readFile(path.join(process.cwd(), 'apps/desktop/native-assets/macos/InstallCleanupBridge.m'), 'utf8'),
+    readFile(path.join(process.cwd(), 'crates/native-services/build.rs'), 'utf8'),
+    readFile(path.join(process.cwd(), 'crates/native-services/src/integration.rs'), 'utf8'),
+    readFile(path.join(process.cwd(), 'apps/desktop/gpui/src/main.rs'), 'utf8'),
     readFile(path.join(process.cwd(), 'scripts/package-gpui-macos.sh'), 'utf8'),
     readFile(path.join(process.cwd(), 'scripts/package-gpui-windows.ps1'), 'utf8'),
     readFile(path.join(process.cwd(), 'apps/desktop/gpui/installer/windows/explorie.iss'), 'utf8'),
     readFile(path.join(process.cwd(), 'crates/native-services/src/updater.rs'), 'utf8'),
+    readFile(path.join(process.cwd(), 'scripts/platform-proof.mjs'), 'utf8'),
   ]);
 
   assert.doesNotMatch(ci, /playwright|vite|explorie-desktop|test-frontend|test-e2e/i);
@@ -521,6 +540,18 @@ test('workflows block audits and publish the exact attested draft assets', async
   assert.match(windowsInstaller, /--unregister-folder-handler/);
   assert.match(windowsInstaller, /RelaunchRequested[\s\S]*?\/RELAUNCHEXPLORIE/);
   assert.match(
+    windowsInstaller,
+    /--cleanup-installer[\s\S]*?Delete the downloaded installer[\s\S]*?postinstall skipifsilent runhidden[\s\S]*?ManualCleanupOffered/
+  );
+  assert.match(windowsInstaller, /--cleanup-installer[\s\S]*?runhidden[\s\S]*?RelaunchRequested/);
+  assert.match(desktopMain, /installer_cleanup_argument[\s\S]*?cleanup_windows_installer/);
+  assert.match(
+    desktopMain,
+    /refusing to remove a path that is not an Explorie Windows installer[\s\S]*?remove_file/
+  );
+  assert.match(release, /The Windows updater did not remove its installer payload/);
+  assert.match(release, /The updated Windows app did not reopen/);
+  assert.match(
     release,
     /Smoke test Windows installer[\s\S]*?\/VERYSILENT[\s\S]*?Explorie\.exe[\s\S]*?rclone\.exe/
   );
@@ -541,6 +572,22 @@ test('workflows block audits and publish the exact attested draft assets', async
   assert.doesNotMatch(release, /WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS|tauri\.localhost/);
   assert.doesNotMatch(release, /Build NSIS installer|--bundles nsis/);
   assert.match(release, /Smoke test macOS DMG/);
+  assert.match(release, /Smoke test macOS automatic replacement and cleanup/);
+  assert.match(release, /--apply-macos-update/);
+  assert.match(release, /The macOS updater left a staged or backup app behind/);
+  assert.match(release, /The updated macOS app did not reopen/);
+  assert.match(nativeServicesBuild, /InstallCleanupBridge\.m/);
+  assert.match(installCleanupBridge, /trashItemAtURL/);
+  assert.match(integration, /\/usr\/bin\/hdiutil[\s\S]*?\/Volumes/);
+  assert.match(integration, /CFBundleShortVersionString[\s\S]*?com\.omershatz\.explorie/);
+  assert.match(integration, /cleanup_install_media[\s\S]*?hdiutil[\s\S]*?detach/);
+  assert.match(desktopMain, /start_install_cleanup_offer/);
+  assert.match(platformProof, /installerCleanupOfferedAndCompleted/);
+  assert.match(platformProof, /dmgCleanupOfferedAndCompleted/);
+  assert.equal(
+    (platformProof.match(/automaticUpdateReplacedCleanedAndReopened/g) ?? []).length,
+    2
+  );
   assert.match(
     release,
     /name: Verify and stage macOS package[\s\S]*?hdiutil attach "\$\{dmgs\[0\]\}"[\s\S]*?app="\$\{apps\[0\]\}"/
@@ -604,8 +651,15 @@ test('workflows block audits and publish the exact attested draft assets', async
   assert.match(updater, /api\.github\.com\/repos\/oshtz\/explorie\/releases\/latest/);
   assert.match(updater, /windows-x64-setup-unsigned\.exe/);
   assert.match(updater, /SHA256SUMS-windows\.txt/);
+  assert.match(updater, /macos-arm64\.dmg/);
+  assert.match(updater, /SHA256SUMS-macos\.txt/);
   assert.match(updater, /failed its SHA-256 integrity check/);
   assert.match(updater, /\/RELAUNCHEXPLORIE/);
+  assert.match(updater, /--apply-macos-update/);
+  assert.match(updater, /hdiutil[\s\S]*?codesign[\s\S]*?spctl/);
+  assert.match(updater, /different developer team/);
+  assert.match(updater, /backup_installed_update[\s\S]*?replace_installed_update/);
+  assert.match(updater, /remove_directory_with_retries[\s\S]*?remove_file_with_retries/);
   assert.match(updater, /rejects_portable_fallbacks_missing_checksums_and_foreign_urls/);
   assert.match(mountDaemon, /kSecGuestAttributePid/);
   assert.match(mountDaemon, /connection\.processIdentifier/);

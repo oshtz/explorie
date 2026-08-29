@@ -293,6 +293,26 @@ jobs:
             }
             $version = & $rclone version | Select-Object -First 1
             if ($version -ne "rclone v1.74.4") { throw "Unexpected installed rclone version: $version" }
+            $updateCopy = Join-Path $env:RUNNER_TEMP "explorie-update-windows-x64-setup-unsigned.exe"
+            Copy-Item -LiteralPath $installer[0].FullName -Destination $updateCopy -Force
+            $env:EXPLORIE_TEST_CONFIG_DIR = $profile
+            $oldProcess = Start-Process -FilePath $app -PassThru
+            Start-Sleep -Seconds 2
+            if ($oldProcess.HasExited) { throw "Installed Explorie exited before the updater smoke test." }
+            $updateInstall = Start-Process -FilePath $updateCopy -ArgumentList @("/SP-", "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CLOSEAPPLICATIONS", "/RELAUNCHEXPLORIE", "/DIR=$installDir") -PassThru
+            $updateInstall.WaitForExit()
+            if ($updateInstall.ExitCode -ne 0) { throw "Updater installer exited with code $($updateInstall.ExitCode)." }
+            $reopened = $null
+            for ($attempt = 0; $attempt -lt 120; $attempt++) {
+              $reopened = @(Get-Process -Name Explorie -ErrorAction SilentlyContinue | Where-Object { $_.Id -ne $oldProcess.Id -and $_.Path -eq $app -and $_.MainWindowHandle -ne 0 }) | Select-Object -First 1
+              if ($reopened -and -not (Test-Path -LiteralPath $updateCopy)) { break }
+              Start-Sleep -Milliseconds 250
+            }
+            if (Test-Path -LiteralPath $updateCopy) {
+              throw "The Windows updater did not remove its installer payload."
+            }
+            if (-not $reopened) { throw "The updated Windows app did not reopen." }
+            Stop-Process -Id $reopened.Id -Force -ErrorAction SilentlyContinue
           } finally {
             $uninstaller = Join-Path $installDir "unins000.exe"
             if (Test-Path -LiteralPath $uninstaller -PathType Leaf) {
@@ -496,6 +516,49 @@ jobs:
           asset="release-artifacts/macos/explorie-$version-macos-arm64.dmg"
           cp "${dmgs[0]}" "$asset"
           (cd release-artifacts/macos && shasum -a 256 "$(basename "$asset")" > SHA256SUMS-macos.txt)
+
+      - name: Smoke test macOS automatic replacement and cleanup
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(node -p "require('./package.json').version")
+          source_app="target/release/bundle/macos/explorie.app"
+          installed_root="$HOME/Applications"
+          installed_app="$installed_root/explorie-updater-smoke-$GITHUB_RUN_ID.app"
+          cache="$HOME/Library/Caches/explorie/updates"
+          payload="$cache/explorie-$version-macos-arm64.dmg"
+          mkdir -p "$installed_root" "$cache"
+          rm -rf "$installed_app"
+          ditto "$source_app" "$installed_app"
+          cp "release-artifacts/macos/explorie-$version-macos-arm64.dmg" "$payload"
+          payload_hash=$(shasum -a 256 "$payload" | cut -d' ' -f1)
+          payload_size=$(stat -f '%z' "$payload")
+          binary="$installed_app/Contents/MacOS/explorie-gpui"
+
+          "$binary" --apply-macos-update "$payload" "$version" "$payload_hash" "$payload_size" 0
+
+          test -d "$installed_app"
+          test ! -e "$payload"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$installed_app/Contents/Info.plist")" = "$version"
+          codesign --verify --deep --strict --verbose=2 "$installed_app"
+          if find "$installed_root" -maxdepth 1 \( -name '.explorie-backup-*.app' -o -name '.explorie-update-*.app' \) | grep -q .; then
+            echo "The macOS updater left a staged or backup app behind."
+            exit 1
+          fi
+          reopened=false
+          for _ in {1..40}; do
+            if pgrep -f -- "$binary" >/dev/null; then
+              reopened=true
+              break
+            fi
+            sleep 0.25
+          done
+          if [ "$reopened" != true ]; then
+            echo "The updated macOS app did not reopen."
+            exit 1
+          fi
+          pkill -TERM -f -- "$binary" || true
+          rm -rf "$installed_app"
 
       - name: Smoke test macOS DMG
         shell: bash

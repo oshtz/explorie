@@ -1,6 +1,6 @@
 {
   "name": "explorie",
-  "version": "0.2.12",
+  "version": "0.2.13",
   "private": true,
   "packageManager": "pnpm@9.15.9",
   "description": "Ridiculously fast, fully-hackable file manager.",

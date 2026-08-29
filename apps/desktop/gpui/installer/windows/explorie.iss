@@ -61,6 +61,8 @@ Name: "{group}\Explorie"; Filename: "{app}\Explorie.exe"; WorkingDir: "{app}"
 [Run]
 Filename: "{app}\Explorie.exe"; Description: "Launch Explorie"; Flags: nowait postinstall skipifsilent
 Filename: "{app}\Explorie.exe"; Flags: nowait; Check: RelaunchRequested
+Filename: "{app}\Explorie.exe"; Parameters: "--cleanup-installer ""{srcexe}"""; Description: "Delete the downloaded installer"; Flags: nowait postinstall skipifsilent runhidden; Check: ManualCleanupOffered
+Filename: "{app}\Explorie.exe"; Parameters: "--cleanup-installer ""{srcexe}"""; Flags: nowait runhidden; Check: RelaunchRequested
 
 [UninstallRun]
 Filename: "{app}\Explorie.exe"; Parameters: "--unregister-folder-handler"; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "RestoreFolderHandler"
@@ -77,4 +79,9 @@ begin
       Result := True;
       Exit;
     end;
+end;
+
+function ManualCleanupOffered: Boolean;
+begin
+  Result := not RelaunchRequested;
 end;

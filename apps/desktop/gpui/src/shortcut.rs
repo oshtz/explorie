@@ -329,7 +329,6 @@ pub fn application_key_bindings(overrides: &BTreeMap<String, String>) -> Vec<Key
         KeyBinding::new("shift-up", SelectPreviousRange, Some("browser")),
         KeyBinding::new("secondary-a", SelectAll, Some("browser")),
         KeyBinding::new("enter", OpenSelected, Some("browser")),
-        KeyBinding::new("space", PreviewSelected, Some("browser")),
         KeyBinding::new("secondary-space", RetryPreview, Some("browser")),
         KeyBinding::new("secondary-shift-space", ClosePreview, Some("browser")),
         KeyBinding::new("secondary-alt-shift-p", ClearPreviewCache, Some("browser")),
@@ -501,5 +500,18 @@ mod tests {
                 "Ctrl + Alt + B"
             }
         );
+    }
+
+    #[test]
+    fn plain_space_is_owned_only_by_the_native_preview_handler() {
+        let space = Keystroke::parse("space").unwrap();
+        assert!(
+            application_key_bindings(&BTreeMap::new())
+                .iter()
+                .all(
+                    |binding| binding.match_keystrokes(std::slice::from_ref(&space)) != Some(false)
+                )
+        );
+        assert!(fixed_browser_bindings().contains(&("space", "preview selected item")));
     }
 }
