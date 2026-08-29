@@ -439,7 +439,21 @@ fn hash_file(path: &Path) -> ServiceResult<String> {
 }
 
 fn validate_downloaded_update(cache_dir: &Path, update: &DownloadedUpdate) -> ServiceResult<()> {
-    validate_update_info(&update.info)?;
+    let platform = UpdatePlatform::current().ok_or_else(|| {
+        ServiceError::new(
+            ErrorCode::Unsupported,
+            "Automatic updates are unavailable on this platform",
+        )
+    })?;
+    validate_downloaded_update_for_platform(cache_dir, update, platform)
+}
+
+fn validate_downloaded_update_for_platform(
+    cache_dir: &Path,
+    update: &DownloadedUpdate,
+    platform: UpdatePlatform,
+) -> ServiceResult<()> {
+    validate_update_info_for_platform(&update.info, platform)?;
     let expected_path = cache_dir.join(&update.info.asset_name);
     if update.installer_path != expected_path || !expected_path.is_file() {
         return Err(ServiceError::new(
@@ -1091,29 +1105,31 @@ mod tests {
     }
 
     #[test]
-    fn prepared_installer_is_rehashed_immediately_before_launch() {
+    fn prepared_update_is_rehashed_immediately_before_launch() {
         let temp = tempfile::tempdir().unwrap();
-        let cache = temp.path().join("updates");
-        fs::create_dir_all(&cache).unwrap();
-        let name = windows_installer_name("0.2.9");
-        let path = cache.join(&name);
-        fs::write(&path, vec![0_u8; MIN_UPDATE_BYTES as usize]).unwrap();
-        let sha256 = hash_file(&path).unwrap();
-        let update = DownloadedUpdate {
-            info: UpdateInfo {
-                version: "0.2.9".to_string(),
-                notes: None,
-                asset_name: name.clone(),
-                download_url: release_asset_url("0.2.9", &name),
-                checksum_url: release_asset_url("0.2.9", WINDOWS_CHECKSUM_ASSET),
-                size: MIN_UPDATE_BYTES,
-            },
-            installer_path: path.clone(),
-            sha256,
-        };
-        assert!(validate_downloaded_update(&cache, &update).is_ok());
-        fs::write(path, b"changed installer").unwrap();
-        assert!(validate_downloaded_update(&cache, &update).is_err());
+        for platform in [UpdatePlatform::Windows, UpdatePlatform::Macos] {
+            let cache = temp.path().join(platform.display_name());
+            fs::create_dir_all(&cache).unwrap();
+            let name = platform.asset_name("0.2.9");
+            let path = cache.join(&name);
+            fs::write(&path, vec![0_u8; MIN_UPDATE_BYTES as usize]).unwrap();
+            let sha256 = hash_file(&path).unwrap();
+            let update = DownloadedUpdate {
+                info: UpdateInfo {
+                    version: "0.2.9".to_string(),
+                    notes: None,
+                    asset_name: name.clone(),
+                    download_url: release_asset_url("0.2.9", &name),
+                    checksum_url: release_asset_url("0.2.9", platform.checksum_asset()),
+                    size: MIN_UPDATE_BYTES,
+                },
+                installer_path: path.clone(),
+                sha256,
+            };
+            assert!(validate_downloaded_update_for_platform(&cache, &update, platform).is_ok());
+            fs::write(&path, b"changed update").unwrap();
+            assert!(validate_downloaded_update_for_platform(&cache, &update, platform).is_err());
+        }
     }
 
     #[test]
