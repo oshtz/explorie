@@ -33558,6 +33558,7 @@ mod tests {
                 "{selector} should render for one file"
             );
         }
+        assert!(window.debug_bounds("context-menu-quick-look").is_none());
         #[cfg(windows)]
         assert!(window.debug_bounds("context-menu-open-with").is_some());
         #[cfg(target_os = "macos")]
@@ -33578,7 +33579,6 @@ mod tests {
                 gpui::size(px(1200.0), px(720.0)),
                 |_, _| view.clone().into_element(),
             );
-            assert!(window.debug_bounds("context-menu-quick-look").is_some());
             assert!(
                 window
                     .debug_bounds("context-menu-open-with-toggle")
