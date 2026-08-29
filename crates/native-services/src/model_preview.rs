@@ -446,7 +446,7 @@ fn rasterize(
         )
     })?;
     let mut rgba = vec![0_u8; pixel_count * 4];
-    for pixel in rgba.chunks_exact_mut(4) {
+    for pixel in rgba.as_chunks_mut::<4>().0 {
         pixel.copy_from_slice(&[13, 17, 23, 255]);
     }
     draw_grid(&mut rgba, width, height);
