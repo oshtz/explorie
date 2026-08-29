@@ -398,6 +398,12 @@ fn detect_preview_content(path: &Path) -> ServiceResult<PreviewDetection> {
         (DetectedPreviewKind::Image, "BMP image", "image/bmp")
     } else if bytes.starts_with(b"qoif") {
         (DetectedPreviewKind::Image, "QOI image", "image/qoi")
+    } else if bytes.starts_with(b"8BPS\0\x01") {
+        (
+            DetectedPreviewKind::Image,
+            "Photoshop document",
+            "image/vnd.adobe.photoshop",
+        )
     } else if bytes.starts_with(&[0xff, 0x0a])
         || bytes.starts_with(&[
             0, 0, 0, 0x0c, b'J', b'X', b'L', b' ', 0x0d, 0x0a, 0x87, 0x0a,
@@ -1593,9 +1599,9 @@ fn generate_preview_artifact(
             DetectedPreviewKind::Svg => return convert_svg_preview(path, cache),
             DetectedPreviewKind::Image => {
                 return match detection.mime_type.as_deref() {
-                    Some("image/avif" | "image/heif" | "image/jxl") => {
-                        convert_image_preview(path, cache, helper_generation, ticket)
-                    }
+                    Some(
+                        "image/avif" | "image/heif" | "image/jxl" | "image/vnd.adobe.photoshop",
+                    ) => convert_image_preview(path, cache, helper_generation, ticket),
                     _ => convert_native_image_preview(path, cache),
                 };
             }
@@ -2522,6 +2528,13 @@ mod tests {
         let source = temp.path().join("design.psd");
         fs::write(&source, minimal_psd(320, 180, [40, 120, 220, 255])).unwrap();
         let service = PreviewService::new(ServiceContext::new(ResourcePaths::test(temp.path())));
+
+        let detection = service.detect(source.clone()).wait().unwrap();
+        assert_eq!(detection.kind, DetectedPreviewKind::Image);
+        assert_eq!(
+            detection.mime_type.as_deref(),
+            Some("image/vnd.adobe.photoshop")
+        );
 
         let artifact = service.artifact(source.clone()).wait().unwrap();
         assert_eq!(artifact.kind, "image");

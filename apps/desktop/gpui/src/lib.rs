@@ -12396,9 +12396,8 @@ impl DirectoryWindow {
                 || self.settings.view.show_preview_panel
             {
                 self.sync_pinned_preview(cx);
-            } else {
-                cx.notify();
             }
+            cx.notify();
         }
     }
 
@@ -20308,6 +20307,8 @@ impl DirectoryWindow {
             .when(compact_settings, |backdrop| backdrop.p_2())
             .when(!compact_settings, |backdrop| backdrop.p_3())
             .bg(with_alpha(rgb(0x000000), 0.58))
+            .occlude()
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
             .child(
                 div()
                     .id("settings-panel")
@@ -25685,6 +25686,11 @@ impl DirectoryWindow {
                             let accessibility_view = cx.entity().downgrade();
                             let row_content = div()
                                 .id(("column-entry-drag-source", column_index * 1_000_000 + index))
+                                .when(selected, |row| {
+                                    row.debug_selector(move || {
+                                        format!("column-entry-selected-{column_index}-{index}")
+                                    })
+                                })
                                 .flex()
                                 .flex_1()
                                 .min_w_0()
@@ -26073,7 +26079,7 @@ impl DirectoryWindow {
             }
         }
 
-        div()
+        let mut column_results = div()
             .id("column-results")
             .flex()
             .flex_1()
@@ -26088,8 +26094,9 @@ impl DirectoryWindow {
                     window.focus(&this.focus_handle, cx);
                     this.open_empty_context_menu(event.position, cx);
                 }),
-            )
-            .into_any_element()
+            );
+        column_results.style().restrict_scroll_to_axis = Some(true);
+        column_results.into_any_element()
     }
 }
 
@@ -28428,6 +28435,27 @@ mod tests {
             )
             .as_bytes(),
         );
+        bytes
+    }
+
+    fn minimal_psd(width: u32, height: u32, color: [u8; 4]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"8BPS");
+        bytes.extend_from_slice(&1_u16.to_be_bytes());
+        bytes.extend_from_slice(&[0; 6]);
+        bytes.extend_from_slice(&4_u16.to_be_bytes());
+        bytes.extend_from_slice(&height.to_be_bytes());
+        bytes.extend_from_slice(&width.to_be_bytes());
+        bytes.extend_from_slice(&8_u16.to_be_bytes());
+        bytes.extend_from_slice(&3_u16.to_be_bytes());
+        bytes.extend_from_slice(&0_u32.to_be_bytes());
+        bytes.extend_from_slice(&0_u32.to_be_bytes());
+        bytes.extend_from_slice(&0_u32.to_be_bytes());
+        bytes.extend_from_slice(&0_u16.to_be_bytes());
+        let pixel_count = usize::try_from(u64::from(width) * u64::from(height)).unwrap();
+        for channel in color {
+            bytes.extend(std::iter::repeat_n(channel, pixel_count));
+        }
         bytes
     }
 
@@ -34567,6 +34595,168 @@ mod tests {
         view.update(window, |view, _| assert!(!view.settings_panel_open));
         window.run_until_parked();
         assert!(window.debug_bounds("settings-panel").is_none());
+    }
+
+    #[gpui::test]
+    fn settings_scroll_does_not_reach_the_listing_behind_the_modal(cx: &mut TestAppContext) {
+        let entries = (0..100)
+            .map(|index| absolute_entry(PathBuf::from(format!("sample/{index:03}.txt"))))
+            .collect::<Vec<_>>();
+        let (view, window) = cx.add_window_view(|window, cx| {
+            let mut view =
+                DirectoryWindow::new(PathBuf::from("sample"), NativeServices::default(), cx);
+            view.browser.replace_entries(entries);
+            view.state = ListingState::Ready;
+            view.settings_panel_open = true;
+            view.settings_tab = SettingsTab::Appearance;
+            window.focus(&view.focus_handle, cx);
+            view
+        });
+        window.simulate_resize(gpui::size(px(800.0), px(600.0)));
+        window.run_until_parked();
+
+        let listing_scroll = view.update(window, |view, _| {
+            view.scroll_handle.0.borrow().base_handle.clone()
+        });
+        listing_scroll.set_offset(gpui::point(px(0.0), px(0.0)));
+        let settings = window.debug_bounds("settings-active-section").unwrap();
+        window.simulate_event(gpui::ScrollWheelEvent {
+            position: settings.center(),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.0), px(-120.0))),
+            ..Default::default()
+        });
+
+        assert_eq!(listing_scroll.offset().y, px(0.0));
+    }
+
+    #[gpui::test]
+    fn column_vertical_scroll_does_not_move_the_horizontal_strip(cx: &mut TestAppContext) {
+        let root = PathBuf::from("column-scroll");
+        let child = root.join("child");
+        let leaf = child.join("leaf");
+        let mut child_entry = absolute_entry(child.clone());
+        child_entry.is_dir = true;
+        let mut leaf_entry = absolute_entry(leaf.clone());
+        leaf_entry.is_dir = true;
+        let leaf_entries = (0..100)
+            .map(|index| absolute_entry(leaf.join(format!("{index:03}.txt"))))
+            .collect::<Vec<_>>();
+        let (view, window) = cx.add_window_view(|window, cx| {
+            let mut view = DirectoryWindow::new(leaf.clone(), NativeServices::default(), cx);
+            view.browser.set_view_mode(ViewMode::Column);
+            view.browser.replace_entries(leaf_entries.clone());
+            view.columns = ColumnState::new(&leaf);
+            assert!(view.columns.apply_listed(&root, vec![child_entry]));
+            assert!(view.columns.apply_listed(&child, vec![leaf_entry]));
+            assert!(view.columns.apply_listed(&leaf, leaf_entries));
+            view.column_scroll_handles = view
+                .columns
+                .columns()
+                .iter()
+                .map(|_| UniformListScrollHandle::new())
+                .collect();
+            view.column_scroll_to_leaf_attempts = 0;
+            view.state = ListingState::Ready;
+            window.focus(&view.focus_handle, cx);
+            view
+        });
+        window.simulate_resize(gpui::size(px(800.0), px(600.0)));
+        window.run_until_parked();
+
+        let strip = view.update(window, |view, _| view.column_strip_scroll.clone());
+        assert!(strip.max_offset().x > px(0.0));
+        let start_x = px(-(f32::from(strip.max_offset().x) / 2.0));
+        strip.set_offset(gpui::point(start_x, px(0.0)));
+        let column_bounds = window.debug_bounds("column-marquee-surface-2").unwrap();
+        window.simulate_event(gpui::ScrollWheelEvent {
+            position: column_bounds.center(),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.0), px(-120.0))),
+            ..Default::default()
+        });
+
+        assert_eq!(strip.offset().x, start_x);
+    }
+
+    #[gpui::test]
+    fn column_keyboard_navigation_repaints_the_selection_indicator(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            cx.bind_keys([KeyBinding::new("down", SelectNext, Some("browser"))]);
+        });
+        let root = PathBuf::from("column-keyboard");
+        let first = absolute_entry(root.join("a.txt"));
+        let second = absolute_entry(root.join("b.txt"));
+        let entries = vec![first.clone(), second.clone()];
+        let (view, window) = cx.add_window_view(|window, cx| {
+            let mut view = DirectoryWindow::new(root.clone(), NativeServices::default(), cx);
+            view.browser.set_view_mode(ViewMode::Column);
+            view.browser.replace_entries(entries.clone());
+            view.browser.select(first.path.clone());
+            view.columns = ColumnState::new(&root);
+            assert!(view.columns.apply_listed(&root, entries));
+            view.column_scroll_handles = vec![UniformListScrollHandle::new()];
+            view.sync_column_selection_from_browser();
+            view.settings.view.show_preview_panel = false;
+            view.preview_state = PreviewState::Closed;
+            view.state = ListingState::Ready;
+            window.focus(&view.focus_handle, cx);
+            view
+        });
+        window.simulate_resize(gpui::size(px(800.0), px(600.0)));
+        window.run_until_parked();
+        assert!(window.debug_bounds("column-entry-selected-0-0").is_some());
+
+        window.simulate_keystrokes("down");
+        window.run_until_parked();
+
+        view.update(window, |view, _| {
+            assert_eq!(view.browser.selected_path(), Some(second.path.as_path()));
+            assert!(view.column_selection.contains(&second.path));
+        });
+        assert!(window.debug_bounds("column-entry-selected-0-0").is_none());
+        assert!(window.debug_bounds("column-entry-selected-0-1").is_some());
+    }
+
+    #[gpui::test]
+    fn quick_look_decodes_photoshop_documents_to_images(cx: &mut TestAppContext) {
+        let directory = fixture_dir();
+        let source = directory.join("design.psd");
+        fs::write(&source, minimal_psd(320, 180, [40, 120, 220, 255])).unwrap();
+        let services = NativeServices::new(ResourcePaths::test(&directory));
+        let (view, window) = cx.add_window_view(|window, cx| {
+            let mut view = DirectoryWindow::new(directory.clone(), services, cx);
+            view.browser
+                .replace_entries(vec![metadata_entry(source.clone())]);
+            view.browser.select(source.clone());
+            view.state = ListingState::Ready;
+            view.open_quick_look(source.clone(), vec![source.clone()], cx);
+            window.focus(&view.focus_handle, cx);
+            view
+        });
+        for _ in 0..200 {
+            window.run_until_parked();
+            if view.update(window, |view, _| {
+                matches!(view.preview_state, PreviewState::Ready { .. })
+            }) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        view.update(window, |view, _| match &view.preview_state {
+            PreviewState::Ready {
+                path,
+                content: PreviewContent::Image(preview),
+            } => {
+                assert_eq!(path, &source);
+                assert_eq!(
+                    preview.extension().and_then(|value| value.to_str()),
+                    Some("png")
+                );
+                assert!(preview.is_file());
+            }
+            state => panic!("PSD Quick Look did not produce an image: {state:?}"),
+        });
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[gpui::test]
