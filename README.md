@@ -21,9 +21,9 @@ Key traits:
 
 Current features:
 
-- **Multiple view modes:** List, Grid, and Finder-style Column views.
+- **Multiple view modes:** List, Grid, and Finder-style Column views with a terminal preview column.
 - **Tabbed browsing:** Open multiple directories in tabs (Ctrl/Cmd+T).
-- **File previews:** Images, embedded audio/video, locally rendered PDFs, highlighted text/code, archive listings, and optional helper-generated previews.
+- **File previews:** One Explorie-owned Quick Look experience on Windows and macOS, including selected-set navigation and an index sheet, plus images, embedded audio/video, locally rendered PDFs, highlighted text/code, archive listings, and optional helper-generated previews.
 - **Custom metadata:** Read/write `.explorie.json` for custom fields per folder.
 - **Theming:** Dark/light/system themes, accent colors, local font stacks, UI scale, density, and more.
 - **Drag & drop:** Move files between folders with visual feedback.
@@ -175,7 +175,7 @@ Remote Drives use the bundled, pinned rclone executable with the user's existing
 - Public binary releases still need real-machine packaged-app QA before broad distribution; macOS is explicitly not release-ready until that proof exists.
 - Video previews use an optional local FFmpeg process for probing and bounded native playback; unavailable helpers produce an actionable fallback.
 - Office/OpenDocument previews require LibreOffice. HEIC/HEIF/TIFF/PSD previews require ImageMagick.
-- macOS Finder/Quick Look integration and notarized DMG behavior should be checked on real machines for each release candidate.
+- Explorie Quick Look and Column View behavior, plus notarized DMG behavior, should be checked on a real Mac for each release candidate.
 
 ---
 

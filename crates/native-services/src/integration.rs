@@ -41,7 +41,6 @@ pub trait FinderTagsBackend: Send + Sync {
 pub trait PlatformActionsBackend: Send + Sync {
     fn open(&self, path: &Path) -> io::Result<()>;
     fn reveal(&self, path: &Path) -> io::Result<()>;
-    fn quick_look(&self, path: &Path) -> io::Result<()>;
     fn open_with(&self, path: &Path, app_name: &str) -> io::Result<()>;
     fn apps_for_file(&self, path: &Path) -> io::Result<Vec<AppInfo>>;
 }
@@ -71,10 +70,6 @@ impl PlatformActionsBackend for SystemPlatformActionsBackend {
 
     fn reveal(&self, path: &Path) -> io::Result<()> {
         reveal(path)
-    }
-
-    fn quick_look(&self, path: &Path) -> io::Result<()> {
-        quick_look(path)
     }
 
     fn open_with(&self, path: &Path, app_name: &str) -> io::Result<()> {
@@ -172,15 +167,6 @@ impl IntegrationService {
             backend
                 .reveal(&path)
                 .map_err(|error| ServiceError::from(error).operation("reveal"))
-        })
-    }
-
-    pub fn quick_look(&self, path: PathBuf) -> BlockingTask<()> {
-        let backend = Arc::clone(&self.platform_actions);
-        self.context.spawn_blocking(move || {
-            backend
-                .quick_look(&path)
-                .map_err(|error| ServiceError::from(error).operation("quick_look"))
         })
     }
 
@@ -323,23 +309,6 @@ fn reveal(_path: &Path) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "Reveal in file manager is not supported on this platform.",
-    ))
-}
-
-#[cfg(target_os = "macos")]
-fn quick_look(path: &Path) -> io::Result<()> {
-    Command::new("qlmanage")
-        .args(["-p"])
-        .arg(path)
-        .spawn()
-        .map(|_| ())
-}
-
-#[cfg(not(target_os = "macos"))]
-fn quick_look(_path: &Path) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "Quick Look is only available on macOS.",
     ))
 }
 
@@ -901,10 +870,6 @@ mod tests {
             self.record("reveal", path)
         }
 
-        fn quick_look(&self, path: &Path) -> io::Result<()> {
-            self.record("quick_look", path)
-        }
-
         fn open_with(&self, path: &Path, app_name: &str) -> io::Result<()> {
             self.record("open_with", path)?;
             self.calls.lock().unwrap().push(format!("app:{app_name}"));
@@ -979,7 +944,6 @@ mod tests {
 
         native.integration.open(path.clone()).wait().unwrap();
         native.integration.reveal(path.clone()).wait().unwrap();
-        native.integration.quick_look(path.clone()).wait().unwrap();
         native
             .integration
             .open_with(path.clone(), "Fixture App".to_string())
@@ -992,13 +956,12 @@ mod tests {
             .unwrap();
         assert_eq!(apps[0].bundle_id.as_deref(), Some("test.fixture.app"));
         let calls = backend.calls.lock().unwrap();
-        assert_eq!(calls.len(), 6);
+        assert_eq!(calls.len(), 5);
         assert!(calls[0].starts_with("open:"));
         assert!(calls[1].starts_with("reveal:"));
-        assert!(calls[2].starts_with("quick_look:"));
-        assert!(calls[3].starts_with("open_with:"));
-        assert_eq!(calls[4], "app:Fixture App");
-        assert!(calls[5].starts_with("apps_for_file:"));
+        assert!(calls[2].starts_with("open_with:"));
+        assert_eq!(calls[3], "app:Fixture App");
+        assert!(calls[4].starts_with("apps_for_file:"));
         drop(calls);
 
         *backend.fail_next.lock().unwrap() = Some("reveal");
