@@ -41,7 +41,8 @@ pub use image_metadata::{
     ImageGps, ImageMetadata, format_exif_date, is_image_metadata_path, parse_image_metadata,
 };
 pub use integration::{
-    AppInfo, FinderTagsBackend, IntegrationService, PlatformActionsBackend, SystemIntegrationStatus,
+    AppInfo, FinderTagsBackend, InstallCleanupOffer, IntegrationService, PlatformActionsBackend,
+    SystemIntegrationStatus,
 };
 pub use listing::{DirInfo, DiskInfo, ListRequest, SystemLocations};
 pub use metadata::MetadataService;

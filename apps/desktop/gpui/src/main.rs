@@ -24,6 +24,22 @@ fn application() -> gpui::Application {
 
 #[cfg(any(windows, target_os = "macos"))]
 fn main() {
+    #[cfg(target_os = "macos")]
+    if let Some(result) =
+        explorie_native_services::updater::apply_macos_update_command(std::env::args_os())
+    {
+        if let Err(error) = result {
+            eprintln!("unable to apply macOS update: {error}");
+        }
+        return;
+    }
+    #[cfg(windows)]
+    if let Some(installer) = installer_cleanup_argument(std::env::args_os()) {
+        if let Err(error) = cleanup_windows_installer(&installer) {
+            eprintln!("unable to remove installer: {error}");
+        }
+        return;
+    }
     #[cfg(any(windows, target_os = "macos"))]
     {
         if let Some(enabled) = system_integration_command(std::env::args_os()) {
@@ -136,7 +152,8 @@ fn main() {
                 view.start_preview_helpers(cx);
                 view.start_system_integration_status(cx);
                 view.start_remote_drives(cx);
-                #[cfg(windows)]
+                #[cfg(target_os = "macos")]
+                view.start_install_cleanup_offer(cx);
                 view.start_update_check(false, cx);
                 if previous_session_unclean {
                     view.announce_unclean_recovery(cx);
@@ -201,6 +218,54 @@ fn main() {
     });
 }
 
+#[cfg(windows)]
+fn installer_cleanup_argument(
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Option<PathBuf> {
+    let mut args = args.into_iter().skip(1);
+    while let Some(argument) = args.next() {
+        if argument == "--cleanup-installer" {
+            return Some(args.next().map(PathBuf::from).unwrap_or_default());
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn cleanup_windows_installer(installer: &std::path::Path) -> std::io::Result<()> {
+    let name = installer
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !installer.is_absolute()
+        || installer
+            .extension()
+            .is_none_or(|extension| extension != "exe")
+        || !name.starts_with("explorie")
+        || !name.contains("windows-x64-setup")
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "refusing to remove a path that is not an Explorie Windows installer",
+        ));
+    }
+    for _ in 0..120 {
+        match std::fs::remove_file(installer) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "the installer remained in use for 30 seconds",
+    ))
+}
+
 #[cfg(any(windows, target_os = "macos"))]
 fn system_integration_command(args: impl IntoIterator<Item = std::ffi::OsString>) -> Option<bool> {
     args.into_iter()
@@ -243,6 +308,32 @@ fn hex_value(value: u8) -> Option<u8> {
         b'a'..=b'f' => Some(value - b'a' + 10),
         b'A'..=b'F' => Some(value - b'A' + 10),
         _ => None,
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn installer_cleanup_command_requires_an_explicit_installer_path() {
+        let path = installer_cleanup_argument([
+            "Explorie.exe".into(),
+            "--cleanup-installer".into(),
+            r"C:\Users\fixture\Downloads\explorie-0.2.13-windows-x64-setup-unsigned.exe".into(),
+        ])
+        .unwrap();
+        assert!(path.is_absolute());
+        assert!(installer_cleanup_argument(["Explorie.exe".into()]).is_none());
+    }
+
+    #[test]
+    fn installer_cleanup_refuses_unrelated_executables() {
+        let error = cleanup_windows_installer(std::path::Path::new(
+            r"C:\Users\fixture\Downloads\unrelated.exe",
+        ))
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     }
 }
 

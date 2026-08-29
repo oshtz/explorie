@@ -5,6 +5,8 @@ const proofPath = path.join(process.cwd(), '.release-checks', 'platform-proof.js
 const required = {
   windows: [
     'installerInstalled',
+    'installerCleanupOfferedAndCompleted',
+    'automaticUpdateReplacedCleanedAndReopened',
     'headedConsoleAbsent',
     'multiWindowIsolation',
     'inboundDragDrop',
@@ -19,6 +21,8 @@ const required = {
   ],
   macos: [
     'dmgInstalledAndLaunched',
+    'dmgCleanupOfferedAndCompleted',
+    'automaticUpdateReplacedCleanedAndReopened',
     'signatureValid',
     'notarizationValid',
     'gatekeeperAccepted',

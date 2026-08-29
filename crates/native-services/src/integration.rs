@@ -16,6 +16,8 @@ use std::time::Duration;
 const METADATA_HELPER_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(target_os = "macos")]
 const MAX_METADATA_OUTPUT: usize = 1024 * 1024;
+#[cfg(target_os = "macos")]
+const INSTALL_CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -30,6 +32,36 @@ pub struct AppInfo {
     pub name: String,
     pub path: PathBuf,
     pub bundle_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallCleanupOffer {
+    pub image_path: PathBuf,
+    pub mount_point: PathBuf,
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Deserialize)]
+struct DiskImageInfo {
+    #[serde(default)]
+    images: Vec<DiskImage>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Deserialize)]
+struct DiskImage {
+    #[serde(rename = "image-path")]
+    image_path: Option<PathBuf>,
+    #[serde(rename = "system-entities", default)]
+    system_entities: Vec<DiskImageEntity>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Deserialize)]
+struct DiskImageEntity {
+    #[serde(rename = "mount-point")]
+    mount_point: Option<PathBuf>,
 }
 
 pub trait FinderTagsBackend: Send + Sync {
@@ -218,6 +250,22 @@ impl IntegrationService {
         })
     }
 
+    pub fn install_cleanup_offer(&self) -> BlockingTask<Option<InstallCleanupOffer>> {
+        let resources = self.context.resources().clone();
+        self.context.spawn_blocking(move || {
+            find_install_cleanup_offer(&resources).map_err(ServiceError::from)
+        })
+    }
+
+    pub fn cleanup_install_media(&self, offer: InstallCleanupOffer) -> BlockingTask<()> {
+        let resources = self.context.resources().clone();
+        let guard = ActiveOperation::new(Arc::clone(&self.shared));
+        self.context.spawn_blocking(move || {
+            let _guard = guard;
+            cleanup_install_media(&resources, &offer).map_err(ServiceError::from)
+        })
+    }
+
     pub fn home_dir(&self) -> BlockingTask<PathBuf> {
         self.context.spawn_blocking(|| {
             dirs::home_dir().ok_or_else(|| {
@@ -241,6 +289,207 @@ fn remote_root(shared: &SharedState, path: &Path) -> bool {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .contains(&crate::listing::normalize_path(path))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_disk_image_info(json: &[u8]) -> io::Result<Vec<InstallCleanupOffer>> {
+    let info: DiskImageInfo = serde_json::from_slice(json).map_err(io::Error::other)?;
+    Ok(info
+        .images
+        .into_iter()
+        .filter_map(|image| {
+            let image_path = image.image_path?;
+            image.system_entities.into_iter().find_map(|entity| {
+                entity.mount_point.map(|mount_point| InstallCleanupOffer {
+                    image_path: image_path.clone(),
+                    mount_point,
+                })
+            })
+        })
+        .collect())
+}
+
+#[cfg(target_os = "macos")]
+fn find_install_cleanup_offer(
+    resources: &crate::ResourcePaths,
+) -> io::Result<Option<InstallCleanupOffer>> {
+    let Some(current_exe) = resources.current_exe.as_deref() else {
+        return Ok(None);
+    };
+    let installed_roots = [
+        PathBuf::from("/Applications"),
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("/"))
+            .join("Applications"),
+    ];
+    let Some(app_bundle) = current_exe
+        .ancestors()
+        .find(|path| path.extension().is_some_and(|extension| extension == "app"))
+    else {
+        return Ok(None);
+    };
+    if !installed_roots
+        .iter()
+        .any(|root| app_bundle.starts_with(root))
+    {
+        return Ok(None);
+    }
+
+    let output = run_with_timeout(
+        Command::new("/usr/bin/hdiutil").args(["info", "-plist"]),
+        INSTALL_CLEANUP_TIMEOUT,
+        MAX_METADATA_OUTPUT,
+        64 * 1024,
+    )
+    .map_err(install_cleanup_process_error)?;
+    if !output.status.success() || output.stdout_truncated {
+        return Ok(None);
+    }
+    let temp = std::env::temp_dir().join(format!(
+        "explorie-install-media-{}-{}.plist",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    fs::write(&temp, output.stdout)?;
+    let converted = run_with_timeout(
+        Command::new("/usr/bin/plutil")
+            .args(["-convert", "json", "-o", "-"])
+            .arg(&temp),
+        INSTALL_CLEANUP_TIMEOUT,
+        MAX_METADATA_OUTPUT,
+        64 * 1024,
+    );
+    let _ = fs::remove_file(&temp);
+    let converted = converted.map_err(install_cleanup_process_error)?;
+    if !converted.status.success() || converted.stdout_truncated {
+        return Ok(None);
+    }
+
+    for offer in parse_disk_image_info(&converted.stdout)? {
+        if !offer.mount_point.starts_with("/Volumes")
+            || offer
+                .image_path
+                .extension()
+                .is_none_or(|extension| extension != "dmg")
+            || !offer.image_path.is_file()
+            || current_exe.starts_with(&offer.mount_point)
+        {
+            continue;
+        }
+        let Some(name) = offer.image_path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.to_ascii_lowercase().starts_with("explorie") {
+            continue;
+        }
+        let info_plist = offer.mount_point.join("explorie.app/Contents/Info.plist");
+        let Ok(info_plist) = fs::read_to_string(info_plist) else {
+            continue;
+        };
+        let version_entry = format!(
+            "<key>CFBundleShortVersionString</key><string>{}</string>",
+            resources.app_version
+        );
+        if info_plist.contains("<string>com.omershatz.explorie</string>")
+            && info_plist.contains(&version_entry)
+        {
+            return Ok(Some(offer));
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn find_install_cleanup_offer(
+    _resources: &crate::ResourcePaths,
+) -> io::Result<Option<InstallCleanupOffer>> {
+    Ok(None)
+}
+
+#[cfg(target_os = "macos")]
+fn cleanup_install_media(
+    resources: &crate::ResourcePaths,
+    offer: &InstallCleanupOffer,
+) -> io::Result<()> {
+    let Some(current) = find_install_cleanup_offer(resources)? else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "The Explorie installer image is no longer mounted",
+        ));
+    };
+    if &current != offer {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "The mounted installer changed before cleanup",
+        ));
+    }
+    let detached = run_with_timeout(
+        Command::new("/usr/bin/hdiutil")
+            .arg("detach")
+            .arg(&offer.mount_point),
+        INSTALL_CLEANUP_TIMEOUT,
+        64 * 1024,
+        64 * 1024,
+    )
+    .map_err(install_cleanup_process_error)?;
+    if !detached.status.success() {
+        let detail = String::from_utf8_lossy(&detached.stderr);
+        return Err(io::Error::other(format!(
+            "Unable to eject the installer image: {}",
+            detail.trim()
+        )));
+    }
+    move_install_image_to_trash(&offer.image_path)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn cleanup_install_media(
+    _resources: &crate::ResourcePaths,
+    _offer: &InstallCleanupOffer,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Installer image cleanup is available only on macOS",
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn install_cleanup_process_error(error: ProcessError) -> io::Error {
+    match error {
+        ProcessError::Io(error) => error,
+        ProcessError::TimedOut => io::Error::new(
+            io::ErrorKind::TimedOut,
+            "Installer cleanup helper timed out",
+        ),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn move_install_image_to_trash(path: &Path) -> io::Result<()> {
+    use std::ffi::{CStr, CString};
+    use std::os::raw::c_char;
+    use std::os::unix::ffi::OsStrExt;
+
+    unsafe extern "C" {
+        fn explorie_move_install_image_to_trash(path: *const c_char) -> *mut c_char;
+        fn explorie_install_cleanup_free(value: *mut c_char);
+    }
+
+    let path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid installer path"))?;
+    // SAFETY: The bridge copies the NUL-terminated path synchronously and returns
+    // either null or a heap string released by the paired free function.
+    let error = unsafe { explorie_move_install_image_to_trash(path.as_ptr()) };
+    if error.is_null() {
+        return Ok(());
+    }
+    // SAFETY: A non-null bridge result is a valid NUL-terminated allocation.
+    let message = unsafe { CStr::from_ptr(error) }
+        .to_string_lossy()
+        .into_owned();
+    // SAFETY: The pointer came from the bridge and has not been released yet.
+    unsafe { explorie_install_cleanup_free(error) };
+    Err(io::Error::other(message))
 }
 
 pub fn system_integration_status() -> io::Result<SystemIntegrationStatus> {
@@ -891,6 +1140,33 @@ mod tests {
         let colors = finder_tag_colors();
         assert_eq!(colors.get("None"), Some(&0));
         assert_eq!(colors.get("Orange"), Some(&7));
+    }
+
+    #[test]
+    fn disk_image_info_keeps_each_backing_image_with_its_mount_point() {
+        let offers = parse_disk_image_info(
+            br#"{
+                "images": [
+                    {
+                        "image-path": "/Users/fixture/Downloads/explorie-0.2.13-macos-arm64.dmg",
+                        "system-entities": [
+                            {"dev-entry": "/dev/disk4"},
+                            {"mount-point": "/Volumes/explorie"}
+                        ]
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            offers,
+            vec![InstallCleanupOffer {
+                image_path: PathBuf::from(
+                    "/Users/fixture/Downloads/explorie-0.2.13-macos-arm64.dmg"
+                ),
+                mount_point: PathBuf::from("/Volumes/explorie"),
+            }]
+        );
     }
 
     #[test]

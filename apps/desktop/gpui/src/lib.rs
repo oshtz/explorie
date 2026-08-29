@@ -19,11 +19,11 @@ use explorie_native_services::{
     BlockingTask, CombineMode, CompressRequest, CompressionLevel, ConflictPolicy,
     DetectedPreviewKind, DiskInfo, DownloadedUpdate, ErrorCode, ExtractRequest, FileOperationEvent,
     FileOperationKind, FileOperationRequest, FileOperationResult, HelperStatus, ImageMetadata,
-    NativeServices, PermanentDeleteResult, PreviewDetection, RemoteDriveEnvironment,
-    RemoteDriveExitBlocker, RemoteDriveProfile, RemoteDriveState, RemoteDriveStatus,
-    SearchCriteria, SearchProgressEvent, SearchResult, SearchType, ServiceError, ServiceEvent,
-    ServiceResult, SystemIntegrationStatus, SystemLocations, TextHighlightKind, TextPreview,
-    UpdateInfo, VideoFrame, VideoStatus, WatcherEvent, WatcherState, format_exif_date,
+    InstallCleanupOffer, NativeServices, PermanentDeleteResult, PreviewDetection,
+    RemoteDriveEnvironment, RemoteDriveExitBlocker, RemoteDriveProfile, RemoteDriveState,
+    RemoteDriveStatus, SearchCriteria, SearchProgressEvent, SearchResult, SearchType, ServiceError,
+    ServiceEvent, ServiceResult, SystemIntegrationStatus, SystemLocations, TextHighlightKind,
+    TextPreview, UpdateInfo, VideoFrame, VideoStatus, WatcherEvent, WatcherState, format_exif_date,
     is_image_metadata_path, validate_remote_drive_profile,
 };
 use gpui::{
@@ -2153,6 +2153,7 @@ enum SettingsConfirmation {
     DeleteTheme(String),
     RemoveCustomField(String),
     InstallUpdate(UpdateInfo),
+    CleanupInstallMedia(InstallCleanupOffer),
     DiscardDraft(PendingDraftAction),
 }
 
@@ -3001,6 +3002,8 @@ pub struct DirectoryWindow {
     integration_tasks: Vec<Task<()>>,
     integration_generation: u64,
     system_integration_task: Option<Task<()>>,
+    install_cleanup_task: Option<Task<()>>,
+    install_cleanup_pending: bool,
     service_event_task: Option<Task<()>>,
     shared_state_task: Option<Task<()>>,
     shared_state_revision: u64,
@@ -3425,6 +3428,8 @@ impl DirectoryWindow {
             integration_tasks: Vec::new(),
             integration_generation: 0,
             system_integration_task: None,
+            install_cleanup_task: None,
+            install_cleanup_pending: false,
             service_event_task: None,
             shared_state_task: None,
             shared_state_revision,
@@ -5779,6 +5784,9 @@ impl DirectoryWindow {
             SettingsConfirmation::DeleteTheme(name) => self.delete_named_theme(&name, cx),
             SettingsConfirmation::RemoveCustomField(name) => self.remove_custom_field(&name, cx),
             SettingsConfirmation::InstallUpdate(update) => self.start_update_download(update, cx),
+            SettingsConfirmation::CleanupInstallMedia(offer) => {
+                self.start_install_media_cleanup(offer, cx)
+            }
             SettingsConfirmation::DiscardDraft(action) => {
                 self.discard_draft_and_continue(action, cx)
             }
@@ -10342,6 +10350,62 @@ impl DirectoryWindow {
         cx.notify();
     }
 
+    pub fn start_install_cleanup_offer(&mut self, cx: &mut Context<Self>) {
+        if self.install_cleanup_pending {
+            return;
+        }
+        self.install_cleanup_pending = true;
+        let task = self.services.integration.install_cleanup_offer();
+        self.install_cleanup_task = Some(cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |view, cx| {
+                view.install_cleanup_pending = false;
+                view.install_cleanup_task = None;
+                if let Ok(Some(offer)) = result
+                    && !view.overlay_is_active()
+                {
+                    view.begin_overlay_focus();
+                    view.request_settings_confirmation(
+                        SettingsConfirmation::CleanupInstallMedia(offer),
+                        cx,
+                    );
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    fn start_install_media_cleanup(&mut self, offer: InstallCleanupOffer, cx: &mut Context<Self>) {
+        if self.install_cleanup_pending {
+            return;
+        }
+        self.install_cleanup_pending = true;
+        let task = self.services.integration.cleanup_install_media(offer);
+        self.install_cleanup_task = Some(cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |view, cx| {
+                view.install_cleanup_pending = false;
+                view.install_cleanup_task = None;
+                match result {
+                    Ok(()) => view.show_toast(
+                        "Installer ejected and moved to Trash",
+                        ToastKind::Success,
+                        cx,
+                    ),
+                    Err(error) => {
+                        view.record_error("Installer cleanup failed", error.to_string());
+                        view.show_toast(
+                            format!("Unable to clean up the installer: {error}"),
+                            ToastKind::Warning,
+                            cx,
+                        );
+                    }
+                }
+                cx.notify();
+            });
+        }));
+    }
+
     fn toggle_system_integration(&mut self, cx: &mut Context<Self>) {
         if self.system_integration_pending {
             return;
@@ -13096,7 +13160,19 @@ impl DirectoryWindow {
         {
             return;
         }
+        let is_plain_space = event.keystroke.key == "space"
+            && !event.keystroke.modifiers.control
+            && !event.keystroke.modifiers.alt
+            && !event.keystroke.modifiers.platform
+            && !event.keystroke.modifiers.shift;
         if self.quick_look_open {
+            if is_plain_space {
+                if !event.is_held {
+                    self.toggle_quick_look_selected(cx);
+                }
+                cx.stop_propagation();
+                return;
+            }
             let is_audio = matches!(
                 self.preview_state,
                 PreviewState::Ready {
@@ -13114,7 +13190,6 @@ impl DirectoryWindow {
             match event.keystroke.key.as_str() {
                 "escape" if self.quick_look_index_open => self.toggle_quick_look_index(cx),
                 "escape" => self.close_quick_look(cx),
-                "space" if !event.is_held => self.close_quick_look(cx),
                 "enter"
                     if event.keystroke.modifiers.platform && self.quick_look_paths.len() > 1 =>
                 {
@@ -13257,6 +13332,13 @@ impl DirectoryWindow {
         }
         if self.context_menu.is_some() {
             self.handle_context_menu_key(event, cx);
+            return;
+        }
+        if is_plain_space {
+            if !event.is_held {
+                self.toggle_quick_look_selected(cx);
+            }
+            cx.stop_propagation();
             return;
         }
         if !self.search_active {
@@ -19938,55 +20020,47 @@ impl DirectoryWindow {
                 "s"
             }
         );
-        let (update_message, update_button_label, update_action) = if !cfg!(windows) {
-            (
-                "Automatic installer updates are currently available on Windows.".to_string(),
-                "Unavailable",
+        let (update_message, update_button_label, update_action) = match &self.update_status {
+            UpdateStatus::Idle => (
+                "Updates are checked automatically when Explorie starts.".to_string(),
+                "Check for updates",
+                Some(UpdateAction::Check),
+            ),
+            UpdateStatus::Checking => (
+                "Checking the latest published release…".to_string(),
+                "Checking…",
                 None,
-            )
-        } else {
-            match &self.update_status {
-                UpdateStatus::Idle => (
-                    "Updates are checked automatically when Explorie starts.".to_string(),
-                    "Check for updates",
-                    Some(UpdateAction::Check),
-                ),
-                UpdateStatus::Checking => (
-                    "Checking the latest published release…".to_string(),
-                    "Checking…",
-                    None,
-                ),
-                UpdateStatus::UpToDate => (
-                    "Explorie is up to date.".to_string(),
-                    "Check again",
-                    Some(UpdateAction::Check),
-                ),
-                UpdateStatus::Available(update) => (
-                    format!("Explorie {} is available.", update.version),
-                    "Download and install",
-                    Some(UpdateAction::Download(update.clone())),
-                ),
-                UpdateStatus::Downloading(update) => (
-                    format!("Downloading and verifying Explorie {}…", update.version),
-                    "Downloading…",
-                    None,
-                ),
-                UpdateStatus::Ready(update) => (
-                    format!("Explorie {} is verified and ready.", update.info.version),
-                    "Install and restart",
-                    Some(UpdateAction::Install(update.clone())),
-                ),
-                UpdateStatus::Installing => (
-                    "Preparing the installer and closing Explorie…".to_string(),
-                    "Installing…",
-                    None,
-                ),
-                UpdateStatus::Failed(error) => (
-                    format!("Update unavailable: {error}"),
-                    "Retry",
-                    Some(UpdateAction::Check),
-                ),
-            }
+            ),
+            UpdateStatus::UpToDate => (
+                "Explorie is up to date.".to_string(),
+                "Check again",
+                Some(UpdateAction::Check),
+            ),
+            UpdateStatus::Available(update) => (
+                format!("Explorie {} is available.", update.version),
+                "Download and install",
+                Some(UpdateAction::Download(update.clone())),
+            ),
+            UpdateStatus::Downloading(update) => (
+                format!("Downloading and verifying Explorie {}…", update.version),
+                "Downloading…",
+                None,
+            ),
+            UpdateStatus::Ready(update) => (
+                format!("Explorie {} is verified and ready.", update.info.version),
+                "Install and restart",
+                Some(UpdateAction::Install(update.clone())),
+            ),
+            UpdateStatus::Installing => (
+                "Replacing Explorie and preparing to reopen…".to_string(),
+                "Installing…",
+                None,
+            ),
+            UpdateStatus::Failed(error) => (
+                format!("Update unavailable: {error}"),
+                "Retry",
+                Some(UpdateAction::Check),
+            ),
         };
         let update_action_enabled = update_action.is_some();
         let update_control = toolbar_button_enabled(
@@ -20429,10 +20503,24 @@ impl DirectoryWindow {
             SettingsConfirmation::InstallUpdate(update) => (
                 Cow::Owned(format!("Install Explorie {}?", update.version)),
                 Cow::Borrowed(
-                    "The installer will be downloaded, verified with the published SHA-256 manifest, and launched silently. Explorie will restart to finish the update.",
+                    "The update will be downloaded, verified against the published release and platform security checks, then replace this installation. Explorie will clean up the update files and reopen automatically.",
                 ),
                 "Download and restart",
                 "Later",
+                self.palette.accent,
+            ),
+            SettingsConfirmation::CleanupInstallMedia(offer) => (
+                Cow::Borrowed("Finish installing Explorie?"),
+                Cow::Owned(format!(
+                    "Eject the mounted installer and move {} to Trash. The installed app and your settings stay untouched.",
+                    offer
+                        .image_path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("the downloaded DMG")
+                )),
+                "Eject and move to Trash",
+                "Keep",
                 self.palette.accent,
             ),
             SettingsConfirmation::DiscardDraft(_) => (

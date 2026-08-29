@@ -15,6 +15,10 @@ fn main() {
             "cargo:rerun-if-changed={}",
             root.join("FolderIntegrationBridge.m").display()
         );
+        println!(
+            "cargo:rerun-if-changed={}",
+            root.join("InstallCleanupBridge.m").display()
+        );
         println!("cargo:rustc-link-lib=framework=Foundation");
         println!("cargo:rustc-link-lib=framework=CoreServices");
         println!("cargo:rustc-link-lib=framework=Security");
@@ -22,6 +26,7 @@ fn main() {
         cc::Build::new()
             .file(root.join("MountBridge.m"))
             .file(root.join("FolderIntegrationBridge.m"))
+            .file(root.join("InstallCleanupBridge.m"))
             .flag("-fobjc-arc")
             .flag("-fblocks")
             .flag("-mmacosx-version-min=13.0")
