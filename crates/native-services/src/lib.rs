@@ -21,10 +21,12 @@ pub mod image_metadata;
 pub mod integration;
 pub mod listing;
 pub mod metadata;
+pub mod model_preview;
 pub mod mutations;
 pub mod preview;
 mod process;
 pub mod remote_drives;
+pub mod rich_preview;
 pub mod search;
 pub mod updater;
 pub mod video;
@@ -46,6 +48,7 @@ pub use integration::{
 };
 pub use listing::{DirInfo, DiskInfo, ListRequest, SystemLocations};
 pub use metadata::MetadataService;
+pub use model_preview::{ModelCamera, ModelFrame, ModelPreview};
 pub use mutations::{
     BatchRenameItem, BatchRenamePair, BatchRenameResult, MutationService, PermanentDeleteFailure,
     PermanentDeleteResult, SafeMutationRequest,
@@ -60,6 +63,7 @@ pub use remote_drives::{
     RemoteDriveService, RemoteDriveState, RemoteDriveStatus, RemoteMountRequest,
     RemoteProcessStatus, validate_remote_drive_profile,
 };
+pub use rich_preview::{RichBlock, RichBlockKind, RichPreview};
 pub use search::{
     CombineMode, SearchCriteria, SearchIndexHealth, SearchProgressEvent, SearchResult,
     SearchService, SearchType,

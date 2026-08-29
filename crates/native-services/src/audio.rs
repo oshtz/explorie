@@ -2,15 +2,22 @@
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
 use rodio::{Decoder, DeviceSinkBuilder, Player, Source};
+use sha2::{Digest, Sha256};
 
+use crate::process::{ProcessError, run_with_timeout};
 use crate::{BlockingTask, ErrorCode, ServiceContext, ServiceError, ServiceResult};
 
 const DEFAULT_VOLUME: f32 = 0.8;
+const AUDIO_TRANSCODE_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_AUDIO_SOURCE_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_TRANSCODE_CACHE_ENTRIES: usize = 8;
+const MAX_TRANSCODE_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Snapshot consumed by the GPUI controls. Durations are milliseconds so the
 /// boundary remains serializable and independent of the playback library.
@@ -45,7 +52,10 @@ pub trait AudioBackend: Send + Sync {
     fn open(&self, path: &Path) -> ServiceResult<Arc<dyn AudioPlayback>>;
 }
 
-struct RodioBackend;
+struct RodioBackend {
+    cache_dir: PathBuf,
+    transcode_lock: Mutex<()>,
+}
 
 struct RodioPlayback {
     _device: rodio::MixerDeviceSink,
@@ -55,35 +65,50 @@ struct RodioPlayback {
 
 impl AudioBackend for RodioBackend {
     fn open(&self, path: &Path) -> ServiceResult<Arc<dyn AudioPlayback>> {
-        let file = File::open(path).map_err(|error| {
-            ServiceError::from(error).operation(format!("open audio {}", path.display()))
-        })?;
-        let decoder = Decoder::try_from(file).map_err(|error| {
-            ServiceError::new(
-                ErrorCode::Unsupported,
-                format!("Unable to decode audio: {error}"),
-            )
-            .operation(format!("decode audio {}", path.display()))
-        })?;
-        let duration = decoder.total_duration();
-        let device = DeviceSinkBuilder::open_default_sink().map_err(|error| {
-            ServiceError::new(
-                ErrorCode::RemoteUnavailable,
-                format!("No usable audio output device is available: {error}"),
-            )
-            .retryable(true)
-            .operation("open default audio output")
-        })?;
-        let player = Player::connect_new(device.mixer());
-        player.set_volume(DEFAULT_VOLUME);
-        player.append(decoder);
-        player.pause();
-        Ok(Arc::new(RodioPlayback {
-            _device: device,
-            player,
-            duration,
-        }))
+        match open_rodio_playback(path) {
+            Ok(playback) => Ok(playback),
+            Err(_) if matches!(audio_extension(path).as_str(), "opus" | "oga") => {
+                let _guard = self
+                    .transcode_lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let transcoded = transcode_opus(path, &self.cache_dir)?;
+                open_rodio_playback(&transcoded)
+            }
+            Err(error) => Err(error),
+        }
     }
+}
+
+fn open_rodio_playback(path: &Path) -> ServiceResult<Arc<dyn AudioPlayback>> {
+    let file = File::open(path).map_err(|error| {
+        ServiceError::from(error).operation(format!("open audio {}", path.display()))
+    })?;
+    let decoder = Decoder::try_from(file).map_err(|error| {
+        ServiceError::new(
+            ErrorCode::Unsupported,
+            format!("Unable to decode audio: {error}"),
+        )
+        .operation(format!("decode audio {}", path.display()))
+    })?;
+    let duration = decoder.total_duration();
+    let device = DeviceSinkBuilder::open_default_sink().map_err(|error| {
+        ServiceError::new(
+            ErrorCode::RemoteUnavailable,
+            format!("No usable audio output device is available: {error}"),
+        )
+        .retryable(true)
+        .operation("open default audio output")
+    })?;
+    let player = Player::connect_new(device.mixer());
+    player.set_volume(DEFAULT_VOLUME);
+    player.append(decoder);
+    player.pause();
+    Ok(Arc::new(RodioPlayback {
+        _device: device,
+        player,
+        duration,
+    }))
 }
 
 impl AudioPlayback for RodioPlayback {
@@ -151,7 +176,14 @@ pub struct AudioService {
 
 impl AudioService {
     pub fn new(context: ServiceContext) -> Self {
-        Self::with_backend(context, Arc::new(RodioBackend))
+        let cache_dir = context.resources().cache_dir.join("audio-preview");
+        Self::with_backend(
+            context,
+            Arc::new(RodioBackend {
+                cache_dir,
+                transcode_lock: Mutex::new(()),
+            }),
+        )
     }
 
     pub fn with_backend(context: ServiceContext, backend: Arc<dyn AudioBackend>) -> Self {
@@ -278,24 +310,146 @@ impl AudioService {
 }
 
 fn validate_audio_path(path: &Path) -> ServiceResult<()> {
-    if !path.is_file() {
+    let metadata = path.metadata().map_err(ServiceError::from)?;
+    if !metadata.is_file() {
         return Err(ServiceError::new(
             ErrorCode::NotFound,
             format!("Audio file does not exist: {}", path.display()),
         ));
     }
-    let extension = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if !matches!(extension.as_str(), "mp3" | "wav" | "flac" | "ogg" | "m4a") {
+    if metadata.len() > MAX_AUDIO_SOURCE_BYTES {
+        return Err(ServiceError::new(
+            ErrorCode::Unsupported,
+            "Audio preview is limited to files no larger than 512 MiB",
+        ));
+    }
+    let extension = audio_extension(path);
+    if !matches!(
+        extension.as_str(),
+        "mp3"
+            | "wav"
+            | "flac"
+            | "ogg"
+            | "opus"
+            | "oga"
+            | "m4a"
+            | "m4b"
+            | "aac"
+            | "aif"
+            | "aiff"
+            | "caf"
+            | "alac"
+    ) {
         return Err(ServiceError::new(
             ErrorCode::Unsupported,
             format!("Native audio playback does not support .{extension}"),
         ));
     }
     Ok(())
+}
+
+fn audio_extension(path: &Path) -> String {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+}
+
+fn transcode_opus(path: &Path, cache_dir: &Path) -> ServiceResult<PathBuf> {
+    let metadata = path.metadata().map_err(ServiceError::from)?;
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |value| value.as_nanos());
+    let mut hasher = Sha256::new();
+    hasher.update(path.as_os_str().to_string_lossy().as_bytes());
+    hasher.update(metadata.len().to_le_bytes());
+    hasher.update(modified.to_le_bytes());
+    let digest = format!("{:x}", hasher.finalize());
+    let output = cache_dir.join(format!("{}-opus.flac", &digest[..24]));
+    if output.metadata().is_ok_and(|metadata| metadata.len() > 0) {
+        return Ok(output);
+    }
+    std::fs::create_dir_all(cache_dir).map_err(ServiceError::from)?;
+    let temporary = output.with_extension(format!("flac.{}.tmp", uuid::Uuid::new_v4()));
+    let result = run_with_timeout(
+        ffmpeg_command()
+            .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i"])
+            .arg(path)
+            .args(["-map", "0:a:0", "-vn", "-c:a", "flac", "-f", "flac"])
+            .arg(&temporary),
+        AUDIO_TRANSCODE_TIMEOUT,
+        0,
+        64 * 1024,
+    )
+    .map_err(|error| match error {
+        ProcessError::Io(error) => ServiceError::new(
+            ErrorCode::HelperMissing,
+            format!("Opus playback requires the bundled FFmpeg helper: {error}"),
+        ),
+        ProcessError::TimedOut => ServiceError::new(
+            ErrorCode::Busy,
+            "Opus conversion timed out before playback could start",
+        ),
+    })?;
+    if !result.status.success()
+        || !temporary
+            .metadata()
+            .is_ok_and(|metadata| metadata.len() > 0)
+    {
+        let message = String::from_utf8_lossy(&result.stderr).trim().to_string();
+        let _ = std::fs::remove_file(&temporary);
+        return Err(ServiceError::new(
+            ErrorCode::Unsupported,
+            if message.is_empty() {
+                "FFmpeg could not decode this Opus file".to_string()
+            } else {
+                format!("FFmpeg could not decode this Opus file: {message}")
+            },
+        ));
+    }
+    if output.exists() {
+        std::fs::remove_file(&output).map_err(ServiceError::from)?;
+    }
+    std::fs::rename(&temporary, &output).map_err(ServiceError::from)?;
+    prune_audio_cache(cache_dir);
+    Ok(output)
+}
+
+fn ffmpeg_command() -> Command {
+    let mut command = Command::new("ffmpeg");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    command
+}
+
+fn prune_audio_cache(cache_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(cache_dir) else {
+        return;
+    };
+    let mut cached = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let metadata = entry.metadata().ok()?;
+            Some((
+                entry.path(),
+                metadata.modified().unwrap_or(UNIX_EPOCH),
+                metadata.len(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    cached.sort_by_key(|(_, modified, _)| *modified);
+    let mut bytes = cached.iter().map(|(_, _, size)| *size).sum::<u64>();
+    while cached.len() > MAX_TRANSCODE_CACHE_ENTRIES || bytes > MAX_TRANSCODE_CACHE_BYTES {
+        let (path, _, size) = cached.remove(0);
+        if std::fs::remove_file(path).is_ok() {
+            bytes = bytes.saturating_sub(size);
+        }
+    }
 }
 
 fn no_active_audio() -> ServiceError {
@@ -463,6 +617,10 @@ mod tests {
         std::fs::write(&unsupported, b"fixture").unwrap();
         let error = service.load(unsupported).wait().unwrap_err();
         assert_eq!(error.code, ErrorCode::Unsupported);
+
+        let opus = directory.path().join("song.opus");
+        std::fs::write(&opus, b"fixture").unwrap();
+        assert_eq!(service.load(opus.clone()).wait().unwrap().path, opus);
     }
 
     struct StaleBackend {

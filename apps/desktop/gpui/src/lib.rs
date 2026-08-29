@@ -19,12 +19,13 @@ use explorie_native_services::{
     BlockingTask, CombineMode, CompressRequest, CompressionLevel, ConflictPolicy,
     DetectedPreviewKind, DiskInfo, DownloadedUpdate, ErrorCode, ExtractRequest, FileOperationEvent,
     FileOperationKind, FileOperationRequest, FileOperationResult, HelperStatus, ImageMetadata,
-    InstallCleanupOffer, NativeServices, PermanentDeleteResult, PreviewDetection,
-    RemoteDriveEnvironment, RemoteDriveExitBlocker, RemoteDriveProfile, RemoteDriveState,
-    RemoteDriveStatus, SearchCriteria, SearchProgressEvent, SearchResult, SearchType, ServiceError,
-    ServiceEvent, ServiceResult, SystemIntegrationStatus, SystemLocations, TextHighlightKind,
-    TextPreview, UpdateInfo, VideoFrame, VideoStatus, WatcherEvent, WatcherState, format_exif_date,
-    is_image_metadata_path, validate_remote_drive_profile,
+    InstallCleanupOffer, ModelCamera, ModelFrame, NativeServices, PermanentDeleteResult,
+    PreviewDetection, RemoteDriveEnvironment, RemoteDriveExitBlocker, RemoteDriveProfile,
+    RemoteDriveState, RemoteDriveStatus, RichBlockKind, SearchCriteria, SearchProgressEvent,
+    SearchResult, SearchType, ServiceError, ServiceEvent, ServiceResult, SystemIntegrationStatus,
+    SystemLocations, TextHighlightKind, TextPreview, UpdateInfo, VideoFrame, VideoStatus,
+    WatcherEvent, WatcherState, format_exif_date, is_image_metadata_path,
+    validate_remote_drive_profile,
 };
 use gpui::{
     AccessibleAction, AnyElement, App, AssetSource, Bounds, ClipboardItem, Context, ElementId,
@@ -166,6 +167,9 @@ gpui::actions!(
         CycleAccent,
         CycleDensity,
         CycleUiScale,
+        IncreaseUiScale,
+        DecreaseUiScale,
+        ResetUiScale,
         CycleListRowHeight,
         CycleGridWidth,
         CycleFont,
@@ -201,6 +205,7 @@ pub const DEFAULT_WINDOW_WIDTH: f32 = 1024.0;
 pub const DEFAULT_WINDOW_HEIGHT: f32 = 768.0;
 pub const MIN_WINDOW_WIDTH: f32 = 800.0;
 pub const MIN_WINDOW_HEIGHT: f32 = 600.0;
+const UI_SCALE_STEPS: &[f32] = &[0.9, 1.0, 1.1, 1.25, 1.4];
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ExplorieAssets;
@@ -460,6 +465,13 @@ fn entry_supports_grid_thumbnail(entry: &FileEntry) -> bool {
             | "ogv"
             | "ts"
             | "vob"
+            | "glb"
+            | "gltf"
+            | "obj"
+            | "stl"
+            | "ply"
+            | "3mf"
+            | "fbx"
     )
 }
 
@@ -824,6 +836,25 @@ fn next_f32(current: f32, values: &[f32]) -> f32 {
         .position(|value| (current - value).abs() < f32::EPSILON)
         .unwrap_or(0);
     values[(index + 1) % values.len()]
+}
+
+fn stepped_f32(current: f32, values: &[f32], direction: isize) -> f32 {
+    if direction > 0 {
+        values
+            .iter()
+            .copied()
+            .find(|value| *value > current + f32::EPSILON)
+            .unwrap_or_else(|| values.last().copied().unwrap_or(current))
+    } else if direction < 0 {
+        values
+            .iter()
+            .rev()
+            .copied()
+            .find(|value| *value < current - f32::EPSILON)
+            .unwrap_or_else(|| values.first().copied().unwrap_or(current))
+    } else {
+        current
+    }
 }
 
 fn next_u8(current: u8, values: &[u8]) -> u8 {
@@ -1345,6 +1376,11 @@ fn unknown_preview_detection() -> PreviewDetection {
 
 fn render_video_frame(frame: &VideoFrame) -> Option<Arc<RenderImage>> {
     let buffer = image::RgbaImage::from_raw(frame.width, frame.height, frame.bgra.to_vec())?;
+    Some(Arc::new(RenderImage::new([image::Frame::new(buffer)])))
+}
+
+fn render_model_frame(frame: &ModelFrame) -> Option<Arc<RenderImage>> {
+    let buffer = image::RgbaImage::from_raw(frame.width, frame.height, frame.rgba.to_vec())?;
     Some(Arc::new(RenderImage::new([image::Frame::new(buffer)])))
 }
 
@@ -2331,6 +2367,14 @@ struct MediaSliderDrag {
     bounds: Bounds<Pixels>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ModelDrag {
+    start_x: f32,
+    start_y: f32,
+    camera: ModelCamera,
+    pan: bool,
+}
+
 impl AppearanceValueEditor {
     fn title(&self) -> &'static str {
         match self.kind {
@@ -3171,6 +3215,12 @@ pub struct DirectoryWindow {
     video_frame_position_ms: Option<u64>,
     video_tick_task: Option<Task<()>>,
     media_slider_drag: Option<MediaSliderDrag>,
+    model_camera: ModelCamera,
+    model_rendered_camera: ModelCamera,
+    model_frame: Option<Arc<RenderImage>>,
+    model_render_generation: u64,
+    model_task: Option<Task<()>>,
+    model_drag: Option<ModelDrag>,
     pdf_zoom_percent: u16,
     pdf_fit: bool,
     custom_fields_editor: Option<CustomFieldsEditor>,
@@ -3600,6 +3650,12 @@ impl DirectoryWindow {
             video_frame_position_ms: None,
             video_tick_task: None,
             media_slider_drag: None,
+            model_camera: ModelCamera::default(),
+            model_rendered_camera: ModelCamera::default(),
+            model_frame: None,
+            model_render_generation: 0,
+            model_task: None,
+            model_drag: None,
             pdf_zoom_percent: 100,
             pdf_fit: true,
             custom_fields_editor: None,
@@ -6099,7 +6155,7 @@ impl DirectoryWindow {
 
     fn settings_slider_values(kind: SettingsSlider) -> &'static [f32] {
         match kind {
-            SettingsSlider::UiScale => &[0.9, 1.0, 1.1, 1.25, 1.4],
+            SettingsSlider::UiScale => UI_SCALE_STEPS,
             SettingsSlider::ListRowHeight => &[26.0, 30.0, 34.0, 40.0, 46.0, 52.0],
             SettingsSlider::GridWidth => &[
                 120.0, 130.0, 140.0, 150.0, 160.0, 170.0, 180.0, 190.0, 200.0, 210.0, 220.0, 230.0,
@@ -6311,14 +6367,29 @@ impl DirectoryWindow {
     }
 
     fn cycle_ui_scale(&mut self, cx: &mut Context<Self>) {
-        self.settings.appearance.ui_scale = next_f32(
-            self.settings.appearance.ui_scale,
-            &[0.9, 1.0, 1.1, 1.25, 1.4],
-        );
+        self.settings.appearance.ui_scale =
+            next_f32(self.settings.appearance.ui_scale, UI_SCALE_STEPS);
         self.finish_settings_change(
             format!("UI scale: {:.2}×", self.settings.appearance.ui_scale),
             cx,
         );
+    }
+
+    fn adjust_ui_scale(&mut self, direction: isize, cx: &mut Context<Self>) {
+        let value = stepped_f32(self.settings.appearance.ui_scale, UI_SCALE_STEPS, direction);
+        self.set_ui_scale(value, cx);
+    }
+
+    fn reset_ui_scale(&mut self, cx: &mut Context<Self>) {
+        self.set_ui_scale(AppearanceSettings::default().ui_scale, cx);
+    }
+
+    fn set_ui_scale(&mut self, value: f32, cx: &mut Context<Self>) {
+        if (self.settings.appearance.ui_scale - value).abs() < f32::EPSILON {
+            return;
+        }
+        self.settings.appearance.ui_scale = value;
+        self.finish_settings_change(format!("UI scale: {value:.2}×"), cx);
     }
 
     fn cycle_list_row_height(&mut self, cx: &mut Context<Self>) {
@@ -9611,6 +9682,12 @@ impl DirectoryWindow {
         self.pdf_zoom_percent = 100;
         self.pdf_fit = true;
         self.stop_media_preview();
+        self.model_camera = ModelCamera::default();
+        self.model_rendered_camera = self.model_camera;
+        self.model_frame = None;
+        self.model_drag = None;
+        self.model_render_generation = self.model_render_generation.wrapping_add(1);
+        self.model_task = None;
         self.preview_detection = None;
         self.preview_prefetch_tasks.clear();
         let editor_matches = self
@@ -9771,6 +9848,65 @@ impl DirectoryWindow {
                     content: PreviewContent::Image(path),
                 };
                 self.preview_task = None;
+            }
+            PreviewRoute::Model => {
+                self.preview_state = PreviewState::Loading { path: path.clone() };
+                let camera = self.model_camera;
+                let task = self.services.previews.model(path.clone(), camera, 960, 640);
+                let fallback = detection.clone();
+                self.preview_task = Some(cx.spawn(async move |this, cx| {
+                    let result = task.await;
+                    let _ = this.update(cx, |view, cx| {
+                        if view.preview_generation != generation {
+                            return;
+                        }
+                        view.preview_state = match result {
+                            Ok(preview) => {
+                                view.model_frame = render_model_frame(&preview.frame);
+                                view.model_rendered_camera = camera;
+                                PreviewState::Ready {
+                                    path,
+                                    content: PreviewContent::Model(preview),
+                                }
+                            }
+                            Err(error) => PreviewState::Ready {
+                                path,
+                                content: PreviewContent::Fallback {
+                                    detection: fallback.unwrap_or_else(unknown_preview_detection),
+                                    error: Some(error),
+                                },
+                            },
+                        };
+                        cx.notify();
+                    });
+                }));
+            }
+            PreviewRoute::Rich => {
+                self.preview_state = PreviewState::Loading { path: path.clone() };
+                let task = self.services.previews.rich(path.clone());
+                let fallback = detection.clone();
+                self.preview_task = Some(cx.spawn(async move |this, cx| {
+                    let result = task.await;
+                    let _ = this.update(cx, |view, cx| {
+                        if view.preview_generation != generation {
+                            return;
+                        }
+                        view.preview_state = match result {
+                            Ok(preview) => PreviewState::Ready {
+                                path,
+                                content: PreviewContent::Rich(preview),
+                            },
+                            Err(error) => PreviewState::Ready {
+                                path,
+                                content: PreviewContent::Fallback {
+                                    detection: fallback.unwrap_or_else(unknown_preview_detection),
+                                    error: Some(error),
+                                },
+                            },
+                        };
+                        cx.notify();
+                    });
+                }));
             }
             PreviewRoute::Archive => {
                 self.preview_state = PreviewState::Ready {
@@ -10642,6 +10778,123 @@ impl DirectoryWindow {
         self.video_frame = None;
         self.video_frame_position_ms = None;
         self.video_tick_task = None;
+    }
+
+    fn request_model_render(&mut self, cx: &mut Context<Self>) {
+        if self.model_task.is_some() || self.model_camera == self.model_rendered_camera {
+            return;
+        }
+        let Some(path) = self.preview_state.path().map(Path::to_path_buf) else {
+            return;
+        };
+        if !matches!(
+            self.preview_state,
+            PreviewState::Ready {
+                content: PreviewContent::Model(_),
+                ..
+            }
+        ) {
+            return;
+        }
+        let preview_generation = self.preview_generation;
+        self.model_render_generation = self.model_render_generation.wrapping_add(1);
+        let model_generation = self.model_render_generation;
+        let camera = self.model_camera;
+        let task = self.services.previews.model(path.clone(), camera, 960, 640);
+        self.model_task = Some(cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |view, cx| {
+                if view.preview_generation != preview_generation
+                    || view.model_render_generation != model_generation
+                {
+                    return;
+                }
+                view.model_task = None;
+                match result {
+                    Ok(preview) => {
+                        view.model_frame = render_model_frame(&preview.frame);
+                        view.model_rendered_camera = camera;
+                        view.preview_state = PreviewState::Ready {
+                            path,
+                            content: PreviewContent::Model(preview),
+                        };
+                    }
+                    Err(error) => view.show_toast(
+                        format!("Unable to redraw the model: {error}"),
+                        ToastKind::Warning,
+                        cx,
+                    ),
+                }
+                let needs_follow_up = view.model_camera != view.model_rendered_camera;
+                if needs_follow_up {
+                    view.request_model_render(cx);
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    fn adjust_model_camera(
+        &mut self,
+        yaw: f32,
+        pitch: f32,
+        zoom_factor: f32,
+        pan_x: f32,
+        pan_y: f32,
+        cx: &mut Context<Self>,
+    ) {
+        self.model_camera.yaw += yaw;
+        self.model_camera.pitch = (self.model_camera.pitch + pitch).clamp(-1.45, 1.45);
+        self.model_camera.zoom = (self.model_camera.zoom * zoom_factor).clamp(0.25, 4.0);
+        self.model_camera.pan_x = (self.model_camera.pan_x + pan_x).clamp(-1.5, 1.5);
+        self.model_camera.pan_y = (self.model_camera.pan_y + pan_y).clamp(-1.5, 1.5);
+        self.request_model_render(cx);
+        cx.notify();
+    }
+
+    fn reset_model_camera(&mut self, cx: &mut Context<Self>) {
+        self.model_camera = ModelCamera::default();
+        self.request_model_render(cx);
+    }
+
+    fn start_model_drag(&mut self, event: &gpui::MouseDownEvent, pan: bool) {
+        self.model_drag = Some(ModelDrag {
+            start_x: f32::from(event.position.x),
+            start_y: f32::from(event.position.y),
+            camera: self.model_camera,
+            pan,
+        });
+    }
+
+    fn update_model_drag(&mut self, event: &gpui::MouseMoveEvent, cx: &mut Context<Self>) {
+        let Some(drag) = self.model_drag else {
+            return;
+        };
+        let expected_button = if drag.pan {
+            MouseButton::Right
+        } else {
+            MouseButton::Left
+        };
+        if event.pressed_button != Some(expected_button) {
+            self.model_drag = None;
+            return;
+        }
+        let delta_x = f32::from(event.position.x) - drag.start_x;
+        let delta_y = f32::from(event.position.y) - drag.start_y;
+        self.model_camera = drag.camera;
+        if drag.pan {
+            self.model_camera.pan_x = (drag.camera.pan_x + delta_x * 0.0025).clamp(-1.5, 1.5);
+            self.model_camera.pan_y = (drag.camera.pan_y - delta_y * 0.0025).clamp(-1.5, 1.5);
+        } else {
+            self.model_camera.yaw = drag.camera.yaw + delta_x * 0.01;
+            self.model_camera.pitch = (drag.camera.pitch + delta_y * 0.01).clamp(-1.45, 1.45);
+        }
+        self.request_model_render(cx);
+        cx.notify();
+    }
+
+    fn finish_model_drag(&mut self) {
+        self.model_drag = None;
     }
 
     fn refresh_audio_status(&mut self) {
@@ -23321,6 +23574,233 @@ impl DirectoryWindow {
                         })
                         .into_any_element()
                 }
+                PreviewContent::Model(model) => {
+                    let frame = self.model_frame.clone();
+                    let details = format!(
+                        "{} · {} mesh{} · {} vertices · {} triangles{}",
+                        model.format,
+                        model.mesh_count,
+                        if model.mesh_count == 1 { "" } else { "es" },
+                        model.vertex_count,
+                        model.triangle_count,
+                        if model.sampled {
+                            " · sampled for display"
+                        } else {
+                            ""
+                        }
+                    );
+                    div()
+                        .id("model-preview")
+                        .flex()
+                        .flex_col()
+                        .w_full()
+                        .min_h(px(300.0))
+                        .bg(self.palette.window)
+                        .child(
+                            div()
+                                .id("model-viewport")
+                                .flex()
+                                .flex_1()
+                                .min_h(px(if quick_look { 480.0 } else { 280.0 }))
+                                .max_h(px(if quick_look { 760.0 } else { 520.0 }))
+                                .items_center()
+                                .justify_center()
+                                .overflow_hidden()
+                                .bg(rgb(0x101317))
+                                .cursor_pointer()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, event, _, cx| {
+                                        this.start_model_drag(event, false);
+                                        cx.stop_propagation();
+                                    }),
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Right,
+                                    cx.listener(|this, event, _, cx| {
+                                        this.start_model_drag(event, true);
+                                        cx.stop_propagation();
+                                    }),
+                                )
+                                .on_scroll_wheel(cx.listener(
+                                    |this, event: &gpui::ScrollWheelEvent, _, cx| {
+                                        let delta = f32::from(event.delta.pixel_delta(px(16.0)).y);
+                                        let zoom = (-delta * 0.0025).exp();
+                                        this.adjust_model_camera(0.0, 0.0, zoom, 0.0, 0.0, cx);
+                                        cx.stop_propagation();
+                                    },
+                                ))
+                                .when_some(frame, |viewport, frame| {
+                                    viewport.child(
+                                        img(frame).max_w_full().max_h(px(if quick_look {
+                                            740.0
+                                        } else {
+                                            500.0
+                                        })),
+                                    )
+                                })
+                                .when(self.model_frame.is_none(), |viewport| {
+                                    viewport.child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(self.palette.muted)
+                                            .child("Rendering model…"),
+                                    )
+                                }),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .items_center()
+                                .justify_center()
+                                .gap_2()
+                                .px_3()
+                                .py_2()
+                                .border_t_1()
+                                .border_color(self.palette.border)
+                                .bg(self.palette.surface)
+                                .child(
+                                    toolbar_button("model-left", "↶", self.palette.control)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.adjust_model_camera(-0.2, 0.0, 1.0, 0.0, 0.0, cx)
+                                        })),
+                                )
+                                .child(
+                                    toolbar_button("model-right", "↷", self.palette.control)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.adjust_model_camera(0.2, 0.0, 1.0, 0.0, 0.0, cx)
+                                        })),
+                                )
+                                .child(
+                                    toolbar_button("model-zoom-out", "−", self.palette.control)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.adjust_model_camera(0.0, 0.0, 0.8, 0.0, 0.0, cx)
+                                        })),
+                                )
+                                .child(
+                                    toolbar_button("model-reset", "Reset", self.palette.control)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.reset_model_camera(cx)
+                                        })),
+                                )
+                                .child(
+                                    toolbar_button("model-zoom-in", "+", self.palette.control)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.adjust_model_camera(0.0, 0.0, 1.25, 0.0, 0.0, cx)
+                                        })),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .px_3()
+                                .pb_2()
+                                .text_center()
+                                .text_xs()
+                                .text_color(self.palette.muted)
+                                .child(details),
+                        )
+                        .child(
+                            div()
+                                .px_3()
+                                .pb_3()
+                                .text_center()
+                                .text_xs()
+                                .text_color(self.palette.tertiary)
+                                .child("Drag to orbit · right-drag to pan · scroll to zoom"),
+                        )
+                        .into_any_element()
+                }
+                PreviewContent::Rich(preview) => {
+                    let blocks = preview.blocks.into_iter().map(|block| {
+                        let row = div()
+                            .w_full()
+                            .text_color(self.palette.text)
+                            .child(block.text);
+                        match block.kind {
+                            RichBlockKind::Heading => {
+                                row.mt_2().text_base().font_weight(FontWeight::SEMIBOLD)
+                            }
+                            RichBlockKind::Metadata => row.text_xs().text_color(self.palette.muted),
+                            RichBlockKind::TableHeader => row
+                                .px_2()
+                                .py_1()
+                                .bg(self.palette.control)
+                                .font_family(monospace_font_family())
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD),
+                            RichBlockKind::TableRow => row
+                                .px_2()
+                                .py_1()
+                                .border_b_1()
+                                .border_color(self.palette.border)
+                                .font_family(monospace_font_family())
+                                .text_xs(),
+                            RichBlockKind::Code => row
+                                .p_2()
+                                .rounded_md()
+                                .bg(self.palette.control)
+                                .font_family(monospace_font_family())
+                                .text_xs(),
+                            RichBlockKind::Paragraph => row.text_sm().line_height(px(21.0)),
+                        }
+                        .into_any_element()
+                    });
+                    div()
+                        .id("rich-preview")
+                        .flex()
+                        .flex_col()
+                        .w_full()
+                        .max_h(px(if quick_look { 820.0 } else { 520.0 }))
+                        .bg(self.palette.window)
+                        .child(
+                            div()
+                                .px_4()
+                                .pt_4()
+                                .text_lg()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(self.palette.text)
+                                .child(preview.title),
+                        )
+                        .child(
+                            div()
+                                .px_4()
+                                .pt_1()
+                                .pb_3()
+                                .text_xs()
+                                .text_color(self.palette.muted)
+                                .child(preview.subtitle),
+                        )
+                        .when_some(preview.image_path, |surface, image_path| {
+                            surface.child(
+                                div()
+                                    .flex()
+                                    .justify_center()
+                                    .max_h(px(if quick_look { 440.0 } else { 260.0 }))
+                                    .overflow_hidden()
+                                    .px_4()
+                                    .pb_3()
+                                    .child(img(image_path).max_w_full().max_h(px(if quick_look {
+                                        420.0
+                                    } else {
+                                        240.0
+                                    }))),
+                            )
+                        })
+                        .child(
+                            div()
+                                .id("rich-preview-blocks")
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .min_h_0()
+                                .overflow_scroll()
+                                .px_4()
+                                .pb_4()
+                                .children(blocks),
+                        )
+                        .into_any_element()
+                }
                 PreviewContent::BlockedScript => div()
                     .flex()
                     .flex_col()
@@ -26977,6 +27457,13 @@ impl Render for DirectoryWindow {
             .on_action(cx.listener(|this, _: &CycleAccent, _, cx| this.cycle_accent(cx)))
             .on_action(cx.listener(|this, _: &CycleDensity, _, cx| this.cycle_density(cx)))
             .on_action(cx.listener(|this, _: &CycleUiScale, _, cx| this.cycle_ui_scale(cx)))
+            .on_action(cx.listener(|this, _: &IncreaseUiScale, _, cx| {
+                this.adjust_ui_scale(1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &DecreaseUiScale, _, cx| {
+                this.adjust_ui_scale(-1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ResetUiScale, _, cx| this.reset_ui_scale(cx)))
             .on_action(cx.listener(|this, _: &CycleListRowHeight, _, cx| {
                 this.cycle_list_row_height(cx);
             }))
@@ -27062,6 +27549,7 @@ impl Render for DirectoryWindow {
                     this.finish_selection_marquee(cx);
                     this.finish_file_drag(cx);
                     this.finish_media_slider_drag();
+                    this.finish_model_drag();
                 }),
             )
             .on_mouse_up_out(
@@ -27073,7 +27561,16 @@ impl Render for DirectoryWindow {
                     this.finish_selection_marquee(cx);
                     this.finish_file_drag(cx);
                     this.finish_media_slider_drag();
+                    this.finish_model_drag();
                 }),
+            )
+            .on_mouse_up(
+                MouseButton::Right,
+                cx.listener(|this, _, _, _| this.finish_model_drag()),
+            )
+            .on_mouse_up_out(
+                MouseButton::Right,
+                cx.listener(|this, _, _, _| this.finish_model_drag()),
             )
             .on_mouse_move(cx.listener(|this, event, _, cx| {
                 this.update_sidebar_resize(event, cx);
@@ -27081,6 +27578,7 @@ impl Render for DirectoryWindow {
                 this.update_column_view_resize(event, cx);
                 this.update_selection_marquee(event, cx);
                 this.update_media_slider_drag(event, cx);
+                this.update_model_drag(event, cx);
             }))
             .relative()
             .flex()
@@ -28366,6 +28864,57 @@ mod tests {
         assert_eq!(stepped_slider_fraction(4, 5), 1.0);
         assert_eq!(stepped_slider_fraction(20, 5), 1.0);
         assert_eq!(stepped_slider_fraction(0, 1), 0.0);
+    }
+
+    #[test]
+    fn ui_scale_shortcuts_step_clamp_and_reset_to_the_default() {
+        assert_eq!(stepped_f32(1.0, UI_SCALE_STEPS, 1), 1.1);
+        assert_eq!(stepped_f32(1.0, UI_SCALE_STEPS, -1), 0.9);
+        assert_eq!(stepped_f32(1.2, UI_SCALE_STEPS, 1), 1.25);
+        assert_eq!(stepped_f32(1.2, UI_SCALE_STEPS, -1), 1.1);
+        assert_eq!(stepped_f32(1.4, UI_SCALE_STEPS, 1), 1.4);
+        assert_eq!(stepped_f32(0.9, UI_SCALE_STEPS, -1), 0.9);
+        assert_eq!(AppearanceSettings::default().ui_scale, 1.0);
+    }
+
+    #[gpui::test]
+    fn ui_scale_shortcuts_dispatch_through_the_app_keymap(cx: &mut TestAppContext) {
+        let directory = fixture_dir();
+        let services = NativeServices::new(ResourcePaths::test(&directory));
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                let view = cx.new(|cx| {
+                    let view = DirectoryWindow::new(directory.clone(), services, cx);
+                    view.install_shortcut_bindings(cx);
+                    view
+                });
+                window.focus(&view.focus_handle(cx), cx);
+                view
+            })
+            .unwrap()
+        });
+
+        cx.dispatch_keystroke(*window, secondary_keystroke("+"));
+        window
+            .update(cx, |view, _, _| {
+                assert_eq!(view.settings.appearance.ui_scale, 1.1)
+            })
+            .unwrap();
+        cx.dispatch_keystroke(*window, secondary_keystroke("-"));
+        window
+            .update(cx, |view, _, _| {
+                assert_eq!(view.settings.appearance.ui_scale, 1.0)
+            })
+            .unwrap();
+        cx.dispatch_keystroke(*window, secondary_keystroke("-"));
+        cx.dispatch_keystroke(*window, secondary_keystroke("0"));
+        window
+            .update(cx, |view, _, _| {
+                assert_eq!(view.settings.appearance.ui_scale, 1.0)
+            })
+            .unwrap();
+
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -29980,7 +30529,8 @@ mod tests {
         for extension in [
             "png", "jpg", "jpeg", "gif", "bmp", "webp", "svg", "svgz", "tif", "tiff", "ico", "tga",
             "dds", "hdr", "pnm", "pbm", "pgm", "ppm", "pam", "qoi", "mp4", "webm", "m4v", "mov",
-            "avi", "mkv", "wmv", "flv", "m2ts", "mts", "mpeg", "mpg", "3gp",
+            "avi", "mkv", "wmv", "flv", "m2ts", "mts", "mpeg", "mpg", "3gp", "glb", "gltf", "obj",
+            "stl", "ply", "3mf", "fbx",
         ] {
             let entry = absolute_entry(PathBuf::from(format!("media.{extension}")));
             assert!(
@@ -32044,9 +32594,9 @@ mod tests {
                 matches!(
                     &view.preview_state,
                     PreviewState::Ready {
-                        content: PreviewContent::Text(preview),
+                        content: PreviewContent::Rich(_),
                         ..
-                    } if preview.wrapped
+                    }
                 )
             }) {
                 break;
@@ -32057,9 +32607,10 @@ mod tests {
             assert!(matches!(
                 &view.preview_state,
                 PreviewState::Ready {
-                    content: PreviewContent::Text(preview),
+                    content: PreviewContent::Rich(preview),
                     ..
-                } if preview.wrapped && preview.language.as_deref() == Some("Markdown")
+                } if preview.subtitle.contains("Rendered Markdown")
+                    && preview.blocks.iter().any(|block| block.text.contains("wraps"))
             ));
         });
         cx.draw(
@@ -34755,6 +35306,80 @@ mod tests {
                 assert!(preview.is_file());
             }
             state => panic!("PSD Quick Look did not produce an image: {state:?}"),
+        });
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[gpui::test]
+    fn quick_look_renders_and_orbits_models_with_a_cached_grid_thumbnail(cx: &mut TestAppContext) {
+        let directory = fixture_dir();
+        let source = directory.join("triangle.obj");
+        fs::write(&source, "v -1 -1 0\nv 1 -1 0\nv 0 1 0\nf 1 2 3\n").unwrap();
+        let services = NativeServices::new(ResourcePaths::test(&directory));
+        let thumbnail = services
+            .previews
+            .thumbnail(source.clone(), 256)
+            .wait()
+            .unwrap()
+            .expect("OBJ should produce a cached thumbnail");
+        assert!(thumbnail.is_file());
+
+        let (view, window) = cx.add_window_view(|window, cx| {
+            let mut view = DirectoryWindow::new(directory.clone(), services, cx);
+            view.browser
+                .replace_entries(vec![metadata_entry(source.clone())]);
+            view.browser.select(source.clone());
+            view.state = ListingState::Ready;
+            view.open_quick_look(source.clone(), vec![source.clone()], cx);
+            window.focus(&view.focus_handle, cx);
+            view
+        });
+        for _ in 0..300 {
+            window.run_until_parked();
+            if view.update(window, |view, _| {
+                matches!(
+                    view.preview_state,
+                    PreviewState::Ready {
+                        content: PreviewContent::Model(_),
+                        ..
+                    }
+                )
+            }) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let first_frame = view.update(window, |view, cx| {
+            let PreviewState::Ready {
+                content: PreviewContent::Model(model),
+                ..
+            } = &view.preview_state
+            else {
+                panic!("OBJ Quick Look did not produce a model preview");
+            };
+            assert_eq!(model.triangle_count, 1);
+            let frame = Arc::clone(&model.frame.rgba);
+            view.adjust_model_camera(0.4, 0.0, 1.0, 0.0, 0.0, cx);
+            frame
+        });
+        for _ in 0..300 {
+            window.run_until_parked();
+            if view.update(window, |view, _| {
+                view.model_task.is_none() && view.model_camera == view.model_rendered_camera
+            }) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        view.update(window, |view, _| {
+            let PreviewState::Ready {
+                content: PreviewContent::Model(model),
+                ..
+            } = &view.preview_state
+            else {
+                panic!("rotated model preview was not retained");
+            };
+            assert_ne!(first_frame, model.frame.rgba);
         });
         fs::remove_dir_all(directory).unwrap();
     }

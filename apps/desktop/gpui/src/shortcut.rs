@@ -286,6 +286,9 @@ pub(crate) fn fixed_browser_bindings() -> &'static [(&'static str, &'static str)
         ("secondary-shift-right", "move tab right"),
         ("secondary-shift-f", "cycle file filter"),
         ("secondary-shift-s", "toggle folder sizes"),
+        ("secondary-+", "increase UI scale"),
+        ("secondary--", "decrease UI scale"),
+        ("secondary-0", "reset UI scale"),
         ("secondary-alt-shift-p", "clear preview cache"),
         ("secondary-alt-p", "refresh preview helpers"),
         ("secondary-alt-a", "create archive"),
@@ -362,6 +365,9 @@ pub fn application_key_bindings(overrides: &BTreeMap<String, String>) -> Vec<Key
             Some("browser"),
         ),
         KeyBinding::new("secondary-shift-s", ToggleFolderSizes, Some("browser")),
+        KeyBinding::new("secondary-+", IncreaseUiScale, None),
+        KeyBinding::new("secondary--", DecreaseUiScale, None),
+        KeyBinding::new("secondary-0", ResetUiScale, None),
         KeyBinding::new(key("window-new", "secondary-n"), NewWindow, Some("browser")),
         KeyBinding::new(key("tab-new", "secondary-t"), NewTab, Some("browser")),
         KeyBinding::new(key("tab-close", "secondary-w"), CloseTab, Some("browser")),
@@ -513,5 +519,24 @@ mod tests {
                 )
         );
         assert!(fixed_browser_bindings().contains(&("space", "preview selected item")));
+    }
+
+    #[test]
+    fn ui_scale_shortcuts_are_global_and_reserved_from_rebinding() {
+        let bindings = application_key_bindings(&BTreeMap::new());
+        let modifier = if cfg!(target_os = "macos") {
+            "cmd"
+        } else {
+            "ctrl"
+        };
+        for key in ["+", "-", "0"] {
+            let key = Keystroke::parse(&format!("{modifier}-{key}")).unwrap();
+            assert!(bindings.iter().any(|binding| {
+                binding.match_keystrokes(std::slice::from_ref(&key)) == Some(false)
+            }));
+        }
+        assert!(fixed_browser_bindings().contains(&("secondary-+", "increase UI scale")));
+        assert!(fixed_browser_bindings().contains(&("secondary--", "decrease UI scale")));
+        assert!(fixed_browser_bindings().contains(&("secondary-0", "reset UI scale")));
     }
 }

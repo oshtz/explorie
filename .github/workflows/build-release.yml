@@ -481,11 +481,13 @@ jobs:
           rclone="$app/Contents/MacOS/rclone"
           rclone_license="$app/Contents/Resources/licenses/rclone-COPYING"
           pixelarticons_license="$app/Contents/Resources/licenses/pixelarticons-LICENSE.txt"
+          assimp_license="$app/Contents/Resources/licenses/assimp-LICENSE.txt"
           helper_plist="$app/Contents/Library/LaunchDaemons/com.omershatz.explorie.mountd.plist"
           test -x "$helper"
           test -x "$rclone"
           test -f "$rclone_license"
           test -f "$pixelarticons_license"
+          test -f "$assimp_license"
           test -f "$helper_plist"
           test "$("$rclone" version | head -n 1)" = 'rclone v1.74.4'
           /usr/libexec/PlistBuddy -c 'Print :BundleProgram' "$helper_plist" | grep -Fx 'Contents/Resources/explorie-mountd'
