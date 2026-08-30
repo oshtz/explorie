@@ -9102,6 +9102,7 @@ impl DirectoryWindow {
         }
     }
 
+    #[cfg(target_os = "macos")]
     fn request_window_dismiss(&mut self, cx: &mut Context<Self>) -> bool {
         self.persist_window_placement();
         if self.operations.active_count() > 0
