@@ -143,6 +143,8 @@ pub struct ViewSettings {
     pub sort_direction: SortDirection,
     #[serde(default = "default_sidebar_width")]
     pub sidebar_width: f32,
+    #[serde(default = "default_preview_panel_width")]
+    pub preview_panel_width: f32,
 }
 
 impl Default for ViewSettings {
@@ -158,6 +160,7 @@ impl Default for ViewSettings {
             sort_key: SortKey::Name,
             sort_direction: SortDirection::Ascending,
             sidebar_width: default_sidebar_width(),
+            preview_panel_width: default_preview_panel_width(),
         }
     }
 }
@@ -375,6 +378,11 @@ impl AppSettings {
         } else {
             default_sidebar_width()
         };
+        self.view.preview_panel_width = if self.view.preview_panel_width.is_finite() {
+            self.view.preview_panel_width.clamp(280.0, 640.0)
+        } else {
+            default_preview_panel_width()
+        };
         self.window_placement.width = self
             .window_placement
             .width
@@ -478,6 +486,14 @@ impl AppSettings {
             480.0,
             &mut invalid_keys,
             |value| settings.view.sidebar_width = value as f32,
+        );
+        import_number(
+            &values,
+            "explorie:previewPanelWidth",
+            280.0,
+            640.0,
+            &mut invalid_keys,
+            |value| settings.view.preview_panel_width = value as f32,
         );
 
         import_enum(&values, "explorie:theme", &mut invalid_keys, |value| {
@@ -749,6 +765,10 @@ fn valid_hex_color(value: &str) -> bool {
 
 fn default_sidebar_width() -> f32 {
     220.0
+}
+
+fn default_preview_panel_width() -> f32 {
+    360.0
 }
 
 fn import_bool(
@@ -1191,21 +1211,29 @@ mod tests {
     }
 
     #[test]
-    fn older_native_settings_default_and_clamp_global_sidebar_width() {
+    fn older_native_settings_default_and_clamp_resizable_panel_widths() {
         let mut value = serde_json::to_value(AppSettings::default()).unwrap();
         value["view"]
             .as_object_mut()
             .unwrap()
             .remove("sidebarWidth");
+        value["view"]
+            .as_object_mut()
+            .unwrap()
+            .remove("previewPanelWidth");
         let settings = serde_json::from_value::<AppSettings>(value)
             .unwrap()
             .validate()
             .unwrap();
         assert_eq!(settings.view.sidebar_width, 220.0);
+        assert_eq!(settings.view.preview_panel_width, 360.0);
 
         let mut settings = AppSettings::default();
         settings.view.sidebar_width = 9_999.0;
-        assert_eq!(settings.validate().unwrap().view.sidebar_width, 480.0);
+        settings.view.preview_panel_width = 9_999.0;
+        let settings = settings.validate().unwrap();
+        assert_eq!(settings.view.sidebar_width, 480.0);
+        assert_eq!(settings.view.preview_panel_width, 640.0);
     }
 
     #[test]

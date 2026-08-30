@@ -1365,7 +1365,9 @@ fn rc_bind_address(rc_url: &str) -> ServiceResult<&str> {
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 fn rclone_command(rclone: &Path) -> Command {
-    let mut command = Command::new(rclone);
+    let command = Command::new(rclone);
+    #[cfg(windows)]
+    let mut command = command;
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;

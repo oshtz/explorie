@@ -418,7 +418,9 @@ fn transcode_opus(path: &Path, cache_dir: &Path) -> ServiceResult<PathBuf> {
 }
 
 fn ffmpeg_command() -> Command {
-    let mut command = Command::new("ffmpeg");
+    let command = Command::new("ffmpeg");
+    #[cfg(windows)]
+    let mut command = command;
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;

@@ -285,7 +285,7 @@ fn is_trusted_system_path_alias(path: &Path) -> bool {
             Some("/etc") => Path::new("/private/etc"),
             _ => return false,
         };
-        return fs::canonicalize(path).is_ok_and(|resolved| resolved == expected);
+        fs::canonicalize(path).is_ok_and(|resolved| resolved == expected)
     }
 
     #[cfg(not(target_os = "macos"))]
