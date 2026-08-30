@@ -28,7 +28,10 @@ type SharedRequests = Arc<Mutex<mpsc::Receiver<SingleInstanceRequest>>>;
 #[cfg(any(windows, target_os = "macos"))]
 #[derive(Clone, Copy)]
 enum PrimaryWindowOpen {
-    Initial { previous_session_unclean: bool },
+    Initial {
+        previous_session_unclean: bool,
+    },
+    #[cfg(target_os = "macos")]
     Reopen,
 }
 
@@ -89,7 +92,9 @@ fn main() {
     let (open_url_tx, open_url_rx) = mpsc::channel();
     #[cfg(target_os = "macos")]
     let open_url_requests = Arc::new(Mutex::new(open_url_rx));
-    let mut request_sources = vec![single_instance_requests];
+    let request_sources = vec![single_instance_requests];
+    #[cfg(target_os = "macos")]
+    let mut request_sources = request_sources;
     #[cfg(target_os = "macos")]
     request_sources.push(open_url_requests);
     let application = application().with_assets(ExplorieAssets);
