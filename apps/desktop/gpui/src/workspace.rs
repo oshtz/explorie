@@ -54,6 +54,8 @@ pub(crate) struct Workspace {
     pub(crate) window: WorkspaceWindowState,
     #[serde(default = "default_sidebar_width")]
     pub(crate) sidebar_width: f32,
+    #[serde(default = "default_preview_panel_width")]
+    pub(crate) preview_panel_width: f32,
     #[serde(default)]
     pub(crate) sidebar_collapsed: bool,
 }
@@ -71,6 +73,7 @@ pub(crate) struct WorkspaceSnapshot {
     pub(crate) grid_min_width: u16,
     pub(crate) window: WorkspaceWindowState,
     pub(crate) sidebar_width: f32,
+    pub(crate) preview_panel_width: f32,
     pub(crate) sidebar_collapsed: bool,
 }
 
@@ -130,6 +133,7 @@ impl WorkspaceState {
             grid_min_width: snapshot.grid_min_width.clamp(120, 260),
             window: sanitize_window(snapshot.window),
             sidebar_width: snapshot.sidebar_width.clamp(140.0, 480.0),
+            preview_panel_width: snapshot.preview_panel_width.clamp(280.0, 640.0),
             sidebar_collapsed: snapshot.sidebar_collapsed,
         };
         self.workspaces.push(workspace);
@@ -250,6 +254,10 @@ fn default_sidebar_width() -> f32 {
     190.0
 }
 
+fn default_preview_panel_width() -> f32 {
+    360.0
+}
+
 fn next_id(now: u64) -> String {
     format!(
         "workspace-{now}-{}",
@@ -302,6 +310,7 @@ fn validate_workspace(workspace: &mut Workspace) -> Result<(), String> {
     workspace.grid_min_width = workspace.grid_min_width.clamp(120, 260);
     workspace.window = sanitize_window(workspace.window);
     workspace.sidebar_width = workspace.sidebar_width.clamp(140.0, 480.0);
+    workspace.preview_panel_width = workspace.preview_panel_width.clamp(280.0, 640.0);
     Ok(())
 }
 
@@ -452,6 +461,8 @@ fn legacy_workspace(value: &serde_json::Value, fallback_id: &str, now: u64) -> O
             y: number("windowY"),
         },
         sidebar_width: number("sidebarWidth").unwrap_or_else(default_sidebar_width),
+        preview_panel_width: number("previewPanelWidth")
+            .unwrap_or_else(default_preview_panel_width),
         sidebar_collapsed: object
             .get("sidebarCollapsed")
             .and_then(serde_json::Value::as_bool)
@@ -760,6 +771,7 @@ mod tests {
                 y: Some(30.0),
             },
             sidebar_width: 240.0,
+            preview_panel_width: 420.0,
             sidebar_collapsed: false,
         }
     }
@@ -779,6 +791,7 @@ mod tests {
         assert!(warning.is_none());
         assert_eq!(restored.get(&id).unwrap().name, "Editing renamed");
         assert_eq!(restored.get(&id).unwrap().window.width, Some(1200.0));
+        assert_eq!(restored.get(&id).unwrap().preview_panel_width, 420.0);
         assert_eq!(
             restored.get(&id).unwrap().sort_key,
             SortKey::Custom("status".to_string())
@@ -831,6 +844,7 @@ mod tests {
         );
         assert_eq!(state.workspaces().len(), 1);
         let workspace = state.get("legacy-one").unwrap();
+        assert_eq!(workspace.preview_panel_width, 360.0);
         assert_eq!(workspace.view_mode, ViewMode::Column);
         assert_eq!(workspace.sort_key, SortKey::Modified);
         assert_eq!(workspace.window.width, Some(1300.0));

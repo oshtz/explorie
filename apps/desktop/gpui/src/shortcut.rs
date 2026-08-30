@@ -96,7 +96,7 @@ pub(crate) const EDITABLE_SHORTCUTS: &[ShortcutDefinition] = &[
     definition("view-column", "Column view", "View", "secondary-3"),
     definition("window-new", "New window", "Tabs", "secondary-n"),
     definition("tab-new", "New tab", "Tabs", "secondary-t"),
-    definition("tab-close", "Close tab", "Tabs", "secondary-w"),
+    definition("tab-close", "Close tab or window", "Tabs", "secondary-w"),
     definition("tab-next", "Next tab", "Tabs", "secondary-tab"),
     definition(
         "tab-previous",

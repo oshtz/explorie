@@ -964,7 +964,9 @@ fn ffmpeg_time(position_ms: u64) -> String {
 }
 
 fn helper_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
-    let mut command = Command::new(program);
+    let command = Command::new(program);
+    #[cfg(windows)]
+    let mut command = command;
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;

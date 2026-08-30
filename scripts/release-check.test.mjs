@@ -116,6 +116,9 @@ test('packaged native assets have a Tauri-independent authority', async () => {
   assert.match(macosPackage, /icons\/icon\.png/);
   assert.doesNotMatch(windowsResources, /native-assets[\\/]icons[\\/]icon\.ico/);
   assert.doesNotMatch(macosPackage, /icons\/icon\.icns/);
+
+  const gitignore = await readFile(path.join(process.cwd(), '.gitignore'), 'utf8');
+  assert.match(gitignore, /apps\/desktop\/native-assets\/binaries\/rclone-\*/);
 });
 
 test('macOS GPUI platform enables native font rendering', async () => {

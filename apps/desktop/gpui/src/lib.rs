@@ -227,6 +227,9 @@ impl AssetSource for ExplorieAssets {
             "icons/close.svg" => Some(include_bytes!("../assets/icons/close.svg")),
             "icons/copy.svg" => Some(include_bytes!("../assets/icons/copy.svg")),
             "icons/cut.svg" => Some(include_bytes!("../assets/icons/cut.svg")),
+            "icons/desktop.svg" => Some(include_bytes!("../assets/icons/desktop.svg")),
+            "icons/download.svg" => Some(include_bytes!("../assets/icons/download.svg")),
+            "icons/drive.svg" => Some(include_bytes!("../assets/icons/drive.svg")),
             "icons/edit.svg" => Some(include_bytes!("../assets/icons/edit.svg")),
             "icons/eye-closed.svg" => Some(include_bytes!("../assets/icons/eye-closed.svg")),
             "icons/eye.svg" => Some(include_bytes!("../assets/icons/eye.svg")),
@@ -235,10 +238,13 @@ impl AssetSource for ExplorieAssets {
             "icons/folder.svg" => Some(include_bytes!("../assets/icons/folder.svg")),
             "icons/frame.svg" => Some(include_bytes!("../assets/icons/frame.svg")),
             "icons/grid.svg" => Some(include_bytes!("../assets/icons/grid.svg")),
+            "icons/home.svg" => Some(include_bytes!("../assets/icons/home.svg")),
+            "icons/image.svg" => Some(include_bytes!("../assets/icons/image.svg")),
             "icons/info.svg" => Some(include_bytes!("../assets/icons/info.svg")),
             "icons/link.svg" => Some(include_bytes!("../assets/icons/link.svg")),
             "icons/list.svg" => Some(include_bytes!("../assets/icons/list.svg")),
             "icons/moon.svg" => Some(include_bytes!("../assets/icons/moon.svg")),
+            "icons/music.svg" => Some(include_bytes!("../assets/icons/music.svg")),
             "icons/minus.svg" => Some(include_bytes!("../assets/icons/minus.svg")),
             "icons/more-vertical.svg" => Some(include_bytes!("../assets/icons/more-vertical.svg")),
             "icons/archive.svg" => Some(include_bytes!("../assets/icons/archive.svg")),
@@ -254,6 +260,7 @@ impl AssetSource for ExplorieAssets {
             "icons/trash.svg" => Some(include_bytes!("../assets/icons/trash.svg")),
             "icons/undo.svg" => Some(include_bytes!("../assets/icons/undo.svg")),
             "icons/view-col.svg" => Some(include_bytes!("../assets/icons/view-col.svg")),
+            "icons/video.svg" => Some(include_bytes!("../assets/icons/video.svg")),
             _ => None,
         };
         Ok(bytes.map(Cow::Borrowed))
@@ -275,6 +282,9 @@ impl AssetSource for ExplorieAssets {
             "close.svg",
             "copy.svg",
             "cut.svg",
+            "desktop.svg",
+            "download.svg",
+            "drive.svg",
             "edit.svg",
             "eye-closed.svg",
             "eye.svg",
@@ -283,10 +293,13 @@ impl AssetSource for ExplorieAssets {
             "folder.svg",
             "frame.svg",
             "grid.svg",
+            "home.svg",
+            "image.svg",
             "info.svg",
             "link.svg",
             "list.svg",
             "moon.svg",
+            "music.svg",
             "minus.svg",
             "more-vertical.svg",
             "archive.svg",
@@ -302,6 +315,7 @@ impl AssetSource for ExplorieAssets {
             "trash.svg",
             "undo.svg",
             "view-col.svg",
+            "video.svg",
         ]
         .into_iter()
         .map(SharedString::from)
@@ -322,6 +336,9 @@ const MAX_COLUMN_VIEW_WIDTH: f32 = 640.0;
 const GRID_HORIZONTAL_PADDING: f32 = 8.0;
 const FILE_DRAG_EDGE_ZONE: f32 = 36.0;
 const FILE_DRAG_SCROLL_STEP: f32 = 16.0;
+const HIDDEN_ENTRY_OPACITY: f32 = 0.62;
+const MIN_PREVIEW_PANEL_WIDTH: f32 = 280.0;
+const MAX_PREVIEW_PANEL_WIDTH: f32 = 640.0;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum EntryIconKey {
@@ -1137,7 +1154,7 @@ fn syntax_highlights_for_line(
         .filter_map(|(range, style)| {
             let start = range.start.max(line_start);
             let end = range.end.min(line_end);
-            (start < end).then_some((start - line_start..end - line_start, *style))
+            (start < end).then(|| (start - line_start..end - line_start, *style))
         })
         .collect()
 }
@@ -2339,6 +2356,12 @@ struct SidebarResize {
     start_width: f32,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PreviewPanelResize {
+    start_x: f32,
+    start_width: f32,
+}
+
 #[derive(Clone, Debug)]
 struct ListColumnResize {
     key: String,
@@ -3086,11 +3109,14 @@ pub struct DirectoryWindow {
     workspace_delete_confirmation: Option<String>,
     smart_folder_editor: Option<SmartFolderDraft>,
     sidebar_width: f32,
+    preview_panel_width: f32,
     sidebar_collapsed: bool,
     sidebar_resize: Option<SidebarResize>,
+    preview_panel_resize: Option<PreviewPanelResize>,
     list_column_resize: Option<ListColumnResize>,
     column_view_resize: Option<ColumnViewResize>,
     sidebar_resize_focus: FocusHandle,
+    preview_panel_resize_focus: FocusHandle,
     listing_viewport_width: f32,
     grid_columns: usize,
     selection_marquee: Option<SelectionMarquee>,
@@ -3448,6 +3474,7 @@ impl DirectoryWindow {
             Duration::from_secs(u64::from(settings.behavior.undo_timeout_minutes) * 60);
         let palette = UiPalette::for_settings(&settings, WindowAppearance::Dark);
         let sidebar_width = settings.view.sidebar_width;
+        let preview_panel_width = settings.view.preview_panel_width;
         let remembered_window = browser.window_placement().map_or(
             WorkspaceWindowState {
                 width: settings.window_placement.width,
@@ -3521,11 +3548,14 @@ impl DirectoryWindow {
             workspace_delete_confirmation: None,
             smart_folder_editor: None,
             sidebar_width,
+            preview_panel_width,
             sidebar_collapsed: false,
             sidebar_resize: None,
+            preview_panel_resize: None,
             list_column_resize: None,
             column_view_resize: None,
             sidebar_resize_focus: cx.focus_handle(),
+            preview_panel_resize_focus: cx.focus_handle(),
             listing_viewport_width: DEFAULT_WINDOW_WIDTH - sidebar_width,
             grid_columns: 1,
             selection_marquee: None,
@@ -3837,6 +3867,7 @@ impl DirectoryWindow {
             grid_min_width: self.settings.appearance.grid_min_width,
             window: self.last_window_bounds,
             sidebar_width: self.sidebar_width,
+            preview_panel_width: self.preview_panel_width,
             sidebar_collapsed: self.sidebar_collapsed,
         }
     }
@@ -3937,8 +3968,10 @@ impl DirectoryWindow {
         self.settings.view.show_preview_panel = workspace.show_preview_panel;
         self.settings.appearance.grid_min_width = workspace.grid_min_width;
         self.sidebar_width = workspace.sidebar_width;
+        self.preview_panel_width = workspace.preview_panel_width;
         self.sidebar_collapsed = workspace.sidebar_collapsed;
         self.settings.view.sidebar_width = self.sidebar_width;
+        self.settings.view.preview_panel_width = self.preview_panel_width;
         self.pending_workspace_bounds = Some(workspace.window);
         self.apply_global_browser_preferences();
         self.columns.reset(self.browser.path());
@@ -5792,8 +5825,10 @@ impl DirectoryWindow {
         self.settings.reset_preserving_legacy();
         self.install_shortcut_bindings(cx);
         self.sidebar_width = self.settings.view.sidebar_width;
+        self.preview_panel_width = self.settings.view.preview_panel_width;
         self.sidebar_collapsed = false;
         self.sidebar_resize = None;
+        self.preview_panel_resize = None;
         self.apply_global_browser_preferences();
         self.calculate_folder_sizes = self.settings.view.show_folder_sizes;
         self.undo_ledger.set_timeout(Duration::from_secs(
@@ -5961,6 +5996,83 @@ impl DirectoryWindow {
         match event.keystroke.key.as_str() {
             "left" => self.adjust_sidebar_width(-10.0, cx),
             "right" => self.adjust_sidebar_width(10.0, cx),
+            _ => return,
+        }
+        cx.stop_propagation();
+    }
+
+    fn begin_preview_panel_resize(
+        &mut self,
+        event: &gpui::MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.preview_panel_resize_focus, cx);
+        self.preview_panel_resize = Some(PreviewPanelResize {
+            start_x: f32::from(event.position.x),
+            start_width: self.preview_panel_width,
+        });
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn update_preview_panel_resize(
+        &mut self,
+        event: &gpui::MouseMoveEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if !event.dragging() {
+            return;
+        }
+        let Some(resize) = self.preview_panel_resize else {
+            return;
+        };
+        let delta = (resize.start_x - f32::from(event.position.x)) / self.palette.scale.max(0.1);
+        let width =
+            (resize.start_width + delta).clamp(MIN_PREVIEW_PANEL_WIDTH, MAX_PREVIEW_PANEL_WIDTH);
+        if (width - self.preview_panel_width).abs() >= f32::EPSILON {
+            self.preview_panel_width = width;
+            if self.browser.view_mode() == ViewMode::Column {
+                self.column_scroll_to_leaf_attempts = 3;
+            }
+            cx.notify();
+        }
+    }
+
+    fn finish_preview_panel_resize(&mut self, cx: &mut Context<Self>) {
+        if self.preview_panel_resize.take().is_none() {
+            return;
+        }
+        self.settings.view.preview_panel_width = self.preview_panel_width;
+        self.finish_settings_change(
+            format!(
+                "Preview width: {} px",
+                self.preview_panel_width.round() as u16
+            ),
+            cx,
+        );
+    }
+
+    fn adjust_preview_panel_width(&mut self, delta: f32, cx: &mut Context<Self>) {
+        self.preview_panel_width = (self.preview_panel_width + delta)
+            .clamp(MIN_PREVIEW_PANEL_WIDTH, MAX_PREVIEW_PANEL_WIDTH);
+        if self.browser.view_mode() == ViewMode::Column {
+            self.column_scroll_to_leaf_attempts = 3;
+        }
+        self.settings.view.preview_panel_width = self.preview_panel_width;
+        self.finish_settings_change(
+            format!(
+                "Preview width: {} px",
+                self.preview_panel_width.round() as u16
+            ),
+            cx,
+        );
+    }
+
+    fn handle_preview_panel_resize_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        match event.keystroke.key.as_str() {
+            "left" => self.adjust_preview_panel_width(10.0, cx),
+            "right" => self.adjust_preview_panel_width(-10.0, cx),
             _ => return,
         }
         cx.stop_propagation();
@@ -7050,7 +7162,7 @@ impl DirectoryWindow {
 
     pub fn start_single_instance_requests(
         &mut self,
-        requests: mpsc::Receiver<SingleInstanceRequest>,
+        requests: Arc<Mutex<mpsc::Receiver<SingleInstanceRequest>>>,
         window: &Window,
         cx: &mut Context<Self>,
     ) {
@@ -7062,7 +7174,11 @@ impl DirectoryWindow {
                     let mut pending = Vec::new();
                     let mut disconnected = false;
                     loop {
-                        match requests.try_recv() {
+                        match requests
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .try_recv()
+                        {
                             Ok(request) => pending.push(request),
                             Err(mpsc::TryRecvError::Empty) => break,
                             Err(mpsc::TryRecvError::Disconnected) => {
@@ -7668,6 +7784,11 @@ impl DirectoryWindow {
 
     fn finish_pending_preview_refresh(&mut self, cx: &mut Context<Self>) {
         let Some(path) = self.pending_preview_refresh.take() else {
+            if self.settings.view.show_preview_panel
+                && matches!(self.preview_state, PreviewState::Closed)
+            {
+                self.sync_pinned_preview(cx);
+            }
             return;
         };
         if self.preview_state.path() != Some(path.as_path()) {
@@ -8120,6 +8241,17 @@ impl DirectoryWindow {
         self.close_tab(id, cx);
     }
 
+    fn close_active_tab_or_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.browser.tabs().len() > 1 {
+            self.close_active_tab(cx);
+            return;
+        }
+
+        if self.request_platform_window_close(cx) {
+            window.remove_window();
+        }
+    }
+
     fn activate_tab_offset(&mut self, offset: isize, cx: &mut Context<Self>) {
         self.sync_active_tab_view_state();
         if self.browser.activate_offset(offset) {
@@ -8206,7 +8338,7 @@ impl DirectoryWindow {
             });
             let close_view = view.clone();
             window.on_window_should_close(cx, move |_, cx| {
-                close_view.update(cx, |view, cx| view.request_window_close(cx))
+                close_view.update(cx, |view, cx| view.request_platform_window_close(cx))
             });
             window.focus(&view.focus_handle(cx), cx);
             view
@@ -8889,6 +9021,9 @@ impl DirectoryWindow {
         if self.sidebar_resize.is_none() {
             self.sidebar_width = self.settings.view.sidebar_width;
         }
+        if self.preview_panel_resize.is_none() {
+            self.preview_panel_width = self.settings.view.preview_panel_width;
+        }
         self.undo_ledger.set_timeout(Duration::from_secs(
             u64::from(self.settings.behavior.undo_timeout_minutes) * 60,
         ));
@@ -8954,6 +9089,31 @@ impl DirectoryWindow {
         }
         self.start_remote_close_check(cx);
         false
+    }
+
+    pub fn request_platform_window_close(&mut self, cx: &mut Context<Self>) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            self.request_window_dismiss(cx)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.request_window_close(cx)
+        }
+    }
+
+    fn request_window_dismiss(&mut self, cx: &mut Context<Self>) -> bool {
+        self.persist_window_placement();
+        if self.operations.active_count() > 0
+            || self.mutation_in_progress
+            || self.undo_progress.is_some()
+        {
+            self.status_message =
+                Some("Finish or cancel this window's filesystem work before closing".to_string());
+            cx.notify();
+            return false;
+        }
+        true
     }
 
     fn start_remote_close_check(&mut self, cx: &mut Context<Self>) {
@@ -17619,6 +17779,7 @@ impl DirectoryWindow {
         let palette = self.palette;
         let titlebar_height = 36.0 * palette.scale;
         let traffic_light_padding = 78.0 * palette.scale;
+        let folder_name = path_label(self.browser.path());
 
         div()
             .id("title-bar")
@@ -17673,28 +17834,16 @@ impl DirectoryWindow {
                             .items_center()
                             .justify_center()
                             .min_w_0()
-                            .gap_1()
                             .child(
                                 div()
-                                    .id("title-bar-app-icon")
-                                    .debug_selector(|| "title-bar-app-icon".to_string())
-                                    .w(px(22.0))
-                                    .h(px(22.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .child(
-                                        img("icons/titlebar-icon.png")
-                                            .w(px(22.0))
-                                            .h(px(22.0))
-                                            .object_fit(ObjectFit::Contain),
-                                    ),
-                            )
-                            .child(
-                                div()
+                                    .id("title-bar-folder-name")
+                                    .debug_selector(|| "title-bar-folder-name".to_string())
+                                    .aria_label(format!("Current folder: {folder_name}"))
+                                    .max_w(px(360.0 * palette.scale))
+                                    .truncate()
                                     .text_sm()
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .child(APP_NAME),
+                                    .child(folder_name),
                             ),
                     )
                     .child(div().w(px(traffic_light_padding)).h_full().flex_none()),
@@ -17722,7 +17871,7 @@ impl DirectoryWindow {
             .iter()
             .map(|tab| (tab.id(), tab.path().to_path_buf()))
             .collect();
-        let mut tab_elements = Vec::with_capacity(tab_count + 3);
+        let mut tab_elements = Vec::with_capacity(tab_count + 1);
 
         for (id, path) in tabs {
             let selected = id == active;
@@ -17855,49 +18004,6 @@ impl DirectoryWindow {
                 .on_click(cx.listener(|this, _, _, cx| this.new_tab(cx)))
                 .into_any_element(),
         );
-        if tab_count > 1 {
-            tab_elements.push(
-                div()
-                    .id("move-tab-left")
-                    .role(Role::Button)
-                    .aria_label("Move active tab left")
-                    .focusable()
-                    .tab_stop(true)
-                    .px_2()
-                    .py_1()
-                    .focus(move |button| button.bg(palette.hover))
-                    .hover(move |button| button.bg(palette.hover))
-                    .cursor_pointer()
-                    .child(toolbar_icon(
-                        "arrow-left",
-                        palette.icon_size.clamp(13.0, 18.0),
-                        palette.muted,
-                    ))
-                    .on_click(cx.listener(|this, _, _, cx| this.move_active_tab(-1, cx)))
-                    .into_any_element(),
-            );
-            tab_elements.push(
-                div()
-                    .id("move-tab-right")
-                    .role(Role::Button)
-                    .aria_label("Move active tab right")
-                    .focusable()
-                    .tab_stop(true)
-                    .px_2()
-                    .py_1()
-                    .focus(move |button| button.bg(palette.hover))
-                    .hover(move |button| button.bg(palette.hover))
-                    .cursor_pointer()
-                    .child(toolbar_icon(
-                        "arrow-right",
-                        palette.icon_size.clamp(13.0, 18.0),
-                        palette.muted,
-                    ))
-                    .on_click(cx.listener(|this, _, _, cx| this.move_active_tab(1, cx)))
-                    .into_any_element(),
-            );
-        }
-
         div()
             .id("tabs")
             .debug_selector(|| "tabs".to_string())
@@ -17923,11 +18029,6 @@ impl DirectoryWindow {
         }
         let palette = self.palette;
         let current_path = self.browser.path().to_path_buf();
-        let favorite_label = if self.browser.is_favorite(&current_path) {
-            "Remove current from favorites"
-        } else {
-            "Add current to favorites"
-        };
         let favorites: Vec<_> = self
             .browser
             .favorites()
@@ -18181,7 +18282,7 @@ impl DirectoryWindow {
         }
 
         let favorites_drop_palette = self.palette;
-        let favorites_section = div()
+        let favorites_drop_target = div()
             .id("favorites-file-drop-target")
             .debug_selector(|| "favorites-file-drop-target".to_string())
             .child(sidebar_section_label("Favorites", palette))
@@ -18218,32 +18319,35 @@ impl DirectoryWindow {
                 cx.stop_propagation();
                 this.drop_external_paths_to_favorites(paths, cx);
             }));
+        let favorites_section = div()
+            .id("favorites-section")
+            .debug_selector(|| "favorites-section".to_string())
+            .child(favorites_drop_target);
 
         let mut location_rows = Vec::new();
         if let Some(locations) = &self.system_locations {
             let mut locations_with_labels = Vec::new();
-            for (label, path) in [
-                ("Home", locations.home.as_ref()),
-                ("Desktop", locations.desktop.as_ref()),
-                ("Documents", locations.documents.as_ref()),
-                ("Downloads", locations.downloads.as_ref()),
-                ("Music", locations.music.as_ref()),
-                ("Pictures", locations.pictures.as_ref()),
-                ("Videos", locations.videos.as_ref()),
+            for (label, path, icon) in [
+                ("Home", locations.home.as_ref(), "home"),
+                ("Desktop", locations.desktop.as_ref(), "desktop"),
+                ("Documents", locations.documents.as_ref(), "file"),
+                ("Downloads", locations.downloads.as_ref(), "download"),
+                ("Music", locations.music.as_ref(), "music"),
+                ("Pictures", locations.pictures.as_ref(), "image"),
+                ("Videos", locations.videos.as_ref(), "video"),
             ] {
                 if let Some(path) = path {
-                    locations_with_labels.push((label.to_string(), PathBuf::from(path)));
+                    locations_with_labels.push((label.to_string(), PathBuf::from(path), icon));
                 }
             }
             for drive in &locations.drives {
-                locations_with_labels.push((drive.clone(), PathBuf::from(drive)));
+                locations_with_labels.push((drive.clone(), PathBuf::from(drive), "drive"));
             }
             let mut seen = std::collections::HashSet::new();
-            for (index, (label, path)) in locations_with_labels
-                .into_iter()
-                .filter(|(_, path)| seen.insert(path.clone()))
-                .enumerate()
-            {
+            locations_with_labels.retain(|(_, path, _)| seen.insert(path.clone()));
+            let active_location =
+                most_specific_location_index(&current_path, &locations_with_labels);
+            for (index, (label, path, icon)) in locations_with_labels.into_iter().enumerate() {
                 let click_path = path.clone();
                 let drag_style_path = path.clone();
                 let hover_path = path.clone();
@@ -18251,13 +18355,14 @@ impl DirectoryWindow {
                 let external_drop_path = path.clone();
                 let leave_target = FileDragHoverTarget::Folder(path);
                 let palette = self.palette;
-                let active = click_path == current_path;
+                let active = active_location == Some(index);
                 location_rows.push(
                     div()
                         .id(("location", index))
                         .debug_selector(move || format!("location-{index}"))
                         .role(Role::Button)
                         .aria_label(label.clone())
+                        .aria_selected(active)
                         .focusable()
                         .tab_stop(true)
                         .flex()
@@ -18277,7 +18382,7 @@ impl DirectoryWindow {
                         .hover(move |row| row.bg(palette.hover))
                         .focus(move |row| row.bg(palette.selected))
                         .cursor_pointer()
-                        .child(toolbar_icon("folder", 14.0, palette.muted))
+                        .child(toolbar_icon(icon, 14.0, palette.muted))
                         .child(div().min_w_0().truncate().child(label))
                         .drag_over::<FileDrag>(move |style, drag, window, _| {
                             if valid_file_drop_target(
@@ -18350,6 +18455,12 @@ impl DirectoryWindow {
                     .into_any_element(),
             );
         }
+
+        let locations_section = div()
+            .id("locations-section")
+            .debug_selector(|| "locations-section".to_string())
+            .child(sidebar_section_label("Locations", palette))
+            .children(location_rows);
 
         let active_smart_folder = self.browser.active_smart_folder().map(|folder| folder.id());
         let smart_folders: Vec<_> = self
@@ -18448,6 +18559,17 @@ impl DirectoryWindow {
             }
         }
 
+        let smart_folders_section = div()
+            .id("smart-folders-section")
+            .debug_selector(|| "smart-folders-section".to_string())
+            .child(sidebar_section_label("Smart folders", palette))
+            .children(smart_rows);
+        let recents_section = div()
+            .id("recents-section")
+            .debug_selector(|| "recents-section".to_string())
+            .child(sidebar_section_label("Recents", palette))
+            .children(recent_rows);
+
         let scrollable_content = div()
             .id("sidebar-scroll")
             .debug_selector(|| "sidebar-scroll".to_string())
@@ -18457,39 +18579,10 @@ impl DirectoryWindow {
             .min_h_0()
             .py_1()
             .overflow_y_scroll()
-            .child(sidebar_section_label("Locations", palette))
-            .children(location_rows)
-            .child(
-                div()
-                    .id("toggle-current-favorite")
-                    .role(Role::Button)
-                    .aria_label(favorite_label)
-                    .focusable()
-                    .tab_stop(true)
-                    .mx_2()
-                    .my_2()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .bg(palette.control)
-                    .focus(move |button| button.bg(palette.hover))
-                    .hover(move |button| button.bg(palette.hover))
-                    .cursor_pointer()
-                    .text_sm()
-                    .child(toolbar_icon("bookmark", 14.0, palette.muted))
-                    .child(div().min_w_0().truncate().child(favorite_label))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.toggle_current_favorite(cx);
-                    })),
-            )
             .child(favorites_section)
-            .child(sidebar_section_label("Smart folders", palette))
-            .children(smart_rows)
-            .child(sidebar_section_label("Recents", palette))
-            .children(recent_rows);
+            .child(smart_folders_section)
+            .child(locations_section)
+            .child(recents_section);
         let settings_button = div()
             .id("sidebar-settings")
             .debug_selector(|| "sidebar-settings".to_string())
@@ -18603,6 +18696,65 @@ impl DirectoryWindow {
             .w(px(8.0))
             .h_full()
             .child(handle)
+            .into_any_element()
+    }
+
+    fn render_preview_panel_resizer(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let accessibility_view = cx.entity().downgrade();
+        let decrement_view = accessibility_view.clone();
+        let line_color = if self.preview_panel_resize.is_some() {
+            self.palette.accent
+        } else {
+            self.palette.border
+        };
+
+        div()
+            .id("preview-panel-resizer")
+            .debug_selector(|| "preview-panel-resizer".to_string())
+            .key_context("preview-panel-resizer")
+            .track_focus(&self.preview_panel_resize_focus)
+            .tab_stop(true)
+            .role(Role::Splitter)
+            .aria_label("Resize preview panel")
+            .aria_orientation(Orientation::Vertical)
+            .aria_numeric_value(f64::from(self.preview_panel_width))
+            .aria_min_numeric_value(f64::from(MIN_PREVIEW_PANEL_WIDTH))
+            .aria_max_numeric_value(f64::from(MAX_PREVIEW_PANEL_WIDTH))
+            .on_a11y_action(AccessibleAction::Increment, move |_, _, cx| {
+                accessibility_view
+                    .update(cx, |this, cx| this.adjust_preview_panel_width(10.0, cx))
+                    .ok();
+            })
+            .on_a11y_action(AccessibleAction::Decrement, move |_, _, cx| {
+                decrement_view
+                    .update(cx, |this, cx| this.adjust_preview_panel_width(-10.0, cx))
+                    .ok();
+            })
+            .absolute()
+            .left(px(-8.0))
+            .top_0()
+            .w(px(8.0))
+            .h_full()
+            .hover(|resizer| resizer.bg(with_alpha(self.palette.accent, 0.22)))
+            .focus(|resizer| resizer.bg(with_alpha(self.palette.accent, 0.28)))
+            .child(
+                div()
+                    .absolute()
+                    .right_0()
+                    .top_0()
+                    .w(px(1.0))
+                    .h_full()
+                    .bg(line_color),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event, window, cx| {
+                    this.begin_preview_panel_resize(event, window, cx)
+                }),
+            )
+            .on_key_down(
+                cx.listener(|this, event, _, cx| this.handle_preview_panel_resize_key(event, cx)),
+            )
             .into_any_element()
     }
 
@@ -18820,6 +18972,12 @@ impl DirectoryWindow {
             .flatten();
         let can_undo = self.undo_ledger.can_undo(SystemTime::now());
         let can_redo = self.undo_ledger.can_redo();
+        let current_is_favorite = self.browser.is_favorite(self.browser.path());
+        let favorite_label = if current_is_favorite {
+            "Remove current from favorites"
+        } else {
+            "Add current to favorites"
+        };
         let view_icon = match self.browser.view_mode() {
             ViewMode::List => "list",
             ViewMode::Grid => "grid",
@@ -18954,6 +19112,22 @@ impl DirectoryWindow {
                 this.toggle_hidden(cx);
             }))
             .into_any_element(),
+            toolbar_menu_item(
+                "view-preview",
+                if self.settings.view.show_preview_panel {
+                    "Hide Preview Panel"
+                } else {
+                    "Show Preview Panel"
+                },
+                "eye",
+                palette,
+                self.settings.view.show_preview_panel,
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.close_toolbar_menu(cx);
+                this.toggle_preview_panel(cx);
+            }))
+            .into_any_element(),
         ];
         let view_menu_width = if self.browser.view_mode() == ViewMode::Grid {
             view_menu.push(toolbar_menu_separator(palette));
@@ -19060,22 +19234,6 @@ impl DirectoryWindow {
                 this.open_go_to_folder(cx);
             }))
             .into_any_element(),
-            toolbar_menu_item(
-                "toolbar-preview",
-                if self.settings.view.show_preview_panel {
-                    "Hide Preview Panel"
-                } else {
-                    "Show Preview Panel"
-                },
-                "eye",
-                palette,
-                self.settings.view.show_preview_panel,
-            )
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.close_toolbar_menu(cx);
-                this.toggle_preview_panel(cx);
-            }))
-            .into_any_element(),
             toolbar_menu_separator(palette),
             toolbar_menu_item(
                 "workspace-manager-button",
@@ -19123,6 +19281,35 @@ impl DirectoryWindow {
             .on_click(cx.listener(|this, _, _, cx| {
                 this.close_toolbar_menu(cx);
                 this.open_control_surface(ControlSurface::Shortcuts, cx);
+            }))
+            .into_any_element(),
+            toolbar_menu_separator(palette),
+            toolbar_menu_item(
+                "refresh-preview-helpers",
+                if self.preview_helpers_loading {
+                    "Checking Preview Helpers…"
+                } else {
+                    "Check Preview Helpers"
+                },
+                "reload",
+                palette,
+                false,
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.close_toolbar_menu(cx);
+                this.start_preview_helpers(cx);
+            }))
+            .into_any_element(),
+            toolbar_menu_item(
+                "clear-preview-cache",
+                "Clear Preview Cache",
+                "trash",
+                palette,
+                false,
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.close_toolbar_menu(cx);
+                this.clear_preview_cache(cx);
             }))
             .into_any_element(),
         ];
@@ -19211,29 +19398,87 @@ impl DirectoryWindow {
                 .priority(1),
             )
         });
-        let view_button = compact_toolbar_button(
-            "view-menu-button",
-            "Change view mode",
-            view_icon,
-            palette,
-            self.toolbar_menu == ToolbarMenu::View,
-            true,
-        )
-        .on_click(cx.listener(|this, _, _, cx| this.toggle_toolbar_menu(ToolbarMenu::View, cx)))
-        .when(self.toolbar_menu == ToolbarMenu::View, |button| {
-            button.relative().child(
-                deferred(
-                    div().absolute().top(px(popover_top)).right(px(0.0)).child(
-                        toolbar_popover("view-menu", palette, view_menu)
-                            .w(px(view_menu_width))
-                            .on_mouse_down_out(
-                                cx.listener(|this, _, _, cx| this.close_toolbar_menu(cx)),
-                            ),
-                    ),
-                )
-                .priority(1),
+        let view_control = if compact {
+            compact_toolbar_button(
+                "view-menu-button",
+                "Change view mode",
+                view_icon,
+                palette,
+                self.toolbar_menu == ToolbarMenu::View,
+                true,
             )
-        });
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_toolbar_menu(ToolbarMenu::View, cx)))
+            .when(self.toolbar_menu == ToolbarMenu::View, |button| {
+                button.relative().child(
+                    deferred(
+                        div().absolute().top(px(popover_top)).right(px(0.0)).child(
+                            toolbar_popover("view-menu", palette, view_menu)
+                                .w(px(view_menu_width))
+                                .on_mouse_down_out(
+                                    cx.listener(|this, _, _, cx| this.close_toolbar_menu(cx)),
+                                ),
+                        ),
+                    )
+                    .priority(1),
+                )
+            })
+            .into_any_element()
+        } else {
+            let view_mode = self.browser.view_mode();
+            let view_buttons = [
+                ("view-list-button", "List view", "list", ViewMode::List),
+                ("view-grid-button", "Grid view", "grid", ViewMode::Grid),
+                (
+                    "view-column-button",
+                    "Column view",
+                    "view-col",
+                    ViewMode::Column,
+                ),
+            ]
+            .into_iter()
+            .map(|(id, label, icon, mode)| {
+                compact_toolbar_button(id, label, icon, palette, view_mode == mode, true)
+                    .role(Role::RadioButton)
+                    .aria_selected(view_mode == mode)
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_view_mode(mode, cx)))
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+            let options_button = compact_toolbar_button(
+                "view-options-button",
+                "View options",
+                "sliders",
+                palette,
+                self.toolbar_menu == ToolbarMenu::View,
+                true,
+            )
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_toolbar_menu(ToolbarMenu::View, cx)))
+            .when(self.toolbar_menu == ToolbarMenu::View, |button| {
+                button.relative().child(
+                    deferred(
+                        div().absolute().top(px(popover_top)).right(px(0.0)).child(
+                            toolbar_popover("view-menu", palette, view_menu)
+                                .w(px(view_menu_width))
+                                .on_mouse_down_out(
+                                    cx.listener(|this, _, _, cx| this.close_toolbar_menu(cx)),
+                                ),
+                        ),
+                    )
+                    .priority(1),
+                )
+            });
+            div()
+                .id("view-mode-control")
+                .debug_selector(|| "view-mode-control".to_string())
+                .role(Role::RadioGroup)
+                .aria_label("View mode")
+                .flex()
+                .items_center()
+                .gap_1()
+                .children(view_buttons)
+                .child(options_button)
+                .into_any_element()
+        };
         let sort_button = compact_toolbar_button(
             "sort",
             "Sort options",
@@ -19291,6 +19536,15 @@ impl DirectoryWindow {
                 .priority(1),
             )
         });
+        let favorite_button = compact_toolbar_button(
+            "toggle-favorite-button",
+            favorite_label,
+            "bookmark",
+            palette,
+            current_is_favorite,
+            true,
+        )
+        .on_click(cx.listener(|this, _, _, cx| this.toggle_current_favorite(cx)));
 
         div()
             .id("browser-toolbar")
@@ -19343,6 +19597,7 @@ impl DirectoryWindow {
             )
             .child(breadcrumbs)
             .when_some(wide_syncthing_badge, |toolbar, badge| toolbar.child(badge))
+            .child(favorite_button)
             .child(create_button)
             .child(
                 compact_toolbar_button_with_tooltip(
@@ -19478,7 +19733,7 @@ impl DirectoryWindow {
                                 search.child(toolbar_icon("search", 14.0, palette.tertiary))
                             }),
                     )
-                    .child(view_button)
+                    .child(view_control)
                     .child(sort_button)
                     .child(filter_button)
                     .child(more_button),
@@ -22390,6 +22645,182 @@ impl DirectoryWindow {
             .into_any_element()
     }
 
+    fn render_preview_summary_panel(
+        &mut self,
+        side_panel: bool,
+        column_preview: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let selected = self.effective_selected_entries();
+        let (selector, icon, title, summary, guidance) = if selected.is_empty() {
+            let folder_count = self
+                .browser
+                .entries()
+                .iter()
+                .filter(|entry| entry.is_dir)
+                .count();
+            let file_count = self.browser.entries().len().saturating_sub(folder_count);
+            (
+                "preview-summary-empty",
+                "folder",
+                path_label(self.browser.path()),
+                format!(
+                    "{folder_count} folder{} · {file_count} file{}",
+                    if folder_count == 1 { "" } else { "s" },
+                    if file_count == 1 { "" } else { "s" }
+                ),
+                "Select an item to preview".to_string(),
+            )
+        } else if selected.len() == 1 && selected[0].is_dir {
+            let entry = &selected[0];
+            (
+                "preview-summary-folder",
+                "folder",
+                file_name(entry),
+                "Folder".to_string(),
+                "Open this folder to browse its contents".to_string(),
+            )
+        } else if selected.len() == 1 {
+            let entry = &selected[0];
+            (
+                "preview-summary-file",
+                "file",
+                file_name(entry),
+                format_size(entry.size),
+                "Preview is not available for this file".to_string(),
+            )
+        } else {
+            let folder_count = selected.iter().filter(|entry| entry.is_dir).count();
+            let file_count = selected.len().saturating_sub(folder_count);
+            let total_size = selected
+                .iter()
+                .filter(|entry| !entry.is_dir)
+                .map(|entry| entry.size)
+                .sum::<u64>();
+            let summary = if total_size > 0 {
+                format!(
+                    "{folder_count} folder{} · {file_count} file{} · {}",
+                    if folder_count == 1 { "" } else { "s" },
+                    if file_count == 1 { "" } else { "s" },
+                    format_size(total_size)
+                )
+            } else {
+                format!(
+                    "{folder_count} folder{} · {file_count} file{}",
+                    if folder_count == 1 { "" } else { "s" },
+                    if file_count == 1 { "" } else { "s" }
+                )
+            };
+            (
+                "preview-summary-multiple",
+                "file",
+                format!("{} items selected", selected.len()),
+                summary,
+                "Choose one file for a full preview".to_string(),
+            )
+        };
+        let resizer = side_panel.then(|| self.render_preview_panel_resizer(cx));
+
+        div()
+            .id(if column_preview {
+                "column-preview"
+            } else {
+                "preview-panel"
+            })
+            .debug_selector(move || {
+                if column_preview {
+                    "column-preview".to_string()
+                } else {
+                    "preview-panel".to_string()
+                }
+            })
+            .role(Role::Region)
+            .aria_label("Pinned preview inspector")
+            .relative()
+            .flex()
+            .flex_col()
+            .border_color(self.palette.border)
+            .bg(self.palette.panel)
+            .when(side_panel, |panel| {
+                panel
+                    .flex_shrink_0()
+                    .w(px(self.preview_panel_width * self.palette.scale))
+                    .min_w(px(MIN_PREVIEW_PANEL_WIDTH * self.palette.scale))
+                    .h_full()
+                    .border_l_1()
+            })
+            .when(!side_panel, |panel| panel.border_t_1())
+            .when_some(resizer, |panel, resizer| panel.child(resizer))
+            .child(
+                div()
+                    .id("preview-summary-header")
+                    .debug_selector(|| "preview-summary-header".to_string())
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(self.palette.border)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child("Inspector"),
+                    )
+                    .child(
+                        compact_toolbar_button(
+                            "close-preview",
+                            "Hide preview inspector",
+                            "close",
+                            self.palette,
+                            false,
+                            true,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_preview_panel(cx))),
+                    ),
+            )
+            .child(
+                div()
+                    .id(selector)
+                    .debug_selector(move || selector.to_string())
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .min_h(px(180.0))
+                    .p_4()
+                    .text_center()
+                    .child(toolbar_icon(icon, 32.0, self.palette.muted))
+                    .child(
+                        div()
+                            .max_w(px(420.0))
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(self.palette.text)
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .max_w(px(420.0))
+                            .text_xs()
+                            .text_color(self.palette.muted)
+                            .child(summary),
+                    )
+                    .child(
+                        div()
+                            .max_w(px(420.0))
+                            .text_xs()
+                            .text_color(self.palette.tertiary)
+                            .child(guidance),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn render_preview_panel(
         &mut self,
         side_panel: bool,
@@ -22401,40 +22832,15 @@ impl DirectoryWindow {
         let Some(path) = state.path().map(Path::to_path_buf) else {
             return div().into_any_element();
         };
-        let helper_label = if self.preview_helpers_loading {
-            "Helpers: checking…".to_string()
-        } else if self.preview_helpers.is_empty() {
-            "Helpers: not checked".to_string()
-        } else {
-            format!(
-                "Helpers: {}",
-                self.preview_helpers
-                    .iter()
-                    .map(|helper| {
-                        if helper.available {
-                            format!(
-                                "{} ✓ {} ({} ext)",
-                                helper.name,
-                                helper.version.as_deref().unwrap_or("available"),
-                                helper.extensions.len()
-                            )
-                        } else {
-                            format!(
-                                "{} missing: {}",
-                                helper.name,
-                                helper.error.as_deref().unwrap_or("unavailable")
-                            )
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" • ")
-            )
-        };
         let preview_body = match state {
             PreviewState::Closed => unreachable!("closed previews have no path"),
             PreviewState::Loading { .. } => div()
+                .id("preview-loading")
+                .debug_selector(|| "preview-loading".to_string())
                 .flex()
                 .flex_1()
+                .w_full()
+                .min_h_0()
                 .items_center()
                 .justify_center()
                 .min_h(px(if quick_look { 320.0 } else { 160.0 }))
@@ -22445,17 +22851,31 @@ impl DirectoryWindow {
                 .child("Preparing preview…")
                 .into_any_element(),
             PreviewState::Failed { error, .. } => div()
+                .id("preview-failed")
+                .debug_selector(|| "preview-failed".to_string())
                 .flex()
                 .flex_col()
-                .items_start()
+                .flex_1()
+                .w_full()
+                .min_h_0()
+                .items_center()
+                .justify_center()
                 .gap_3()
                 .px_4()
                 .py_5()
                 .text_sm()
+                .text_center()
                 .text_color(rgb(0xffb86c))
-                .child(error.to_string())
+                .child(
+                    div()
+                        .id("preview-failed-message")
+                        .debug_selector(|| "preview-failed-message".to_string())
+                        .max_w(px(480.0))
+                        .child(error.to_string()),
+                )
                 .child(
                     toolbar_button("retry-preview", "Retry", rgb(0x493232))
+                        .debug_selector(|| "retry-preview".to_string())
                         .on_click(cx.listener(|this, _, _, cx| this.retry_preview(cx))),
                 )
                 .into_any_element(),
@@ -22607,6 +23027,7 @@ impl DirectoryWindow {
                         .track_scroll(&self.text_preview.unwrapped_scroll);
                         div()
                             .id("text-preview-code")
+                            .debug_selector(|| "text-preview-code".to_string())
                             .flex()
                             .flex_1()
                             .min_h_0()
@@ -22624,9 +23045,11 @@ impl DirectoryWindow {
                         .id("text-preview-surface")
                         .flex()
                         .flex_col()
+                        .flex_1()
+                        .min_h_0()
                         .w_full()
                         .max_h(px((if quick_look { 820.0 } else { 360.0 }) * preview_scale))
-                        .when(quick_look, |surface| surface.flex_1().h_full())
+                        .when(quick_look, |surface| surface.h_full())
                         .bg(self.palette.window)
                         .child(
                             div()
@@ -23802,8 +24225,13 @@ impl DirectoryWindow {
                         .into_any_element()
                 }
                 PreviewContent::BlockedScript => div()
+                    .id("preview-blocked-script")
+                    .debug_selector(|| "preview-blocked-script".to_string())
                     .flex()
                     .flex_col()
+                    .flex_1()
+                    .w_full()
+                    .min_h_0()
                     .items_center()
                     .justify_center()
                     .gap_2()
@@ -24411,6 +24839,7 @@ impl DirectoryWindow {
                     .into_any_element()
             })
             .collect();
+        let resizer = side_panel.then(|| self.render_preview_panel_resizer(cx));
         div()
             .id(if column_preview {
                 "column-preview"
@@ -24424,6 +24853,9 @@ impl DirectoryWindow {
                     "preview-panel".to_string()
                 }
             })
+            .role(Role::Region)
+            .aria_label("Pinned preview inspector")
+            .relative()
             .flex()
             .flex_col()
             .border_color(self.palette.border)
@@ -24431,12 +24863,13 @@ impl DirectoryWindow {
             .when(side_panel, |panel| {
                 panel
                     .flex_shrink_0()
-                    .w(px(360.0 * self.palette.scale))
-                    .min_w(px(280.0 * self.palette.scale))
+                    .w(px(self.preview_panel_width * self.palette.scale))
+                    .min_w(px(MIN_PREVIEW_PANEL_WIDTH * self.palette.scale))
                     .h_full()
                     .border_l_1()
             })
             .when(!side_panel, |panel| panel.border_t_1())
+            .when_some(resizer, |panel, resizer| panel.child(resizer))
             .child(
                 div()
                     .id("preview-navigation")
@@ -24509,42 +24942,11 @@ impl DirectoryWindow {
                                 false,
                                 true,
                             )
-                            .on_click(cx.listener(|this, _, _, cx| this.close_preview(cx))),
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_preview_panel(cx))),
                         )
                     })
                     .border_b_1()
                     .border_color(self.palette.border),
-            )
-            .child(
-                div()
-                    .id("preview-tools")
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap_2()
-                    .px_3()
-                    .py_2()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_xs()
-                            .text_color(self.palette.muted)
-                            .child(helper_label),
-                    )
-                    .child(
-                        toolbar_button(
-                            "refresh-preview-helpers",
-                            "Check helpers",
-                            self.palette.control,
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| this.start_preview_helpers(cx))),
-                    )
-                    .child(
-                        toolbar_button("clear-preview-cache", "Clear cache", self.palette.control)
-                            .on_click(cx.listener(|this, _, _, cx| this.clear_preview_cache(cx))),
-                    ),
             )
             .child(
                 div()
@@ -25441,6 +25843,7 @@ impl DirectoryWindow {
                     let pointer_path = path.clone();
                     let context_path = path.clone();
                     let is_dir = entry.is_dir;
+                    let hidden = entry.hidden;
                     let target_is_link = entry.is_symlink || entry.is_junction;
                     let selected = this.browser.is_selected(&path);
                     let dragging = this.file_drag_sources.contains(&path);
@@ -25475,8 +25878,9 @@ impl DirectoryWindow {
                             .into_any_element()
                     });
                     let accessibility_label = format!(
-                        "{}: {}",
-                        if is_dir { "Folder" } else { "File" },
+                        "{}{}: {}",
+                        if hidden { "Hidden " } else { "" },
+                        if is_dir { "folder" } else { "file" },
                         file_name(&entry)
                     );
                     let accessibility_path = path.clone();
@@ -25489,6 +25893,10 @@ impl DirectoryWindow {
                         .h_full()
                         .items_center()
                         .cursor_pointer()
+                        .when(hidden, |content| {
+                            content.debug_selector(move || format!("list-hidden-entry-{index}"))
+                        })
+                        .opacity(if hidden { HIDDEN_ENTRY_OPACITY } else { 1.0 })
                         .child(
                             div()
                                 .flex()
@@ -25724,6 +26132,7 @@ impl DirectoryWindow {
                         let pointer_path = path.clone();
                         let context_path = path.clone();
                         let is_dir = entry.is_dir;
+                        let hidden = entry.hidden;
                         let target_is_link = entry.is_symlink || entry.is_junction;
                         let selected = this.browser.is_selected(&path);
                         let dragging = this.file_drag_sources.contains(&path);
@@ -25752,12 +26161,37 @@ impl DirectoryWindow {
                         );
                         let detail = format_size(entry.size);
                         let accessibility_label = format!(
-                            "{}: {}",
-                            if is_dir { "Folder" } else { "File" },
+                            "{}{}: {}",
+                            if hidden { "Hidden " } else { "" },
+                            if is_dir { "folder" } else { "file" },
                             file_name(&entry)
                         );
                         let accessibility_path = path.clone();
                         let accessibility_view = cx.entity().downgrade();
+                        let card_content = div()
+                            .id(("grid-entry-content", index))
+                            .when(hidden, |content| {
+                                content.debug_selector(move || format!("grid-hidden-entry-{index}"))
+                            })
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap_1()
+                            .w_full()
+                            .opacity(if hidden { HIDDEN_ENTRY_OPACITY } else { 1.0 })
+                            .child(visual)
+                            .child(
+                                div()
+                                    .w_full()
+                                    .text_center()
+                                    .whitespace_normal()
+                                    .line_clamp(2)
+                                    .text_ellipsis()
+                                    .text_sm()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(file_name(&entry)),
+                            )
+                            .child(div().text_xs().text_color(palette.muted).child(detail));
                         cards.push(
                             div()
                                 .id(("grid-entry", index))
@@ -25800,19 +26234,7 @@ impl DirectoryWindow {
                                 .opacity(if dragging { 0.45 } else { 1.0 })
                                 .hover(move |card| card.bg(palette.hover))
                                 .cursor_pointer()
-                                .child(visual)
-                                .child(
-                                    div()
-                                        .w_full()
-                                        .text_center()
-                                        .whitespace_normal()
-                                        .line_clamp(2)
-                                        .text_ellipsis()
-                                        .text_sm()
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .child(file_name(&entry)),
-                                )
-                                .child(div().text_xs().text_color(palette.muted).child(detail))
+                                .child(card_content)
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(
@@ -26144,6 +26566,7 @@ impl DirectoryWindow {
                             let context_path = path.clone();
                             let context_entry = entry.clone();
                             let is_dir = entry.is_dir;
+                            let hidden = entry.hidden;
                             let target_is_link = entry.is_symlink || entry.is_junction;
                             let dragging = this.file_drag_sources.contains(&path);
                             let drag = this.file_drag_for_entry(&entry);
@@ -26155,18 +26578,20 @@ impl DirectoryWindow {
                                 entry_icon_visual(&entry, native_icon, icon_size, this.palette);
                             let detail = entry_detail(&entry, this.calculate_folder_sizes, false);
                             let selected = this.column_selection.contains(&path)
-                                || (is_last && this.browser.is_selected(&path))
-                                || (!is_last && child_path.as_ref() == Some(&path));
+                                || (is_last && this.browser.is_selected(&path));
+                            let branch_active = !is_last && child_path.as_ref() == Some(&path);
+                            let highlighted = selected || branch_active;
                             let accessibility_label = format!(
-                                "{}: {}",
-                                if is_dir { "Folder" } else { "File" },
+                                "{}{}: {}",
+                                if hidden { "Hidden " } else { "" },
+                                if is_dir { "folder" } else { "file" },
                                 file_name(&entry)
                             );
                             let accessibility_path = path.clone();
                             let accessibility_view = cx.entity().downgrade();
                             let row_content = div()
                                 .id(("column-entry-drag-source", column_index * 1_000_000 + index))
-                                .when(selected, |row| {
+                                .when(highlighted, |row| {
                                     row.debug_selector(move || {
                                         format!("column-entry-selected-{column_index}-{index}")
                                     })
@@ -26178,9 +26603,21 @@ impl DirectoryWindow {
                                 .items_center()
                                 .gap_2()
                                 .cursor_pointer()
+                                .opacity(if hidden { HIDDEN_ENTRY_OPACITY } else { 1.0 })
                                 .child(icon)
                                 .child(
                                     div()
+                                        .id((
+                                            "column-entry-label",
+                                            column_index * 1_000_000 + index,
+                                        ))
+                                        .when(hidden, |label| {
+                                            label.debug_selector(move || {
+                                                format!(
+                                                    "column-hidden-entry-{column_index}-{index}"
+                                                )
+                                            })
+                                        })
                                         .flex_1()
                                         .min_w_0()
                                         .truncate()
@@ -26238,7 +26675,7 @@ impl DirectoryWindow {
                                     })
                                     .role(Role::ListItem)
                                     .aria_label(accessibility_label)
-                                    .aria_selected(selected)
+                                    .aria_selected(highlighted)
                                     .aria_position_in_set(index + 1)
                                     .aria_size_of_set(entry_count)
                                     .on_a11y_action(AccessibleAction::Click, move |_, _, cx| {
@@ -26271,8 +26708,16 @@ impl DirectoryWindow {
                                     .h(px(column_row_height))
                                     .items_center()
                                     .px_2()
+                                    .border_l_2()
+                                    .border_color(if branch_active {
+                                        palette.accent
+                                    } else {
+                                        with_alpha(palette.border, 0.0)
+                                    })
                                     .bg(if selected {
                                         palette.selected
+                                    } else if branch_active {
+                                        with_alpha(palette.accent, 0.12)
                                     } else {
                                         palette.window
                                     })
@@ -26534,11 +26979,12 @@ impl DirectoryWindow {
             );
         }
 
-        if self.settings.view.show_preview_panel
-            && !matches!(self.preview_state, PreviewState::Closed)
-            && !self.quick_look_open
-        {
-            rendered_columns.push(self.render_preview_panel(true, false, true, cx));
+        if self.settings.view.show_preview_panel && !self.quick_look_open {
+            rendered_columns.push(if matches!(self.preview_state, PreviewState::Closed) {
+                self.render_preview_summary_panel(true, true, cx)
+            } else {
+                self.render_preview_panel(true, false, true, cx)
+            });
         }
         let rendered_column_count = rendered_columns.len();
 
@@ -26548,14 +26994,13 @@ impl DirectoryWindow {
                 let offset = self.column_strip_scroll.offset();
                 self.column_strip_scroll
                     .set_offset(gpui::point(-max_offset, offset.y));
-                self.column_scroll_to_leaf_attempts = 0;
             } else {
                 self.column_strip_scroll
                     .scroll_to_item(rendered_column_count - 1);
-                self.column_scroll_to_leaf_attempts -= 1;
-                if self.column_scroll_to_leaf_attempts > 0 {
-                    cx.notify();
-                }
+            }
+            self.column_scroll_to_leaf_attempts -= 1;
+            if self.column_scroll_to_leaf_attempts > 0 {
+                cx.notify();
             }
         }
 
@@ -26879,16 +27324,6 @@ impl Render for DirectoryWindow {
                 }
             })
         };
-        let disk_summary = self.disk_info.as_ref().map(|disk| {
-            (
-                format!(
-                    "{} free of {}",
-                    format_size(disk.available_space),
-                    format_size(disk.total_space)
-                ),
-                format!("Disk: {}", disk.name),
-            )
-        });
         let active_operation_count = self.process_active_operation_count();
         let operation_summary = if active_operation_count > 1 {
             Some((
@@ -26966,13 +27401,15 @@ impl Render for DirectoryWindow {
                         .map(|error| format!("Unable to save workspaces: {error}"))
                 })
             });
-        let (watch_label, watch_color) = match &self.watch_status {
-            WatchStatus::Starting => ("Watcher: starting…".to_string(), rgb(0x909090)),
-            WatchStatus::Watching => ("● Watching".to_string(), rgb(0x6fcf97)),
-            WatchStatus::Unavailable(error) => (
+        let watch_summary = match &self.watch_status {
+            WatchStatus::Starting => {
+                Some(("Watcher: starting…".to_string(), self.palette.tertiary))
+            }
+            WatchStatus::Watching => None,
+            WatchStatus::Unavailable(error) => Some((
                 format!("Watcher unavailable — manual Refresh remains available: {error}"),
                 rgb(0xffb86c),
-            ),
+            )),
         };
         let main_area_width = f32::from(bounds.size.width)
             - if self.sidebar_collapsed {
@@ -26989,7 +27426,7 @@ impl Render for DirectoryWindow {
             300.0 * self.palette.scale
         };
         let title_bar = self.render_title_bar(window.is_maximized(), cx);
-        let toolbar = self.render_toolbar(logical_main_width < 900.0, cx);
+        let toolbar = self.render_toolbar(logical_main_width < 760.0, cx);
         let settings_panel = self.render_settings_panel(cx);
         let settings_confirmation = self.render_settings_confirmation(window, cx);
         let go_to_folder = self.render_go_to_folder(f32::from(bounds.size.height), cx);
@@ -26998,22 +27435,31 @@ impl Render for DirectoryWindow {
         let archive_inspection = self.render_archive_inspection(cx);
         let preview_open = !matches!(self.preview_state, PreviewState::Closed);
         let inspector_preview_open = self.settings.view.show_preview_panel
-            && preview_open
             && !self.quick_look_open
             && self.browser.view_mode() != ViewMode::Column;
         let preview_as_side_panel = inspector_preview_open && logical_main_width >= 708.0;
         self.listing_viewport_width = (main_area_width
             - 16.0 * self.palette.scale
             - if preview_as_side_panel {
-                368.0 * self.palette.scale
+                (self.preview_panel_width + 8.0) * self.palette.scale
             } else {
                 0.0
             })
         .max(1.0);
-        let side_preview =
-            preview_as_side_panel.then(|| self.render_preview_panel(true, false, false, cx));
-        let bottom_preview = (inspector_preview_open && !preview_as_side_panel)
-            .then(|| self.render_preview_panel(false, false, false, cx));
+        let side_preview = preview_as_side_panel.then(|| {
+            if preview_open {
+                self.render_preview_panel(true, false, false, cx)
+            } else {
+                self.render_preview_summary_panel(true, false, cx)
+            }
+        });
+        let bottom_preview = (inspector_preview_open && !preview_as_side_panel).then(|| {
+            if preview_open {
+                self.render_preview_panel(false, false, false, cx)
+            } else {
+                self.render_preview_summary_panel(false, false, cx)
+            }
+        });
         let quick_look = self
             .quick_look_open
             .then(|| self.render_preview_panel(false, true, false, cx));
@@ -27163,35 +27609,14 @@ impl Render for DirectoryWindow {
                                     .child(summary),
                             )
                         })
-                        .when(main_area_width > 820.0, |cluster| {
-                            cluster.when_some(disk_summary, |cluster, (summary, label)| {
-                                cluster.child(
-                                    div()
-                                        .id("status-disk-summary")
-                                        .debug_selector(|| "status-disk-summary".to_string())
-                                        .aria_label(label)
-                                        .flex_shrink_0()
-                                        .text_color(self.palette.tertiary)
-                                        .child(summary),
-                                )
-                            })
-                        })
-                        .child(
-                            div()
-                                .id("status-watcher-summary")
-                                .debug_selector(|| "status-watcher-summary".to_string())
-                                .flex_shrink_0()
-                                .text_color(watch_color)
-                                .child(watch_label),
-                        )
-                        .when(main_area_width > 620.0, |cluster| {
+                        .when_some(watch_summary, |cluster, (label, color)| {
                             cluster.child(
                                 div()
-                                    .id("status-view-summary")
-                                    .debug_selector(|| "status-view-summary".to_string())
+                                    .id("status-watcher-summary")
+                                    .debug_selector(|| "status-watcher-summary".to_string())
                                     .flex_shrink_0()
-                                    .text_color(self.palette.tertiary)
-                                    .child(format!("{} view", self.browser.view_mode().label())),
+                                    .text_color(color)
+                                    .child(label),
                             )
                         }),
                 )
@@ -27337,8 +27762,8 @@ impl Render for DirectoryWindow {
                 this.open_new_window(true, cx);
             }))
             .on_action(cx.listener(|this, _: &NewTab, _, cx| this.new_tab(cx)))
-            .on_action(cx.listener(|this, _: &CloseTab, _, cx| {
-                this.close_active_tab(cx);
+            .on_action(cx.listener(|this, _: &CloseTab, window, cx| {
+                this.close_active_tab_or_window(window, cx);
             }))
             .on_action(cx.listener(|this, _: &NextTab, _, cx| {
                 this.activate_tab_offset(1, cx);
@@ -27544,6 +27969,7 @@ impl Render for DirectoryWindow {
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
                     this.finish_sidebar_resize(cx);
+                    this.finish_preview_panel_resize(cx);
                     this.finish_list_column_resize(cx);
                     this.finish_column_view_resize(cx);
                     this.finish_selection_marquee(cx);
@@ -27556,6 +27982,7 @@ impl Render for DirectoryWindow {
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
                     this.finish_sidebar_resize(cx);
+                    this.finish_preview_panel_resize(cx);
                     this.finish_list_column_resize(cx);
                     this.finish_column_view_resize(cx);
                     this.finish_selection_marquee(cx);
@@ -27574,6 +28001,7 @@ impl Render for DirectoryWindow {
             )
             .on_mouse_move(cx.listener(|this, event, _, cx| {
                 this.update_sidebar_resize(event, cx);
+                this.update_preview_panel_resize(event, cx);
                 this.update_list_column_resize(event, cx);
                 this.update_column_view_resize(event, cx);
                 this.update_selection_marquee(event, cx);
@@ -27720,6 +28148,18 @@ fn path_label(path: &std::path::Path) -> String {
         .unwrap_or(path.as_os_str())
         .to_string_lossy()
         .into_owned()
+}
+
+fn most_specific_location_index(
+    current_path: &Path,
+    locations: &[(String, PathBuf, &'static str)],
+) -> Option<usize> {
+    locations
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, path, _))| current_path.starts_with(path))
+        .max_by_key(|(_, (_, path, _))| path.components().count())
+        .map(|(index, _)| index)
 }
 
 fn recovery_session_context(tab_count: usize, path: &Path) -> String {
@@ -28539,56 +28979,9 @@ fn entry_icon_visual(
     let base = if let Some(path) = native_icon {
         img(path).w(px(size)).h(px(size)).into_any_element()
     } else if entry.is_dir {
-        let folder = if palette.dark {
-            rgb(0xe0ae4f)
-        } else {
-            rgb(0xc88a18)
-        };
-        div()
-            .flex()
-            .flex_col()
-            .justify_end()
-            .w(px(size))
-            .h(px(size))
-            .child(
-                div()
-                    .ml(px(size * 0.08))
-                    .w(px(size * 0.46))
-                    .h(px((size * 0.2).max(3.0)))
-                    .rounded_sm()
-                    .bg(folder),
-            )
-            .child(
-                div()
-                    .w_full()
-                    .h(px(size * 0.68))
-                    .rounded_sm()
-                    .border_1()
-                    .border_color(if palette.dark {
-                        rgb(0xf0c66b)
-                    } else {
-                        rgb(0xa46c0d)
-                    })
-                    .bg(folder),
-            )
-            .into_any_element()
+        fallback_folder_icon(size, palette)
     } else {
-        let (label, accent) = semantic_file_icon(&entry.path, palette.dark);
-        div()
-            .flex()
-            .items_center()
-            .justify_center()
-            .w(px(size * 0.82))
-            .h(px(size))
-            .rounded_sm()
-            .border_1()
-            .border_color(accent)
-            .bg(with_alpha(accent, if palette.dark { 0.2 } else { 0.1 }))
-            .text_color(accent)
-            .text_size(px((size * 0.24).clamp(7.0, 11.0)))
-            .font_weight(FontWeight::SEMIBOLD)
-            .child(label)
-            .into_any_element()
+        fallback_file_icon(&entry.path, size, palette)
     };
 
     let link_badge = entry_link_badge(entry);
@@ -28623,6 +29016,158 @@ fn entry_icon_visual(
                     .child(badge),
             )
         })
+        .into_any_element()
+}
+
+fn fallback_folder_icon(size: f32, palette: UiPalette) -> AnyElement {
+    let (front, back, highlight, outline) = if palette.dark {
+        (rgb(0xdda846), rgb(0xb9791f), rgb(0xf0c66b), rgb(0x8d5a16))
+    } else {
+        (rgb(0xd69225), rgb(0xb86e16), rgb(0xefb44d), rgb(0x92530e))
+    };
+    let inset = size * 0.04;
+    let radius = (size * 0.12).clamp(2.0, 6.0);
+
+    div()
+        .relative()
+        .w(px(size))
+        .h(px(size))
+        .debug_selector(|| "fallback-icon-folder".to_string())
+        .child(
+            div()
+                .absolute()
+                .left(px(inset))
+                .top(px(size * 0.12))
+                .w(px(size * 0.46))
+                .h(px(size * 0.28))
+                .rounded(px(radius * 0.75))
+                .border_1()
+                .border_color(outline)
+                .bg(back),
+        )
+        .child(
+            div()
+                .absolute()
+                .left(px(inset))
+                .top(px(size * 0.28))
+                .w(px(size - inset * 2.0))
+                .h(px(size * 0.68))
+                .rounded(px(radius))
+                .border_1()
+                .border_color(outline)
+                .bg(front),
+        )
+        .child(
+            div()
+                .absolute()
+                .left(px(size * 0.12))
+                .top(px(size * 0.38))
+                .w(px(size * 0.76))
+                .h(px((size * 0.06).max(1.0)))
+                .rounded_full()
+                .bg(highlight),
+        )
+        .into_any_element()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FallbackFileIconKind {
+    Image,
+    Audio,
+    Video,
+    Archive,
+    Code,
+    Pdf,
+    Document,
+    Spreadsheet,
+    Presentation,
+    Generic,
+}
+
+impl FallbackFileIconKind {
+    fn debug_name(self) -> &'static str {
+        match self {
+            Self::Image => "image",
+            Self::Audio => "audio",
+            Self::Video => "video",
+            Self::Archive => "archive",
+            Self::Code => "code",
+            Self::Pdf => "pdf",
+            Self::Document => "document",
+            Self::Spreadsheet => "spreadsheet",
+            Self::Presentation => "presentation",
+            Self::Generic => "generic",
+        }
+    }
+}
+
+struct FallbackFileIconSpec {
+    kind: FallbackFileIconKind,
+    label: String,
+    accent: Rgba,
+}
+
+fn fallback_file_icon(path: &Path, size: f32, palette: UiPalette) -> AnyElement {
+    let spec = fallback_file_icon_spec(path, palette.dark);
+    let debug_name = spec.kind.debug_name();
+    let paper = if palette.dark {
+        rgb(0x2c3239)
+    } else {
+        rgb(0xf7f9fb)
+    };
+    let outline = if palette.dark {
+        rgb(0x707a85)
+    } else {
+        rgb(0x89939e)
+    };
+    let x = size * 0.12;
+    let y = size * 0.04;
+    let width = size * 0.76;
+    let height = size * 0.92;
+    let radius = (size * 0.1).clamp(1.5, 5.0);
+    let label_size = if spec.label.len() > 3 {
+        (size * 0.18).clamp(5.5, 9.0)
+    } else {
+        (size * 0.22).clamp(6.5, 11.0)
+    };
+
+    div()
+        .relative()
+        .w(px(size))
+        .h(px(size))
+        .debug_selector(move || format!("fallback-icon-{debug_name}"))
+        .child(
+            div()
+                .absolute()
+                .left(px(x))
+                .top(px(y))
+                .flex()
+                .items_center()
+                .justify_center()
+                .w(px(width))
+                .h(px(height))
+                .rounded(px(radius))
+                .border_1()
+                .border_color(outline)
+                .bg(paper)
+                .text_color(spec.accent)
+                .text_size(px(label_size))
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(spec.label),
+        )
+        .child(
+            div()
+                .absolute()
+                .left(px(size * 0.25))
+                .top(px(size * 0.75))
+                .w(px(size * 0.5))
+                .h(px((size * 0.07).max(1.0)))
+                .rounded_full()
+                .bg(with_alpha(
+                    spec.accent,
+                    if palette.dark { 0.34 } else { 0.24 },
+                )),
+        )
         .into_any_element()
 }
 
@@ -28675,9 +29220,31 @@ fn grid_entry_visual(
                 rgb(0xc94f5d),
                 if palette.dark { 0.12 } else { 0.07 },
             ))
-            .text_xs()
-            .text_color(rgb(0xe06c78))
-            .child("Thumbnail unavailable")
+            .debug_selector(|| "thumbnail-failed-card".to_string())
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .items_center()
+                    .justify_center()
+                    .gap_1()
+                    .px_2()
+                    .text_center()
+                    .text_xs()
+                    .line_height(px(14.0 * palette.scale))
+                    .text_color(rgb(0xe06c78))
+                    .child(
+                        div()
+                            .debug_selector(|| "thumbnail-failed-primary".to_string())
+                            .child("Thumbnail"),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(|| "thumbnail-failed-secondary".to_string())
+                            .child("unavailable"),
+                    ),
+            )
             .into_any_element(),
         None => entry_icon_visual(entry, native_icon, icon_size, palette),
     }
@@ -28693,95 +29260,81 @@ fn entry_link_badge(entry: &FileEntry) -> Option<&'static str> {
     }
 }
 
-fn semantic_file_icon(path: &Path, dark: bool) -> (String, Rgba) {
+fn fallback_file_icon_spec(path: &Path, dark: bool) -> FallbackFileIconSpec {
     let extension = path
         .extension()
         .and_then(|extension| extension.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let color = match extension.as_str() {
-        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "tif" | "tiff" | "heic" => {
-            if dark {
-                rgb(0xc58af9)
-            } else {
-                rgb(0x7e3bb5)
-            }
-        }
-        "mp3" | "wav" | "flac" | "ogg" | "m4a" | "aac" | "wma" => {
-            if dark {
-                rgb(0xf080b7)
-            } else {
-                rgb(0xb32970)
-            }
-        }
-        "mp4" | "webm" | "m4v" | "mov" | "avi" | "mkv" | "wmv" | "flv" => {
-            if dark {
-                rgb(0x72b7f2)
-            } else {
-                rgb(0x1769aa)
-            }
-        }
-        "zip" | "rar" | "7z" | "tar" | "gz" | "bz2" | "xz" => {
-            if dark {
-                rgb(0xf2a65a)
-            } else {
-                rgb(0xb75b00)
-            }
-        }
+    let (kind, label, accent) = match extension.as_str() {
+        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "tif" | "tiff" | "heic" => (
+            FallbackFileIconKind::Image,
+            "IMG",
+            if dark { rgb(0xc58af9) } else { rgb(0x7e3bb5) },
+        ),
+        "mp3" | "wav" | "flac" | "ogg" | "m4a" | "aac" | "wma" => (
+            FallbackFileIconKind::Audio,
+            "AUD",
+            if dark { rgb(0xf080b7) } else { rgb(0xb32970) },
+        ),
+        "mp4" | "webm" | "m4v" | "mov" | "avi" | "mkv" | "wmv" | "flv" => (
+            FallbackFileIconKind::Video,
+            "VID",
+            if dark { rgb(0x72b7f2) } else { rgb(0x1769aa) },
+        ),
+        "zip" | "rar" | "7z" | "tar" | "gz" | "bz2" | "xz" => (
+            FallbackFileIconKind::Archive,
+            "ZIP",
+            if dark { rgb(0xf2a65a) } else { rgb(0xb75b00) },
+        ),
         "rs" | "js" | "jsx" | "ts" | "tsx" | "html" | "css" | "json" | "toml" | "yaml" | "yml"
-        | "py" | "go" | "swift" | "kt" | "java" | "c" | "cpp" | "h" | "hpp" => {
-            if dark {
-                rgb(0x72d39b)
-            } else {
-                rgb(0x167442)
-            }
-        }
-        "pdf" => {
-            if dark {
-                rgb(0xff7b72)
-            } else {
-                rgb(0xb42318)
-            }
-        }
-        "doc" | "docx" | "odt" | "rtf" => {
-            if dark {
-                rgb(0x78a9ff)
-            } else {
-                rgb(0x2457a7)
-            }
-        }
-        "xls" | "xlsx" | "ods" | "csv" => {
-            if dark {
-                rgb(0x66c58a)
-            } else {
-                rgb(0x1f7a45)
-            }
-        }
-        "ppt" | "pptx" | "odp" => {
-            if dark {
-                rgb(0xf39a72)
-            } else {
-                rgb(0xb5481d)
-            }
-        }
-        _ => {
-            if dark {
-                rgb(0xa9b1ba)
-            } else {
-                rgb(0x59636e)
-            }
-        }
+        | "py" | "go" | "swift" | "kt" | "java" | "c" | "cpp" | "h" | "hpp" => (
+            FallbackFileIconKind::Code,
+            "DEV",
+            if dark { rgb(0x72d39b) } else { rgb(0x167442) },
+        ),
+        "pdf" => (
+            FallbackFileIconKind::Pdf,
+            "PDF",
+            if dark { rgb(0xff7b72) } else { rgb(0xb42318) },
+        ),
+        "doc" | "docx" | "odt" | "rtf" => (
+            FallbackFileIconKind::Document,
+            "DOC",
+            if dark { rgb(0x78a9ff) } else { rgb(0x2457a7) },
+        ),
+        "xls" | "xlsx" | "ods" | "csv" => (
+            FallbackFileIconKind::Spreadsheet,
+            "XLS",
+            if dark { rgb(0x66c58a) } else { rgb(0x1f7a45) },
+        ),
+        "ppt" | "pptx" | "odp" => (
+            FallbackFileIconKind::Presentation,
+            "PPT",
+            if dark { rgb(0xf39a72) } else { rgb(0xb5481d) },
+        ),
+        _ => (
+            FallbackFileIconKind::Generic,
+            "",
+            if dark { rgb(0xa9b1ba) } else { rgb(0x59636e) },
+        ),
     };
-    let label = if extension.is_empty() {
+    let label = if label.is_empty() && extension.is_empty() {
         "FILE".to_string()
-    } else {
+    } else if label.is_empty() {
         extension
             .chars()
-            .take(4)
+            .take(3)
             .collect::<String>()
             .to_ascii_uppercase()
+    } else {
+        label.to_string()
     };
-    (label, color)
+    FallbackFileIconSpec {
+        kind,
+        label,
+        accent,
+    }
 }
 
 fn entry_detail(entry: &FileEntry, calculate_folder_sizes: bool, name_folders: bool) -> String {
@@ -28858,12 +29411,45 @@ mod tests {
     }
 
     #[test]
+    fn containing_location_uses_the_most_specific_ancestor() {
+        let locations = vec![
+            ("Home".to_string(), PathBuf::from("root"), "home"),
+            (
+                "Documents".to_string(),
+                PathBuf::from("root/Documents"),
+                "file",
+            ),
+            (
+                "Downloads".to_string(),
+                PathBuf::from("root/Downloads"),
+                "download",
+            ),
+        ];
+
+        assert_eq!(
+            most_specific_location_index(Path::new("root/Documents/projects/explorie"), &locations,),
+            Some(1)
+        );
+        assert_eq!(
+            most_specific_location_index(Path::new("elsewhere"), &locations),
+            None
+        );
+    }
+
+    #[test]
     fn stepped_slider_fraction_spans_the_track_and_clamps_invalid_indexes() {
         assert_eq!(stepped_slider_fraction(0, 5), 0.0);
         assert_eq!(stepped_slider_fraction(2, 5), 0.5);
         assert_eq!(stepped_slider_fraction(4, 5), 1.0);
         assert_eq!(stepped_slider_fraction(20, 5), 1.0);
         assert_eq!(stepped_slider_fraction(0, 1), 0.0);
+    }
+
+    #[test]
+    fn syntax_highlights_ignore_ranges_before_the_rendered_line() {
+        assert!(
+            syntax_highlights_for_line(&[(0..4, HighlightStyle::default())], 10, 20).is_empty()
+        );
     }
 
     #[test]
@@ -29759,6 +30345,13 @@ mod tests {
             "frame.svg",
             "minus.svg",
             "view-col.svg",
+            "home.svg",
+            "desktop.svg",
+            "download.svg",
+            "drive.svg",
+            "music.svg",
+            "image.svg",
+            "video.svg",
             "sort.svg",
             "shield.svg",
             "more-vertical.svg",
@@ -29925,6 +30518,75 @@ mod tests {
     }
 
     #[gpui::test]
+    fn default_shell_uses_single_row_view_controls_and_navigation_first_sidebar(
+        cx: &mut TestAppContext,
+    ) {
+        let directory = fixture_dir();
+        let services = NativeServices::new(ResourcePaths::test(&directory));
+        let (view, window) =
+            cx.add_window_view(|_, cx| DirectoryWindow::new(directory.clone(), services, cx));
+        view.update(window, |view, cx| {
+            view.browser.new_tab();
+            view.state = ListingState::Ready;
+            cx.notify();
+        });
+
+        window.simulate_resize(gpui::size(px(1_024.0), px(768.0)));
+        window.run_until_parked();
+
+        assert_eq!(
+            f32::from(window.debug_bounds("browser-toolbar").unwrap().size.height),
+            40.0
+        );
+        assert!(window.debug_bounds("view-mode-control").is_some());
+        for selector in ["view-list-button", "view-grid-button", "view-column-button"] {
+            assert!(
+                window.debug_bounds(selector).is_some(),
+                "missing visible view control {selector}"
+            );
+        }
+        assert!(window.debug_bounds("view-menu-button").is_none());
+        assert!(window.debug_bounds("view-options-button").is_some());
+        assert!(window.debug_bounds("toggle-favorite-button").is_some());
+        assert!(window.debug_bounds("toggle-current-favorite").is_none());
+        assert!(window.debug_bounds("move-tab-left").is_none());
+        assert!(window.debug_bounds("move-tab-right").is_none());
+
+        let favorites = window.debug_bounds("favorites-section").unwrap();
+        let smart_folders = window.debug_bounds("smart-folders-section").unwrap();
+        let locations = window.debug_bounds("locations-section").unwrap();
+        let recents = window.debug_bounds("recents-section").unwrap();
+        assert!(favorites.top() < smart_folders.top());
+        assert!(smart_folders.top() < locations.top());
+        assert!(locations.top() < recents.top());
+
+        let grid = window.debug_bounds("view-grid-button").unwrap().center();
+        window.simulate_click(grid, gpui::Modifiers::default());
+        window.run_until_parked();
+        view.update(window, |view, _| {
+            assert_eq!(view.browser.view_mode(), ViewMode::Grid)
+        });
+
+        let view_options = window.debug_bounds("view-options-button").unwrap().center();
+        window.simulate_click(view_options, gpui::Modifiers::default());
+        window.run_until_parked();
+        assert!(window.debug_bounds("view-preview").is_some());
+        window.simulate_keystrokes("escape");
+
+        let favorite = window
+            .debug_bounds("toggle-favorite-button")
+            .unwrap()
+            .center();
+        window.simulate_click(favorite, gpui::Modifiers::default());
+        window.run_until_parked();
+        view.update(window, |view, _| {
+            assert!(view.browser.is_favorite(&directory));
+        });
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[gpui::test]
     fn compact_toolbar_popovers_preserve_actions_at_the_minimum_window_size(
         cx: &mut TestAppContext,
     ) {
@@ -29949,15 +30611,21 @@ mod tests {
         let content_top = {
             let title_bar = window.debug_bounds("title-bar").unwrap();
             let drag_region = window.debug_bounds("title-bar-drag-region").unwrap();
-            let app_icon = window.debug_bounds("title-bar-app-icon").unwrap();
             assert_eq!(f32::from(title_bar.size.height), 36.0);
             assert_eq!(title_bar.top(), px(0.0));
             assert_eq!(drag_region.top(), title_bar.top());
             assert_eq!(drag_region.bottom(), title_bar.bottom());
-            assert_eq!(f32::from(app_icon.size.width), 22.0);
-            assert_eq!(f32::from(app_icon.size.height), 22.0);
-            assert!(app_icon.left() >= drag_region.left());
-            assert!(app_icon.right() <= drag_region.right());
+            #[cfg(windows)]
+            let app_icon = window.debug_bounds("title-bar-app-icon").unwrap();
+            #[cfg(windows)]
+            {
+                assert_eq!(f32::from(app_icon.size.width), 22.0);
+                assert_eq!(f32::from(app_icon.size.height), 22.0);
+                assert!(app_icon.left() >= drag_region.left());
+                assert!(app_icon.right() <= drag_region.right());
+            }
+            #[cfg(target_os = "macos")]
+            assert!(window.debug_bounds("title-bar-folder-name").is_some());
             #[cfg(windows)]
             for selector in ["window-minimize", "window-maximize", "window-close"] {
                 let bounds = window.debug_bounds(selector).unwrap();
@@ -30070,6 +30738,7 @@ mod tests {
         window.simulate_click(view_trigger, gpui::Modifiers::default());
         window.run_until_parked();
         assert!(window.debug_bounds("view-menu").is_some());
+        assert!(window.debug_bounds("view-preview").is_some());
         let grid = window.debug_bounds("grid-view").unwrap().center();
         window.simulate_click(grid, gpui::Modifiers::default());
         window.run_until_parked();
@@ -30116,7 +30785,6 @@ mod tests {
         for selector in [
             "toolbar-theme",
             "folder-sizes",
-            "toolbar-preview",
             "workspace-manager-button",
             "remote-drive-manager-button",
             "command-palette-button",
@@ -30675,6 +31343,18 @@ mod tests {
             gpui::size(px(1200.0), px(720.0)),
             |_, _| view.clone().into_element(),
         );
+        let failed_card = cx
+            .debug_bounds("thumbnail-failed-card")
+            .expect("failed thumbnail card");
+        let failed_primary = cx
+            .debug_bounds("thumbnail-failed-primary")
+            .expect("failed thumbnail first line");
+        let failed_secondary = cx
+            .debug_bounds("thumbnail-failed-secondary")
+            .expect("failed thumbnail second line");
+        assert!(failed_card.contains(&failed_primary.center()));
+        assert!(failed_card.contains(&failed_secondary.center()));
+        assert!(failed_primary.center().y < failed_secondary.center().y);
         view.update(cx, |view, _| {
             assert!(view.entry_thumbnail_queue.is_empty());
             assert!(view.entry_thumbnails.iter().any(|(key, state)| {
@@ -31026,6 +31706,80 @@ mod tests {
         view.update(cx, |view, _| assert_eq!(view.entry_icons.len(), 3));
 
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn fallback_file_icon_pack_covers_every_semantic_family() {
+        let cases = [
+            ("photo.jpeg", FallbackFileIconKind::Image, "IMG"),
+            ("song.flac", FallbackFileIconKind::Audio, "AUD"),
+            ("movie.mov", FallbackFileIconKind::Video, "VID"),
+            ("bundle.7z", FallbackFileIconKind::Archive, "ZIP"),
+            ("source.rs", FallbackFileIconKind::Code, "DEV"),
+            ("manual.pdf", FallbackFileIconKind::Pdf, "PDF"),
+            ("letter.docx", FallbackFileIconKind::Document, "DOC"),
+            ("budget.xlsx", FallbackFileIconKind::Spreadsheet, "XLS"),
+            ("deck.pptx", FallbackFileIconKind::Presentation, "PPT"),
+            ("notes.txt", FallbackFileIconKind::Generic, "TXT"),
+            ("LICENSE", FallbackFileIconKind::Generic, "FILE"),
+        ];
+
+        for (name, expected_kind, expected_label) in cases {
+            let spec = fallback_file_icon_spec(Path::new(name), true);
+            assert_eq!(spec.kind, expected_kind, "wrong icon family for {name}");
+            assert_eq!(spec.label, expected_label, "wrong icon label for {name}");
+        }
+    }
+
+    #[gpui::test]
+    fn fallback_icon_pack_renders_every_family_in_the_listing(cx: &mut TestAppContext) {
+        let root = PathBuf::from("fallback-icon-pack");
+        let mut entries = vec![
+            absolute_entry(root.join("folder")),
+            absolute_entry(root.join("photo.jpeg")),
+            absolute_entry(root.join("song.flac")),
+            absolute_entry(root.join("movie.mov")),
+            absolute_entry(root.join("bundle.7z")),
+            absolute_entry(root.join("source.rs")),
+            absolute_entry(root.join("manual.pdf")),
+            absolute_entry(root.join("letter.docx")),
+            absolute_entry(root.join("budget.xlsx")),
+            absolute_entry(root.join("deck.pptx")),
+            absolute_entry(root.join("notes.txt")),
+        ];
+        entries[0].is_dir = true;
+
+        let (view, window) = cx.add_window_view(|window, cx| {
+            let mut view = DirectoryWindow::new(root, NativeServices::default(), cx);
+            view.entry_icon_loading_enabled = false;
+            view.browser.replace_entries(entries);
+            view.state = ListingState::Ready;
+            window.focus(&view.focus_handle, cx);
+            view
+        });
+        window.simulate_resize(gpui::size(px(900.0), px(720.0)));
+        window.run_until_parked();
+
+        for (family, selector) in [
+            ("folder", "fallback-icon-folder"),
+            ("image", "fallback-icon-image"),
+            ("audio", "fallback-icon-audio"),
+            ("video", "fallback-icon-video"),
+            ("archive", "fallback-icon-archive"),
+            ("code", "fallback-icon-code"),
+            ("pdf", "fallback-icon-pdf"),
+            ("document", "fallback-icon-document"),
+            ("spreadsheet", "fallback-icon-spreadsheet"),
+            ("presentation", "fallback-icon-presentation"),
+            ("generic", "fallback-icon-generic"),
+        ] {
+            assert!(
+                window.debug_bounds(selector).is_some(),
+                "missing rendered fallback icon family {family}"
+            );
+        }
+
+        drop(view);
     }
 
     #[gpui::test]
@@ -33508,6 +34262,71 @@ mod tests {
     }
 
     #[gpui::test]
+    fn quick_look_terminal_states_are_centered_in_the_preview_canvas(cx: &mut TestAppContext) {
+        let directory = fixture_dir();
+        let file = directory.join("missing.txt");
+        let services = NativeServices::new(ResourcePaths::test(&directory));
+        let (view, window) = cx.add_window_view(|window, cx| {
+            let view = DirectoryWindow::new(directory.clone(), services, cx);
+            window.focus(&view.focus_handle(cx), cx);
+            view
+        });
+        view.update(window, |view, cx| {
+            view.quick_look_open = true;
+            view.quick_look_paths = vec![file.clone()];
+            view.preview_state = PreviewState::Failed {
+                path: file.clone(),
+                error: ServiceError::new(
+                    ErrorCode::InvalidInput,
+                    "Preview detection requires a regular file",
+                ),
+            };
+            cx.notify();
+        });
+        window.simulate_resize(gpui::size(px(800.0), px(600.0)));
+        window.run_until_parked();
+
+        let content = window.debug_bounds("quick-look-content").unwrap();
+        let retry = window.debug_bounds("retry-preview").unwrap();
+        assert!(
+            (f32::from(retry.center().x) - f32::from(content.center().x)).abs() <= 1.0,
+            "retry action should be horizontally centered in the preview canvas"
+        );
+        assert!(
+            (f32::from(retry.center().y) - f32::from(content.center().y)).abs() <= 80.0,
+            "retry action should stay near the vertical center of the preview canvas"
+        );
+
+        view.update(window, |view, cx| {
+            view.preview_state = PreviewState::Loading { path: file.clone() };
+            cx.notify();
+        });
+        window.run_until_parked();
+        assert_eq!(
+            window.debug_bounds("preview-loading").unwrap().center(),
+            window.debug_bounds("quick-look-content").unwrap().center()
+        );
+
+        view.update(window, |view, cx| {
+            view.preview_state = PreviewState::Ready {
+                path: file.clone(),
+                content: PreviewContent::BlockedScript,
+            };
+            cx.notify();
+        });
+        window.run_until_parked();
+        assert_eq!(
+            window
+                .debug_bounds("preview-blocked-script")
+                .unwrap()
+                .center(),
+            window.debug_bounds("quick-look-content").unwrap().center()
+        );
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[gpui::test]
     fn quick_look_restores_legacy_modal_geometry_navigation_and_pinned_preview_return(
         cx: &mut TestAppContext,
     ) {
@@ -33803,6 +34622,37 @@ mod tests {
 
         assert!(window.debug_bounds("column-preview").is_some());
         assert!(window.debug_bounds("preview-panel").is_none());
+        window.simulate_resize(gpui::size(px(800.0), px(720.0)));
+        window.run_until_parked();
+        let strip = view.update(window, |view, _| view.column_strip_scroll.clone());
+        let initial_max_offset = strip.max_offset().x;
+        assert!(initial_max_offset > px(0.0));
+        view.update(window, |view, cx| {
+            let offset = view.column_strip_scroll.offset();
+            view.column_strip_scroll
+                .set_offset(gpui::point(-initial_max_offset, offset.y));
+            cx.notify();
+        });
+        window.run_until_parked();
+
+        let resizer = window.debug_bounds("preview-panel-resizer").unwrap();
+        let start = resizer.center();
+        let end = gpui::point(start.x - px(100.0), start.y);
+        window.simulate_mouse_down(start, MouseButton::Left, gpui::Modifiers::default());
+        window.simulate_mouse_move(end, Some(MouseButton::Left), gpui::Modifiers::default());
+        window.simulate_mouse_up(end, MouseButton::Left, gpui::Modifiers::default());
+        window.run_until_parked();
+
+        view.update(window, |view, _| {
+            assert_eq!(view.preview_panel_width, 460.0);
+        });
+        let final_max_offset = strip.max_offset().x;
+        assert!(final_max_offset > initial_max_offset);
+        assert_eq!(strip.offset().x, -final_max_offset);
+        assert_eq!(
+            window.debug_bounds("column-preview").unwrap().right(),
+            strip.bounds().right()
+        );
         view.update(window, |view, cx| {
             assert!(
                 view.browser
@@ -35213,6 +36063,8 @@ mod tests {
         });
         window.simulate_resize(gpui::size(px(800.0), px(600.0)));
         window.run_until_parked();
+        assert!(window.debug_bounds("column-entry-selected-0-0").is_some());
+        assert!(window.debug_bounds("column-entry-selected-1-0").is_some());
 
         let strip = view.update(window, |view, _| view.column_strip_scroll.clone());
         assert!(strip.max_offset().x > px(0.0));
@@ -35265,6 +36117,42 @@ mod tests {
         });
         assert!(window.debug_bounds("column-entry-selected-0-0").is_none());
         assert!(window.debug_bounds("column-entry-selected-0-1").is_some());
+    }
+
+    #[gpui::test]
+    fn visible_hidden_items_keep_a_dimmed_content_state_in_every_view(cx: &mut TestAppContext) {
+        let root = PathBuf::from("hidden-item-state");
+        let mut hidden = absolute_entry(root.join(".secret.txt"));
+        hidden.hidden = true;
+        let (view, window) = cx.add_window_view(|window, cx| {
+            let mut view = DirectoryWindow::new(root.clone(), NativeServices::default(), cx);
+            view.browser
+                .apply_common_preferences(true, false, EntryFilter::All);
+            view.browser.replace_entries(vec![hidden.clone()]);
+            view.state = ListingState::Ready;
+            window.focus(&view.focus_handle, cx);
+            view
+        });
+        window.simulate_resize(gpui::size(px(900.0), px(640.0)));
+        window.run_until_parked();
+        assert!(window.debug_bounds("list-hidden-entry-0").is_some());
+
+        view.update(window, |view, cx| {
+            view.browser.set_view_mode(ViewMode::Grid);
+            cx.notify();
+        });
+        window.run_until_parked();
+        assert!(window.debug_bounds("grid-hidden-entry-0").is_some());
+
+        view.update(window, |view, cx| {
+            view.browser.set_view_mode(ViewMode::Column);
+            view.columns = ColumnState::new(&root);
+            assert!(view.columns.apply_listed(&root, vec![hidden]));
+            view.column_scroll_handles = vec![UniformListScrollHandle::new()];
+            cx.notify();
+        });
+        window.run_until_parked();
+        assert!(window.debug_bounds("column-hidden-entry-0-0").is_some());
     }
 
     #[gpui::test]
@@ -35576,6 +36464,7 @@ mod tests {
             }));
             view.operation_panel_hidden = true;
             view.operation_panel_minimized = true;
+            view.watch_status = WatchStatus::Watching;
             view.state = ListingState::Ready;
             cx.notify();
         });
@@ -35587,9 +36476,6 @@ mod tests {
             "status-filter-summary",
             "status-operation-summary",
             "status-selection-summary",
-            "status-disk-summary",
-            "status-watcher-summary",
-            "status-view-summary",
         ] {
             let bounds = window
                 .debug_bounds(selector)
@@ -35614,6 +36500,9 @@ mod tests {
             f32::from(window.debug_bounds("watcher-status").unwrap().size.height),
             28.0
         );
+        assert!(window.debug_bounds("status-disk-summary").is_none());
+        assert!(window.debug_bounds("status-watcher-summary").is_none());
+        assert!(window.debug_bounds("status-view-summary").is_none());
         assert_eq!(
             f32::from(window.debug_bounds("operation-panel").unwrap().size.height),
             0.0
@@ -35636,8 +36525,8 @@ mod tests {
         assert!(window.debug_bounds("status-item-summary").is_some());
         assert!(window.debug_bounds("status-filter-summary").is_some());
         assert!(window.debug_bounds("status-operation-summary").is_some());
-        assert!(window.debug_bounds("status-watcher-summary").is_some());
         assert!(window.debug_bounds("status-disk-summary").is_none());
+        assert!(window.debug_bounds("status-watcher-summary").is_none());
         assert!(window.debug_bounds("status-view-summary").is_none());
         let compact_status = window.debug_bounds("watcher-status").unwrap();
         assert_eq!(f32::from(compact_status.size.height), 28.0);
@@ -35645,7 +36534,6 @@ mod tests {
             "status-item-summary",
             "status-operation-summary",
             "status-selection-summary",
-            "status-watcher-summary",
         ] {
             let bounds = window.debug_bounds(selector).unwrap();
             assert!(
@@ -35663,6 +36551,12 @@ mod tests {
             compact_operation.right() <= compact_selection.left(),
             "compact status clusters must not overlap: operation={compact_operation:?}, selection={compact_selection:?}, status={compact_status:?}"
         );
+        view.update(window, |view, cx| {
+            view.watch_status = WatchStatus::Unavailable("watch failed".to_string());
+            cx.notify();
+        });
+        window.run_until_parked();
+        assert!(window.debug_bounds("status-watcher-summary").is_some());
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -36361,6 +37255,155 @@ mod tests {
     }
 
     #[gpui::test]
+    fn pinned_inspector_stays_visible_summarizes_multi_selection_and_persists_width(
+        cx: &mut TestAppContext,
+    ) {
+        let directory = fixture_dir();
+        let resources = ResourcePaths::test(&directory);
+        let first = directory.join("first.txt");
+        let second = directory.join("second.txt");
+        fs::write(&first, "first").unwrap();
+        fs::write(&second, "second").unwrap();
+        let services = NativeServices::new(resources.clone());
+        let (view, window) = cx.add_window_view(|_, cx| {
+            DirectoryWindow::restore(directory.clone(), false, services, cx)
+        });
+        view.update(window, |view, cx| {
+            view.browser.replace_entries(vec![
+                absolute_entry(first.clone()),
+                absolute_entry(second.clone()),
+            ]);
+            view.settings.appearance.ui_scale = 0.9;
+            view.settings.view.show_preview_panel = true;
+            view.sync_pinned_preview(cx);
+        });
+        window.simulate_resize(gpui::size(px(1_200.0), px(720.0)));
+        window.run_until_parked();
+
+        assert!(window.debug_bounds("preview-panel").is_some());
+        assert!(window.debug_bounds("preview-summary-empty").is_some());
+        let initial_width = f32::from(window.debug_bounds("preview-panel").unwrap().size.width);
+        assert_eq!(initial_width, 324.0);
+
+        view.update(window, |view, cx| {
+            view.browser.select(first.clone());
+            view.browser.toggle_selection(second.clone());
+            view.sync_pinned_preview(cx);
+        });
+        window.run_until_parked();
+        assert!(window.debug_bounds("preview-summary-multiple").is_some());
+
+        let resizer = window.debug_bounds("preview-panel-resizer").unwrap();
+        let start = resizer.center();
+        let end = gpui::point(start.x - px(54.0), start.y);
+        window.simulate_mouse_down(start, MouseButton::Left, gpui::Modifiers::default());
+        window.simulate_mouse_move(end, Some(MouseButton::Left), gpui::Modifiers::default());
+        window.run_until_parked();
+        assert_eq!(
+            window
+                .debug_bounds("preview-panel-resizer")
+                .unwrap()
+                .center()
+                .x,
+            end.x
+        );
+        window.simulate_mouse_up(end, MouseButton::Left, gpui::Modifiers::default());
+        window.run_until_parked();
+        assert_eq!(
+            f32::from(window.debug_bounds("preview-panel").unwrap().size.width),
+            378.0
+        );
+        window.simulate_keystrokes("left");
+        window.run_until_parked();
+        assert_eq!(
+            f32::from(window.debug_bounds("preview-panel").unwrap().size.width),
+            387.0
+        );
+        view.update(window, |view, _| {
+            view.settings_store.as_ref().unwrap().flush();
+        });
+
+        let saved: serde_json::Value = serde_json::from_slice(
+            &fs::read(resources.config_dir.join("settings-v1.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved["view"]["previewPanelWidth"], 430.0);
+
+        let restart_services = NativeServices::new(resources);
+        let (restarted, restarted_window) = cx.add_window_view(|_, cx| {
+            DirectoryWindow::restore(directory.clone(), false, restart_services, cx)
+        });
+        restarted_window.simulate_resize(gpui::size(px(1_200.0), px(720.0)));
+        restarted_window.run_until_parked();
+        restarted.update(restarted_window, |view, _| {
+            assert_eq!(view.settings.view.preview_panel_width, 430.0);
+        });
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[gpui::test]
+    fn restored_single_selection_starts_the_pinned_preview_after_listing(cx: &mut TestAppContext) {
+        let directory = fixture_dir();
+        let file = directory.join("restored.txt");
+        fs::write(&file, "restored preview").unwrap();
+        let services = NativeServices::new(ResourcePaths::test(&directory));
+        let (view, cx) =
+            cx.add_window_view(|_, cx| DirectoryWindow::new(directory.clone(), services, cx));
+
+        view.update(cx, |view, cx| {
+            view.browser.restore_folder_view_states(HashMap::from([(
+                directory.clone(),
+                crate::browser::FolderViewState {
+                    view_mode: ViewMode::List,
+                    sort_key: SortKey::Name,
+                    sort_direction: SortDirection::Ascending,
+                    selected: vec![file.clone()],
+                    scroll_index: 0,
+                    grid_min_width: 140,
+                    show_preview_panel: true,
+                    column_widths: HashMap::new(),
+                },
+            )]));
+            view.settings.view.show_preview_panel = true;
+            view.apply_event(
+                DirectoryEvent::Listed {
+                    generation: view.request_generation,
+                    request: ListRequest {
+                        path: directory.clone(),
+                        calc_dir_size: false,
+                    },
+                    entries: vec![absolute_entry(file.clone())],
+                },
+                cx,
+            );
+        });
+        for _ in 0..300 {
+            cx.run_until_parked();
+            if view.update(cx, |view, _| {
+                matches!(view.preview_state, PreviewState::Ready { .. })
+            }) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        view.update(cx, |view, _| {
+            assert!(matches!(
+                &view.preview_state,
+                PreviewState::Ready { path, .. } if path == &file
+            ));
+        });
+        cx.simulate_resize(gpui::size(px(1_180.0), px(760.0)));
+        cx.run_until_parked();
+        assert!(
+            f32::from(cx.debug_bounds("text-preview-code").unwrap().size.height) > 40.0,
+            "pinned text preview content should receive visible height"
+        );
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[gpui::test]
     fn pinned_preview_follows_single_selection_and_closes_for_multi_selection(
         cx: &mut TestAppContext,
     ) {
@@ -36863,6 +37906,36 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    fn close_shortcut_closes_the_last_tab_as_a_window_without_quitting(cx: &mut TestAppContext) {
+        let directory = fixture_dir();
+        cx.update(|cx| {
+            cx.bind_keys([KeyBinding::new("cmd-w", CloseTab, Some("browser"))]);
+        });
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                let view = cx.new(|cx| {
+                    DirectoryWindow::new(
+                        directory.clone(),
+                        NativeServices::new(ResourcePaths::test(&directory)),
+                        cx,
+                    )
+                });
+                window.focus(&view.focus_handle(cx), cx);
+                view
+            })
+            .unwrap()
+        });
+
+        assert_eq!(cx.update(|cx| cx.windows().len()), 1);
+        cx.dispatch_keystroke(*window, Keystroke::parse("cmd-w").unwrap());
+        cx.run_until_parked();
+        assert!(cx.update(|cx| cx.windows().is_empty()));
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     #[gpui::test]
     fn smart_folder_editor_creates_validates_edits_and_persists_full_criteria(
         cx: &mut TestAppContext,
@@ -37342,6 +38415,7 @@ mod tests {
                     y: Some(90.0),
                 },
                 sidebar_width: 260.0,
+                preview_panel_width: 440.0,
                 sidebar_collapsed: true,
             };
             let partial_id = view.workspaces.save_current("Partial", partial).unwrap();
@@ -37354,6 +38428,8 @@ mod tests {
             assert!(view.sidebar_collapsed);
             assert_eq!(view.sidebar_width, 260.0);
             assert_eq!(view.settings.view.sidebar_width, 260.0);
+            assert_eq!(view.preview_panel_width, 440.0);
+            assert_eq!(view.settings.view.preview_panel_width, 440.0);
             assert_eq!(
                 view.pending_workspace_bounds,
                 Some(WorkspaceWindowState {

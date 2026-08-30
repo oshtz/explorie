@@ -20,7 +20,9 @@ use syntect::util::LinesWithEndings;
 
 const MAX_TEXT_PREVIEW_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_TEXT_HIGHLIGHTS: usize = 50_000;
+#[cfg(windows)]
 const MAX_ICON_CACHE_ENTRIES: usize = 256;
+#[cfg(windows)]
 const MAX_ICON_CACHE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_THUMBNAIL_ENTRIES: usize = 256;
 const MAX_THUMBNAIL_BYTES: u64 = 128 * 1024 * 1024;
@@ -37,6 +39,7 @@ const DETECTION_BYTES: u64 = 8 * 1024;
 const HEX_PREVIEW_BYTES: usize = 16 * 12;
 const HELPER_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const HELPER_CONVERSION_TIMEOUT: Duration = Duration::from_secs(45);
+#[cfg(windows)]
 const SHELL_ICON_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_HELPER_STDOUT_BYTES: usize = 64 * 1024;
 const MAX_GENERATED_ARTIFACT_ENTRIES: usize = 96;
@@ -1302,6 +1305,7 @@ finally { [void][ExplorieShellIcon.NativeMethods]::DestroyIcon($info.hIcon) }"#;
     }
 }
 
+#[cfg(windows)]
 fn prune_icon_cache(cache: &Path) {
     let Ok(entries) = fs::read_dir(cache) else {
         return;
