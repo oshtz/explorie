@@ -1,8 +1,8 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex, mpsc};
 
-#[cfg(target_os = "macos")]
 use explorie_gpui::SingleInstanceRequest;
 use explorie_gpui::{
     APP_NAME, DEFAULT_WINDOW_HEIGHT, DEFAULT_WINDOW_WIDTH, DirectoryWindow, ExplorieAssets,
@@ -20,6 +20,20 @@ fn application() -> gpui::Application {
         gpui_windows::WindowsPlatform::new(false)
             .expect("failed to initialize the Windows GPUI platform"),
     ))
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+type SharedRequests = Arc<Mutex<mpsc::Receiver<SingleInstanceRequest>>>;
+
+#[cfg(any(windows, target_os = "macos"))]
+#[derive(Clone)]
+enum PrimaryWindowOpen {
+    Initial {
+        previous_session_unclean: bool,
+        plugin_startup_error: Option<String>,
+    },
+    #[cfg(target_os = "macos")]
+    Reopen,
 }
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -64,7 +78,7 @@ fn main() {
     let _instance = instance.guard;
     let plugin_startup_error =
         explorie_gpui::initialize_plugins(&services, std::env::args_os()).err();
-    let single_instance_requests = instance.requests;
+    let single_instance_requests = Arc::new(Mutex::new(instance.requests));
     let path = explicit_path
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("."));
@@ -78,7 +92,14 @@ fn main() {
     let (window_runtime, restored_window_sessions) = WindowRuntime::open(&config_dir);
 
     #[cfg(target_os = "macos")]
-    let (open_url_tx, open_url_rx) = std::sync::mpsc::channel();
+    let (open_url_tx, open_url_rx) = mpsc::channel();
+    #[cfg(target_os = "macos")]
+    let open_url_requests = Arc::new(Mutex::new(open_url_rx));
+    let request_sources = vec![single_instance_requests];
+    #[cfg(target_os = "macos")]
+    let mut request_sources = request_sources;
+    #[cfg(target_os = "macos")]
+    request_sources.push(open_url_requests);
     let application = application().with_assets(ExplorieAssets);
     #[cfg(target_os = "macos")]
     application.on_open_urls(move |urls| {
@@ -88,6 +109,26 @@ fn main() {
             }
         }
     });
+    #[cfg(target_os = "macos")]
+    {
+        let reopen_path = path.clone();
+        let reopen_services = services.clone();
+        let reopen_runtime = window_runtime.clone();
+        let reopen_requests = request_sources.clone();
+        application.on_reopen(move |cx| {
+            if let Err(error) = open_primary_window(
+                cx,
+                reopen_path.clone(),
+                false,
+                reopen_services.clone(),
+                reopen_runtime.clone(),
+                reopen_requests.clone(),
+                PrimaryWindowOpen::Reopen,
+            ) {
+                eprintln!("unable to reopen Explorie window: {error}");
+            }
+        });
+    }
 
     application.run(move |cx: &mut App| {
         let quitting_runtime = window_runtime.clone();
@@ -133,58 +174,18 @@ fn main() {
             })
             .detach();
         }
-        let fallback_bounds = Bounds::centered(
-            None,
-            size(px(DEFAULT_WINDOW_WIDTH), px(DEFAULT_WINDOW_HEIGHT)),
+        open_primary_window(
             cx,
-        );
-        let bounds = initial_window_bounds(&config_dir, fallback_bounds, cx);
-        let options = desktop_window_options(bounds);
-        let primary_path = path.clone();
-        let primary_services = services.clone();
-        let primary_runtime = window_runtime.clone();
-        cx.open_window(options, move |window, cx| {
-            window.set_window_title(APP_NAME);
-            let view = cx.new(|cx| {
-                let mut view = DirectoryWindow::restore_window_session(
-                    primary_path,
-                    startup_path_is_explicit,
-                    primary_services,
-                    Some(primary_runtime),
-                    "primary".to_string(),
-                    cx,
-                );
-                if let Some(error) = plugin_startup_error {
-                    view.announce_plugin_startup_error(error, cx);
-                }
-                view.install_shortcut_bindings(cx);
-                view.start_listing(cx);
-                view.start_watching(cx);
-                view.start_system_locations(cx);
-                view.start_service_events(cx);
-                view.start_preview_helpers(cx);
-                view.start_system_integration_status(cx);
-                view.start_remote_drives(cx);
-                #[cfg(target_os = "macos")]
-                view.start_install_cleanup_offer(cx);
-                view.start_update_check(false, cx);
-                if previous_session_unclean {
-                    view.announce_unclean_recovery(cx);
-                }
-                view
-            });
-            view.update(cx, |view, cx| {
-                view.start_single_instance_requests(single_instance_requests, window, cx);
-                #[cfg(target_os = "macos")]
-                view.start_single_instance_requests(open_url_rx, window, cx);
-            });
-            let close_view = view.clone();
-            window.on_window_should_close(cx, move |_, cx| {
-                close_view.update(cx, |view, cx| view.request_window_close(cx))
-            });
-            window.focus(&view.focus_handle(cx), cx);
-            view
-        })
+            path.clone(),
+            startup_path_is_explicit,
+            services.clone(),
+            window_runtime.clone(),
+            request_sources,
+            PrimaryWindowOpen::Initial {
+                previous_session_unclean,
+                plugin_startup_error,
+            },
+        )
         .expect("unable to open explorie window");
         for session_id in restored_window_sessions {
             let fallback_bounds = Bounds::centered(
@@ -219,7 +220,7 @@ fn main() {
                 });
                 let close_view = view.clone();
                 window.on_window_should_close(cx, move |_, cx| {
-                    close_view.update(cx, |view, cx| view.request_window_close(cx))
+                    close_view.update(cx, |view, cx| view.request_platform_window_close(cx))
                 });
                 window.focus(&view.focus_handle(cx), cx);
                 view
@@ -229,6 +230,83 @@ fn main() {
         }
         cx.activate(true);
     });
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn open_primary_window(
+    cx: &mut App,
+    path: PathBuf,
+    startup_path_is_explicit: bool,
+    services: NativeServices,
+    runtime: WindowRuntime,
+    request_sources: Vec<SharedRequests>,
+    open: PrimaryWindowOpen,
+) -> Result<(), String> {
+    let fallback_bounds = Bounds::centered(
+        None,
+        size(px(DEFAULT_WINDOW_WIDTH), px(DEFAULT_WINDOW_HEIGHT)),
+        cx,
+    );
+    let bounds = initial_window_bounds(&services.resources().config_dir, fallback_bounds, cx);
+    let options = desktop_window_options(bounds);
+    cx.open_window(options, move |window, cx| {
+        window.set_window_title(APP_NAME);
+        let view = cx.new(|cx| {
+            let mut view = DirectoryWindow::restore_window_session(
+                path,
+                startup_path_is_explicit,
+                services,
+                Some(runtime),
+                "primary".to_string(),
+                cx,
+            );
+            if let PrimaryWindowOpen::Initial {
+                plugin_startup_error: Some(error),
+                ..
+            } = &open
+            {
+                view.announce_plugin_startup_error(error.clone(), cx);
+            }
+            view.install_shortcut_bindings(cx);
+            view.start_listing(cx);
+            view.start_watching(cx);
+            view.start_system_locations(cx);
+            view.start_service_events(cx);
+            view.start_preview_helpers(cx);
+            view.start_system_integration_status(cx);
+            view.start_remote_drives(cx);
+            #[cfg(target_os = "macos")]
+            if matches!(open, PrimaryWindowOpen::Initial { .. }) {
+                view.start_install_cleanup_offer(cx);
+            }
+            if matches!(open, PrimaryWindowOpen::Initial { .. }) {
+                view.start_update_check(false, cx);
+            }
+            if matches!(
+                open,
+                PrimaryWindowOpen::Initial {
+                    previous_session_unclean: true,
+                    ..
+                }
+            ) {
+                view.announce_unclean_recovery(cx);
+            }
+            view
+        });
+        view.update(cx, |view, cx| {
+            for requests in request_sources {
+                view.start_single_instance_requests(requests, window, cx);
+            }
+        });
+        let close_view = view.clone();
+        window.on_window_should_close(cx, move |_, cx| {
+            close_view.update(cx, |view, cx| view.request_platform_window_close(cx))
+        });
+        window.focus(&view.focus_handle(cx), cx);
+        view
+    })
+    .map(|_| ())
+    .map_err(|error| error.to_string())
 }
 
 #[cfg(windows)]

@@ -1,7 +1,7 @@
 {
   "id": "syncthing",
   "name": "Syncthing",
-  "version": "0.2.15",
+  "version": "0.3.0",
   "protocolVersion": 1,
   "description": "Recognize synced folders and optionally connect to a local Syncthing instance.",
   "executables": {

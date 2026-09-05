@@ -114,6 +114,20 @@ plugin versions to equal the app version. Output includes three ZIPs, a platform
 and a platform checksum file. Asset URLs use the immutable `vVERSION` GitHub release;
 unpublished versions cannot be installed from the official catalog until their assets exist.
 
+### Personal testing from a draft release
+
+GitHub draft assets require an authenticated download. The app's anonymous catalog URLs
+cannot install plugins from a draft, so Settings → Install will remain unavailable until
+publication. For personal testing, download the matching platform ZIPs from the draft while
+signed in as the repository owner (or use `gh release download v0.3.0 --repo oshtz/explorie
+--pattern 'explorie-plugin-*.zip'`). Extract each plugin to its own directory, then launch
+the packaged app with `--load-plugin-dir <extracted-directory>` for each plugin to test.
+These packages appear as Development and can be enabled in Settings → Integrations.
+Quit the running app before relaunching with these flags.
+
+This exercises the plugin behavior without publishing the release. It does not establish
+official catalog download/install/update proof; that remains a separate release check.
+
 The release workflow packages plugins before compiling the app. On macOS it signs each
 executable with the existing Developer ID identity and hardened runtime, submits each ZIP
 to Apple's notary service, requires Accepted status, and verifies extracted signatures and

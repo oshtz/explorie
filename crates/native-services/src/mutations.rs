@@ -555,11 +555,11 @@ fn validate_real_directory(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn mount_check_path(path: &Path, canonical: io::Result<PathBuf>) -> io::Result<PathBuf> {
+fn mount_check_path(_path: &Path, canonical: io::Result<PathBuf>) -> io::Result<PathBuf> {
     match canonical {
         Ok(path) => Ok(path),
         #[cfg(windows)]
-        Err(error) if error.raw_os_error() == Some(1005) => Ok(path.to_path_buf()),
+        Err(error) if error.raw_os_error() == Some(1005) => Ok(_path.to_path_buf()),
         Err(error) => Err(error),
     }
 }
