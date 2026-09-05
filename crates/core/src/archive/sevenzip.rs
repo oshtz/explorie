@@ -299,6 +299,7 @@ fn parse_listing(text: &str, archive: &Path, max_entries: usize) -> io::Result<V
     let text = text.trim_start_matches('\n');
     let text = text
         .strip_prefix("Enter password (will not be echoed):\n")
+        .or_else(|| text.strip_prefix("Enter password:\n"))
         .unwrap_or(text);
     let mut entries = Vec::new();
     let mut paths = HashSet::new();
@@ -626,6 +627,44 @@ mod tests {
         assert!(parse_listing("Size = \nPacked Size = \n", Path::new("notes.cab"), 100).is_err());
     }
 
+    #[test]
+    fn listing_accepts_only_exact_leading_password_prompts() {
+        let record = "Path = secret.txt\nSize = 15\nEncrypted = +\n";
+        for prompt in ["Enter password (will not be echoed):", "Enter password:"] {
+            for newline in ["\n", "\r\n"] {
+                let listing = format!("\n{prompt}\n{record}").replace('\n', newline);
+                let entries = parse_listing(&listing, Path::new("encrypted.cab"), 100).unwrap();
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].entry.path, "secret.txt");
+                assert!(entries[0].encrypted);
+            }
+            // Prompts inside technical records must not be silently discarded.
+            assert!(
+                parse_listing(
+                    &format!("{record}\n{prompt}\n"),
+                    Path::new("encrypted.cab"),
+                    100,
+                )
+                .is_err()
+            );
+        }
+        for prompt in [
+            "Enter password:unexpected\n",
+            "Enter password (will not be echoed):unexpected\n",
+            "Enter password\n",
+            "Enter password:\nEnter password:\n",
+        ] {
+            assert!(
+                parse_listing(
+                    &format!("{prompt}{record}"),
+                    Path::new("encrypted.cab"),
+                    100,
+                )
+                .is_err()
+            );
+        }
+    }
+
     fn fixture(root: &Path, format: &str, extension: &str) -> PathBuf {
         let source = root.join("input");
         fs::create_dir_all(&source).unwrap();
@@ -786,7 +825,9 @@ mod tests {
     fn bundled_engine_accepts_passwords_via_stdin_for_encrypted_headers() {
         let temporary = TempDir::new().unwrap();
         let source = temporary.path().join("secret.txt");
-        fs::write(&source, "fixture content").unwrap();
+        let content =
+            b"\nEnter password:\nEnter password (will not be echoed):\n\0\xfffixture content";
+        fs::write(&source, content).unwrap();
         let archive = temporary.path().join("encrypted.cab");
         let mut create = command(&executable().unwrap(), "a").unwrap();
         // This is a fixed test password, not user data. Production supplies
@@ -803,10 +844,7 @@ mod tests {
         assert!(extract_archive_with_password(&archive, &output, Some("wrong")).is_err());
         assert!(!output.exists());
         extract_archive_with_password(&archive, &output, Some("fixture-password")).unwrap();
-        assert_eq!(
-            fs::read_to_string(output.join("secret.txt")).unwrap(),
-            "fixture content"
-        );
+        assert_eq!(fs::read(output.join("secret.txt")).unwrap(), content);
     }
 
     #[test]
