@@ -6,13 +6,19 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { SEVENZIP_VERSION } from './prepare-7zip.mjs';
 
+export function verifySevenZipVersion(output) {
+  // The standalone Unix engine includes the (z) variant in its banner.
+  const version = /^7-Zip(?: \(z\))? (\d+\.\d+)(?= )/m.exec(output)?.[1];
+  assert.equal(version, SEVENZIP_VERSION, 'Unexpected 7-Zip version');
+}
+
 export async function smokeSevenZip(executable) {
   executable = path.resolve(executable);
   const temporary = await mkdtemp(path.join(os.tmpdir(), 'explorie-7zip-smoke-'));
   const run = (...args) => execFileSync(executable, args, { cwd: temporary, encoding: 'utf8', windowsHide: true });
   try {
     const formats = run('i');
-    assert.ok(formats.includes(`7-Zip ${SEVENZIP_VERSION}`), 'Unexpected 7-Zip version');
+    verifySevenZipVersion(formats);
     for (const format of ['Cab', 'Dmg', 'Iso', 'Rar', 'Wim']) {
       assert.match(formats, new RegExp(`\\s${format}\\s`, 'i'), `Full engine must support ${format}`);
     }

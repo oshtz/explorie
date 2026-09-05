@@ -1,6 +1,6 @@
 [package]
 name = "explorie-gpui"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 authors = ["explorie contributors"]
 description = "Native GPUI desktop application for explorie"

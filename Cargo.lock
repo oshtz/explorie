@@ -2183,7 +2183,7 @@ version = "0.1.0"
 
 [[package]]
 name = "explorie-gpui"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "chrono",
  "cocoa 0.26.0",
@@ -2258,7 +2258,7 @@ dependencies = [
 
 [[package]]
 name = "explorie-plugin-git"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "explorie-plugin-protocol",
  "serde_json",
@@ -2268,7 +2268,7 @@ dependencies = [
 
 [[package]]
 name = "explorie-plugin-obsidian"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "explorie-plugin-protocol",
  "serde_json",
@@ -2286,7 +2286,7 @@ dependencies = [
 
 [[package]]
 name = "explorie-plugin-syncthing"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "dirs 5.0.1",
  "explorie-plugin-protocol",
