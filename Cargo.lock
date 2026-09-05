@@ -2191,6 +2191,7 @@ dependencies = [
  "drag",
  "embed-resource",
  "explorie-core",
+ "explorie-plugin-protocol",
  "explorie-native-services",
  "gpui",
  "gpui_platform",
@@ -2220,6 +2221,7 @@ dependencies = [
  "cc",
  "dirs 5.0.1",
  "explorie-core",
+ "explorie-plugin-protocol",
  "fontdue",
  "hayro-syntax",
  "html2text",
@@ -10062,4 +10064,60 @@ dependencies = [
  "serde",
  "syn 3.0.4",
  "winnow 1.0.4",
+]
+
+[[package]]
+name = "explorie-plugin-git"
+version = "0.2.15"
+dependencies = [
+ "explorie-plugin-protocol",
+ "serde_json",
+ "tempfile",
+ "url",
+]
+
+
+[[package]]
+name = "explorie-plugin-obsidian"
+version = "0.2.15"
+dependencies = [
+ "explorie-plugin-protocol",
+ "serde_json",
+ "tempfile",
+ "url",
+]
+
+
+[[package]]
+name = "explorie-plugin-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+
+[[package]]
+name = "explorie-plugin-syncthing"
+version = "0.2.15"
+dependencies = [
+ "dirs 5.0.1",
+ "explorie-plugin-protocol",
+ "roxmltree",
+ "rustls",
+ "rustls-pemfile",
+ "serde_json",
+ "tempfile",
+ "ureq",
+ "url",
+]
+
+
+[[package]]
+name = "rustls-pemfile"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dce314e5fee3f39953d46bb63bb8a46d40c2f8fb7cc5a3b6cab2bde9721d6e50"
+dependencies = [
+ "rustls-pki-types",
 ]

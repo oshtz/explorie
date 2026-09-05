@@ -74,6 +74,7 @@ target/
 **/src-tauri/gen/
 **/target/**/bundle/
 apps/desktop/frontend/src-tauri/binaries/rclone-*
+apps/desktop/native-assets/binaries/7zip-*/
 
 # Tests / Coverage
 .release-checks/

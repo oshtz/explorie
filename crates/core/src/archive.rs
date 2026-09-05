@@ -13,6 +13,8 @@ use zip::{CompressionMethod, ZipArchive, ZipWriter};
 // Re-export Password for 7z operations
 pub use sevenz_rust::Password as SevenZPassword;
 
+mod sevenzip;
+
 #[derive(Clone, Copy, Debug)]
 pub struct ExtractionLimits {
     pub max_entries: usize,
@@ -2220,6 +2222,7 @@ pub fn list_archive_contents(archive_path: &Path) -> io::Result<ArchiveInfo> {
         Some(ArchiveFormat::Tar) => list_tar_contents(archive_path, false),
         Some(ArchiveFormat::Rar) => list_rar_contents(archive_path),
         Some(ArchiveFormat::SevenZ) => list_7z_contents(archive_path),
+        None if sevenzip::supports(archive_path) => sevenzip::list(archive_path),
         None => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "Unsupported archive format",
@@ -2272,6 +2275,9 @@ pub fn extract_archive_with_password_and_limits(
             }
             Some(ArchiveFormat::SevenZ) => {
                 extract_7z_archive_into(archive_path, staging, password, &mut budget)
+            }
+            None if sevenzip::supports(archive_path) => {
+                sevenzip::extract_into(archive_path, staging, password, &mut budget)
             }
             None => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -2638,7 +2644,7 @@ fn add_file_to_zip_with_password<W: Write + io::Seek>(
 
 /// Check if a file is a supported archive format
 pub fn is_archive(path: &Path) -> bool {
-    ArchiveFormat::from_path(path).is_some()
+    ArchiveFormat::from_path(path).is_some() || sevenzip::supports(path)
 }
 
 /// Check if an archive requires a password
@@ -2689,6 +2695,7 @@ pub fn archive_needs_password(archive_path: &Path) -> io::Result<bool> {
             // TAR archives don't support encryption
             Ok(false)
         }
+        None if sevenzip::supports(archive_path) => sevenzip::needs_password(archive_path),
         None => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "Unsupported archive format",

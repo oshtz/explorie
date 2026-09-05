@@ -535,6 +535,12 @@ fn detect_preview_content(path: &Path) -> ServiceResult<PreviewDetection> {
             "TAR archive",
             "application/x-tar",
         )
+    } else if explorie_core::archive::is_archive(path) {
+        (
+            DetectedPreviewKind::Archive,
+            "Archive",
+            "application/octet-stream",
+        )
     } else if looks_like_text(&bytes) {
         (DetectedPreviewKind::Text, "Text document", "text/plain")
     } else {
@@ -2687,6 +2693,26 @@ mod tests {
             service.detect(audio).wait().unwrap().kind,
             DetectedPreviewKind::Audio
         );
+    }
+
+    #[test]
+    fn fallback_archive_extensions_reach_archive_preview() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = PreviewService::new(ServiceContext::new(ResourcePaths::test(temp.path())));
+        for name in [
+            "disk.iso",
+            "backup.wim",
+            "bundle.cab",
+            "notes.xz",
+            "notes.bz2",
+        ] {
+            let path = temp.path().join(name);
+            fs::write(&path, b"\0\x01\x02\x03").unwrap();
+            assert_eq!(
+                service.detect(path).wait().unwrap().kind,
+                DetectedPreviewKind::Archive
+            );
+        }
     }
 
     #[test]

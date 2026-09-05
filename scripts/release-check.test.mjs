@@ -31,7 +31,7 @@ const expectedDisplays = [
   'cargo clippy --locked --workspace --all-targets --all-features -- -D warnings',
   'cargo audit',
   'pnpm audit --audit-level=moderate',
-  'cargo build -p explorie-gpui --release --locked',
+  'node scripts/build-desktop.mjs',
   'git diff --check',
 ];
 
@@ -61,10 +61,10 @@ test('WinFsp installer is pinned for on-demand Windows remote drives', () => {
 test('root desktop commands make GPUI the only executable desktop authority', async () => {
   const rootPackage = JSON.parse(await readFile(path.join(process.cwd(), 'package.json'), 'utf8'));
 
-  assert.equal(rootPackage.scripts['desktop:dev'], 'cargo run -p explorie-gpui');
+  assert.equal(rootPackage.scripts['desktop:dev'], 'node scripts/prepare-7zip.mjs && cargo run -p explorie-gpui');
   assert.equal(
     rootPackage.scripts['desktop:build'],
-    'cargo build -p explorie-gpui --release --locked'
+    'node scripts/build-desktop.mjs'
   );
   assert.equal(
     rootPackage.scripts['desktop:smoke:release:windows'],
@@ -180,14 +180,8 @@ test('DEFAULT_COMMANDS preserves exact display order and representative executio
     '-D',
     'warnings',
   ]);
-  assert.equal(DEFAULT_COMMANDS[8].command, 'cargo');
-  assert.deepEqual(DEFAULT_COMMANDS[8].args, [
-    'build',
-    '-p',
-    'explorie-gpui',
-    '--release',
-    '--locked',
-  ]);
+  assert.equal(DEFAULT_COMMANDS[8].command, 'node');
+  assert.deepEqual(DEFAULT_COMMANDS[8].args, ['scripts/build-desktop.mjs']);
   assert.equal(DEFAULT_COMMANDS[9].command, 'git');
   assert.deepEqual(DEFAULT_COMMANDS[9].args, ['diff', '--check']);
 });

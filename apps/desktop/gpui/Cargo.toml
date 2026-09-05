@@ -8,6 +8,7 @@ license = "MIT"
 repository = "https://github.com/oshtz/explorie"
 
 [dependencies]
+explorie-plugin-protocol = { path = "../../../crates/plugin-protocol" }
 explorie-core = { path = "../../../crates/core" }
 explorie-native-services = { path = "../../../crates/native-services" }
 gpui = { git = "https://github.com/zed-industries/zed", rev = "1d029c5ff5654fb1b1e8caf4462993c8ee13a133", default-features = false }

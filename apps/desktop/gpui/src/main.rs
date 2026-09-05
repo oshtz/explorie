@@ -62,6 +62,8 @@ fn main() {
         return;
     };
     let _instance = instance.guard;
+    let plugin_startup_error =
+        explorie_gpui::initialize_plugins(&services, std::env::args_os()).err();
     let single_instance_requests = instance.requests;
     let path = explicit_path
         .or_else(|| std::env::current_dir().ok())
@@ -97,6 +99,14 @@ fn main() {
         let shutdown_remotes = services.remotes.clone();
         let shutdown_audio = services.audio.clone();
         let shutdown_video = services.video.clone();
+        let shutdown_plugins = services.plugins.clone();
+        cx.on_app_quit(move |_| {
+            let task = shutdown_plugins.shutdown();
+            async move {
+                let _ = task.await;
+            }
+        })
+        .detach();
         cx.on_app_quit(move |_| {
             shutdown_audio.stop();
             shutdown_video.stop();
@@ -144,6 +154,9 @@ fn main() {
                     "primary".to_string(),
                     cx,
                 );
+                if let Some(error) = plugin_startup_error {
+                    view.announce_plugin_startup_error(error, cx);
+                }
                 view.install_shortcut_bindings(cx);
                 view.start_listing(cx);
                 view.start_watching(cx);

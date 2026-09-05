@@ -5,7 +5,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     mpsc,
 };
@@ -40,6 +40,8 @@ use gpui::{
 mod batch_rename;
 mod browser;
 mod column;
+#[cfg(test)]
+mod column_interaction_tests;
 mod command;
 mod custom_fields;
 mod diagnostics;
@@ -47,7 +49,9 @@ mod error_reports;
 mod native_text_input;
 mod operation;
 mod operation_recovery;
+mod plugins_ui;
 mod preview_panel;
+pub use plugins_ui::initialize_plugins;
 mod prompt;
 mod recovery;
 mod session;
@@ -634,25 +638,80 @@ struct FileDragItem {
 
 #[derive(Clone, Debug)]
 struct FileDrag {
-    items: Vec<FileDragItem>,
+    items: Arc<OnceLock<Vec<FileDragItem>>>,
     position: gpui::Point<gpui::Pixels>,
     native_export_attempted: Arc<AtomicBool>,
 }
 
+#[cfg(test)]
+thread_local! {
+    static MULTI_FILE_DRAG_BUILDS: Cell<usize> = const { Cell::new(0) };
+}
+
 impl FileDrag {
     fn from_entries(entries: Vec<FileEntry>) -> Self {
+        #[cfg(test)]
+        if entries.len() > 1 {
+            MULTI_FILE_DRAG_BUILDS.with(|count| count.set(count.get() + 1));
+        }
         Self {
-            items: entries
-                .into_iter()
-                .map(|entry| FileDragItem {
-                    name: file_name(&entry),
-                    path: entry.path,
-                    is_dir: entry.is_dir,
-                })
-                .collect(),
+            items: Arc::new(OnceLock::from(
+                entries
+                    .into_iter()
+                    .map(|entry| FileDragItem {
+                        name: file_name(&entry),
+                        path: entry.path,
+                        is_dir: entry.is_dir,
+                    })
+                    .collect::<Vec<_>>(),
+            )),
             position: gpui::Point::default(),
             native_export_attempted: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    fn deferred() -> Self {
+        Self {
+            items: Arc::default(),
+            position: gpui::Point::default(),
+            native_export_attempted: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn items(&self) -> &[FileDragItem] {
+        self.items.get().map_or(&[], Vec::as_slice)
+    }
+
+    fn initialize(
+        &self,
+        source: &FileEntry,
+        selection: &BTreeSet<PathBuf>,
+        entries: &[Arc<FileEntry>],
+    ) {
+        self.items.get_or_init(|| {
+            let item = |entry: &FileEntry| FileDragItem {
+                name: file_name(entry),
+                path: entry.path.clone(),
+                is_dir: entry.is_dir,
+            };
+            let mut items = if selection.contains(&source.path) {
+                entries
+                    .iter()
+                    .filter(|entry| selection.contains(&entry.path))
+                    .map(|entry| item(entry))
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            if items.is_empty() {
+                items.push(item(source));
+            }
+            #[cfg(test)]
+            if items.len() > 1 {
+                MULTI_FILE_DRAG_BUILDS.with(|count| count.set(count.get() + 1));
+            }
+            items
+        });
     }
 
     fn at(mut self, position: gpui::Point<gpui::Pixels>) -> Self {
@@ -665,8 +724,8 @@ impl Render for FileDrag {
     fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         let modifiers = window.modifiers();
         let copy = modifiers.control || modifiers.alt;
-        let visible = self.items.iter().take(4);
-        let count = self.items.len();
+        let visible = self.items().iter().take(4);
+        let count = self.items().len();
         div()
             .pl(self.position.x - px(86.0))
             .pt(self.position.y - px(22.0))
@@ -727,12 +786,12 @@ fn comparable_drop_path(path: &Path) -> String {
 }
 
 fn valid_file_drop_target(target: &Path, drag: &FileDrag, kind: FileOperationKind) -> bool {
-    if drag.items.is_empty() {
+    if drag.items().is_empty() {
         return false;
     }
     let target = comparable_drop_path(target);
     if kind == FileOperationKind::Move
-        && drag.items.iter().all(|item| {
+        && drag.items().iter().all(|item| {
             item.path
                 .parent()
                 .is_some_and(|parent| comparable_drop_path(parent) == target)
@@ -740,7 +799,7 @@ fn valid_file_drop_target(target: &Path, drag: &FileDrag, kind: FileOperationKin
     {
         return false;
     }
-    drag.items.iter().all(|item| {
+    drag.items().iter().all(|item| {
         let source = comparable_drop_path(&item.path);
         target != source && (!item.is_dir || !target.starts_with(&format!("{source}/")))
     })
@@ -1432,7 +1491,16 @@ pub fn desktop_window_options(bounds: Bounds<Pixels>) -> WindowOptions {
 }
 
 pub fn parse_startup_path(args: impl IntoIterator<Item = OsString>) -> Option<PathBuf> {
-    launch_directory_from_args(args)
+    let mut filtered = Vec::new();
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        if arg == "--load-plugin" {
+            args.next();
+        } else {
+            filtered.push(arg);
+        }
+    }
+    launch_directory_from_args(filtered)
 }
 
 fn apply_smart_folder_browser_state(browser: &mut SessionState, criteria: &SearchCriteria) {
@@ -1542,6 +1610,11 @@ fn archive_base_name(path: &Path) -> String {
         if lowercase.ends_with(suffix) {
             return name[..name.len() - suffix.len()].to_string();
         }
+    }
+    if explorie_core::archive::is_archive(path)
+        && let Some(stem) = path.file_stem()
+    {
+        return stem.to_string_lossy().into_owned();
     }
     format!("{name}-extracted")
 }
@@ -2168,6 +2241,7 @@ enum SettingsTab {
     #[default]
     General,
     Integration,
+    Plugins,
     Appearance,
     Themes,
     Shortcuts,
@@ -2231,6 +2305,7 @@ enum SettingsSlider {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TextInputTarget {
+    PluginSetting,
     Search,
     ControlQuery,
     GoToFolder,
@@ -2250,9 +2325,10 @@ enum ColumnSelectionTarget {
 }
 
 impl SettingsTab {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::General,
         Self::Integration,
+        Self::Plugins,
         Self::Appearance,
         Self::Themes,
         Self::Shortcuts,
@@ -2263,6 +2339,7 @@ impl SettingsTab {
         match self {
             Self::General => "General",
             Self::Integration => "System Integration",
+            Self::Plugins => "Integrations",
             Self::Appearance => "Appearance",
             Self::Themes => "Themes",
             Self::Shortcuts => "Shortcuts",
@@ -3032,6 +3109,7 @@ impl TextPreviewUiState {
 }
 
 pub struct DirectoryWindow {
+    plugin_ui: plugins_ui::PluginUiState,
     browser: SessionState,
     services: NativeServices,
     window_lifetime: Option<WindowLifetime>,
@@ -3040,7 +3118,6 @@ pub struct DirectoryWindow {
     search_task: Option<Task<()>>,
     locations_task: Option<Task<()>>,
     disk_info_task: Option<Task<()>>,
-    syncthing_task: Option<Task<()>>,
     watcher_task: Option<Task<()>>,
     column_tasks: Vec<Task<()>>,
     integration_tasks: Vec<Task<()>>,
@@ -3055,7 +3132,6 @@ pub struct DirectoryWindow {
     single_instance_tasks: Vec<Task<()>>,
     request_generation: u64,
     disk_info_generation: u64,
-    syncthing_generation: u64,
     search_generation: u64,
     search_request_id: Option<String>,
     search_progress: Option<SearchProgressEvent>,
@@ -3095,6 +3171,7 @@ pub struct DirectoryWindow {
     grid_columns: usize,
     selection_marquee: Option<SelectionMarquee>,
     file_drag_sources: BTreeSet<PathBuf>,
+    file_drag_selection: Option<Arc<BTreeSet<PathBuf>>>,
     file_drag_hover_target: Option<FileDragHoverTarget>,
     file_drag_hover_task: Option<Task<()>>,
     favorite_focus_handles: Vec<FocusHandle>,
@@ -3162,8 +3239,6 @@ pub struct DirectoryWindow {
     update_task: Option<Task<()>>,
     disk_info: Option<DiskInfo>,
     disk_info_path: Option<PathBuf>,
-    syncthing_root: Option<PathBuf>,
-    syncthing_path: Option<PathBuf>,
     operations: OperationQueue,
     operation_panel_minimized: bool,
     operation_panel_hidden: bool,
@@ -3467,6 +3542,7 @@ impl DirectoryWindow {
             || remembered_window.x.is_some()
             || remembered_window.y.is_some();
         Self {
+            plugin_ui: plugins_ui::PluginUiState::default(),
             browser,
             services,
             window_lifetime: stores.window_lifetime,
@@ -3475,7 +3551,6 @@ impl DirectoryWindow {
             search_task: None,
             locations_task: None,
             disk_info_task: None,
-            syncthing_task: None,
             watcher_task: None,
             column_tasks: Vec::new(),
             integration_tasks: Vec::new(),
@@ -3490,7 +3565,6 @@ impl DirectoryWindow {
             single_instance_tasks: Vec::new(),
             request_generation: 0,
             disk_info_generation: 0,
-            syncthing_generation: 0,
             search_generation: 0,
             search_request_id: None,
             search_progress: None,
@@ -3530,6 +3604,7 @@ impl DirectoryWindow {
             grid_columns: 1,
             selection_marquee: None,
             file_drag_sources: BTreeSet::new(),
+            file_drag_selection: None,
             file_drag_hover_target: None,
             file_drag_hover_task: None,
             favorite_focus_handles: Vec::new(),
@@ -3597,8 +3672,6 @@ impl DirectoryWindow {
             update_task: None,
             disk_info: None,
             disk_info_path: None,
-            syncthing_root: None,
-            syncthing_path: None,
             operations: OperationQueue::default(),
             operation_panel_minimized: false,
             operation_panel_hidden: false,
@@ -5433,6 +5506,11 @@ impl DirectoryWindow {
 
     fn apply_native_text_input_change(&mut self, value: String, cx: &mut Context<Self>) {
         match self.native_text_input_target {
+            Some(TextInputTarget::PluginSetting) => {
+                if let Some((_, _, input)) = self.plugin_ui.text_editor.as_mut() {
+                    *input = value;
+                }
+            }
             Some(TextInputTarget::Search) => {
                 self.browser.set_search_query(value);
                 self.search_active = true;
@@ -7034,7 +7112,7 @@ impl DirectoryWindow {
 
     pub fn start_listing(&mut self, cx: &mut Context<Self>) {
         self.start_disk_info(cx);
-        self.start_syncthing_root(cx);
+        self.clear_plugin_context(cx);
         if let Some(criteria) = self
             .browser
             .active_smart_folder()
@@ -7130,6 +7208,7 @@ impl DirectoryWindow {
             } if generation == self.request_generation && request.path == self.browser.path() => {
                 self.browser.replace_entries(entries);
                 self.state = ListingState::Ready;
+                self.start_plugin_scan(true, cx);
                 if self.reset_scroll_on_result {
                     self.scroll_handle
                         .scroll_to_item_strict(0, ScrollStrategy::Top);
@@ -7183,34 +7262,6 @@ impl DirectoryWindow {
             let _ = this.update(cx, |view, cx| {
                 if generation == view.disk_info_generation && view.browser.path() == path {
                     view.disk_info = result.ok();
-                    cx.notify();
-                }
-            });
-        }));
-    }
-
-    fn start_syncthing_root(&mut self, cx: &mut Context<Self>) {
-        let path = self.browser.path().to_path_buf();
-        if self.syncthing_path.as_deref() == Some(path.as_path()) {
-            return;
-        }
-        self.syncthing_generation = self.syncthing_generation.wrapping_add(1);
-        let generation = self.syncthing_generation;
-        self.syncthing_path = Some(path.clone());
-        self.syncthing_root = None;
-        let task = self.services.listing.syncthing_root(path.clone());
-        self.syncthing_task = Some(cx.spawn(async move |this, cx| {
-            let result = task.await;
-            let _ = this.update(cx, |view, cx| {
-                if generation == view.syncthing_generation && view.browser.path() == path {
-                    match result {
-                        Ok(root) => view.syncthing_root = root,
-                        Err(error) => {
-                            view.syncthing_path = None;
-                            view.syncthing_root = None;
-                            view.record_error("Syncthing detection failed", error.to_string());
-                        }
-                    }
                     cx.notify();
                 }
             });
@@ -7374,19 +7425,16 @@ impl DirectoryWindow {
         self.column_generation = self.column_generation.wrapping_add(1);
         let generation = self.column_generation;
         if reset_stack {
-            self.columns.reset(self.browser.path());
+            let retained = self.columns.reset(self.browser.path());
+            self.column_scroll_handles.truncate(retained);
             self.column_selection.clear();
         } else {
             self.columns.begin_refresh();
         }
 
         let paths = self.columns.paths();
-        if self.column_scroll_handles.len() != paths.len() {
-            self.column_scroll_handles = paths
-                .iter()
-                .map(|_| UniformListScrollHandle::new())
-                .collect();
-        }
+        self.column_scroll_handles
+            .resize_with(paths.len(), UniformListScrollHandle::new);
         if reset_stack && !paths.is_empty() {
             self.column_strip_scroll.scroll_to_item(paths.len() - 1);
             self.column_scroll_to_leaf_attempts = 3;
@@ -7454,6 +7502,7 @@ impl DirectoryWindow {
                         }
                     }
                     self.finish_pending_preview_refresh(cx);
+                    self.start_plugin_scan(true, cx);
                 }
             }
             DirectoryEvent::Failed {
@@ -7720,7 +7769,7 @@ impl DirectoryWindow {
         self.mutate_shared_session(|session| session.record_current_path(path));
         self.save_session_snapshot();
         self.start_disk_info(cx);
-        self.start_syncthing_root(cx);
+        self.clear_plugin_context(cx);
         if self.browser.view_mode() == ViewMode::Column {
             self.state = ListingState::Loading;
             self.start_column_listings(true, cx);
@@ -7756,6 +7805,32 @@ impl DirectoryWindow {
             let target = self.browser.path().to_path_buf();
             self.prepare_column_selection(&origin, &target);
             self.path_did_change(cx);
+        }
+    }
+
+    fn activate_column(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(column) = self.columns.columns().get(index) else {
+            return;
+        };
+        if column.path() == self.browser.path() {
+            return;
+        }
+        let path = column.path().to_path_buf();
+        let entries = column.entries().to_vec();
+        let ready = !column.loading() && column.error().is_none();
+        self.sync_active_tab_view_state();
+        self.browser.navigate(path);
+        // An interaction inside the column strip must keep that view active,
+        // even if this folder has a different saved view mode.
+        self.browser.set_view_mode(ViewMode::Column);
+        self.path_did_change(cx);
+        self.pending_column_selection = None;
+        // Use the displayed listing immediately so this click and subsequent
+        // keyboard input work while the fresh directory request is pending.
+        self.browser.replace_entries(entries);
+        self.browser.clear_selection();
+        if ready {
+            self.state = ListingState::Ready;
         }
     }
 
@@ -8251,7 +8326,7 @@ impl DirectoryWindow {
     }
 
     fn track_file_drag(&mut self, drag: &FileDrag, cx: &mut Context<Self>) {
-        let sources: BTreeSet<_> = drag.items.iter().map(|item| item.path.clone()).collect();
+        let sources: BTreeSet<_> = drag.items().iter().map(|item| item.path.clone()).collect();
         if self.file_drag_sources != sources {
             self.file_drag_sources = sources;
             cx.notify();
@@ -8283,7 +8358,7 @@ impl DirectoryWindow {
         }
 
         let paths = drag
-            .items
+            .items()
             .iter()
             .map(|item| item.path.clone())
             .collect::<Vec<_>>();
@@ -8372,6 +8447,7 @@ impl DirectoryWindow {
     }
 
     fn finish_file_drag(&mut self, cx: &mut Context<Self>) {
+        self.file_drag_selection = None;
         let changed = !self.file_drag_sources.is_empty()
             || self.file_drag_hover_target.is_some()
             || self.file_drag_hover_task.is_some();
@@ -8394,7 +8470,7 @@ impl DirectoryWindow {
         let kind = file_drag_operation(window);
         if target_is_link || !valid_file_drop_target(&target, drag, kind) {
             let target_key = comparable_drop_path(&target);
-            if drag.items.iter().any(|item| {
+            if drag.items().iter().any(|item| {
                 let source = comparable_drop_path(&item.path);
                 item.is_dir
                     && (target_key == source || target_key.starts_with(&format!("{source}/")))
@@ -8417,7 +8493,7 @@ impl DirectoryWindow {
 
         let target_key = comparable_drop_path(&target);
         let sources = drag
-            .items
+            .items()
             .iter()
             .filter(|item| {
                 kind != FileOperationKind::Move
@@ -8485,7 +8561,7 @@ impl DirectoryWindow {
 
     fn drop_files_to_favorites(&mut self, drag: &FileDrag, cx: &mut Context<Self>) {
         let paths = drag
-            .items
+            .items()
             .iter()
             .filter(|item| item.is_dir)
             .map(|item| item.path.clone())
@@ -8821,6 +8897,7 @@ impl DirectoryWindow {
     }
 
     pub fn start_service_events(&mut self, cx: &mut Context<Self>) {
+        self.start_plugin_status(cx);
         self.start_shared_state_sync(cx);
         let subscription = self.services.subscribe_async();
         self.service_event_task = Some(cx.spawn(async move |this, cx| {
@@ -9078,6 +9155,13 @@ impl DirectoryWindow {
                 }
             }
             ServiceEvent::MutationIdle => self.finish_waiting_exit(cx),
+            ServiceEvent::PluginStatusChanged { id, contribution } => {
+                self.apply_plugin_contribution(id, contribution, cx);
+            }
+            ServiceEvent::PluginRegistryChanged => {
+                self.clear_plugin_context(cx);
+                self.start_plugin_status(cx);
+            }
             ServiceEvent::HelperStatus(_) | ServiceEvent::Watcher(_) => {}
         }
     }
@@ -10365,6 +10449,7 @@ impl DirectoryWindow {
     }
 
     fn sync_pinned_preview(&mut self, cx: &mut Context<Self>) {
+        self.start_plugin_scan(false, cx);
         if !self.settings.view.show_preview_panel
             && matches!(self.preview_state, PreviewState::Closed)
         {
@@ -13089,6 +13174,8 @@ impl DirectoryWindow {
         cx: &mut Context<Self>,
     ) {
         self.context_menu = None;
+        // Keep the mouse-down selection even if a redraw occurs before drag start.
+        self.file_drag_selection = Some(self.browser.selection_snapshot());
         if event.modifiers.shift {
             self.browser.select_range_to(path);
         } else if event.modifiers.control || event.modifiers.platform {
@@ -13190,10 +13277,20 @@ impl DirectoryWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        window.focus(&self.focus_handle, cx);
+        if let MarqueeLayout::Column { index, .. } = layout {
+            self.activate_column(index, cx);
+            self.pending_column_selection = None;
+        }
         let Some((viewport, scroll_top, _)) = self.marquee_viewport(layout) else {
+            if matches!(layout, MarqueeLayout::Column { .. }) {
+                self.browser.clear_selection();
+                self.column_selection.clear();
+                self.sync_pinned_preview(cx);
+                cx.notify();
+            }
             return;
         };
-        window.focus(&self.focus_handle, cx);
         let window_point = GridPoint {
             x: f32::from(event.position.x),
             y: f32::from(event.position.y),
@@ -13314,6 +13411,7 @@ impl DirectoryWindow {
             }
         }
         self.sync_pinned_preview(cx);
+        cx.notify();
     }
 
     fn cancel_selection_marquee(&mut self, cx: &mut Context<Self>) {
@@ -14040,6 +14138,7 @@ impl DirectoryWindow {
         if let Some(index) = selected {
             self.reveal_selected(index);
             self.sync_column_selection_from_browser();
+            self.sync_pinned_preview(cx);
             cx.stop_propagation();
             cx.notify();
         }
@@ -18187,7 +18286,7 @@ impl DirectoryWindow {
             .child(sidebar_section_label("Favorites", palette))
             .children(favorite_rows)
             .drag_over::<FileDrag>(move |style, drag, _, _| {
-                if drag.items.iter().any(|item| item.is_dir) {
+                if drag.items().iter().any(|item| item.is_dir) {
                     style
                         .border_color(favorites_drop_palette.accent)
                         .bg(with_alpha(favorites_drop_palette.accent, 0.08))
@@ -18788,36 +18887,8 @@ impl DirectoryWindow {
         } else {
             query_preview
         };
-        let syncthing_conflicts = self
-            .browser
-            .entries()
-            .iter()
-            .filter(|entry| file_name(entry).contains(".sync-conflict-"))
-            .count();
-        let wide_syncthing_badge = (!compact)
-            .then(|| {
-                self.syncthing_root.as_deref().map(|root| {
-                    render_syncthing_badge(
-                        root,
-                        syncthing_conflicts,
-                        palette,
-                        self.settings.appearance.ui_scale,
-                    )
-                })
-            })
-            .flatten();
-        let compact_syncthing_badge = compact
-            .then(|| {
-                self.syncthing_root.as_deref().map(|root| {
-                    render_syncthing_badge(
-                        root,
-                        syncthing_conflicts,
-                        palette,
-                        self.settings.appearance.ui_scale,
-                    )
-                })
-            })
-            .flatten();
+        let wide_plugin_badges = (!compact).then(|| self.render_plugin_badges(cx));
+        let compact_plugin_badges = compact.then(|| self.render_plugin_badges(cx));
         let can_undo = self.undo_ledger.can_undo(SystemTime::now());
         let can_redo = self.undo_ledger.can_redo();
         let view_icon = match self.browser.view_mode() {
@@ -19342,7 +19413,7 @@ impl DirectoryWindow {
                 .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
             )
             .child(breadcrumbs)
-            .when_some(wide_syncthing_badge, |toolbar, badge| toolbar.child(badge))
+            .when_some(wide_plugin_badges, |toolbar, badge| toolbar.child(badge))
             .child(create_button)
             .child(
                 compact_toolbar_button_with_tooltip(
@@ -19376,7 +19447,7 @@ impl DirectoryWindow {
                     .items_center()
                     .gap_1()
                     .when(compact, |controls| controls.w_full().justify_end())
-                    .when_some(compact_syncthing_badge, |controls, badge| {
+                    .when_some(compact_plugin_badges, |controls, badge| {
                         controls.child(badge)
                     })
                     .child(
@@ -20236,6 +20307,9 @@ impl DirectoryWindow {
                     .child(tab.label())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.settings_tab = tab;
+                        if tab == SettingsTab::Plugins {
+                            this.start_plugin_status(cx);
+                        }
                         if tab == SettingsTab::Integration {
                             this.start_system_integration_status(cx);
                         } else {
@@ -20361,6 +20435,7 @@ impl DirectoryWindow {
             }
         }));
         let active_content = match self.settings_tab {
+            SettingsTab::Plugins => self.render_plugin_settings(cx),
             SettingsTab::General => div()
                 .id("settings-general")
                 .debug_selector(|| "settings-general".to_string())
@@ -25444,7 +25519,8 @@ impl DirectoryWindow {
                     let target_is_link = entry.is_symlink || entry.is_junction;
                     let selected = this.browser.is_selected(&path);
                     let dragging = this.file_drag_sources.contains(&path);
-                    let drag = this.file_drag_for_entry(&entry);
+                    let drag_selection = this.browser.selection_snapshot();
+                    let drag_view = cx.entity().downgrade();
                     let palette = this.palette;
                     let icon_size =
                         (this.settings.appearance.icon_size as f32 + 4.0).clamp(16.0, 28.0);
@@ -25497,8 +25573,14 @@ impl DirectoryWindow {
                                 .gap_2()
                                 .px_3()
                                 .child(icon)
-                                .child(
-                                    div().flex_1().min_w_0().truncate().child(file_name(&entry)),
+                                .child(div().flex_1().min_w_0().truncate().child(file_name(&entry)))
+                                .when_some(
+                                    this.plugin_entry_decoration(&entry.path),
+                                    |row, label| {
+                                        row.child(
+                                            div().text_xs().text_color(palette.accent).child(label),
+                                        )
+                                    },
                                 ),
                         )
                         .children(custom_cells)
@@ -25516,7 +25598,18 @@ impl DirectoryWindow {
                                 cx.notify();
                             }),
                         )
-                        .on_drag(drag, |drag, position, _, cx| {
+                        .on_drag(FileDrag::deferred(), move |drag, position, _, cx| {
+                            drag_view
+                                .read_with(cx, |view, _| {
+                                    drag.initialize(
+                                        &entry,
+                                        view.file_drag_selection
+                                            .as_ref()
+                                            .unwrap_or(&drag_selection),
+                                        view.browser.visible_entries(),
+                                    );
+                                })
+                                .ok();
                             cx.new(|_| drag.clone().at(position))
                         });
                     rows.push(
@@ -25712,6 +25805,11 @@ impl DirectoryWindow {
             "grid-results",
             row_count,
             cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+                #[cfg(test)]
+                {
+                    this.last_rendered_items = (range.end * metrics.columns).min(item_count)
+                        - range.start * metrics.columns;
+                }
                 let mut rows = Vec::with_capacity(range.end - range.start);
                 for row_index in range {
                     let mut cards = Vec::with_capacity(metrics.columns);
@@ -25727,7 +25825,8 @@ impl DirectoryWindow {
                         let target_is_link = entry.is_symlink || entry.is_junction;
                         let selected = this.browser.is_selected(&path);
                         let dragging = this.file_drag_sources.contains(&path);
-                        let drag = this.file_drag_for_entry(&entry);
+                        let drag_selection = this.browser.selection_snapshot();
+                        let drag_view = cx.entity().downgrade();
                         let palette = this.palette;
                         let icon_size = (f32::from(this.settings.appearance.icon_size)
                             * 2.5
@@ -25813,6 +25912,14 @@ impl DirectoryWindow {
                                         .child(file_name(&entry)),
                                 )
                                 .child(div().text_xs().text_color(palette.muted).child(detail))
+                                .when_some(
+                                    this.plugin_entry_decoration(&entry.path),
+                                    |row, label| {
+                                        row.child(
+                                            div().text_xs().text_color(palette.accent).child(label),
+                                        )
+                                    },
+                                )
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(
@@ -25846,7 +25953,18 @@ impl DirectoryWindow {
                                         },
                                     ),
                                 )
-                                .on_drag(drag, |drag, position, _, cx| {
+                                .on_drag(FileDrag::deferred(), move |drag, position, _, cx| {
+                                    drag_view
+                                        .read_with(cx, |view, _| {
+                                            drag.initialize(
+                                                &entry,
+                                                view.file_drag_selection
+                                                    .as_ref()
+                                                    .unwrap_or(&drag_selection),
+                                                view.browser.visible_entries(),
+                                            );
+                                        })
+                                        .ok();
                                     cx.new(|_| drag.clone().at(position))
                                 })
                                 .on_drag_move::<FileDrag>(cx.listener(
@@ -26142,7 +26260,6 @@ impl DirectoryWindow {
                             let path = entry.path.clone();
                             let pointer_path = path.clone();
                             let context_path = path.clone();
-                            let context_entry = entry.clone();
                             let is_dir = entry.is_dir;
                             let target_is_link = entry.is_symlink || entry.is_junction;
                             let dragging = this.file_drag_sources.contains(&path);
@@ -26187,6 +26304,14 @@ impl DirectoryWindow {
                                         .text_sm()
                                         .child(file_name(&entry)),
                                 )
+                                .when_some(
+                                    this.plugin_entry_decoration(&entry.path),
+                                    |row, label| {
+                                        row.child(
+                                            div().text_xs().text_color(palette.accent).child(label),
+                                        )
+                                    },
+                                )
                                 .when(!detail.is_empty(), |row| {
                                     row.child(
                                         div().text_xs().text_color(rgb(0x888888)).child(detail),
@@ -26204,20 +26329,24 @@ impl DirectoryWindow {
                                     cx.listener(
                                         move |this, event: &gpui::MouseDownEvent, window, cx| {
                                             window.focus(&this.focus_handle, cx);
-                                            if is_last {
+                                            let extend = event.modifiers.shift
+                                                || event.modifiers.control
+                                                || event.modifiers.platform;
+                                            if !is_dir || extend {
+                                                this.activate_column(column_index, cx);
+                                            }
+                                            this.pending_column_selection = None;
+                                            if is_last || !is_dir || extend {
                                                 this.select_from_pointer(
                                                     pointer_path.clone(),
                                                     event,
                                                     cx,
                                                 );
                                                 this.sync_column_selection_from_browser();
-                                            } else {
-                                                this.set_column_selection(pointer_path.clone());
-                                                this.browser.clear_selection();
                                             }
-                                            if is_dir {
+                                            if is_dir && !extend {
                                                 this.navigate_to(pointer_path.clone(), cx);
-                                            } else if event.click_count >= 2 {
+                                            } else if !is_dir && !extend && event.click_count >= 2 {
                                                 this.open_entry(pointer_path.clone(), false, cx);
                                             } else {
                                                 this.sync_pinned_preview(cx);
@@ -26244,15 +26373,13 @@ impl DirectoryWindow {
                                     .on_a11y_action(AccessibleAction::Click, move |_, _, cx| {
                                         accessibility_view
                                             .update(cx, |this, cx| {
-                                                if is_last {
+                                                if !is_dir {
+                                                    this.activate_column(column_index, cx);
+                                                }
+                                                this.pending_column_selection = None;
+                                                if is_last || !is_dir {
                                                     this.browser.select(accessibility_path.clone());
                                                     this.sync_column_selection_from_browser();
-                                                    this.sync_pinned_preview(cx);
-                                                } else {
-                                                    this.set_column_selection(
-                                                        accessibility_path.clone(),
-                                                    );
-                                                    this.browser.clear_selection();
                                                 }
                                                 if is_dir {
                                                     this.navigate_to(
@@ -26302,34 +26429,16 @@ impl DirectoryWindow {
                                                   window,
                                                   cx| {
                                                 window.focus(&this.focus_handle, cx);
-                                                if is_last {
-                                                    this.open_file_context_menu(
-                                                        context_path.clone(),
-                                                        is_dir,
-                                                        event.position,
-                                                        cx,
-                                                    );
-                                                } else {
-                                                    if !this
-                                                        .column_selection
-                                                        .contains(&context_path)
-                                                    {
-                                                        this.set_column_selection(
-                                                            context_path.clone(),
-                                                        );
-                                                        this.browser.clear_selection();
-                                                    }
-                                                    let entries = this.effective_selected_entries();
-                                                    this.open_context_menu_for_entries(
-                                                        if entries.is_empty() {
-                                                            vec![context_entry.clone()]
-                                                        } else {
-                                                            entries
-                                                        },
-                                                        event.position,
-                                                        cx,
-                                                    );
-                                                }
+                                                this.activate_column(column_index, cx);
+                                                this.pending_column_selection = None;
+                                                this.open_file_context_menu(
+                                                    context_path.clone(),
+                                                    is_dir,
+                                                    event.position,
+                                                    cx,
+                                                );
+                                                this.sync_column_selection_from_browser();
+                                                this.sync_pinned_preview(cx);
                                                 cx.stop_propagation();
                                             },
                                         ),
@@ -26480,6 +26589,19 @@ impl DirectoryWindow {
                 div()
                     .id(("column", column_index))
                     .debug_selector(move || format!("column-{column_index}"))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                            window.focus(&this.focus_handle, cx);
+                            this.activate_column(column_index, cx);
+                            this.pending_column_selection = None;
+                            this.browser.clear_selection();
+                            this.column_selection.clear();
+                            this.open_empty_context_menu(event.position, cx);
+                            this.sync_pinned_preview(cx);
+                            cx.stop_propagation();
+                        }),
+                    )
                     .relative()
                     .flex()
                     .flex_col()
@@ -26781,6 +26903,15 @@ impl Focusable for DirectoryWindow {
 
 impl Render for DirectoryWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !self.plugin_ui.activation_observed {
+            self.plugin_ui.activation_observed = true;
+            cx.observe_window_activation(window, |view, window, cx| {
+                if window.is_window_active() {
+                    view.start_plugin_scan(true, cx);
+                }
+            })
+            .detach();
+        }
         window.set_rem_size(px(16.0 * self.settings.appearance.ui_scale));
         if let Some(saved) = self.pending_workspace_bounds.take() {
             let current = window.bounds();
@@ -26990,6 +27121,8 @@ impl Render for DirectoryWindow {
         };
         let title_bar = self.render_title_bar(window.is_maximized(), cx);
         let toolbar = self.render_toolbar(logical_main_width < 900.0, cx);
+        let plugin_invitation = self.render_plugin_invitation(cx);
+        let plugin_details = self.render_plugin_details(cx);
         let settings_panel = self.render_settings_panel(cx);
         let settings_confirmation = self.render_settings_confirmation(window, cx);
         let go_to_folder = self.render_go_to_folder(f32::from(bounds.size.height), cx);
@@ -27300,6 +27433,9 @@ impl Render for DirectoryWindow {
                     this.close_toolbar_menu(cx);
                 } else if this.control_surface != ControlSurface::Closed {
                     this.close_control_surface(cx);
+                } else if this.plugin_ui.details_open {
+                    this.plugin_ui.details_open = false;
+                    cx.notify();
                 } else if this.settings_panel_open {
                     this.close_settings_panel(cx);
                 } else if matches!(this.preview_state, PreviewState::Closed) {
@@ -27357,7 +27493,9 @@ impl Render for DirectoryWindow {
             }))
             .on_action(cx.listener(|this, _: &SelectAll, _, cx| {
                 this.browser.select_all();
+                this.sync_column_selection_from_browser();
                 this.sync_pinned_preview(cx);
+                cx.notify();
             }))
             .on_action(cx.listener(|this, _: &SelectNextRange, _, cx| {
                 this.select_next_range(cx);
@@ -27611,6 +27749,7 @@ impl Render for DirectoryWindow {
                             .overflow_hidden()
                             .child(div().px_2().bg(self.palette.topbar).child(toolbar))
                             .child(tabs)
+                            .child(plugin_invitation)
                             .child(recovery_notice)
                             .child(
                                 div()
@@ -27645,6 +27784,7 @@ impl Render for DirectoryWindow {
                     )
                     .child(sidebar_resizer),
             )
+            .child(plugin_details)
             .child(settings_panel)
             .child(control_surface)
             .child(go_to_folder)
@@ -27728,43 +27868,6 @@ fn recovery_session_context(tab_count: usize, path: &Path) -> String {
         if tab_count == 1 { "" } else { "s" },
         path_label(path)
     )
-}
-
-fn syncthing_badge_label(conflict_count: usize) -> String {
-    if conflict_count == 0 {
-        "Syncthing".to_string()
-    } else {
-        format!(
-            "Syncthing · {conflict_count} conflict{}",
-            if conflict_count == 1 { "" } else { "s" }
-        )
-    }
-}
-
-fn render_syncthing_badge(
-    root: &Path,
-    conflict_count: usize,
-    palette: UiPalette,
-    ui_scale: f32,
-) -> AnyElement {
-    let label = syncthing_badge_label(conflict_count);
-    div()
-        .id("syncthing-badge")
-        .debug_selector(|| "syncthing-badge".to_string())
-        .role(Role::Status)
-        .aria_label(format!("Synced by Syncthing: {}. {label}", root.display()))
-        .flex()
-        .flex_none()
-        .items_center()
-        .h(px(24.0))
-        .px_2()
-        .border_1()
-        .border_color(with_alpha(palette.accent, 0.35))
-        .bg(palette.selected)
-        .text_size(px(10.0 * ui_scale))
-        .text_color(palette.accent)
-        .child(label)
-        .into_any_element()
 }
 
 fn sidebar_section_label(label: &'static str, palette: UiPalette) -> impl IntoElement {
@@ -29776,104 +29879,6 @@ mod tests {
     }
 
     #[gpui::test]
-    fn syncthing_badge_restores_root_conflicts_and_compact_toolbar_geometry(
-        cx: &mut TestAppContext,
-    ) {
-        let root = fixture_dir();
-        let unsynced = fixture_dir();
-        let nested = root.join("Synced").join("Projects");
-        fs::create_dir(root.join(".stfolder")).unwrap();
-        fs::create_dir_all(&nested).unwrap();
-        fs::write(
-            nested.join("notes.sync-conflict-20260825-120000.txt"),
-            b"conflict",
-        )
-        .unwrap();
-        fs::write(nested.join("normal.txt"), b"normal").unwrap();
-
-        let services = NativeServices::new(ResourcePaths::test(&root));
-        assert_eq!(
-            services.listing.syncthing_root_blocking(&nested),
-            Some(root.clone())
-        );
-        assert_eq!(syncthing_badge_label(0), "Syncthing");
-        assert_eq!(syncthing_badge_label(1), "Syncthing · 1 conflict");
-        assert_eq!(syncthing_badge_label(2), "Syncthing · 2 conflicts");
-
-        let (view, window) =
-            cx.add_window_view(|_, cx| DirectoryWindow::new(nested.clone(), services.clone(), cx));
-        view.update(window, |view, cx| {
-            view.browser.replace_entries(vec![
-                metadata_entry(nested.join("notes.sync-conflict-20260825-120000.txt")),
-                metadata_entry(nested.join("normal.txt")),
-            ]);
-            view.state = ListingState::Ready;
-            view.start_syncthing_root(cx);
-        });
-        window.simulate_resize(gpui::size(px(1_200.0), px(720.0)));
-        for _ in 0..1_000 {
-            window.run_until_parked();
-            if view.update(window, |view, _| view.syncthing_root.is_some()) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        view.update(window, |view, _| {
-            assert_eq!(view.syncthing_root.as_deref(), Some(root.as_path()));
-            assert_eq!(view.syncthing_path.as_deref(), Some(nested.as_path()));
-            assert_eq!(view.browser.entries().len(), 2);
-        });
-        let wide_toolbar = window.debug_bounds("browser-toolbar").unwrap();
-        let wide_badge = window.debug_bounds("syncthing-badge").unwrap();
-        assert_eq!(f32::from(wide_badge.size.height), 24.0);
-        assert!(wide_badge.left() >= wide_toolbar.left());
-        assert!(wide_badge.right() <= wide_toolbar.right());
-        assert!(
-            wide_badge.right() <= window.debug_bounds("create-menu-button").unwrap().left(),
-            "Syncthing badge must retain its place between breadcrumbs and Create"
-        );
-
-        window.simulate_resize(gpui::size(px(800.0), px(600.0)));
-        window.run_until_parked();
-        let compact_toolbar = window.debug_bounds("browser-toolbar").unwrap();
-        let compact_badge = window.debug_bounds("syncthing-badge").unwrap();
-        assert_eq!(f32::from(compact_toolbar.size.height), 72.0);
-        assert_eq!(f32::from(compact_badge.size.height), 24.0);
-        assert!(compact_badge.left() >= compact_toolbar.left());
-        assert!(compact_badge.right() <= compact_toolbar.right());
-        for selector in [
-            "create-menu-button",
-            "search",
-            "view-menu-button",
-            "sort",
-            "filter",
-            "more-menu-button",
-        ] {
-            assert!(
-                window.debug_bounds(selector).is_some(),
-                "Syncthing badge displaced compact toolbar action {selector}: toolbar={compact_toolbar:?}, badge={compact_badge:?}, trailing={:?}",
-                window.debug_bounds("toolbar-trailing-controls")
-            );
-        }
-        view.update(window, |view, cx| {
-            assert!(view.browser.navigate(root.clone()));
-            view.start_syncthing_root(cx);
-            assert!(view.browser.navigate(unsynced.clone()));
-            view.start_syncthing_root(cx);
-        });
-        window.run_until_parked();
-        view.update(window, |view, _| {
-            assert_eq!(view.syncthing_path.as_deref(), Some(unsynced.as_path()));
-            assert!(view.syncthing_root.is_none());
-        });
-        view.update(window, |_, cx| cx.notify());
-        window.run_until_parked();
-        assert!(window.debug_bounds("syncthing-badge").is_none());
-        fs::remove_dir_all(root).unwrap();
-        fs::remove_dir_all(unsynced).unwrap();
-    }
-
-    #[gpui::test]
     fn breadcrumb_background_restores_inline_path_edit_submit_and_cancel(cx: &mut TestAppContext) {
         let directory = fixture_dir();
         let target = directory.join("Target");
@@ -31101,8 +31106,10 @@ mod tests {
     }
 
     #[gpui::test]
-    fn ten_thousand_entry_list_renders_a_bounded_window(cx: &mut TestAppContext) {
-        let entries: Vec<_> = (0..10_000)
+    fn hundred_thousand_selected_entries_render_without_building_drag_payloads(
+        cx: &mut TestAppContext,
+    ) {
+        let entries: Vec<_> = (0..100_000)
             .map(|index| FileEntry {
                 id: Uuid::new_v4(),
                 path: PathBuf::from("fixture").join(format!("file-{index:05}.txt")),
@@ -31122,27 +31129,34 @@ mod tests {
         });
         view.update(cx, |view, cx| {
             view.browser.replace_entries(entries);
+            view.browser.select_all();
+            view.browser.set_sort(SortKey::Size);
+            assert_eq!(view.browser.selection_count(), 100_000);
             view.state = ListingState::Ready;
             cx.notify();
         });
 
-        cx.draw(
-            gpui::point(px(0.0), px(0.0)),
-            gpui::size(px(800.0), px(600.0)),
-            |_, _| view.clone().into_element(),
-        );
-
-        let (visible_items, rendered_items) = view.update(cx, |view, _| {
-            (
-                view.browser.visible_entries().len(),
-                view.last_rendered_items,
-            )
-        });
-        assert_eq!(visible_items, 10_000);
-        assert!(
-            rendered_items < 100,
-            "virtualized list rendered {rendered_items} items",
-        );
+        for mode in [ViewMode::List, ViewMode::Grid] {
+            view.update(cx, |view, cx| {
+                view.browser.set_view_mode(mode);
+                cx.notify();
+            });
+            MULTI_FILE_DRAG_BUILDS.with(|count| count.set(0));
+            cx.draw(
+                gpui::point(px(0.0), px(0.0)),
+                gpui::size(px(800.0), px(600.0)),
+                |_, _| view.clone().into_element(),
+            );
+            view.update(cx, |view, _| {
+                assert_eq!(view.browser.selection_count(), 100_000);
+                assert!(
+                    (1..200).contains(&view.last_rendered_items),
+                    "{mode:?} rendered {} items",
+                    view.last_rendered_items
+                );
+            });
+            assert_eq!(MULTI_FILE_DRAG_BUILDS.with(Cell::get), 0);
+        }
     }
 
     #[test]
@@ -31152,6 +31166,65 @@ mod tests {
         assert_eq!(MIN_WINDOW_WIDTH, 800.0);
         assert_eq!(MIN_WINDOW_HEIGHT, 600.0);
         assert_eq!(APP_IDENTIFIER, "com.omershatz.explorie");
+    }
+
+    #[gpui::test]
+    #[ignore = "explicit large-selection native render benchmark"]
+    fn records_large_selection_render_baselines(cx: &mut TestAppContext) {
+        for count in [10_000, 100_000] {
+            for mode in [ViewMode::List, ViewMode::Grid] {
+                let entries = (0..count)
+                    .map(|index| {
+                        absolute_entry(
+                            PathBuf::from("fixture").join(format!("file-{index:06}.txt")),
+                        )
+                    })
+                    .collect();
+                let (view, window) = cx.add_window_view(|_, cx| {
+                    DirectoryWindow::new(PathBuf::from("fixture"), NativeServices::default(), cx)
+                });
+                view.update(window, |view, cx| {
+                    view.browser.replace_entries(entries);
+                    view.browser.set_view_mode(mode);
+                    view.browser.select_all();
+                    view.state = ListingState::Ready;
+                    cx.notify();
+                });
+                MULTI_FILE_DRAG_BUILDS.with(|count| count.set(0));
+                let started = Instant::now();
+                window.draw(
+                    point(px(0.0), px(0.0)),
+                    gpui::size(px(800.0), px(600.0)),
+                    |_, _| view.clone().into_element(),
+                );
+                let first_draw = started.elapsed();
+                let mut scroll_draws = Vec::new();
+                for index in [100, 200, 300] {
+                    view.update(window, |view, cx| {
+                        view.scroll_handle
+                            .scroll_to_item_strict(index, ScrollStrategy::Top);
+                        cx.notify();
+                    });
+                    let started = Instant::now();
+                    window.draw(
+                        point(px(0.0), px(0.0)),
+                        gpui::size(px(800.0), px(600.0)),
+                        |_, _| view.clone().into_element(),
+                    );
+                    scroll_draws.push(started.elapsed());
+                    view.update(window, |view, _| {
+                        assert!(view.scroll_handle.0.borrow().base_handle.offset().y < px(0.0));
+                    });
+                }
+                view.update(window, |view, _| {
+                    assert_eq!(view.browser.selection_count(), count)
+                });
+                assert_eq!(MULTI_FILE_DRAG_BUILDS.with(Cell::get), 0);
+                eprintln!(
+                    "{count} selected | {mode:?} | first draw {first_draw:.2?} | scroll draws {scroll_draws:.2?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -31351,6 +31424,11 @@ mod tests {
             assert_eq!(request.destination.as_deref(), Some(destination.as_path()));
         });
 
+        // The onboarding invitation moves rows down; keep the next source visible
+        // by minimizing floating operation history before starting another drag.
+        let minimize = window.debug_bounds("minimize-operations").unwrap().center();
+        window.simulate_click(minimize, gpui::Modifiers::default());
+        window.run_until_parked();
         let pinned_point = window
             .debug_bounds("entry-1")
             .expect("pinned folder row")
@@ -31394,6 +31472,138 @@ mod tests {
         assert!(!move_source.exists());
         assert!(copy_source.is_file());
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[gpui::test]
+    fn deferred_file_drag_preserves_mouse_down_selection_across_redraws(cx: &mut TestAppContext) {
+        for mode in [ViewMode::List, ViewMode::Grid] {
+            for copy in [false, true] {
+                for selected_source in [false, true] {
+                    let directory = fixture_dir();
+                    let destination = directory.join("destination");
+                    fs::create_dir(&destination).unwrap();
+                    let alpha = directory.join("alpha.txt");
+                    let beta = directory.join("beta.txt");
+                    let solo = directory.join("solo.txt");
+                    for path in [&alpha, &beta, &solo] {
+                        fs::write(path, "drag fixture").unwrap();
+                    }
+                    let mut folder = metadata_entry(destination.clone());
+                    folder.is_dir = true;
+                    let services = NativeServices::new(ResourcePaths::test(&directory));
+                    let (view, window) = cx.add_window_view(|_, cx| {
+                        DirectoryWindow::new(directory.clone(), services, cx)
+                    });
+                    view.update(window, |view, cx| {
+                        view.browser.replace_entries(vec![
+                            folder,
+                            metadata_entry(alpha.clone()),
+                            metadata_entry(beta.clone()),
+                            metadata_entry(solo.clone()),
+                        ]);
+                        view.browser.set_view_mode(mode);
+                        view.browser
+                            .replace_selection([alpha.clone(), beta.clone()]);
+                        view.state = ListingState::Ready;
+                        cx.notify();
+                    });
+                    MULTI_FILE_DRAG_BUILDS.with(|count| count.set(0));
+                    window.simulate_resize(gpui::size(px(800.0), px(600.0)));
+                    window.run_until_parked();
+                    assert_eq!(MULTI_FILE_DRAG_BUILDS.with(Cell::get), 0);
+
+                    let (source_selector, target_selector) = if mode == ViewMode::List {
+                        (
+                            if selected_source {
+                                "entry-1"
+                            } else {
+                                "entry-3"
+                            },
+                            "entry-0",
+                        )
+                    } else {
+                        (
+                            if selected_source {
+                                "grid-entry-1"
+                            } else {
+                                "grid-entry-3"
+                            },
+                            "grid-entry-0",
+                        )
+                    };
+                    let source = window.debug_bounds(source_selector).unwrap().center();
+                    let target = window.debug_bounds(target_selector).unwrap().center();
+                    window.simulate_mouse_down(
+                        source,
+                        MouseButton::Left,
+                        gpui::Modifiers::default(),
+                    );
+                    // A normal click still collapses selection; the drag must keep the pre-click set.
+                    view.update(window, |view, _| {
+                        assert_eq!(view.browser.selection_count(), 1)
+                    });
+                    window.run_until_parked();
+                    assert_eq!(MULTI_FILE_DRAG_BUILDS.with(Cell::get), 0);
+                    let modifiers = gpui::Modifiers {
+                        control: copy,
+                        ..gpui::Modifiers::default()
+                    };
+                    window.simulate_mouse_move(
+                        point(source.x + px(12.0), source.y),
+                        Some(MouseButton::Left),
+                        modifiers,
+                    );
+                    window.simulate_mouse_move(target, Some(MouseButton::Left), modifiers);
+                    assert_eq!(
+                        MULTI_FILE_DRAG_BUILDS.with(Cell::get),
+                        usize::from(selected_source)
+                    );
+                    window.simulate_mouse_up(target, MouseButton::Left, modifiers);
+                    let expected = if selected_source {
+                        vec![alpha.clone(), beta.clone()]
+                    } else {
+                        vec![solo.clone()]
+                    };
+                    view.update(window, |view, _| {
+                        let request = view
+                            .operations
+                            .latest()
+                            .expect("queued file drop")
+                            .request();
+                        assert_eq!(
+                            request.kind,
+                            if copy {
+                                FileOperationKind::Copy
+                            } else {
+                                FileOperationKind::Move
+                            }
+                        );
+                        assert_eq!(request.sources, expected);
+                        assert_eq!(request.destination.as_deref(), Some(destination.as_path()));
+                        assert!(view.file_drag_selection.is_none());
+                    });
+                    for _ in 0..1_000 {
+                        window.run_until_parked();
+                        if expected
+                            .iter()
+                            .all(|path| destination.join(path.file_name().unwrap()).exists())
+                        {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    for path in &expected {
+                        assert_eq!(
+                            fs::read_to_string(destination.join(path.file_name().unwrap()))
+                                .unwrap(),
+                            "drag fixture"
+                        );
+                        assert_eq!(path.exists(), copy);
+                    }
+                    fs::remove_dir_all(directory).unwrap();
+                }
+            }
+        }
     }
 
     #[gpui::test]
@@ -32267,6 +32477,66 @@ mod tests {
         view.update(cx, |view, _| {
             assert!(view.mutation_prompt.is_none());
             assert!(!view.undo_ledger.can_undo(SystemTime::now()));
+            assert!(
+                view.status_message
+                    .as_deref()
+                    .is_some_and(|message| message.contains("Extracted"))
+            );
+        });
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[gpui::test]
+    fn native_sevenzip_fallback_inspection_and_extraction(cx: &mut TestAppContext) {
+        let directory = fixture_dir();
+        let source = directory.join("source.txt");
+        fs::write(&source, "7-Zip native proof").unwrap();
+        // The fallback suffix selects the full engine; 7-Zip identifies the
+        // actual ZIP contents itself. Core fixtures separately exercise XZ/WIM.
+        let archive = directory.join("bundle.cab");
+        explorie_core::archive::create_zip_archive(&[source], &archive, CompressionLevel::Normal)
+            .unwrap();
+        assert_eq!(preview_panel::route(&archive, false), PreviewRoute::Archive);
+        assert_eq!(archive_base_name(&archive), "bundle");
+        let services =
+            NativeServices::new(explorie_native_services::ResourcePaths::test(&directory));
+        let (view, cx) =
+            cx.add_window_view(|_, cx| DirectoryWindow::new(directory.clone(), services, cx));
+        view.update(cx, |view, cx| view.inspect_archive(archive.clone(), cx));
+        for _ in 0..500 {
+            cx.run_until_parked();
+            if view.update(cx, |view, _| !view.archive_inspection_loading) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        view.update(cx, |view, cx| {
+            let (_, info) = view
+                .archive_inspection
+                .as_ref()
+                .expect("7-Zip archive inspection");
+            assert_eq!(info.entries[0].path, "source.txt");
+            view.prompt_extract_archive_path(archive.clone(), cx);
+            view.submit_mutation_prompt(cx);
+            assert!(matches!(
+                view.mutation_prompt.as_ref().map(|prompt| &prompt.kind),
+                Some(MutationPromptKind::ExtractPassword { .. })
+            ));
+            view.submit_mutation_prompt(cx);
+        });
+        for _ in 0..500 {
+            cx.run_until_parked();
+            if view.update(cx, |view, _| !view.mutation_in_progress) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            fs::read_to_string(directory.join("bundle/source.txt")).unwrap(),
+            "7-Zip native proof"
+        );
+        view.update(cx, |view, _| {
+            assert!(view.mutation_prompt.is_none());
             assert!(
                 view.status_message
                     .as_deref()
@@ -35102,10 +35372,11 @@ mod tests {
 
         for (tab_index, section_selector, control_selector) in [
             (1, "settings-integration", "settings-refresh-helpers"),
-            (2, "settings-appearance", "settings-theme-options"),
-            (3, "settings-themes", "settings-theme-save"),
-            (4, "settings-shortcuts", "settings-shortcuts-reset"),
-            (5, "settings-about", "settings-update-action"),
+            (2, "settings-plugins", "settings-plugins"),
+            (3, "settings-appearance", "settings-theme-options"),
+            (4, "settings-themes", "settings-theme-save"),
+            (5, "settings-shortcuts", "settings-shortcuts-reset"),
+            (6, "settings-about", "settings-update-action"),
         ] {
             let tab_selector = Box::leak(format!("settings-tab-{tab_index}").into_boxed_str());
             let target = window.debug_bounds(tab_selector).unwrap().center();
@@ -35119,7 +35390,7 @@ mod tests {
                 window.debug_bounds(control_selector).is_some(),
                 "settings tab {tab_index} did not expose {control_selector}"
             );
-            if tab_index == 2 {
+            if tab_index == 3 {
                 let slider = window.debug_bounds("settings-ui-scale").unwrap();
                 let track = window.debug_bounds("settings-ui-scale-track").unwrap();
                 assert!(track.left() > slider.left());

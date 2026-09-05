@@ -56,9 +56,9 @@ export const DEFAULT_COMMANDS = [
     args: ['audit', '--audit-level=moderate'],
   },
   {
-    display: 'cargo build -p explorie-gpui --release --locked',
-    command: 'cargo',
-    args: ['build', '-p', 'explorie-gpui', '--release', '--locked'],
+    display: 'node scripts/build-desktop.mjs',
+    command: 'node',
+    args: ['scripts/build-desktop.mjs'],
   },
   {
     display: 'git diff --check',

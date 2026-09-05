@@ -24,12 +24,14 @@ Current features:
 - **Multiple view modes:** List, Grid, and Finder-style Column views with a terminal preview column.
 - **Tabbed browsing:** Open multiple directories in tabs (Ctrl/Cmd+T).
 - **File previews:** One Explorie-owned Quick Look experience on Windows and macOS, including selected-set navigation and an index sheet, plus images, embedded audio/video, locally rendered PDFs, highlighted text/code, archive listings, and optional helper-generated previews.
+- **Archives:** Built-in ZIP, 7z, TAR/TAR.GZ and RAR handling, plus bundled upstream 7-Zip 26.03 for inspecting and extracting XZ, BZIP2, GZIP, CAB, ISO, WIM, MSI, DMG and other supported archive/disk-image formats. No separate 7-Zip installation is needed. Additional formats are extract-only in Explorie; single-stream formats decompress one layer (for example, `files.tar.xz` produces `files.tar`).
 - **Custom metadata:** Read/write `.explorie.json` for custom fields per folder.
 - **Theming:** Dark/light/system themes, accent colors, local font stacks, UI scale, density, and more.
 - **Drag & drop:** Move files between folders with visual feedback.
 - **Settings panel:** Comprehensive appearance and behavior customization.
 - **OS integration:** Native window controls and platform file opening.
 - **Persistent Remote Drives:** Reconnect existing rclone remotes as native Windows drive letters or macOS volumes while explorie is running.
+- **Optional integrations:** Install and enable Syncthing, Git, and Obsidian plugins in Settings → Integrations. Recognize overlapping folder types, inspect local status, and open related applications without leaving the native file browser. See [integration setup and plugin development](docs/plugins.md).
 
 ---
 
@@ -96,6 +98,8 @@ Both installed apps check for newer published versions at startup. After confirm
 
 Platform-specific `SHA256SUMS` files are published alongside each release.
 
+Releases also include the exact bundled 7-Zip source (`7z2603-src.tar.xz`), `7zip-NOTICE.txt`, and `SHA256SUMS-7zip.txt`.
+
 ---
 
 ## Quickstart
@@ -105,6 +109,7 @@ git clone https://github.com/oshtz/explorie.git
 cd explorie
 
 pnpm install                             # install release-script tooling
+pnpm prepare:native                      # prepare pinned native helpers and 7-Zip
 pnpm desktop:dev                         # run the native GPUI desktop app
 
 cargo run -p explorie-cli -- --help      # CLI help (listing and ffmpeg-preview)
@@ -133,6 +138,22 @@ cargo run -p explorie-cli -- --help      # CLI help (listing and ffmpeg-preview)
 | `pnpm lint`          | Check Rust formatting and strict workspace clippy                      |
 
 For release-candidate verification, run `pnpm release:check` and use the release checklist below.
+
+To measure GPUI listing-state updates at 10,000 and 100,000 entries, including sorting, refreshing, and filtering with every file selected:
+
+```bash
+cargo test --locked -p explorie-gpui records_large_folder_interaction_baselines --release -- --ignored --nocapture
+```
+
+Set `EXPLORIE_BENCH_COUNTS` to comma-separated sizes for smaller comparisons. These in-memory fixtures measure browser-state work; filesystem enumeration, preview decoding, and GPU frame time are excluded. Compare revisions using the same machine, toolchain, profile, and fixture sizes.
+
+To measure List and Grid draws while scrolling with 10,000 and 100,000 files selected:
+
+```bash
+cargo test --locked -p explorie-gpui records_large_selection_render_baselines --release -- --ignored --nocapture
+```
+
+This uses GPUI's native test runtime at an 800×600 viewport and checks that drawing does not construct multi-file drag payloads. It measures CPU layout/paint work, not GPU presentation time.
 
 ### CLI
 
@@ -260,6 +281,8 @@ The metadata stays next to your files and is not synced by explorie itself.
 explorie source code is MIT-licensed. The authoritative dependency graph is primarily MIT, Apache-2.0, Apache-2.0/MIT dual-licensed, BSD-2-Clause, BSD-3-Clause, ISC, MIT-0, and compatible permissive licenses.
 
 Notable runtime and UI dependencies include GPUI, AccessKit, and Rust crates for filesystem, archive, tracing, local media decoding, and platform integration. Explorie bundles rclone v1.74.4 under its MIT license and includes the license in packaged applications. Windows packages also include the official, unmodified WinFsp installer: **WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos**, [source and license](https://github.com/winfsp/winfsp). Optional external helpers such as FFmpeg, LibreOffice, and ImageMagick are not bundled; their own licenses apply to user-installed copies.
+
+The bundled [7-Zip](https://www.7-zip.org/) 26.03 engine is copyright Igor Pavlov and distributed under LGPL-2.1-or-later with the additional BSD notices and unRAR restriction in its [license](https://www.7-zip.org/license.txt). Its license, LGPL text and attribution are included in packaged applications; exact corresponding source is offered alongside release binaries. Explorie's own source remains MIT-licensed. The fallback streams decoded bytes through Explorie's existing path checks, byte limits and staged extraction; it never delegates output-path creation to 7-Zip. Archives with ambiguous names, unsupported links or alternate streams are rejected. Formats that omit decoded sizes may show zero in inspection until extracted. Existing archive creation and ZIP/7z/TAR/RAR extraction continue to use the Rust integrations.
 
 App icons and sample assets in this repository are project assets unless replaced before release.
 

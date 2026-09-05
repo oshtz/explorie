@@ -4,9 +4,81 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_PKG_VERSION");
 
     generate_titlebar_icon();
+    stage_sevenzip();
+    embed_plugin_catalog();
 
     #[cfg(windows)]
     embed_windows_resources();
+}
+
+fn embed_plugin_catalog() {
+    use std::{env, fs, path::PathBuf};
+
+    println!("cargo:rerun-if-env-changed=EXPLORIE_PLUGIN_CATALOG");
+    let catalog = match env::var_os("EXPLORIE_PLUGIN_CATALOG") {
+        Some(path) => {
+            let path = PathBuf::from(path);
+            println!("cargo:rerun-if-changed={}", path.display());
+            let contents = fs::read_to_string(path).expect("read official plugin catalog");
+            assert!(
+                contents.trim() != "[]",
+                "Official plugin catalog must not be empty"
+            );
+            contents
+        }
+        None => {
+            assert_ne!(
+                env::var("PROFILE").as_deref(),
+                Ok("release"),
+                "Prepare official plugins before release builds: pnpm desktop:build (or set EXPLORIE_PLUGIN_CATALOG to the generated catalog)"
+            );
+            "[]".to_owned()
+        }
+    };
+    let output = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+    fs::write(output.join("plugin-catalog.json"), catalog).expect("embed official plugin catalog");
+}
+
+fn stage_sevenzip() {
+    use std::{env, fs, path::PathBuf};
+
+    let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    let target = env::var("TARGET").unwrap();
+    if !target.contains("windows") && !target.contains("apple-darwin") {
+        return;
+    }
+    let source = manifest
+        .join("../native-assets/binaries")
+        .join(format!("7zip-{target}"));
+    println!("cargo:rerun-if-changed={}", source.display());
+    let files: &[&str] = if target.contains("windows") {
+        &["7z.exe", "7z.dll"]
+    } else {
+        &["7zz"]
+    };
+    if files.iter().any(|name| !source.join(name).is_file()) {
+        assert_ne!(
+            env::var("PROFILE").as_deref(),
+            Ok("release"),
+            "Prepare bundled 7-Zip before a release build: node scripts/prepare-7zip.mjs {target}"
+        );
+        println!("cargo:warning=Run pnpm prepare:native to enable the full 7-Zip archive backend");
+        return;
+    }
+    let output = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+    let profile = output.ancestors().nth(3).expect("Cargo profile directory");
+    let destination = profile.join("7zip");
+    fs::create_dir_all(&destination).expect("create 7-Zip directory");
+    for name in files {
+        fs::copy(source.join(name), destination.join(name)).expect("stage bundled 7-Zip");
+    }
+    let licenses = profile.join("licenses");
+    fs::create_dir_all(&licenses).expect("create license directory");
+    for name in ["7zip-LICENSE.txt", "7zip-COPYING.txt", "7zip-NOTICE.txt"] {
+        let source = manifest.join("../native-assets/resources").join(name);
+        println!("cargo:rerun-if-changed={}", source.display());
+        fs::copy(source, licenses.join(name)).expect("stage 7-Zip license");
+    }
 }
 
 fn generate_titlebar_icon() {
