@@ -119,7 +119,7 @@ unpublished versions cannot be installed from the official catalog until their a
 GitHub draft assets require an authenticated download. The app's anonymous catalog URLs
 cannot install plugins from a draft, so Settings → Install will remain unavailable until
 publication. For personal testing, download the matching platform ZIPs from the draft while
-signed in as the repository owner (or use `gh release download v0.3.0 --repo oshtz/explorie
+signed in as the repository owner (or use `gh release download v0.3.1 --repo oshtz/explorie
 --pattern 'explorie-plugin-*.zip'`). Extract each plugin to its own directory, then launch
 the packaged app with `--load-plugin-dir <extracted-directory>` for each plugin to test.
 These packages appear as Development and can be enabled in Settings → Integrations.
@@ -130,8 +130,8 @@ official catalog download/install/update proof; that remains a separate release 
 
 The release workflow packages plugins before compiling the app. On macOS it signs each
 executable with the existing Developer ID identity and hardened runtime, submits each ZIP
-to Apple's notary service, requires Accepted status, and verifies extracted signatures and
-Gatekeeper acceptance. Bare executables and ZIPs cannot carry stapled tickets; Gatekeeper
+to Apple's notary service, requires Accepted status, and verifies extracted signatures with
+the `notarized` code requirement. Bare executables and ZIPs cannot carry stapled tickets; Gatekeeper
 retrieves tickets for notarized executable bytes. See Apple's
 [notarization guidance](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution).
 

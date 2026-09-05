@@ -451,8 +451,8 @@ jobs:
             extracted="$RUNNER_TEMP/plugin-notarization/$plugin"
             mkdir -p "$extracted"
             ditto -x -k "$archive" "$extracted"
-            codesign --verify --strict --verbose=2 "$extracted/explorie-plugin-$plugin"
-            spctl --assess --type execute --verbose=2 "$extracted/explorie-plugin-$plugin"
+            # Standalone tools require a notarization check, not an app-bundle assessment.
+            codesign --verify --strict --verbose=4 -R="notarized" --check-notarization "$extracted/explorie-plugin-$plugin"
           done
           # ZIPs and bare command-line executables cannot carry stapled tickets.
           # Keep notarized bytes unchanged; Gatekeeper retrieves their tickets.
