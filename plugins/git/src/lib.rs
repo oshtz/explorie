@@ -239,6 +239,20 @@ impl GitPlugin {
             return Ok(None);
         };
         let root = PathBuf::from(String::from_utf8_lossy(&bytes).trim_end_matches(['\r', '\n']));
+        // Git resolves directory aliases (for example /var -> /private/var on
+        // macOS). Keep the caller's spelling so listing paths and actions agree.
+        let canonical_root = root.canonicalize().ok();
+        let root = context
+            .path
+            .ancestors()
+            .find(|ancestor| {
+                *ancestor == root
+                    || canonical_root.as_ref().is_some_and(|canonical| {
+                        ancestor.canonicalize().is_ok_and(|path| path == *canonical)
+                    })
+            })
+            .map(Path::to_path_buf)
+            .unwrap_or(root);
         if !context.force
             && let Some((time, status)) = self.cache.get(&root)
             && time.elapsed() < Duration::from_secs(2)
@@ -440,6 +454,33 @@ mod tests {
         assert!(github_remote("https://github.com.evil/owner/repo").is_none());
         assert!(github_remote("https://github.com/../repo").is_none());
     }
+    #[test]
+    #[cfg(unix)]
+    fn repository_alias_keeps_listing_paths_and_decorations() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repository");
+        std::fs::create_dir(&root).unwrap();
+        run(&root, &["init", "--initial-branch=main"])
+            .unwrap()
+            .unwrap();
+        std::fs::write(root.join("note.md"), "note").unwrap();
+        let alias = temp.path().join("alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        let context = Inspection {
+            path: alias.clone(),
+            entries: vec![explorie_plugin_protocol::EntryContext {
+                path: alias.join("note.md"),
+                is_dir: false,
+            }],
+            ..Default::default()
+        };
+        let mut plugin = GitPlugin::default();
+        let contribution = plugin.inspect(context).unwrap();
+        assert_eq!(contribution.root, Some(alias.clone()));
+        assert_eq!(contribution.decorations.len(), 1);
+        assert_eq!(contribution.decorations[0].path, alias.join("note.md"));
+    }
+
     #[test]
     fn real_repository_worktree_detached_and_cache() {
         let temp = tempfile::tempdir().unwrap();
