@@ -2,6 +2,16 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import { SEVENZIP_SOURCE, SEVENZIP_TARGETS, SEVENZIP_VERSION, prepareSevenZip, verifySha256 } from './prepare-7zip.mjs';
+import { verifySevenZipVersion } from './smoke-7zip.mjs';
+
+test('7-Zip version smoke accepts Windows and standalone Unix banners only at the pinned version', () => {
+  for (const banner of ['7-Zip 26.03 (x64)', '7-Zip (z) 26.03 (arm64)']) {
+    assert.doesNotThrow(() => verifySevenZipVersion(`\n${banner} : Copyright (c) Igor Pavlov\n`));
+  }
+  for (const banner of ['7-Zip (z) 25.01 (arm64)', '7-Zip 26.030 (x64)', '7-Zip (a) 26.03 (arm64)', 'p7zip 26.03', 'unknown']) {
+    assert.throws(() => verifySevenZipVersion(banner), /Unexpected 7-Zip version/);
+  }
+});
 
 test('7-Zip download integrity rejects altered bytes', () => {
   const digest = 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad';

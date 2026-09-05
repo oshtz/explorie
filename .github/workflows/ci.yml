@@ -137,6 +137,7 @@ jobs:
           TMPDIR: ${{ runner.temp }}
         run: |
           node scripts/prepare-7zip.mjs
+          node scripts/smoke-7zip.mjs apps/desktop/native-assets/binaries/7zip-aarch64-apple-darwin/7zz
           cargo test --locked -p explorie-core -p explorie-native-services -p explorie-ffmpeg-wrapper -p explorie-cli
           cargo test --locked -p explorie-gpui -- --test-threads=1
 

@@ -1,7 +1,7 @@
 {
   "id": "git",
   "name": "Git",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "protocolVersion": 1,
   "description": "Local repository status and GitHub links.",
   "executables": {

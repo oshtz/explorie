@@ -119,7 +119,7 @@ unpublished versions cannot be installed from the official catalog until their a
 GitHub draft assets require an authenticated download. The app's anonymous catalog URLs
 cannot install plugins from a draft, so Settings → Install will remain unavailable until
 publication. For personal testing, download the matching platform ZIPs from the draft while
-signed in as the repository owner (or use `gh release download v0.3.1 --repo oshtz/explorie
+signed in as the repository owner (or use `gh release download v0.3.2 --repo oshtz/explorie
 --pattern 'explorie-plugin-*.zip'`). Extract each plugin to its own directory, then launch
 the packaged app with `--load-plugin-dir <extracted-directory>` for each plugin to test.
 These packages appear as Development and can be enabled in Settings → Integrations.
