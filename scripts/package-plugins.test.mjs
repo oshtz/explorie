@@ -102,7 +102,10 @@ test('release order preserves signing, notarization, catalogs and publication ga
   assert.ok(mac.indexOf('codesign --force') < mac.indexOf('package-plugins.mjs --target'));
   assert.ok(mac.indexOf('notarytool submit') < mac.indexOf('Build GPUI macOS app and DMG'));
   assert.match(mac, /status!=="Accepted"/);
-  assert.match(mac, /spctl --assess --type execute/);
+  const macPlugins = mac.slice(0, mac.indexOf('- name: Upload macOS plugin notarization proof'));
+  assert.match(macPlugins, /codesign --verify --strict --verbose=4 -R="notarized" --check-notarization "\$extracted\/explorie-plugin-\$plugin"/);
+  assert.doesNotMatch(macPlugins, /spctl --assess/);
+  assert.match(mac, /spctl --assess --type execute --verbose=2 "\$app"/);
   assert.equal((workflow.match(/sha256sum --check "SHA256SUMS-plugins-\$target.txt"/g) ?? []).length, 2);
   assert.match(workflow, /needs: \[validate, build-windows, build-macos\]/);
   assert.match(workflow, /environment: release-publish/);
