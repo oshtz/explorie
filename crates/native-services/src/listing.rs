@@ -105,15 +105,6 @@ impl ListingService {
             .map_err(ServiceError::from)
     }
 
-    pub fn syncthing_root(&self, path: PathBuf) -> BlockingTask<Option<PathBuf>> {
-        self.context
-            .spawn_blocking(move || Ok(find_syncthing_root(&path)))
-    }
-
-    pub fn syncthing_root_blocking(&self, path: &Path) -> Option<PathBuf> {
-        find_syncthing_root(path)
-    }
-
     pub fn launch_path(&self, args: Vec<std::ffi::OsString>) -> BlockingTask<Option<PathBuf>> {
         self.context
             .spawn_blocking(move || Ok(launch_directory_from_args(args)))
@@ -203,12 +194,6 @@ pub(crate) fn normalize_path(path: &Path) -> String {
 
 fn path_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
-}
-
-pub(crate) fn find_syncthing_root(path: &Path) -> Option<PathBuf> {
-    path.ancestors()
-        .find(|ancestor| ancestor.join(".stfolder").is_dir())
-        .map(Path::to_path_buf)
 }
 
 pub fn launch_directory_from_args(

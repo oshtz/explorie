@@ -176,7 +176,7 @@ pub struct BrowserState {
     forward: Vec<PathBuf>,
     entries: Vec<Arc<FileEntry>>,
     visible_entries: Vec<Arc<FileEntry>>,
-    selected: BTreeSet<PathBuf>,
+    selected: Arc<BTreeSet<PathBuf>>,
     selection_cursor: Option<PathBuf>,
     selection_anchor: Option<PathBuf>,
     show_hidden: bool,
@@ -203,7 +203,7 @@ impl BrowserState {
             forward: Vec::new(),
             entries: Vec::new(),
             visible_entries: Vec::new(),
-            selected: BTreeSet::new(),
+            selected: Arc::default(),
             selection_cursor: None,
             selection_anchor: None,
             show_hidden: false,
@@ -299,6 +299,10 @@ impl BrowserState {
 
     pub fn selection_count(&self) -> usize {
         self.selected.len()
+    }
+
+    pub(super) fn selection_snapshot(&self) -> Arc<BTreeSet<PathBuf>> {
+        Arc::clone(&self.selected)
     }
 
     pub fn selected_paths(&self) -> Vec<PathBuf> {
@@ -643,8 +647,7 @@ impl BrowserState {
 
     pub fn select(&mut self, path: PathBuf) {
         if self.visible_entries.iter().any(|entry| entry.path == path) {
-            self.selected.clear();
-            self.selected.insert(path.clone());
+            self.selected = Arc::new(BTreeSet::from([path.clone()]));
             self.selection_cursor = Some(path.clone());
             self.selection_anchor = Some(path);
         }
@@ -654,8 +657,9 @@ impl BrowserState {
         if !self.visible_entries.iter().any(|entry| entry.path == path) {
             return;
         }
-        if !self.selected.remove(&path) {
-            self.selected.insert(path.clone());
+        let selected = Arc::make_mut(&mut self.selected);
+        if !selected.remove(&path) {
+            selected.insert(path.clone());
         }
         self.selection_cursor = self.selected.contains(&path).then(|| path.clone());
         if self.selection_cursor.is_none() {
@@ -687,10 +691,12 @@ impl BrowserState {
         } else {
             (target, anchor)
         };
-        self.selected = self.visible_entries[start..=end]
-            .iter()
-            .map(|entry| entry.path.clone())
-            .collect();
+        self.selected = Arc::new(
+            self.visible_entries[start..=end]
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect(),
+        );
         self.selection_cursor = Some(path);
         if self.selection_anchor.is_none() {
             self.selection_anchor = self
@@ -701,11 +707,12 @@ impl BrowserState {
     }
 
     pub fn select_all(&mut self) {
-        self.selected = self
-            .visible_entries
-            .iter()
-            .map(|entry| entry.path.clone())
-            .collect();
+        self.selected = Arc::new(
+            self.visible_entries
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect(),
+        );
         self.selection_cursor = self.visible_entries.first().map(|entry| entry.path.clone());
         self.selection_anchor = self.selection_cursor.clone();
     }
@@ -715,12 +722,13 @@ impl BrowserState {
         I: IntoIterator<Item = PathBuf>,
     {
         let requested: BTreeSet<_> = paths.into_iter().collect();
-        self.selected = self
-            .visible_entries
-            .iter()
-            .filter(|entry| requested.contains(&entry.path))
-            .map(|entry| entry.path.clone())
-            .collect();
+        self.selected = Arc::new(
+            self.visible_entries
+                .iter()
+                .filter(|entry| requested.contains(&entry.path))
+                .map(|entry| entry.path.clone())
+                .collect(),
+        );
         self.selection_cursor = self.selected.first().cloned();
         self.selection_anchor = self.selection_cursor.clone();
     }
@@ -736,7 +744,8 @@ impl BrowserState {
     }
 
     pub fn clear_selection(&mut self) {
-        self.selected.clear();
+        self.pending_selection.clear();
+        self.selected = Arc::default();
         self.selection_cursor = None;
         self.selection_anchor = None;
     }
@@ -881,11 +890,16 @@ impl BrowserState {
             &self.search_query,
         );
 
-        self.selected.retain(|selected| {
-            self.visible_entries
-                .iter()
-                .any(|entry| &entry.path == selected)
-        });
+        // Walk the listing once instead of scanning it for every selected path.
+        if !self.selected.is_empty() {
+            self.selected = Arc::new(
+                self.visible_entries
+                    .iter()
+                    .filter(|entry| self.selected.contains(&entry.path))
+                    .map(|entry| entry.path.clone())
+                    .collect(),
+            );
+        }
         if self
             .selection_cursor
             .as_ref()
@@ -1429,6 +1443,116 @@ mod tests {
     }
 
     #[test]
+    fn bulk_selection_survives_sort_and_refresh_but_drops_filtered_and_removed_paths() {
+        let entries = (0..1_000)
+            .map(|index| entry(&format!("file-{index:04}.txt"), false, index, false, 0))
+            .collect::<Vec<_>>();
+        let mut state = BrowserState::new(PathBuf::from("root"));
+        state.replace_entries(entries.clone());
+        state.select_all();
+        state.set_sort(SortKey::Size);
+        state.set_sort(SortKey::Size);
+        assert_eq!(state.selection_count(), 1_000);
+        assert_eq!(state.selected_path(), Some(Path::new("root/file-0000.txt")));
+
+        state.replace_entries(entries.into_iter().skip(1).collect());
+        assert_eq!(state.selection_count(), 999);
+        assert_eq!(state.selected_path(), Some(Path::new("root/file-0001.txt")));
+        assert_eq!(state.selection_anchor, state.selection_cursor);
+
+        state.set_search_query("file-09".to_string());
+        assert_eq!(state.selection_count(), 100);
+        assert_eq!(state.selected_path(), Some(Path::new("root/file-0900.txt")));
+        assert_eq!(state.selection_anchor, state.selection_cursor);
+        assert!(state.selected_paths().iter().all(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("file-09")
+        }));
+
+        state.clear_search();
+        assert_eq!(state.selection_count(), 100);
+        state.set_filter(EntryFilter::Folders);
+        assert_eq!(state.selection_count(), 0);
+        assert!(state.selection_cursor.is_none());
+        assert!(state.selection_anchor.is_none());
+    }
+
+    /// Run with `cargo test -p explorie-gpui records_large_folder_interaction_baselines
+    /// --release -- --ignored --nocapture`. Set EXPLORIE_BENCH_COUNTS to a
+    /// comma-separated list to compare the same fixture sizes across revisions.
+    #[test]
+    #[ignore = "explicit large-folder interaction benchmark"]
+    fn records_large_folder_interaction_baselines() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let counts =
+            std::env::var("EXPLORIE_BENCH_COUNTS").unwrap_or_else(|_| "10000,100000".to_string());
+        for count in counts
+            .split(',')
+            .map(|count| count.parse::<usize>().unwrap())
+        {
+            assert!(count > 0);
+            let entries = (0..count)
+                .rev()
+                .map(|index| {
+                    entry(
+                        &format!("file-{index:06}.txt"),
+                        false,
+                        index as u64,
+                        false,
+                        0,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut state = BrowserState::new(PathBuf::from("root"));
+            let refresh_entries = entries.clone();
+            let started = Instant::now();
+            state.replace_entries(entries);
+            let listing = started.elapsed();
+
+            let started = Instant::now();
+            state.set_sort(SortKey::Size);
+            let sort = started.elapsed();
+
+            state.select_all();
+            let started = Instant::now();
+            state.set_sort(SortKey::Name);
+            let selected_sort = started.elapsed();
+            assert_eq!(state.selection_count(), count);
+
+            let started = Instant::now();
+            state.replace_entries(refresh_entries);
+            let selected_refresh = started.elapsed();
+            assert_eq!(state.selection_count(), count);
+
+            let started = Instant::now();
+            state.set_search_query(".txt".to_string());
+            let selected_filter = started.elapsed();
+            assert_eq!(state.selection_count(), count);
+            black_box(&state);
+            eprintln!(
+                "{count} entries | listing {listing:.2?} | sort {sort:.2?} | selected sort {selected_sort:.2?} | selected refresh {selected_refresh:.2?} | selected filter {selected_filter:.2?}"
+            );
+        }
+    }
+
+    #[test]
+    fn clearing_selection_cancels_saved_selection_before_listing_arrives() {
+        let root = PathBuf::from("root");
+        let mut state = BrowserState::new(root.clone());
+        state.replace_entries(vec![entry("a", false, 0, false, 0)]);
+        state.select(root.join("a"));
+        state.navigate(root.join("child"));
+        state.go_back();
+        state.clear_selection();
+        state.replace_entries(vec![entry("a", false, 0, false, 0)]);
+        assert_eq!(state.selection_count(), 0);
+    }
+
+    #[test]
     fn selection_supports_replace_toggle_range_and_select_all() {
         let mut state = BrowserState::new(PathBuf::from("root"));
         state.replace_entries(vec![
@@ -1462,6 +1586,27 @@ mod tests {
         assert_eq!(state.selected_path(), Some(Path::new("root/b")));
         state.clear_selection();
         assert_eq!(state.selection_count(), 0);
+    }
+
+    #[test]
+    fn drag_selection_snapshot_survives_toggle_replace_and_clear() {
+        let mut state = BrowserState::new(PathBuf::from("root"));
+        state.replace_entries(vec![
+            entry("a", false, 0, false, 0),
+            entry("b", false, 0, false, 0),
+        ]);
+        state.select_all();
+        let snapshot = state.selection_snapshot();
+        state.toggle_selection(PathBuf::from("root/a"));
+        assert_eq!(state.selection_count(), 1);
+        assert_eq!(snapshot.len(), 2);
+        state.select(PathBuf::from("root/a"));
+        state.clear_selection();
+        assert_eq!(state.selection_count(), 0);
+        assert_eq!(
+            *snapshot,
+            BTreeSet::from([PathBuf::from("root/a"), PathBuf::from("root/b")])
+        );
     }
 
     #[test]

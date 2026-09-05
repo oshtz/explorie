@@ -4,6 +4,8 @@ set -euo pipefail
 repository=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 version=$(node -p "require('$repository/package.json').version")
 target=${EXPLORIE_MACOS_TARGET:-aarch64-apple-darwin}
+: "${EXPLORIE_PLUGIN_CATALOG:?Set the official plugin catalog used to build this application}"
+node "$repository/scripts/package-plugins.mjs" --verify-catalog "$EXPLORIE_PLUGIN_CATALOG" --target "$target"
 identity=${APPLE_SIGNING_IDENTITY:--}
 team_id=${APPLE_TEAM_ID:-}
 assets="$repository/apps/desktop/native-assets"
@@ -13,6 +15,7 @@ app="$bundle_root/macos/explorie.app"
 dmg_root="$bundle_root/dmg-root"
 dmg="$bundle_root/dmg/explorie_${version}_${target}.dmg"
 rclone="$assets/binaries/rclone-$target"
+sevenzip="$assets/binaries/7zip-$target/7zz"
 helper="$assets/macos/build/explorie-mountd"
 icon_source="$assets/icons/icon.png"
 iconset="$bundle_root/explorie.iconset"
@@ -31,10 +34,14 @@ esac
 
 test -x "$binary"
 test -x "$rclone"
+test -x "$sevenzip"
 test -f "$icon_source"
 test -f "$assets/resources/rclone-COPYING"
 test -f "$assets/resources/pixelarticons-LICENSE.txt"
 test -f "$assets/resources/assimp-LICENSE.txt"
+test -f "$assets/resources/7zip-LICENSE.txt"
+test -f "$assets/resources/7zip-COPYING.txt"
+test -f "$assets/resources/7zip-NOTICE.txt"
 test -f "$assets/macos/MountDaemon.m"
 test -f "$assets/macos/com.omershatz.explorie.mountd.plist"
 
@@ -55,6 +62,7 @@ rm -f "$generated_icon"
 mkdir -p \
   "$app/Contents/MacOS" \
   "$app/Contents/Resources/licenses" \
+  "$app/Contents/Resources/7zip" \
   "$app/Contents/Library/LaunchDaemons" \
   "$bundle_root/dmg" \
   "$dmg_root" \
@@ -82,6 +90,11 @@ test -s "$generated_icon"
 
 install -m 755 "$binary" "$app/Contents/MacOS/explorie-gpui"
 install -m 755 "$rclone" "$app/Contents/MacOS/rclone"
+install -m 755 "$sevenzip" "$app/Contents/Resources/7zip/7zz"
+for notice in 7zip-LICENSE.txt 7zip-COPYING.txt 7zip-NOTICE.txt; do
+  install -m 644 "$assets/resources/$notice" "$app/Contents/Resources/licenses/$notice"
+done
+node "$repository/scripts/smoke-7zip.mjs" "$app/Contents/Resources/7zip/7zz"
 install -m 755 "$helper" "$app/Contents/Resources/explorie-mountd"
 install -m 644 "$generated_icon" "$app/Contents/Resources/icon.icns"
 install -m 644 "$assets/resources/rclone-COPYING" "$app/Contents/Resources/licenses/rclone-COPYING"
@@ -140,6 +153,7 @@ sign() {
 
 sign com.omershatz.explorie.mountd "$app/Contents/Resources/explorie-mountd"
 sign com.omershatz.explorie.rclone "$app/Contents/MacOS/rclone"
+sign com.omershatz.explorie.sevenzip "$app/Contents/Resources/7zip/7zz"
 sign com.omershatz.explorie "$app/Contents/MacOS/explorie-gpui"
 sign com.omershatz.explorie "$app"
 codesign --verify --deep --strict --verbose=2 "$app"

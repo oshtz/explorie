@@ -12,12 +12,12 @@ on:
         required: true
         default: false
       windows_real_machine_verified:
-        description: Windows installer, folder-handler toggle/reversal, remote drives, and disposable filesystem operations passed
+        description: Windows installer, folder-handler toggle/reversal, remote drives, opt-in downloaded plugins, and disposable filesystem operations passed
         type: boolean
         required: true
         default: false
       macos_real_machine_verified:
-        description: Signed/notarized macOS install, launch, and disposable filesystem operations passed
+        description: Signed/notarized macOS install, launch, downloaded plugin execution, and disposable filesystem operations passed
         type: boolean
         required: true
         default: false
@@ -167,13 +167,36 @@ jobs:
           workspaces: './ -> target'
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Test native file operations on Windows
-        run: cargo test --locked -p explorie-core
-
       - name: Prepare native dependencies
         run: |
           node scripts/prepare-rclone.mjs
           node scripts/prepare-winfsp.mjs
+          node scripts/prepare-7zip.mjs
+
+      - name: Test native file operations on Windows
+        run: cargo test --locked -p explorie-core
+
+      - name: Upload corresponding 7-Zip source and notices
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: explorie-third-party
+          path: release-artifacts/third-party/*
+          if-no-files-found: error
+
+      - name: Build and package official Windows plugins
+        shell: pwsh
+        run: |
+          node scripts/package-plugins.mjs --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw "Plugin packaging failed." }
+          $catalog = Join-Path $PWD "release-artifacts/plugins-x86_64-pc-windows-msvc/explorie-plugin-catalog-x86_64-pc-windows-msvc.json"
+          "EXPLORIE_PLUGIN_CATALOG=$catalog" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Upload Windows plugin packages
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: explorie-plugins-windows
+          path: release-artifacts/plugins-x86_64-pc-windows-msvc/*
+          if-no-files-found: error
 
       - name: Build GPUI Windows application
         shell: pwsh
@@ -283,6 +306,11 @@ jobs:
           $app = Join-Path $installDir "Explorie.exe"
           $rclone = Join-Path $installDir "rclone.exe"
           try {
+            node scripts/smoke-7zip.mjs (Join-Path $installDir "7zip/7z.exe")
+            if ($LASTEXITCODE -ne 0) { throw "Installed 7-Zip archive smoke failed." }
+            foreach ($notice in @("7zip-LICENSE.txt", "7zip-COPYING.txt", "7zip-NOTICE.txt")) {
+              if (-not (Test-Path -LiteralPath (Join-Path $installDir "licenses/$notice") -PathType Leaf)) { throw "Installed 7-Zip notice is missing: $notice" }
+            }
             if (-not (Test-Path -LiteralPath $app -PathType Leaf)) { throw "Installed Explorie executable was not found." }
             if (-not (Test-Path -LiteralPath $rclone -PathType Leaf)) { throw "Installed rclone executable was not found." }
             pwsh -NoProfile -File scripts/smoke-gpui-release.ps1 -Executable $app -ProfilePath $profile
@@ -395,6 +423,57 @@ jobs:
           p12-file-base64: ${{ secrets.APPLE_CERTIFICATE }}
           p12-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
 
+      - name: Build, sign, and notarize official macOS plugins
+        shell: bash
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ steps.signing.outputs.identity }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          target=aarch64-apple-darwin
+          cargo build --release --locked --target "$target" -p explorie-plugin-syncthing -p explorie-plugin-git -p explorie-plugin-obsidian
+          for plugin in syncthing git obsidian; do
+            binary="target/$target/release/explorie-plugin-$plugin"
+            codesign --force --sign "$APPLE_SIGNING_IDENTITY" --options runtime --timestamp "$binary"
+            codesign --verify --strict --verbose=2 "$binary"
+            codesign -d --verbose=4 "$binary" 2>&1 | grep -Fx "TeamIdentifier=$APPLE_TEAM_ID"
+          done
+          node scripts/package-plugins.mjs --target "$target" --no-build
+          mkdir -p "$RUNNER_TEMP/plugin-notarization"
+          version=$(node -p "require('./package.json').version")
+          for plugin in syncthing git obsidian; do
+            archive="release-artifacts/plugins-$target/explorie-plugin-$plugin-$version-$target.zip"
+            proof="$RUNNER_TEMP/plugin-notarization/$plugin.json"
+            xcrun notarytool submit "$archive" --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait --output-format json > "$proof"
+            node -e 'const p=require(process.argv[1]); if(p.status!=="Accepted") process.exit(1)' "$proof"
+            extracted="$RUNNER_TEMP/plugin-notarization/$plugin"
+            mkdir -p "$extracted"
+            ditto -x -k "$archive" "$extracted"
+            codesign --verify --strict --verbose=2 "$extracted/explorie-plugin-$plugin"
+            spctl --assess --type execute --verbose=2 "$extracted/explorie-plugin-$plugin"
+          done
+          # ZIPs and bare command-line executables cannot carry stapled tickets.
+          # Keep notarized bytes unchanged; Gatekeeper retrieves their tickets.
+          catalog="$PWD/release-artifacts/plugins-$target/explorie-plugin-catalog-$target.json"
+          node scripts/package-plugins.mjs --verify-catalog "$catalog" --target "$target"
+          echo "EXPLORIE_PLUGIN_CATALOG=$catalog" >> "$GITHUB_ENV"
+
+      - name: Upload macOS plugin notarization proof
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: macos-plugin-notarization
+          path: ${{ runner.temp }}/plugin-notarization/*.json
+          if-no-files-found: error
+
+      - name: Upload macOS plugin packages
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: explorie-plugins-macos
+          path: release-artifacts/plugins-aarch64-apple-darwin/*
+          if-no-files-found: error
+
       - name: Build GPUI macOS app and DMG
         env:
           APPLE_SIGNING_IDENTITY: ${{ steps.signing.outputs.identity }}
@@ -402,6 +481,7 @@ jobs:
           EXPLORIE_MACOS_TARGET: aarch64-apple-darwin
         run: |
           node scripts/prepare-rclone.mjs aarch64-apple-darwin
+          node scripts/prepare-7zip.mjs aarch64-apple-darwin
           cargo build -p explorie-gpui --release --locked --target aarch64-apple-darwin
           bash scripts/package-gpui-macos.sh
 
@@ -479,12 +559,18 @@ jobs:
           app="${apps[0]}"
           helper="$app/Contents/Resources/explorie-mountd"
           rclone="$app/Contents/MacOS/rclone"
+          sevenzip="$app/Contents/Resources/7zip/7zz"
           rclone_license="$app/Contents/Resources/licenses/rclone-COPYING"
           pixelarticons_license="$app/Contents/Resources/licenses/pixelarticons-LICENSE.txt"
           assimp_license="$app/Contents/Resources/licenses/assimp-LICENSE.txt"
           helper_plist="$app/Contents/Library/LaunchDaemons/com.omershatz.explorie.mountd.plist"
           test -x "$helper"
           test -x "$rclone"
+          test -x "$sevenzip"
+          node scripts/smoke-7zip.mjs "$sevenzip"
+          for notice in 7zip-LICENSE.txt 7zip-COPYING.txt 7zip-NOTICE.txt; do
+            test -f "$app/Contents/Resources/licenses/$notice"
+          done
           test -f "$rclone_license"
           test -f "$pixelarticons_license"
           test -f "$assimp_license"
@@ -494,6 +580,7 @@ jobs:
           /usr/libexec/PlistBuddy -c 'Print :AssociatedBundleIdentifiers:0' "$helper_plist" | grep -Fx 'com.omershatz.explorie'
           codesign --verify --strict --verbose=2 "$helper"
           codesign --verify --strict --verbose=2 "$rclone"
+          codesign --verify --strict --verbose=2 "$sevenzip"
           codesign --verify --deep --strict --verbose=2 "$app"
           codesign --verify --verbose=2 "${dmgs[0]}"
           codesign -d --verbose=4 "$helper" 2>&1 | grep -Fx 'Identifier=com.omershatz.explorie.mountd'
@@ -502,6 +589,7 @@ jobs:
           codesign -d --verbose=4 "$app" 2>&1 | grep -E 'flags=.*runtime'
           codesign -d --verbose=4 "$helper" 2>&1 | grep -Fx "TeamIdentifier=$APPLE_TEAM_ID"
           codesign -d --verbose=4 "$rclone" 2>&1 | grep -Fx "TeamIdentifier=$APPLE_TEAM_ID"
+          codesign -d --verbose=4 "$sevenzip" 2>&1 | grep -Fx "TeamIdentifier=$APPLE_TEAM_ID"
           codesign -d --verbose=4 "$app" 2>&1 | grep -Fx "TeamIdentifier=$APPLE_TEAM_ID"
 
           if [ "$GITHUB_REF_TYPE" = "tag" ]; then
@@ -587,6 +675,7 @@ jobs:
 
           binary="$installed_app/Contents/MacOS/explorie-gpui"
           rclone="$installed_app/Contents/MacOS/rclone"
+          node scripts/smoke-7zip.mjs "$installed_app/Contents/Resources/7zip/7zz"
           if [ ! -x "$binary" ]; then
             echo "Installed application executable was not found."
             exit 1
@@ -638,15 +727,23 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           windows="explorie-$version-windows-x64-setup-unsigned.exe"
           macos="explorie-$version-macos-arm64.dmg"
-          for asset in "$windows" "$macos" SHA256SUMS-windows.txt SHA256SUMS-macos.txt; do
+          for asset in "$windows" "$macos" SHA256SUMS-windows.txt SHA256SUMS-macos.txt 7z2603-src.tar.xz 7zip-NOTICE.txt SHA256SUMS-7zip.txt; do
             test -f "$asset"
           done
-          if [ "$(find . -maxdepth 1 -type f | wc -l | tr -d ' ')" != "4" ]; then
-            echo "Candidate release must contain exactly the four documented assets."
+          if [ "$(find . -maxdepth 1 -type f | wc -l | tr -d ' ')" != "17" ]; then
+            echo "Candidate release must contain desktop/plugin packages, catalogs, checksums, and corresponding 7-Zip source/notices."
             exit 1
           fi
           sha256sum --check SHA256SUMS-windows.txt
           sha256sum --check SHA256SUMS-macos.txt
+          sha256sum --check SHA256SUMS-7zip.txt
+          for target in x86_64-pc-windows-msvc aarch64-apple-darwin; do
+            test -f "explorie-plugin-catalog-$target.json"
+            for plugin in syncthing git obsidian; do
+              test -f "explorie-plugin-$plugin-$version-$target.zip"
+            done
+            sha256sum --check "SHA256SUMS-plugins-$target.txt"
+          done
           gh release create "$GITHUB_REF_NAME" ./* \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
@@ -682,20 +779,30 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --pattern 'explorie-*' \
             --pattern 'SHA256SUMS-*' \
+            --pattern '7z2603-src.tar.xz' \
+            --pattern '7zip-NOTICE.txt' \
             --dir release-artifacts
           cd release-artifacts
           version="${GITHUB_REF_NAME#v}"
           windows="explorie-$version-windows-x64-setup-unsigned.exe"
           macos="explorie-$version-macos-arm64.dmg"
-          for asset in "$windows" "$macos" SHA256SUMS-windows.txt SHA256SUMS-macos.txt; do
+          for asset in "$windows" "$macos" SHA256SUMS-windows.txt SHA256SUMS-macos.txt 7z2603-src.tar.xz 7zip-NOTICE.txt SHA256SUMS-7zip.txt; do
             test -f "$asset"
           done
-          if [ "$(find . -maxdepth 1 -type f | wc -l | tr -d ' ')" != "4" ]; then
-            echo "Draft release must contain exactly the four documented assets."
+          if [ "$(find . -maxdepth 1 -type f | wc -l | tr -d ' ')" != "17" ]; then
+            echo "Draft release must contain desktop/plugin packages, catalogs, checksums, and corresponding 7-Zip source/notices."
             exit 1
           fi
           sha256sum --check SHA256SUMS-windows.txt
           sha256sum --check SHA256SUMS-macos.txt
+          sha256sum --check SHA256SUMS-7zip.txt
+          for target in x86_64-pc-windows-msvc aarch64-apple-darwin; do
+            test -f "explorie-plugin-catalog-$target.json"
+            for plugin in syncthing git obsidian; do
+              test -f "explorie-plugin-$plugin-$version-$target.zip"
+            done
+            sha256sum --check "SHA256SUMS-plugins-$target.txt"
+          done
           windows_actual=$(sha256sum "$windows" | cut -d' ' -f1)
           macos_actual=$(sha256sum "$macos" | cut -d' ' -f1)
           if [ "${windows_actual,,}" != "${WINDOWS_ATTESTED_SHA256,,}" ]; then

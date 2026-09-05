@@ -1,6 +1,10 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/plugin-protocol",
+    "plugins/syncthing",
+    "plugins/git",
+    "plugins/obsidian",
     "crates/core",
     "crates/native-services",
     "crates/ffmpeg-wrapper",

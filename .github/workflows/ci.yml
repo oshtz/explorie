@@ -85,6 +85,7 @@ jobs:
         run: |
           node scripts/prepare-rclone.mjs
           node scripts/prepare-winfsp.mjs
+          node scripts/prepare-7zip.mjs
 
       - name: Generate native Rust coverage
         run: cargo llvm-cov --locked --all-features --lcov --output-path lcov.info -p explorie-core -p explorie-native-services -p explorie-ffmpeg-wrapper -p explorie-cli -- --test-threads=1 --skip windows_shell_icons_cover_regular_files_and_folders_and_reuse_cache
@@ -128,10 +129,14 @@ jobs:
           workspaces: './ -> target'
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      - name: Test integration protocol and providers
+        run: cargo test --locked -p explorie-plugin-protocol -p explorie-plugin-syncthing -p explorie-plugin-git -p explorie-plugin-obsidian
+
       - name: Test GPUI-native application on macOS
         env:
           TMPDIR: ${{ runner.temp }}
         run: |
+          node scripts/prepare-7zip.mjs
           cargo test --locked -p explorie-core -p explorie-native-services -p explorie-ffmpeg-wrapper -p explorie-cli
           cargo test --locked -p explorie-gpui -- --test-threads=1
 
@@ -150,7 +155,10 @@ jobs:
           retention-days: 14
 
       - name: Build GPUI macOS application
-        run: cargo build -p explorie-gpui --release --locked
+        run: |
+          node scripts/package-plugins.mjs --target aarch64-apple-darwin
+          export EXPLORIE_PLUGIN_CATALOG="$PWD/release-artifacts/plugins-aarch64-apple-darwin/explorie-plugin-catalog-aarch64-apple-darwin.json"
+          cargo build -p explorie-gpui --release --locked
 
   test-rust-unix-safety:
     name: Unix Safety Regression Tests
@@ -232,6 +240,9 @@ jobs:
       - name: GPUI-native Rust clippy
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
+      - name: Test integration protocol and providers
+        run: cargo test --locked -p explorie-plugin-protocol -p explorie-plugin-syncthing -p explorie-plugin-git -p explorie-plugin-obsidian
+
       - name: Test native Rust crates on Windows
         timeout-minutes: 15
         run: cargo test --locked -p explorie-core -p explorie-native-services -p explorie-ffmpeg-wrapper -p explorie-cli --no-fail-fast -- --test-threads=1
@@ -245,7 +256,13 @@ jobs:
 
       - name: Build GPUI Windows release
         timeout-minutes: 20
-        run: cargo build -p explorie-gpui --release --locked
+        shell: pwsh
+        run: |
+          node scripts/package-plugins.mjs --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw "Plugin packaging failed." }
+          $env:EXPLORIE_PLUGIN_CATALOG = Join-Path $PWD "release-artifacts/plugins-x86_64-pc-windows-msvc/explorie-plugin-catalog-x86_64-pc-windows-msvc.json"
+          cargo build -p explorie-gpui --release --locked
+          if ($LASTEXITCODE -ne 0) { throw "GPUI release build failed." }
 
       - name: Smoke test GPUI Windows release
         timeout-minutes: 5

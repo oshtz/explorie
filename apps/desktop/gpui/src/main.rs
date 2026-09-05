@@ -26,10 +26,11 @@ fn application() -> gpui::Application {
 type SharedRequests = Arc<Mutex<mpsc::Receiver<SingleInstanceRequest>>>;
 
 #[cfg(any(windows, target_os = "macos"))]
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum PrimaryWindowOpen {
     Initial {
         previous_session_unclean: bool,
+        plugin_startup_error: Option<String>,
     },
     #[cfg(target_os = "macos")]
     Reopen,
@@ -75,6 +76,8 @@ fn main() {
         return;
     };
     let _instance = instance.guard;
+    let plugin_startup_error =
+        explorie_gpui::initialize_plugins(&services, std::env::args_os()).err();
     let single_instance_requests = Arc::new(Mutex::new(instance.requests));
     let path = explicit_path
         .or_else(|| std::env::current_dir().ok())
@@ -137,6 +140,14 @@ fn main() {
         let shutdown_remotes = services.remotes.clone();
         let shutdown_audio = services.audio.clone();
         let shutdown_video = services.video.clone();
+        let shutdown_plugins = services.plugins.clone();
+        cx.on_app_quit(move |_| {
+            let task = shutdown_plugins.shutdown();
+            async move {
+                let _ = task.await;
+            }
+        })
+        .detach();
         cx.on_app_quit(move |_| {
             shutdown_audio.stop();
             shutdown_video.stop();
@@ -172,6 +183,7 @@ fn main() {
             request_sources,
             PrimaryWindowOpen::Initial {
                 previous_session_unclean,
+                plugin_startup_error,
             },
         )
         .expect("unable to open explorie window");
@@ -248,6 +260,13 @@ fn open_primary_window(
                 "primary".to_string(),
                 cx,
             );
+            if let PrimaryWindowOpen::Initial {
+                plugin_startup_error: Some(error),
+                ..
+            } = &open
+            {
+                view.announce_plugin_startup_error(error.clone(), cx);
+            }
             view.install_shortcut_bindings(cx);
             view.start_listing(cx);
             view.start_watching(cx);
@@ -266,7 +285,8 @@ fn open_primary_window(
             if matches!(
                 open,
                 PrimaryWindowOpen::Initial {
-                    previous_session_unclean: true
+                    previous_session_unclean: true,
+                    ..
                 }
             ) {
                 view.announce_unclean_recovery(cx);

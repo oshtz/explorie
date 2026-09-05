@@ -315,6 +315,8 @@ pub struct WindowPlacementSettings {
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
     version: u32,
+    #[serde(default)]
+    pub integrations_onboarding_complete: bool,
     pub view: ViewSettings,
     pub appearance: AppearanceSettings,
     pub behavior: BehaviorSettings,
@@ -338,6 +340,7 @@ impl Default for AppSettings {
     fn default() -> Self {
         Self {
             version: SETTINGS_VERSION,
+            integrations_onboarding_complete: false,
             view: ViewSettings::default(),
             appearance: AppearanceSettings::default(),
             behavior: BehaviorSettings::default(),
@@ -1180,6 +1183,27 @@ mod tests {
             remote_path: "projects".to_string(),
             mount_target: if cfg!(windows) { "R:" } else { "Archive" }.to_string(),
         }
+    }
+
+    #[test]
+    fn integration_onboarding_is_backward_compatible_and_persists() {
+        let mut value = serde_json::to_value(AppSettings::default()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("integrationsOnboardingComplete");
+        let old: AppSettings = serde_json::from_value(value).unwrap();
+        assert!(!old.integrations_onboarding_complete);
+        let root = fixture_dir();
+        let (store, mut settings, _) = open_test(&root);
+        settings.integrations_onboarding_complete = true;
+        store.save(&settings).unwrap();
+        drop(store);
+        let (store, restored, warning) = open_test(&root);
+        assert!(warning.is_none());
+        assert!(restored.integrations_onboarding_complete);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

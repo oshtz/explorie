@@ -25,6 +25,10 @@ impl ColumnData {
         self.error.as_deref()
     }
 
+    pub fn entries(&self) -> &[FileEntry] {
+        &self.entries
+    }
+
     pub fn visible_entries(&self, browser: &BrowserState) -> Vec<FileEntry> {
         filtered_sorted_entries(
             &self.entries,
@@ -53,11 +57,19 @@ impl ColumnState {
         }
     }
 
-    pub fn reset(&mut self, path: &Path) {
-        self.columns = build_path_stack(path)
-            .into_iter()
-            .map(empty_column)
-            .collect();
+    pub fn reset(&mut self, path: &Path) -> usize {
+        let paths = build_path_stack(path);
+        let retained = self
+            .columns
+            .iter()
+            .zip(&paths)
+            .take_while(|(column, path)| column.path() == path.as_path())
+            .count();
+        self.columns.truncate(retained);
+        self.columns
+            .extend(paths.into_iter().skip(retained).map(empty_column));
+        self.begin_refresh();
+        retained
     }
 
     pub fn begin_refresh(&mut self) {
@@ -172,6 +184,24 @@ mod tests {
         let browser = BrowserState::new(path);
         assert!(state.columns()[0].loading());
         assert_eq!(state.columns()[0].visible_entries(&browser).len(), 1);
+    }
+
+    #[test]
+    fn navigating_preserves_shared_columns_and_discards_closed_descendants() {
+        let root = PathBuf::from("root");
+        let child = root.join("child");
+        let sibling = root.join("sibling");
+        let mut state = ColumnState::new(&child);
+        state.apply_listed(&root, vec![entry(&root, "child"), entry(&root, "sibling")]);
+        state.apply_listed(&child, vec![entry(&child, "file")]);
+
+        assert_eq!(state.reset(&sibling), 1);
+        assert_eq!(state.columns()[0].entries().len(), 2);
+        assert!(state.columns()[1].entries().is_empty());
+        assert!(!state.apply_listed(&child, vec![entry(&child, "late")]));
+        assert_eq!(state.reset(&root), 1);
+        assert_eq!(state.paths(), vec![root]);
+        assert_eq!(state.columns()[0].entries().len(), 2);
     }
 
     #[test]

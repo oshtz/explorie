@@ -23,6 +23,7 @@ pub mod listing;
 pub mod metadata;
 pub mod model_preview;
 pub mod mutations;
+pub mod plugins;
 pub mod preview;
 mod process;
 pub mod remote_drives;
@@ -53,6 +54,7 @@ pub use mutations::{
     BatchRenameItem, BatchRenamePair, BatchRenameResult, MutationService, PermanentDeleteFailure,
     PermanentDeleteResult, SafeMutationRequest,
 };
+pub use plugins::{PluginManager, PluginResult, PluginService, PluginSource, PluginStatus};
 pub use preview::{
     DetectedPreviewKind, HelperStatus, PdfPagePreview, PreviewArtifact, PreviewDetection,
     PreviewService, TextHighlight, TextHighlightKind, TextPreview,
@@ -284,6 +286,24 @@ impl ServiceEventQueue {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut event = Some(event);
+        if let Some(ServiceEvent::PluginStatusChanged { id, contribution }) = event.as_ref() {
+            for queued in events.iter_mut().rev() {
+                if let ServiceEvent::PluginStatusChanged {
+                    id: pending_id,
+                    contribution: pending,
+                } = queued
+                    && pending_id == id
+                    && pending.path == contribution.path
+                    && pending.context_id == contribution.context_id
+                    && pending.generation == contribution.generation
+                {
+                    if let Some(replacement) = event.take() {
+                        *queued = replacement;
+                    }
+                    break;
+                }
+            }
+        }
         if let Some(ServiceEvent::FileOperation(incoming)) = event.as_ref()
             && matches!(incoming.state, FileOperationState::Running)
         {
@@ -394,6 +414,11 @@ impl Future for ServiceNext<'_> {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ServiceEvent {
+    PluginStatusChanged {
+        id: String,
+        contribution: explorie_plugin_protocol::Contribution,
+    },
+    PluginRegistryChanged,
     FileOperation(FileOperationEvent),
     ArchiveProgress(ArchiveProgressEvent),
     SearchProgress(SearchProgressEvent),
@@ -639,6 +664,7 @@ pub struct NativeServices {
     pub search: search::SearchService,
     pub updater: updater::UpdateService,
     pub integration: integration::IntegrationService,
+    pub plugins: plugins::PluginService,
     pub watcher: watcher::WatcherService,
 }
 
@@ -805,6 +831,7 @@ impl NativeServices {
                 }
             },
             watcher: watcher::WatcherService::new(context.clone()),
+            plugins: plugins::PluginService::new(context.clone(), Vec::new()),
             context,
         }
     }

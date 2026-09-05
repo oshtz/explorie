@@ -569,10 +569,7 @@ pub fn route(path: &Path, preview_executable_scripts: bool) -> PreviewRoute {
             | "qoi"
     ) {
         PreviewRoute::GeneratedArtifact
-    } else if matches!(
-        extension.as_str(),
-        "zip" | "tar" | "tgz" | "gz" | "7z" | "rar"
-    ) {
+    } else if explorie_core::archive::is_archive(path) {
         PreviewRoute::Archive
     } else {
         PreviewRoute::External
@@ -628,6 +625,21 @@ mod tests {
 
     #[test]
     fn routes_native_and_helper_backed_preview_types() {
+        for name in [
+            "disk.iso",
+            "backup.WIM",
+            "installer.msi",
+            "bundle.cab",
+            "notes.xz",
+            "notes.bz2",
+            "disk.dmg",
+        ] {
+            assert_eq!(
+                route(Path::new(name), false),
+                PreviewRoute::Archive,
+                "{name}"
+            );
+        }
         assert_eq!(route(Path::new("code.rs"), false), PreviewRoute::Text);
         assert_eq!(route(Path::new("song.flac"), false), PreviewRoute::Audio);
         assert_eq!(route(Path::new("scene.glb"), false), PreviewRoute::Model);
