@@ -19,6 +19,8 @@ const windowsX64 = {
     '7z.dll': '65e4c1f855f9ef6e8f0f5df8e3f27d9eb5f07311408639da0a1ca0b8f4871b0d',
   },
 };
+const repository = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const cache = path.join(repository, '.cache', '7zip');
 const macos = {
   archive: '7z2603-mac.tar.xz',
   sha256: '5ca87677072c59f5602e5c49baa27d4694bacd2259b4e507f0094249d4281480',
@@ -67,21 +69,22 @@ async function verifyFiles(directory, files) {
   }
 }
 
+export async function stageSevenZipSource(directory) {
+  const source = await download(SEVENZIP_SOURCE, cache);
+  await mkdir(directory, { recursive: true });
+  const destination = path.join(directory, SEVENZIP_SOURCE.archive);
+  await copyFile(source, destination);
+  await chmod(destination, 0o644);
+  return destination;
+}
+
 export async function prepareSevenZip(target = process.env.CARGO_BUILD_TARGET ?? nativeTarget()) {
   const asset = SEVENZIP_TARGETS[target];
   if (!asset) throw new Error(`Unsupported 7-Zip sidecar target: ${target}`);
-  const repository = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
   const assets = path.join(repository, 'apps', 'desktop', 'native-assets');
   const destination = path.join(assets, 'binaries', `7zip-${target}`);
-  const cache = path.join(repository, '.cache', '7zip');
-  const sourceAssets = path.join(repository, 'release-artifacts', 'third-party');
-  // Source must be offered from the same release as the binaries, even on cache hits.
-  await download(SEVENZIP_SOURCE, sourceAssets);
-  const notice = await readFile(path.join(assets, 'resources', '7zip-NOTICE.txt'));
-  await writeFile(path.join(sourceAssets, '7zip-NOTICE.txt'), notice);
-  const noticeHash = createHash('sha256').update(notice).digest('hex');
-  await writeFile(path.join(sourceAssets, 'SHA256SUMS-7zip.txt'),
-    `${SEVENZIP_SOURCE.sha256} *${SEVENZIP_SOURCE.archive}\n${noticeHash} *7zip-NOTICE.txt\n`);
+  // Keep the corresponding source ready to embed beside the installer licenses.
+  await download(SEVENZIP_SOURCE, cache);
 
   try {
     await verifyFiles(destination, asset.files);
@@ -119,5 +122,16 @@ export async function prepareSevenZip(target = process.env.CARGO_BUILD_TARGET ??
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  prepareSevenZip(process.argv[2]).then((destination) => console.log(`Prepared ${destination}`));
+  const [argument, destination] = process.argv.slice(2);
+  if (argument === '--stage-source' || argument === '--verify-source') {
+    if (!destination) throw new Error(`${argument} requires a path`);
+    if (argument === '--stage-source') {
+      console.log(`Prepared ${await stageSevenZipSource(destination)}`);
+    } else {
+      verifySha256(await readFile(destination), SEVENZIP_SOURCE.sha256, SEVENZIP_SOURCE.archive);
+      console.log(`Verified ${destination}`);
+    }
+  } else {
+    console.log(`Prepared ${await prepareSevenZip(argument)}`);
+  }
 }

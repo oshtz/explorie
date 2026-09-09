@@ -554,7 +554,7 @@ test('workflows block audits and publish the exact attested draft assets', async
   );
   assert.match(
     release,
-    /Download previous Windows installer when available[\s\S]*?SHA256SUMS-windows\.txt[\s\S]*?Get-FileHash[\s\S]*?previous-windows\.outputs\.path/
+    /Download previous Windows installer when available[\s\S]*?digest[\s\S]*?Get-FileHash[\s\S]*?previous-windows\.outputs\.path/
   );
   assert.match(release, /Previous Explorie did not create real settings state/);
   assert.match(release, /Real Explorie settings did not survive the installer upgrade/);
@@ -600,8 +600,13 @@ test('workflows block audits and publish the exact attested draft assets', async
   assert.match(release, /inputs\.macos_real_machine_verified == true/);
   assert.match(release, /WINDOWS_ATTESTED_SHA256: \$\{\{ inputs\.windows_sha256 \}\}/);
   assert.match(release, /MACOS_ATTESTED_SHA256: \$\{\{ inputs\.macos_sha256 \}\}/);
-  assert.match(release, /Windows draft asset is not the real-machine-tested artifact/);
-  assert.match(release, /macOS draft asset is not the real-machine-tested artifact/);
+  assert.match(release, /verify-release-assets\.mjs[^\n]+--attested/);
+  assert.match(release, /gh release create "\$GITHUB_REF_NAME" "\$windows" "\$macos"/);
+  assert.doesNotMatch(release, /gh release create[^\n]+\.\/\*/);
+  assert.match(release, /pattern: explorie-installer-\*/);
+  assert.match(release, /gh release view[^\n]+--json databaseId/);
+  assert.doesNotMatch(release, /gh api "repos\/\$GITHUB_REPOSITORY\/releases\/tags/);
+  assert.doesNotMatch(release, /name: explorie-plugins-|name: explorie-third-party/);
   assert.match(release, /environment: release-signing/);
   assert.match(release, /environment: release-publish/);
   assert.match(release, /if: github\.ref_type == 'tag'/);
@@ -645,9 +650,9 @@ test('workflows block audits and publish the exact attested draft assets', async
   assert.doesNotMatch(`${ci}\n${release}\n${macosUi}`, /uses:[^\n]+@(v\d+|stable|cargo-)/);
   assert.match(updater, /api\.github\.com\/repos\/oshtz\/explorie\/releases\/latest/);
   assert.match(updater, /windows-x64-setup-unsigned\.exe/);
-  assert.match(updater, /SHA256SUMS-windows\.txt/);
+  assert.match(updater, /digest/);
   assert.match(updater, /macos-arm64\.dmg/);
-  assert.match(updater, /SHA256SUMS-macos\.txt/);
+  assert.doesNotMatch(updater, /SHA256SUMS|checksum_url|parse_checksum_manifest/);
   assert.match(updater, /failed its SHA-256 integrity check/);
   assert.match(updater, /\/RELAUNCHEXPLORIE/);
   assert.match(updater, /--apply-macos-update/);
@@ -655,7 +660,7 @@ test('workflows block audits and publish the exact attested draft assets', async
   assert.match(updater, /different developer team/);
   assert.match(updater, /backup_installed_update[\s\S]*?replace_installed_update/);
   assert.match(updater, /remove_directory_with_retries[\s\S]*?remove_file_with_retries/);
-  assert.match(updater, /rejects_portable_fallbacks_missing_checksums_and_foreign_urls/);
+  assert.match(updater, /rejects_portable_fallbacks_wrong_platform_sizes_and_foreign_urls/);
   assert.match(mountDaemon, /kSecGuestAttributePid/);
   assert.match(mountDaemon, /connection\.processIdentifier/);
   assert.doesNotMatch(mountDaemon, /\.auditToken/);

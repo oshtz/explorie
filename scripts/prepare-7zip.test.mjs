@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { spawnSync } from 'node:child_process';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 import { SEVENZIP_SOURCE, SEVENZIP_TARGETS, SEVENZIP_VERSION, prepareSevenZip, verifySha256 } from './prepare-7zip.mjs';
 import { verifySevenZipVersion } from './smoke-7zip.mjs';
 
@@ -19,6 +23,25 @@ test('7-Zip download integrity rejects altered bytes', () => {
   assert.throws(() => verifySha256(Buffer.from('abd'), digest, 'fixture'), /SHA-256 mismatch for fixture/);
 });
 
+test('installed corresponding source verification rejects altered bytes and missing paths', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'explorie-7zip-source-test-'));
+  const script = fileURLToPath(new URL('./prepare-7zip.mjs', import.meta.url));
+  try {
+    const archive = path.join(directory, SEVENZIP_SOURCE.archive);
+    await writeFile(archive, 'altered source');
+    const altered = spawnSync(process.execPath, [script, '--verify-source', archive], { encoding: 'utf8' });
+    assert.notEqual(altered.status, 0);
+    assert.match(altered.stderr, /SHA-256 mismatch/);
+    for (const flag of ['--stage-source', '--verify-source']) {
+      const missing = spawnSync(process.execPath, [script, flag], { encoding: 'utf8' });
+      assert.notEqual(missing.status, 0);
+      assert.match(missing.stderr, /requires a path/);
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test('full engine and corresponding source are pinned for supported targets', async () => {
   assert.equal(SEVENZIP_VERSION, '26.03');
   assert.equal(SEVENZIP_SOURCE.archive, '7z2603-src.tar.xz');
@@ -34,11 +57,12 @@ test('full engine and corresponding source are pinned for supported targets', as
 
 test('7-Zip licenses, corresponding source, packaged paths and signing remain connected', async () => {
   const read = (file) => readFile(new URL(`../${file}`, import.meta.url), 'utf8');
-  const [notice, license, copying, installer, macos, release] = await Promise.all([
+  const [notice, license, copying, installer, windows, macos, release] = await Promise.all([
     'apps/desktop/native-assets/resources/7zip-NOTICE.txt',
     'apps/desktop/native-assets/resources/7zip-LICENSE.txt',
     'apps/desktop/native-assets/resources/7zip-COPYING.txt',
     'apps/desktop/gpui/installer/windows/explorie.iss',
+    'scripts/package-gpui-windows.ps1',
     'scripts/package-gpui-macos.sh',
     '.github/workflows/build-release.yml',
   ].map(read));
@@ -52,10 +76,10 @@ test('7-Zip licenses, corresponding source, packaged paths and signing remain co
     assert.ok(macos.includes(file));
   }
   assert.match(installer, /7zip\\7z\.dll.*DestDir: "\{app\}\\7zip"/);
+  assert.ok(installer.includes(`licenses\\${SEVENZIP_SOURCE.archive}"; DestDir: "{app}\\licenses"`));
+  assert.match(windows, /prepare-7zip\.mjs"\) --stage-source \(Join-Path \$build "licenses"\)/);
+  assert.match(macos, /prepare-7zip\.mjs" --stage-source "\$app\/Contents\/Resources\/licenses"/);
   assert.match(macos, /sign com\.omershatz\.explorie\.sevenzip "\$app\/Contents\/Resources\/7zip\/7zz"/);
-  assert.match(release, /name: explorie-third-party[\s\S]*?path: release-artifacts\/third-party\/\*/);
-  assert.equal((release.match(/sha256sum --check SHA256SUMS-7zip\.txt/g) ?? []).length, 2);
-  assert.ok(release.includes(`--pattern '${SEVENZIP_SOURCE.archive}'`));
   assert.match(release, /smoke-7zip\.mjs \(Join-Path \$installDir "7zip\/7z\.exe"\)/);
   assert.match(release, /smoke-7zip\.mjs "\$installed_app\/Contents\/Resources\/7zip\/7zz"/);
 });

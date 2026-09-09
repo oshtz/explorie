@@ -16,10 +16,7 @@ use std::time::Duration;
 
 const RELEASE_API_URL: &str = "https://api.github.com/repos/oshtz/explorie/releases/latest";
 const RELEASE_DOWNLOAD_PREFIX: &str = "https://github.com/oshtz/explorie/releases/download";
-const WINDOWS_CHECKSUM_ASSET: &str = "SHA256SUMS-windows.txt";
-const MACOS_CHECKSUM_ASSET: &str = "SHA256SUMS-macos.txt";
 const MAX_RELEASE_METADATA_BYTES: u64 = 1024 * 1024;
-const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 const MAX_UPDATE_BYTES: u64 = 512 * 1024 * 1024;
 const MIN_UPDATE_BYTES: u64 = 1024 * 1024;
 #[cfg(any(windows, test))]
@@ -60,13 +57,6 @@ impl UpdatePlatform {
         }
     }
 
-    fn checksum_asset(self) -> &'static str {
-        match self {
-            Self::Windows => WINDOWS_CHECKSUM_ASSET,
-            Self::Macos => MACOS_CHECKSUM_ASSET,
-        }
-    }
-
     fn display_name(self) -> &'static str {
         match self {
             Self::Windows => "Windows installer",
@@ -81,7 +71,7 @@ pub struct UpdateInfo {
     pub notes: Option<String>,
     pub asset_name: String,
     pub download_url: String,
-    pub checksum_url: String,
+    pub sha256: String,
     pub size: u64,
 }
 
@@ -108,7 +98,7 @@ impl UpdateService {
             let Some(platform) = UpdatePlatform::current() else {
                 return Ok(None);
             };
-            let release = get_bytes(RELEASE_API_URL, MAX_RELEASE_METADATA_BYTES, true)?;
+            let release = get_bytes(RELEASE_API_URL, MAX_RELEASE_METADATA_BYTES)?;
             discover_update(&current_version, &release, platform)
         })
     }
@@ -119,14 +109,7 @@ impl UpdateService {
             validate_update_info(&update)?;
             fs::create_dir_all(&cache_dir).map_err(ServiceError::from)?;
 
-            let manifest = get_bytes(&update.checksum_url, MAX_MANIFEST_BYTES, false)?;
-            let manifest = std::str::from_utf8(&manifest).map_err(|_| {
-                ServiceError::new(
-                    ErrorCode::InvalidInput,
-                    "The update checksum manifest is not valid UTF-8",
-                )
-            })?;
-            let expected_sha256 = checksum_for_asset(manifest, &update.asset_name)?;
+            let expected_sha256 = update.sha256.clone();
             let installer_path = cache_dir.join(&update.asset_name);
             if installer_path.is_file()
                 && hash_file(&installer_path)? == expected_sha256
@@ -199,6 +182,7 @@ struct GitHubAsset {
     name: String,
     browser_download_url: String,
     size: u64,
+    digest: Option<String>,
 }
 
 fn discover_update(
@@ -255,26 +239,12 @@ fn discover_update(
             "The update payload has an invalid size",
         ));
     }
-    let checksum = release
-        .assets
-        .iter()
-        .find(|asset| asset.name == platform.checksum_asset())
-        .ok_or_else(|| {
-            ServiceError::new(
-                ErrorCode::NotFound,
-                format!(
-                    "The {} update checksum manifest is missing",
-                    platform.display_name()
-                ),
-            )
-        })?;
-
     let update = UpdateInfo {
         version: version_text.to_string(),
         notes: release.body.filter(|body| !body.trim().is_empty()),
         asset_name,
         download_url: installer.browser_download_url.clone(),
-        checksum_url: checksum.browser_download_url.clone(),
+        sha256: sha256_from_digest(installer.digest.as_deref())?,
         size: installer.size,
     };
     validate_update_info_for_platform(&update, platform)?;
@@ -304,7 +274,7 @@ fn validate_update_info_for_platform(
     let expected_asset = platform.asset_name(&update.version);
     if update.asset_name != expected_asset
         || update.download_url != release_asset_url(&update.version, &expected_asset)
-        || update.checksum_url != release_asset_url(&update.version, platform.checksum_asset())
+        || !is_sha256(&update.sha256)
         || !(MIN_UPDATE_BYTES..=MAX_UPDATE_BYTES).contains(&update.size)
     {
         return Err(ServiceError::new(
@@ -327,40 +297,33 @@ fn release_asset_url(version: &str, asset_name: &str) -> String {
     format!("{RELEASE_DOWNLOAD_PREFIX}/v{version}/{asset_name}")
 }
 
-fn checksum_for_asset(manifest: &str, asset_name: &str) -> ServiceResult<String> {
-    let mut matches = manifest.lines().filter_map(|line| {
-        let (hash, name) = line.trim().split_once(char::is_whitespace)?;
-        let name = name.trim_start().trim_start_matches('*');
-        (name == asset_name).then_some(hash)
-    });
-    let Some(hash) = matches.next() else {
-        return Err(ServiceError::new(
-            ErrorCode::NotFound,
-            "The update payload is not covered by its checksum manifest",
-        ));
-    };
-    if matches.next().is_some()
-        || hash.len() != 64
-        || !hash.bytes().all(|value| value.is_ascii_hexdigit())
-    {
-        return Err(ServiceError::new(
-            ErrorCode::InvalidInput,
-            "The update checksum manifest is malformed",
-        ));
-    }
+fn sha256_from_digest(digest: Option<&str>) -> ServiceResult<String> {
+    let hash = digest
+        .and_then(|value| value.strip_prefix("sha256:"))
+        .filter(|hash| is_sha256(hash))
+        .ok_or_else(|| {
+            ServiceError::new(
+                ErrorCode::InvalidInput,
+                "The update asset is missing a valid GitHub SHA-256 digest",
+            )
+        })?;
     Ok(hash.to_ascii_lowercase())
 }
 
-fn get_bytes(url: &str, limit: u64, github_api: bool) -> ServiceResult<Vec<u8>> {
+fn is_sha256(hash: &str) -> bool {
+    hash.len() == 64 && hash.bytes().all(|value| value.is_ascii_hexdigit())
+}
+
+fn get_bytes(url: &str, limit: u64) -> ServiceResult<Vec<u8>> {
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(10))
         .timeout_read(Duration::from_secs(30))
         .timeout_write(Duration::from_secs(30))
         .build();
-    let mut request = agent.get(url).set("User-Agent", "explorie-updater");
-    if github_api {
-        request = request.set("Accept", "application/vnd.github+json");
-    }
+    let request = agent
+        .get(url)
+        .set("User-Agent", "explorie-updater")
+        .set("Accept", "application/vnd.github+json");
     let response = request.call().map_err(network_error)?;
     let mut bytes = Vec::new();
     response
@@ -467,6 +430,7 @@ fn validate_downloaded_update_for_platform(
         .map(|value| value.len())
         .unwrap_or(0)
         != update.info.size
+        || actual_sha256 != update.info.sha256
         || actual_sha256 != update.sha256
     {
         return Err(ServiceError::new(
@@ -603,7 +567,7 @@ fn apply_macos_update(
         notes: None,
         asset_name: macos_dmg_name(&version),
         download_url: release_asset_url(&version, &macos_dmg_name(&version)),
-        checksum_url: release_asset_url(&version, MACOS_CHECKSUM_ASSET),
+        sha256: sha256.clone(),
         size,
     };
     let update = DownloadedUpdate {
@@ -985,123 +949,150 @@ fn network_error(error: ureq::Error) -> ServiceError {
 mod tests {
     use super::*;
 
-    fn release_json(
-        version: &str,
-        size: u64,
-        asset_name: &str,
-        platform: UpdatePlatform,
-    ) -> Vec<u8> {
-        let checksum = platform.checksum_asset();
-        format!(
-            r#"{{"tag_name":"v{version}","body":"Fixes","assets":[{{"name":"{asset_name}","browser_download_url":"{RELEASE_DOWNLOAD_PREFIX}/v{version}/{asset_name}","size":{size}}},{{"name":"{checksum}","browser_download_url":"{RELEASE_DOWNLOAD_PREFIX}/v{version}/{checksum}","size":100}}]}}"#
-        )
-        .into_bytes()
+    fn release_json(version: &str, size: u64, asset_name: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "tag_name": format!("v{version}"),
+            "body": "Fixes",
+            "assets": [{
+                "name": asset_name,
+                "browser_download_url": release_asset_url(version, asset_name),
+                "size": size,
+                "digest": format!("sha256:{}", "a".repeat(64)),
+            }],
+        }))
+        .unwrap()
     }
 
     #[test]
-    fn discovers_only_a_newer_exact_unsigned_installer() {
-        let name = windows_installer_name("0.2.9");
-        let update = discover_update(
-            "0.2.8",
-            &release_json("0.2.9", MIN_UPDATE_BYTES, &name, UpdatePlatform::Windows),
-            UpdatePlatform::Windows,
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(update.version, "0.2.9");
-        assert_eq!(update.asset_name, name);
+    fn discovers_only_a_newer_exact_platform_asset_with_its_digest() {
+        for platform in [UpdatePlatform::Windows, UpdatePlatform::Macos] {
+            let name = platform.asset_name("0.2.9");
+            let release = release_json("0.2.9", MIN_UPDATE_BYTES, &name);
+            let update = discover_update("0.2.8", &release, platform)
+                .unwrap()
+                .unwrap();
+            assert_eq!(update.version, "0.2.9");
+            assert_eq!(update.asset_name, name);
+            assert_eq!(update.sha256, "a".repeat(64));
+            assert!(
+                discover_update("0.2.9", &release, platform)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
 
-        assert!(
-            discover_update(
-                "0.2.9",
-                &release_json(
-                    "0.2.9",
-                    MIN_UPDATE_BYTES,
-                    &update.asset_name,
+    #[test]
+    fn rejects_portable_fallbacks_wrong_platform_sizes_and_foreign_urls() {
+        for name in [
+            "explorie-0.2.9-windows-x64-portable-unsigned.exe",
+            &macos_dmg_name("0.2.9"),
+        ] {
+            assert!(
+                discover_update(
+                    "0.2.8",
+                    &release_json("0.2.9", MIN_UPDATE_BYTES, name),
                     UpdatePlatform::Windows,
-                ),
-                UpdatePlatform::Windows,
+                )
+                .is_err()
+            );
+        }
+        for platform in [UpdatePlatform::Windows, UpdatePlatform::Macos] {
+            let name = platform.asset_name("0.2.9");
+            for size in [MIN_UPDATE_BYTES - 1, MAX_UPDATE_BYTES + 1] {
+                assert!(
+                    discover_update("0.2.8", &release_json("0.2.9", size, &name), platform)
+                        .is_err()
+                );
+            }
+            let mut update = discover_update(
+                "0.2.8",
+                &release_json("0.2.9", MIN_UPDATE_BYTES, &name),
+                platform,
             )
             .unwrap()
-            .is_none()
-        );
+            .unwrap();
+            update.download_url = "https://example.com/update.exe".to_string();
+            assert!(validate_update_info_for_platform(&update, platform).is_err());
+        }
     }
 
     #[test]
-    fn discovers_the_exact_macos_dmg_and_checksum_contract() {
-        let name = macos_dmg_name("0.2.9");
-        let update = discover_update(
-            "0.2.8",
-            &release_json("0.2.9", MIN_UPDATE_BYTES, &name, UpdatePlatform::Macos),
-            UpdatePlatform::Macos,
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(update.asset_name, "explorie-0.2.9-macos-arm64.dmg");
-        assert_eq!(
-            update.checksum_url,
-            release_asset_url("0.2.9", MACOS_CHECKSUM_ASSET)
-        );
-
-        let windows_asset = windows_installer_name("0.2.9");
-        assert!(
-            discover_update(
-                "0.2.8",
-                &release_json(
-                    "0.2.9",
-                    MIN_UPDATE_BYTES,
-                    &windows_asset,
-                    UpdatePlatform::Macos,
-                ),
-                UpdatePlatform::Macos,
-            )
-            .is_err()
-        );
+    fn release_digest_is_required_and_must_be_sha256() {
+        for platform in [UpdatePlatform::Windows, UpdatePlatform::Macos] {
+            let name = platform.asset_name("0.2.9");
+            let mut release: serde_json::Value =
+                serde_json::from_slice(&release_json("0.2.9", MIN_UPDATE_BYTES, &name)).unwrap();
+            for digest in [
+                serde_json::Value::Null,
+                serde_json::json!(""),
+                serde_json::json!(format!("sha512:{}", "a".repeat(64))),
+                serde_json::json!(format!("sha256:{}", "a".repeat(63))),
+                serde_json::json!(format!("sha256:{}", "a".repeat(65))),
+                serde_json::json!(format!("sha256:{}", "g".repeat(64))),
+                serde_json::json!(format!("sha256:{} ", "a".repeat(64))),
+            ] {
+                release["assets"][0]["digest"] = digest;
+                assert!(
+                    discover_update("0.2.8", &serde_json::to_vec(&release).unwrap(), platform)
+                        .is_err()
+                );
+            }
+            release["assets"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("digest");
+            assert!(
+                discover_update("0.2.8", &serde_json::to_vec(&release).unwrap(), platform).is_err()
+            );
+            release["assets"][0]["digest"] =
+                serde_json::json!(format!("sha256:{}", "A".repeat(64)));
+            assert_eq!(
+                discover_update("0.2.8", &serde_json::to_vec(&release).unwrap(), platform)
+                    .unwrap()
+                    .unwrap()
+                    .sha256,
+                "a".repeat(64)
+            );
+        }
     }
 
     #[test]
-    fn rejects_portable_fallbacks_missing_checksums_and_foreign_urls() {
-        let portable = "explorie-0.2.9-windows-x64-portable-unsigned.exe";
-        assert!(
-            discover_update(
-                "0.2.8",
-                &release_json("0.2.9", MIN_UPDATE_BYTES, portable, UpdatePlatform::Windows,),
-                UpdatePlatform::Windows,
-            )
-            .is_err()
-        );
-
-        let name = windows_installer_name("0.2.9");
-        let mut update = discover_update(
-            "0.2.8",
-            &release_json("0.2.9", MIN_UPDATE_BYTES, &name, UpdatePlatform::Windows),
-            UpdatePlatform::Windows,
-        )
-        .unwrap()
-        .unwrap();
-        update.download_url = "https://example.com/update.exe".to_string();
-        assert!(validate_update_info(&update).is_err());
-
-        let no_checksum = format!(
-            r#"{{"tag_name":"v0.2.9","assets":[{{"name":"{name}","browser_download_url":"{RELEASE_DOWNLOAD_PREFIX}/v0.2.9/{name}","size":{MIN_UPDATE_BYTES}}}]}}"#
-        );
-        assert!(
-            discover_update("0.2.8", no_checksum.as_bytes(), UpdatePlatform::Windows,).is_err()
-        );
-    }
-
-    #[test]
-    fn checksum_manifest_requires_one_exact_valid_entry() {
-        let asset = windows_installer_name("0.2.9");
-        let hash = "a".repeat(64);
-        assert_eq!(
-            checksum_for_asset(&format!("{hash} *{asset}\n"), &asset).unwrap(),
-            hash
-        );
-        assert!(checksum_for_asset(&format!("{hash} *other.exe\n"), &asset).is_err());
-        assert!(
-            checksum_for_asset(&format!("{hash} *{asset}\n{hash} *{asset}\n"), &asset).is_err()
-        );
+    fn downloaded_payload_must_match_metadata_digest_and_size() {
+        let temp = tempfile::tempdir().unwrap();
+        let payload = b"fixture update payload";
+        let correct_hash = format!("{:x}", Sha256::digest(payload));
+        for (size, digest, accepted) in [
+            (payload.len() as u64, correct_hash.as_str(), true),
+            (payload.len() as u64, "a".repeat(64).as_str(), false),
+            (payload.len() as u64 - 1, correct_hash.as_str(), false),
+            (payload.len() as u64 + 1, correct_hash.as_str(), false),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/update", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = [0_u8; 4096];
+                assert!(stream.read(&mut request).unwrap() > 0);
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    payload.len()
+                )
+                .unwrap();
+                stream.write_all(payload).unwrap();
+            });
+            let path = temp.path().join("update.part");
+            let result = download_installer(&url, &path, size, digest);
+            server.join().unwrap();
+            assert_eq!(result.is_ok(), accepted, "{result:?}");
+            if accepted {
+                assert_eq!(fs::read(&path).unwrap(), payload);
+            }
+        }
     }
 
     #[test]
@@ -1114,20 +1105,22 @@ mod tests {
             let path = cache.join(&name);
             fs::write(&path, vec![0_u8; MIN_UPDATE_BYTES as usize]).unwrap();
             let sha256 = hash_file(&path).unwrap();
-            let update = DownloadedUpdate {
+            let mut update = DownloadedUpdate {
                 info: UpdateInfo {
                     version: "0.2.9".to_string(),
                     notes: None,
                     asset_name: name.clone(),
                     download_url: release_asset_url("0.2.9", &name),
-                    checksum_url: release_asset_url("0.2.9", platform.checksum_asset()),
+                    sha256: sha256.clone(),
                     size: MIN_UPDATE_BYTES,
                 },
                 installer_path: path.clone(),
                 sha256,
             };
             assert!(validate_downloaded_update_for_platform(&cache, &update, platform).is_ok());
-            fs::write(&path, b"changed update").unwrap();
+            fs::write(&path, vec![1_u8; MIN_UPDATE_BYTES as usize]).unwrap();
+            assert!(validate_downloaded_update_for_platform(&cache, &update, platform).is_err());
+            update.sha256 = hash_file(&path).unwrap();
             assert!(validate_downloaded_update_for_platform(&cache, &update, platform).is_err());
         }
     }

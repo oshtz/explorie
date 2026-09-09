@@ -127,7 +127,8 @@ test('release order preserves signing, notarization, catalogs and publication ga
   assert.match(macPlugins, /codesign --verify --strict --verbose=4 -R="notarized" --check-notarization "\$extracted\/explorie-plugin-\$plugin"/);
   assert.doesNotMatch(macPlugins, /spctl --assess/);
   assert.match(mac, /spctl --assess --type execute --verbose=2 "\$app"/);
-  assert.equal((workflow.match(/sha256sum --check "SHA256SUMS-plugins-\$target.txt"/g) ?? []).length, 2);
+  assert.doesNotMatch(workflow, /Upload (Windows|macOS) plugin packages/);
+  assert.match(workflow, /gh release create "\$GITHUB_REF_NAME" "\$windows" "\$macos"/);
   assert.match(workflow, /needs: \[validate, build-windows, build-macos\]/);
   assert.match(workflow, /environment: release-publish/);
   assert.match(workflow, /WINDOWS_ATTESTED_SHA256/);
