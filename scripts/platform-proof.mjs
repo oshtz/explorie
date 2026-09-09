@@ -18,6 +18,7 @@ const required = {
     'folderIntegrationRestoredAfterUninstall',
     'disposableFilesystemOperations',
     'remoteDriveLifecycle',
+    'bundledIntegrationsActivated',
   ],
   macos: [
     'dmgInstalledAndLaunched',
@@ -34,17 +35,19 @@ const required = {
     'folderIntegrationEnabled',
     'folderIntegrationDisabled',
     'disposableFilesystemOperations',
+    'remoteDriveLifecycle',
+    'bundledIntegrationsActivated',
   ],
 };
 
-async function packageVersion() {
-  return JSON.parse(await readFile(path.join(process.cwd(), 'package.json'), 'utf8')).version;
+async function packageMetadata() {
+  return JSON.parse(await readFile(path.join(process.cwd(), 'package.json'), 'utf8'));
 }
 
 async function initialize() {
   const checks = (platform) => Object.fromEntries(required[platform].map((name) => [name, false]));
   const proof = {
-    version: await packageVersion(),
+    version: (await packageMetadata()).version,
     candidateTag: '',
     windows: { artifact: '', sha256: '', machine: '', testedAt: '', checks: checks('windows') },
     macos: { artifact: '', sha256: '', machine: '', testedAt: '', checks: checks('macos') },
@@ -55,7 +58,7 @@ async function initialize() {
   console.log(proofPath);
 }
 
-function validatePlatform(proof, platform, version, errors) {
+function validatePlatform(proof, platform, version, firstRelease, errors) {
   const candidate = proof[platform];
   if (!candidate || typeof candidate !== 'object') {
     errors.push(`${platform}: proof section is missing`);
@@ -77,6 +80,13 @@ function validatePlatform(proof, platform, version, errors) {
     errors.push(`${platform}: sha256 must be the tested artifact's 64-character digest`);
   }
   for (const check of required[platform]) {
+    if (
+      firstRelease &&
+      check === 'automaticUpdateReplacedCleanedAndReopened' &&
+      candidate.checks?.[check] === 'not-applicable'
+    ) {
+      continue;
+    }
     if (candidate.checks?.[check] !== true) {
       errors.push(`${platform}: ${check} was not attested`);
     }
@@ -85,18 +95,33 @@ function validatePlatform(proof, platform, version, errors) {
 
 async function verify() {
   const proof = JSON.parse(await readFile(proofPath, 'utf8'));
-  const version = await packageVersion();
+  const { version, repository } = await packageMetadata();
   const errors = [];
+  const firstRelease = Object.hasOwn(proof, 'firstRelease');
+  if (firstRelease) {
+    const repositoryUrl = typeof repository === 'string' ? repository : repository?.url;
+    if (
+      version !== '0.1.0' ||
+      typeof repositoryUrl !== 'string' ||
+      !/^https:\/\/github\.com\/bildhaus\/explorie(?:\.git)?\/?$/i.test(repositoryUrl)
+    ) {
+      errors.push('firstRelease: updater exemption is only valid for bildhaus/explorie v0.1.0');
+    }
+    if (typeof proof.firstRelease?.reason !== 'string' || !proof.firstRelease.reason.trim()) {
+      errors.push('firstRelease: a reason for the updater exemption is required');
+    }
+  }
   if (proof.version !== version) errors.push(`version: expected ${version}, got ${proof.version}`);
   if (proof.candidateTag !== `v${version}`) {
     errors.push(`candidateTag: expected v${version}, got ${proof.candidateTag || '(empty)'}`);
   }
-  validatePlatform(proof, 'windows', version, errors);
-  validatePlatform(proof, 'macos', version, errors);
+  validatePlatform(proof, 'windows', version, firstRelease, errors);
+  validatePlatform(proof, 'macos', version, firstRelease, errors);
   if (errors.length > 0) {
     throw new Error(`Platform proof is incomplete:\n- ${errors.join('\n- ')}`);
   }
   console.log(`Platform proof is complete for v${version}.`);
+  if (firstRelease) console.log(`First-release updater exemption: ${proof.firstRelease.reason}`);
   console.log(`Windows tested SHA-256: ${proof.windows.sha256.toLowerCase()}`);
   console.log(`macOS tested SHA-256: ${proof.macos.sha256.toLowerCase()}`);
 }

@@ -160,6 +160,10 @@ jobs:
           node scripts/package-plugins.mjs --target aarch64-apple-darwin
           export EXPLORIE_PLUGIN_CATALOG="$PWD/release-artifacts/plugins-aarch64-apple-darwin/explorie-plugin-catalog-aarch64-apple-darwin.json"
           cargo build -p explorie-gpui --release --locked
+          export EXPLORIE_PLUGIN_SMOKE_CATALOG="$EXPLORIE_PLUGIN_CATALOG"
+          export EXPLORIE_PLUGIN_SMOKE_DIRECTORY="$PWD/target/release/plugins"
+          cargo test --locked -p explorie-native-services plugins::tests::official_bundled_packages_install_and_execute_through_native_manager -- --ignored --exact --nocapture
+          cargo test --locked -p explorie-gpui bundled_integrations_do_not_stall_column_navigation -- --ignored --nocapture
 
   test-rust-unix-safety:
     name: Unix Safety Regression Tests
@@ -198,7 +202,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.native == 'true'
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     steps:
       - name: Checkout repository
@@ -264,6 +268,12 @@ jobs:
           $env:EXPLORIE_PLUGIN_CATALOG = Join-Path $PWD "release-artifacts/plugins-x86_64-pc-windows-msvc/explorie-plugin-catalog-x86_64-pc-windows-msvc.json"
           cargo build -p explorie-gpui --release --locked
           if ($LASTEXITCODE -ne 0) { throw "GPUI release build failed." }
+          $env:EXPLORIE_PLUGIN_SMOKE_CATALOG = $env:EXPLORIE_PLUGIN_CATALOG
+          $env:EXPLORIE_PLUGIN_SMOKE_DIRECTORY = Join-Path $PWD "target/release/plugins"
+          cargo test --locked -p explorie-native-services plugins::tests::official_bundled_packages_install_and_execute_through_native_manager -- --ignored --exact --nocapture
+          if ($LASTEXITCODE -ne 0) { throw "Bundled plugin offline smoke failed." }
+          cargo test --locked -p explorie-gpui bundled_integrations_do_not_stall_column_navigation -- --ignored --nocapture
+          if ($LASTEXITCODE -ne 0) { throw "Bundled integration navigation smoke failed." }
 
       - name: Smoke test GPUI Windows release
         timeout-minutes: 5

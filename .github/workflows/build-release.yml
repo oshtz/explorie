@@ -12,12 +12,12 @@ on:
         required: true
         default: false
       windows_real_machine_verified:
-        description: Windows installer, folder-handler toggle/reversal, remote drives, opt-in downloaded plugins, and disposable filesystem operations passed
+        description: Windows installer, folder-handler toggle/reversal, remote drives, opt-in bundled plugins, and disposable filesystem operations passed
         type: boolean
         required: true
         default: false
       macos_real_machine_verified:
-        description: Signed/notarized macOS install, launch, downloaded plugin execution, and disposable filesystem operations passed
+        description: Signed/notarized macOS install, launch, bundled plugin execution, and disposable filesystem operations passed
         type: boolean
         required: true
         default: false
@@ -306,6 +306,12 @@ jobs:
           $app = Join-Path $installDir "Explorie.exe"
           $rclone = Join-Path $installDir "rclone.exe"
           try {
+            node scripts/package-plugins.mjs --verify-catalog $env:EXPLORIE_PLUGIN_CATALOG --target x86_64-pc-windows-msvc --verify-directory (Join-Path $installDir "plugins")
+            if ($LASTEXITCODE -ne 0) { throw "Installed plugin packages failed integrity verification." }
+            $env:EXPLORIE_PLUGIN_SMOKE_CATALOG = $env:EXPLORIE_PLUGIN_CATALOG
+            $env:EXPLORIE_PLUGIN_SMOKE_DIRECTORY = Join-Path $installDir "plugins"
+            cargo test --locked -p explorie-native-services plugins::tests::official_bundled_packages_install_and_execute_through_native_manager -- --ignored --exact --nocapture
+            if ($LASTEXITCODE -ne 0) { throw "Installed plugin offline execution smoke failed." }
             node scripts/smoke-7zip.mjs (Join-Path $installDir "7zip/7z.exe")
             if ($LASTEXITCODE -ne 0) { throw "Installed 7-Zip archive smoke failed." }
             foreach ($notice in @("7zip-LICENSE.txt", "7zip-COPYING.txt", "7zip-NOTICE.txt")) {
@@ -567,6 +573,7 @@ jobs:
           test -x "$helper"
           test -x "$rclone"
           test -x "$sevenzip"
+          node scripts/package-plugins.mjs --verify-catalog "$EXPLORIE_PLUGIN_CATALOG" --target aarch64-apple-darwin --verify-directory "$app/Contents/Resources/plugins"
           node scripts/smoke-7zip.mjs "$sevenzip"
           for notice in 7zip-LICENSE.txt 7zip-COPYING.txt 7zip-NOTICE.txt; do
             test -f "$app/Contents/Resources/licenses/$notice"
@@ -675,6 +682,10 @@ jobs:
 
           binary="$installed_app/Contents/MacOS/explorie-gpui"
           rclone="$installed_app/Contents/MacOS/rclone"
+          node scripts/package-plugins.mjs --verify-catalog "$EXPLORIE_PLUGIN_CATALOG" --target aarch64-apple-darwin --verify-directory "$installed_app/Contents/Resources/plugins"
+          export EXPLORIE_PLUGIN_SMOKE_CATALOG="$EXPLORIE_PLUGIN_CATALOG"
+          export EXPLORIE_PLUGIN_SMOKE_DIRECTORY="$installed_app/Contents/Resources/plugins"
+          cargo test --locked -p explorie-native-services plugins::tests::official_bundled_packages_install_and_execute_through_native_manager -- --ignored --exact --nocapture
           node scripts/smoke-7zip.mjs "$installed_app/Contents/Resources/7zip/7zz"
           if [ ! -x "$binary" ]; then
             echo "Installed application executable was not found."
