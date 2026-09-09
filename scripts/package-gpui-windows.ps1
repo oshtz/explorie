@@ -28,6 +28,8 @@ $output = [IO.Path]::GetFullPath((Join-Path $repository $OutputDirectory))
 $resources = [IO.Path]::GetFullPath((Join-Path $repository "apps/desktop/native-assets/resources"))
 $definition = [IO.Path]::GetFullPath((Join-Path $repository "apps/desktop/gpui/installer/windows/explorie.iss"))
 $sevenZip = Join-Path $repository "apps/desktop/native-assets/binaries/7zip-x86_64-pc-windows-msvc"
+& node (Join-Path $PSScriptRoot "prepare-7zip.mjs") --stage-source (Join-Path $build "licenses")
+if ($LASTEXITCODE -ne 0) { throw "Bundled 7-Zip corresponding source verification failed." }
 & node (Join-Path $PSScriptRoot "package-plugins.mjs") --verify-catalog $env:EXPLORIE_PLUGIN_CATALOG --target x86_64-pc-windows-msvc --stage-directory (Join-Path $build "plugins")
 if ($LASTEXITCODE -ne 0) { throw "Bundled plugin staging failed." }
 

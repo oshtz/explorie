@@ -95,6 +95,7 @@ node "$repository/scripts/package-plugins.mjs" --verify-catalog "$EXPLORIE_PLUGI
 for notice in 7zip-LICENSE.txt 7zip-COPYING.txt 7zip-NOTICE.txt; do
   install -m 644 "$assets/resources/$notice" "$app/Contents/Resources/licenses/$notice"
 done
+node "$repository/scripts/prepare-7zip.mjs" --stage-source "$app/Contents/Resources/licenses"
 node "$repository/scripts/smoke-7zip.mjs" "$app/Contents/Resources/7zip/7zz"
 install -m 755 "$helper" "$app/Contents/Resources/explorie-mountd"
 install -m 644 "$generated_icon" "$app/Contents/Resources/icon.icns"

@@ -63,6 +63,7 @@ Source: "{#BuildDir}\plugins\explorie-plugin-obsidian-{#AppVersion}-x86_64-pc-wi
 Source: "{#ResourceDir}\7zip-LICENSE.txt"; DestDir: "{app}\licenses"; Flags: ignoreversion
 Source: "{#ResourceDir}\7zip-COPYING.txt"; DestDir: "{app}\licenses"; Flags: ignoreversion
 Source: "{#ResourceDir}\7zip-NOTICE.txt"; DestDir: "{app}\licenses"; Flags: ignoreversion
+Source: "{#BuildDir}\licenses\7z2603-src.tar.xz"; DestDir: "{app}\licenses"; Flags: ignoreversion
 Source: "{#ResourceDir}\winfsp-2.1.25156.msi"; DestDir: "{app}\installers"; Flags: ignoreversion
 Source: "{#ResourceDir}\rclone-COPYING"; DestDir: "{app}\licenses"; Flags: ignoreversion
 Source: "{#ResourceDir}\winfsp-NOTICE.txt"; DestDir: "{app}\licenses"; Flags: ignoreversion

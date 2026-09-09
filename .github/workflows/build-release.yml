@@ -176,13 +176,6 @@ jobs:
       - name: Test native file operations on Windows
         run: cargo test --locked -p explorie-core
 
-      - name: Upload corresponding 7-Zip source and notices
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: explorie-third-party
-          path: release-artifacts/third-party/*
-          if-no-files-found: error
-
       - name: Build and package official Windows plugins
         shell: pwsh
         run: |
@@ -190,13 +183,6 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Plugin packaging failed." }
           $catalog = Join-Path $PWD "release-artifacts/plugins-x86_64-pc-windows-msvc/explorie-plugin-catalog-x86_64-pc-windows-msvc.json"
           "EXPLORIE_PLUGIN_CATALOG=$catalog" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-
-      - name: Upload Windows plugin packages
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: explorie-plugins-windows
-          path: release-artifacts/plugins-x86_64-pc-windows-msvc/*
-          if-no-files-found: error
 
       - name: Build GPUI Windows application
         shell: pwsh
@@ -254,21 +240,21 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $release = gh api "repos/$env:GITHUB_REPOSITORY/releases/latest" | ConvertFrom-Json
+          try {
+            $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases/latest" -Headers @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json" }
+          } catch {
+            if ([int]$_.Exception.Response.StatusCode -ne 404) { throw }
+            $release = $null
+          }
           $assets = @($release.assets | Where-Object { $_.name -like "explorie-*-windows-x64-setup-unsigned.exe" })
           if ($assets.Count -gt 1) { throw "The latest release has multiple Windows installer assets." }
           if ($assets.Count -eq 1) {
-            $checksums = @($release.assets | Where-Object { $_.name -eq "SHA256SUMS-windows.txt" })
-            if ($checksums.Count -ne 1) { throw "The previous Windows installer has no unique checksum manifest." }
+            if ($assets[0].digest -cnotmatch '^sha256:[a-f0-9]{64}$') { throw "The previous Windows installer has no valid SHA-256 digest." }
+            $expected = $assets[0].digest.Substring(7)
             $destination = Join-Path $env:RUNNER_TEMP $assets[0].name
-            $checksumPath = Join-Path $env:RUNNER_TEMP "SHA256SUMS-windows-previous.txt"
-            Invoke-WebRequest -Uri $assets[0].browser_download_url -OutFile $destination
-            Invoke-WebRequest -Uri $checksums[0].browser_download_url -OutFile $checksumPath
-            $escapedName = [Regex]::Escape($assets[0].name)
-            $checksumPattern = '^([0-9a-fA-F]{64})\s+\*?' + $escapedName + '$'
-            $entries = @(Get-Content -LiteralPath $checksumPath | Where-Object { $_ -match $checksumPattern })
-            if ($entries.Count -ne 1) { throw "The previous installer checksum entry is missing or ambiguous." }
-            $expected = ([Regex]::Match($entries[0], "^[0-9a-fA-F]{64}")).Value.ToLowerInvariant()
+            gh release download $release.tag_name --repo $env:GITHUB_REPOSITORY --pattern $assets[0].name --output $destination
+            if ($LASTEXITCODE -ne 0) { throw "The previous Windows installer could not be downloaded." }
+            if ((Get-Item -LiteralPath $destination).Length -ne $assets[0].size) { throw "The previous Windows installer size does not match." }
             $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $destination).Hash.ToLowerInvariant()
             if ($actual -ne $expected) { throw "The previous Windows installer checksum does not match." }
             "path=$destination" >> $env:GITHUB_OUTPUT
@@ -314,6 +300,8 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "Installed plugin offline execution smoke failed." }
             node scripts/smoke-7zip.mjs (Join-Path $installDir "7zip/7z.exe")
             if ($LASTEXITCODE -ne 0) { throw "Installed 7-Zip archive smoke failed." }
+            node scripts/prepare-7zip.mjs --verify-source (Join-Path $installDir "licenses/7z2603-src.tar.xz")
+            if ($LASTEXITCODE -ne 0) { throw "Installed 7-Zip source failed integrity verification." }
             foreach ($notice in @("7zip-LICENSE.txt", "7zip-COPYING.txt", "7zip-NOTICE.txt")) {
               if (-not (Test-Path -LiteralPath (Join-Path $installDir "licenses/$notice") -PathType Leaf)) { throw "Installed 7-Zip notice is missing: $notice" }
             }
@@ -358,7 +346,7 @@ jobs:
       - name: Upload Windows package
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: explorie-windows
+          name: explorie-installer-windows
           path: release-artifacts/windows/*
           if-no-files-found: error
 
@@ -473,13 +461,6 @@ jobs:
           path: ${{ runner.temp }}/plugin-notarization/*.json
           if-no-files-found: error
 
-      - name: Upload macOS plugin packages
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: explorie-plugins-macos
-          path: release-artifacts/plugins-aarch64-apple-darwin/*
-          if-no-files-found: error
-
       - name: Build GPUI macOS app and DMG
         env:
           APPLE_SIGNING_IDENTITY: ${{ steps.signing.outputs.identity }}
@@ -575,6 +556,7 @@ jobs:
           test -x "$sevenzip"
           node scripts/package-plugins.mjs --verify-catalog "$EXPLORIE_PLUGIN_CATALOG" --target aarch64-apple-darwin --verify-directory "$app/Contents/Resources/plugins"
           node scripts/smoke-7zip.mjs "$sevenzip"
+          node scripts/prepare-7zip.mjs --verify-source "$app/Contents/Resources/licenses/7z2603-src.tar.xz"
           for notice in 7zip-LICENSE.txt 7zip-COPYING.txt 7zip-NOTICE.txt; do
             test -f "$app/Contents/Resources/licenses/$notice"
           done
@@ -687,6 +669,7 @@ jobs:
           export EXPLORIE_PLUGIN_SMOKE_DIRECTORY="$installed_app/Contents/Resources/plugins"
           cargo test --locked -p explorie-native-services plugins::tests::official_bundled_packages_install_and_execute_through_native_manager -- --ignored --exact --nocapture
           node scripts/smoke-7zip.mjs "$installed_app/Contents/Resources/7zip/7zz"
+          node scripts/prepare-7zip.mjs --verify-source "$installed_app/Contents/Resources/licenses/7z2603-src.tar.xz"
           if [ ! -x "$binary" ]; then
             echo "Installed application executable was not found."
             exit 1
@@ -707,7 +690,7 @@ jobs:
       - name: Upload macOS package
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: explorie-macos
+          name: explorie-installer-macos
           path: release-artifacts/macos/*
           if-no-files-found: error
 
@@ -722,10 +705,18 @@ jobs:
       contents: write
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: '20.20.2'
+
       - name: Download candidate packages
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          pattern: explorie-*
+          pattern: explorie-installer-*
           path: release-artifacts
           merge-multiple: true
 
@@ -738,29 +729,25 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           windows="explorie-$version-windows-x64-setup-unsigned.exe"
           macos="explorie-$version-macos-arm64.dmg"
-          for asset in "$windows" "$macos" SHA256SUMS-windows.txt SHA256SUMS-macos.txt 7z2603-src.tar.xz 7zip-NOTICE.txt SHA256SUMS-7zip.txt; do
+          for asset in "$windows" "$macos" SHA256SUMS-windows.txt SHA256SUMS-macos.txt; do
             test -f "$asset"
           done
-          if [ "$(find . -maxdepth 1 -type f | wc -l | tr -d ' ')" != "17" ]; then
-            echo "Candidate release must contain desktop/plugin packages, catalogs, checksums, and corresponding 7-Zip source/notices."
+          if [ "$(find . -maxdepth 1 -type f | wc -l | tr -d ' ')" != "4" ]; then
+            echo "Candidate staging must contain two installers and their internal build checksums."
             exit 1
           fi
           sha256sum --check SHA256SUMS-windows.txt
           sha256sum --check SHA256SUMS-macos.txt
-          sha256sum --check SHA256SUMS-7zip.txt
-          for target in x86_64-pc-windows-msvc aarch64-apple-darwin; do
-            test -f "explorie-plugin-catalog-$target.json"
-            for plugin in syncthing git obsidian; do
-              test -f "explorie-plugin-$plugin-$version-$target.zip"
-            done
-            sha256sum --check "SHA256SUMS-plugins-$target.txt"
-          done
-          gh release create "$GITHUB_REF_NAME" ./* \
+          gh release create "$GITHUB_REF_NAME" "$windows" "$macos" \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
             --draft \
             --title "$GITHUB_REF_NAME" \
             --generate-notes
+          cd ..
+          release_id=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json databaseId --jq '.databaseId')
+          gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" > "$RUNNER_TEMP/candidate-release.json"
+          node scripts/verify-release-assets.mjs "$RUNNER_TEMP/candidate-release.json" release-artifacts "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME"
 
   publish:
     name: Publish verified draft release
@@ -778,6 +765,14 @@ jobs:
       contents: write
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: '20.20.2'
+
       - name: Download and verify draft assets
         env:
           GH_TOKEN: ${{ github.token }}
@@ -786,44 +781,17 @@ jobs:
         run: |
           set -euo pipefail
           mkdir release-artifacts
-          gh release download "$GITHUB_REF_NAME" \
-            --repo "$GITHUB_REPOSITORY" \
-            --pattern 'explorie-*' \
-            --pattern 'SHA256SUMS-*' \
-            --pattern '7z2603-src.tar.xz' \
-            --pattern '7zip-NOTICE.txt' \
-            --dir release-artifacts
-          cd release-artifacts
           version="${GITHUB_REF_NAME#v}"
           windows="explorie-$version-windows-x64-setup-unsigned.exe"
           macos="explorie-$version-macos-arm64.dmg"
-          for asset in "$windows" "$macos" SHA256SUMS-windows.txt SHA256SUMS-macos.txt 7z2603-src.tar.xz 7zip-NOTICE.txt SHA256SUMS-7zip.txt; do
-            test -f "$asset"
-          done
-          if [ "$(find . -maxdepth 1 -type f | wc -l | tr -d ' ')" != "17" ]; then
-            echo "Draft release must contain desktop/plugin packages, catalogs, checksums, and corresponding 7-Zip source/notices."
-            exit 1
-          fi
-          sha256sum --check SHA256SUMS-windows.txt
-          sha256sum --check SHA256SUMS-macos.txt
-          sha256sum --check SHA256SUMS-7zip.txt
-          for target in x86_64-pc-windows-msvc aarch64-apple-darwin; do
-            test -f "explorie-plugin-catalog-$target.json"
-            for plugin in syncthing git obsidian; do
-              test -f "explorie-plugin-$plugin-$version-$target.zip"
-            done
-            sha256sum --check "SHA256SUMS-plugins-$target.txt"
-          done
-          windows_actual=$(sha256sum "$windows" | cut -d' ' -f1)
-          macos_actual=$(sha256sum "$macos" | cut -d' ' -f1)
-          if [ "${windows_actual,,}" != "${WINDOWS_ATTESTED_SHA256,,}" ]; then
-            echo "The Windows draft asset is not the real-machine-tested artifact."
-            exit 1
-          fi
-          if [ "${macos_actual,,}" != "${MACOS_ATTESTED_SHA256,,}" ]; then
-            echo "The macOS draft asset is not the real-machine-tested artifact."
-            exit 1
-          fi
+          release_id=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json databaseId --jq '.databaseId')
+          gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" > "$RUNNER_TEMP/draft-release.json"
+          gh release download "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "$windows" \
+            --pattern "$macos" \
+            --dir release-artifacts
+          node scripts/verify-release-assets.mjs "$RUNNER_TEMP/draft-release.json" release-artifacts "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" --attested
 
       - name: Publish the verified draft
         env:

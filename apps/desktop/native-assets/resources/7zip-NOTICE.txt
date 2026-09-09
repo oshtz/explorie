@@ -9,8 +9,11 @@ RAR support is for decompression; the unRAR sources must not be used to
 develop a RAR (WinRAR) compatible archiver.
 
 The exact upstream corresponding source, including upstream build scripts,
-is supplied as 7z2603-src.tar.xz alongside each Explorie binary release:
-https://github.com/oshtz/explorie/releases
+is included as 7z2603-src.tar.xz beside this notice in each Explorie installer:
+Windows: licenses/7z2603-src.tar.xz beside Explorie.exe.
+macOS: explorie.app/Contents/Resources/licenses/7z2603-src.tar.xz
+(Finder: Show Package Contents). The archive can be copied and extracted
+with standard archive tools, including the bundled 7-Zip executable.
 Upstream source: https://github.com/ip7z/7zip/releases/download/26.03/7z2603-src.tar.xz
 Source SHA-256: 9cbde5099c6deb73691b0579063da5827522ccbbcba3f0020fd04e8c8c16c0d4
 
