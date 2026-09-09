@@ -442,7 +442,7 @@ test('workflows block audits and publish the exact attested draft assets', async
   assert.match(ci, /save-if: \$\{\{ github\.ref == 'refs\/heads\/main' \}\}/);
   assert.match(
     ci,
-    /name: Windows Tests, Lint & Release Contracts[\s\S]*?runs-on: windows-latest[\s\S]*?timeout-minutes: 45/
+    /name: Windows Tests, Lint & Release Contracts[\s\S]*?runs-on: windows-latest[\s\S]*?timeout-minutes: 60/
   );
   assert.match(
     ci,
