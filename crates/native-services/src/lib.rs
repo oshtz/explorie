@@ -23,6 +23,7 @@ pub mod listing;
 pub mod metadata;
 pub mod model_preview;
 pub mod mutations;
+mod plugin_detection;
 pub mod plugins;
 pub mod preview;
 mod process;

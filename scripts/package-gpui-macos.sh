@@ -91,6 +91,7 @@ test -s "$generated_icon"
 install -m 755 "$binary" "$app/Contents/MacOS/explorie-gpui"
 install -m 755 "$rclone" "$app/Contents/MacOS/rclone"
 install -m 755 "$sevenzip" "$app/Contents/Resources/7zip/7zz"
+node "$repository/scripts/package-plugins.mjs" --verify-catalog "$EXPLORIE_PLUGIN_CATALOG" --target "$target" --stage-directory "$app/Contents/Resources/plugins"
 for notice in 7zip-LICENSE.txt 7zip-COPYING.txt 7zip-NOTICE.txt; do
   install -m 644 "$assets/resources/$notice" "$app/Contents/Resources/licenses/$notice"
 done

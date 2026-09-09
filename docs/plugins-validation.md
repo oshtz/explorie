@@ -1,5 +1,81 @@
 # Integration validation — Windows x64, 2026-09-05
 
+## Cutover preparation — 2026-09-09
+
+Filesystem watcher bursts previously canceled every unfinished listing and discarded its
+generation, allowing active folders to remain loading indefinitely. Watcher refreshes now
+coalesce until the current List/Grid/Column listings finish, including failed ancestors;
+one follow-up refresh incorporates the changes. Existing rows remain visible during refresh.
+Smart-folder invalidation still restarts its canceled search immediately, and explicit user
+cancellation remains final. The native regression injects event bursts and delayed/stale
+results without depending on filesystem timing. A modal input regression also ensures archive
+controls cannot click through to the visible file rows underneath.
+
+Failed migration from a downloaded integration to a missing/corrupt bundled package now blocks
+the previous executable, marks the integration unavailable, and preserves preferences for
+repair. The regression starts the old executable, verifies it stops and cannot restart after
+failed bundle verification, then repairs the bundle and verifies activation succeeds.
+
+The packaged integration navigation fixture is now required by both Windows and macOS CI,
+alongside the native manager's offline activation smoke. Release-proof validation requires
+bundled integration activation and remote-drive lifecycle checks on both platforms. Its only
+updater exemption is explicit, documented `bildhaus/explorie` first-release proof at `0.1.0`.
+
+These corrections address demonstrated failure paths. They do not establish the cause of the
+earlier isolated `STATUS_STACK_OVERFLOW` or replace real-machine candidate attestations. Final
+verification logs and the cutover source SHA are kept under ignored `.release-checks/`.
+
+## Bundled integration update
+
+The three official integrations now ship as catalog-verified ZIPs inside the app. Native
+runtime tests cover offline registration and activation, disabled defaults, migration from
+downloaded integrations, preserved preferences across updates/restarts, corrupted-cache
+repair, and unavailable bundles refusing a download fallback. Native GPUI tests verify
+enablement controls and separate detection rows without install/uninstall controls.
+
+Validation for this update: 429 workspace tests passed (8 ignored), followed by the focused
+16-test runtime suite for the final missing-bundle fallback correction. Strict workspace
+Clippy, formatting, 31 packaging checks, and the real three-plugin offline activation smoke
+passed. The Windows release executable and local installer built successfully.
+
+The final desktop launch/temporary-profile cleanup smoke command was rejected by automatic
+approval review with “blocked by policy”; it did not run. This update has not been executed
+on macOS locally. Both platform CI/release lanes now require execution of the exact bundled
+ZIPs through the native manager, in addition to existing app/signing checks. No new release
+or version bump was made for this source change.
+
+## Loading-files investigation
+
+The user reported that the installed Windows app remained responsive but folder listings
+stayed on “Loading files” with Git enabled, and disabling Git restored navigation. They later
+reported normal navigation with Git enabled again. The intermittent installed-app failure
+has not been reproduced in the native test harness; no production fix or new installer is
+claimed.
+
+An isolated GPUI test loads the actual three bundled release ZIPs, enables them, starts native
+service events and filesystem watching, and awaits column listings and integration results.
+The initial run including the machine's Downloads and Program Files folders passed in 8.12s.
+All columns finished loading and all three integration scans completed. This checks the
+headless native lifecycle, not real-window activation or the installed application.
+
+The retained ignored test uses a temporary Git repository and Obsidian vault by default and
+requires successful integration results and a detected Git repository. An extra real folder
+can be supplied explicitly without changing the user's configuration:
+
+```powershell
+$env:EXPLORIE_PLUGIN_SMOKE_CATALOG = Join-Path $PWD 'release-artifacts/plugins-x86_64-pc-windows-msvc/explorie-plugin-catalog-x86_64-pc-windows-msvc.json'
+$env:EXPLORIE_PLUGIN_SMOKE_DIRECTORY = Join-Path $PWD 'target/release/plugins'
+# Optional: $env:EXPLORIE_PLUGIN_NAVIGATION_PATH = 'C:\path\to\investigate'
+cargo test --locked -p explorie-gpui bundled_integrations_do_not_stall_column_navigation -- --ignored --nocapture
+```
+
+The strengthened test, including the Git fixture and opt-in Downloads navigation, passed
+in 17.58s. Its first run aborted in an unnamed native thread with `STATUS_STACK_OVERFLOW`;
+the unchanged rerun passed. That isolated test-process failure remains unexplained and is
+not evidence that the intermittent installed-app problem is resolved.
+
+## Original plugin implementation
+
 Local implementation evidence; this is not a release attestation. No release was published
 and no installed application or user integration configuration was modified for these checks.
 

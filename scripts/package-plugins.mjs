@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { mkdir, readFile, writeFile, stat } from 'node:fs/promises';
+import { copyFile, mkdir, readFile, writeFile, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
@@ -113,7 +113,7 @@ export async function packagePlugins({ root = repository, target = nativeTarget(
   return catalogPath;
 }
 
-export async function verifyCatalog(catalogPath, target, version) {
+export async function verifyCatalog(catalogPath, target, version, packageDirectory = path.dirname(catalogPath)) {
   const entries = JSON.parse(await readFile(catalogPath, 'utf8'));
   if (!Array.isArray(entries) || entries.length !== PLUGINS.length) throw new Error('Official catalog must contain all three plugins');
   for (const id of PLUGINS) {
@@ -123,11 +123,25 @@ export async function verifyCatalog(catalogPath, target, version) {
     const filename = `explorie-plugin-${id}-${version}-${target}.zip`;
     if (entry.assetUrl !== `https://github.com/oshtz/explorie/releases/download/v${version}/${filename}`
         || !/^[a-f0-9]{64}$/.test(entry.sha256)) throw new Error(`Invalid official catalog asset for ${id}`);
-    if (sha256(await readFile(path.join(path.dirname(catalogPath), filename))) !== entry.sha256) {
+    if (sha256(await readFile(path.join(packageDirectory, filename))) !== entry.sha256) {
       throw new Error(`Plugin package integrity failed: ${id}`);
     }
   }
   return entries;
+}
+
+// Copy the notarized ZIP bytes unchanged. The application embeds the catalog;
+// the bundle only needs the packages authenticated by that catalog.
+export async function stagePlugins(catalogPath, target, version, destination) {
+  const entries = await verifyCatalog(catalogPath, target, version);
+  await mkdir(destination, { recursive: true });
+  for (const { manifest } of entries) {
+    const filename = `explorie-plugin-${manifest.id}-${version}-${target}.zip`;
+    const source = path.join(path.dirname(catalogPath), filename);
+    const output = path.join(destination, filename);
+    if (path.resolve(source) !== path.resolve(output)) await copyFile(source, output);
+  }
+  await verifyCatalog(catalogPath, target, version, destination);
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
@@ -138,7 +152,9 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     const catalog = option('--verify-catalog');
     if (catalog) {
       const { version } = JSON.parse(await readFile(path.join(repository, 'package.json'), 'utf8'));
-      await verifyCatalog(catalog, target, version);
+      if (option('--stage-directory')) {
+        await stagePlugins(catalog, target, version, option('--stage-directory'));
+      } else await verifyCatalog(catalog, target, version, option('--verify-directory'));
       console.log('Official plugin catalog and packages verified.');
     } else console.log(await packagePlugins({ target, binaryDirectory: option('--binary-dir'),
       outputDirectory: option('--output'), build: !args.includes('--no-build') }));

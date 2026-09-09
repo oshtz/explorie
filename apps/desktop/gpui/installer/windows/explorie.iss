@@ -47,11 +47,19 @@ VersionInfoDescription=Explorie installer
 VersionInfoProductName=Explorie
 VersionInfoProductVersion={#AppVersion}
 
+[InstallDelete]
+Type: files; Name: "{app}\plugins\explorie-plugin-syncthing-*-x86_64-pc-windows-msvc.zip"
+Type: files; Name: "{app}\plugins\explorie-plugin-git-*-x86_64-pc-windows-msvc.zip"
+Type: files; Name: "{app}\plugins\explorie-plugin-obsidian-*-x86_64-pc-windows-msvc.zip"
+
 [Files]
 Source: "{#BuildDir}\explorie-gpui.exe"; DestDir: "{app}"; DestName: "Explorie.exe"; Flags: ignoreversion
 Source: "{#BuildDir}\rclone.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#BuildDir}\7zip\7z.exe"; DestDir: "{app}\7zip"; Flags: ignoreversion
 Source: "{#BuildDir}\7zip\7z.dll"; DestDir: "{app}\7zip"; Flags: ignoreversion
+Source: "{#BuildDir}\plugins\explorie-plugin-syncthing-{#AppVersion}-x86_64-pc-windows-msvc.zip"; DestDir: "{app}\plugins"; Flags: ignoreversion
+Source: "{#BuildDir}\plugins\explorie-plugin-git-{#AppVersion}-x86_64-pc-windows-msvc.zip"; DestDir: "{app}\plugins"; Flags: ignoreversion
+Source: "{#BuildDir}\plugins\explorie-plugin-obsidian-{#AppVersion}-x86_64-pc-windows-msvc.zip"; DestDir: "{app}\plugins"; Flags: ignoreversion
 Source: "{#ResourceDir}\7zip-LICENSE.txt"; DestDir: "{app}\licenses"; Flags: ignoreversion
 Source: "{#ResourceDir}\7zip-COPYING.txt"; DestDir: "{app}\licenses"; Flags: ignoreversion
 Source: "{#ResourceDir}\7zip-NOTICE.txt"; DestDir: "{app}\licenses"; Flags: ignoreversion

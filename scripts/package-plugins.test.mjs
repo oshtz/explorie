@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { createZip, nativeTarget, packagePlugins, PLUGINS, TARGETS, validateManifest, verifyCatalog } from './package-plugins.mjs';
+import { createZip, nativeTarget, packagePlugins, PLUGINS, stagePlugins, TARGETS, validateManifest, verifyCatalog } from './package-plugins.mjs';
 
 function manifest(id) {
   return { id, name: id, version: '0.2.15', protocolVersion: 1, description: 'Fixture',
@@ -83,6 +83,27 @@ test('missing inputs preserve previous catalog; tampered archives fail verificat
   await assert.rejects(verifyCatalog(catalog, TARGETS[0], '0.2.15'), /integrity failed/);
 });
 
+for (const target of TARGETS) test(`stages intact offline packages and detects missing or corrupted bundle files for ${target}`, async t => {
+  const options = await fixture(t, target);
+  const catalogPath = await packagePlugins(options);
+  const destination = path.join(options.root, 'app', 'plugins');
+  await stagePlugins(catalogPath, target, '0.2.15', destination);
+  const catalog = await verifyCatalog(catalogPath, target, '0.2.15', destination);
+  for (const entry of catalog) {
+    const filename = new URL(entry.assetUrl).pathname.split('/').at(-1);
+    assert.deepEqual(await readFile(path.join(destination, filename)), await readFile(path.join(path.dirname(catalogPath), filename)));
+  }
+  const filename = new URL(catalog[0].assetUrl).pathname.split('/').at(-1);
+  await rm(path.join(destination, filename));
+  await assert.rejects(verifyCatalog(catalogPath, target, '0.2.15', destination), /ENOENT/);
+  await stagePlugins(catalogPath, target, '0.2.15', destination);
+  await writeFile(path.join(destination, filename), 'corrupt');
+  await assert.rejects(verifyCatalog(catalogPath, target, '0.2.15', destination), /integrity failed/);
+  await writeFile(path.join(path.dirname(catalogPath), filename), 'corrupt source');
+  await assert.rejects(stagePlugins(catalogPath, target, '0.2.15', destination), /integrity failed/);
+  assert.equal(await readFile(path.join(destination, filename), 'utf8'), 'corrupt');
+});
+
 test('rejects incompatible manifests, unsafe paths and unsupported platforms', () => {
   assert.throws(() => validateManifest({ ...manifest('git'), protocolVersion: 2 }, 'git', '0.2.15', TARGETS[0]), /Incompatible/);
   assert.throws(() => validateManifest(manifest('git'), 'git', '0.2.16', TARGETS[0]), /Incompatible/);
@@ -114,4 +135,25 @@ test('release order preserves signing, notarization, catalogs and publication ga
   const build = await readFile('apps/desktop/gpui/build.rs', 'utf8');
   assert.match(build, /EXPLORIE_PLUGIN_CATALOG/);
   assert.match(build, /output.join\("plugin-catalog.json"\)/);
+  assert.match(build, /arg\("--stage-directory"\)/);
+  assert.match(build, /arg\(profile.join\("plugins"\)\)/);
+  const windows = await readFile('scripts/package-gpui-windows.ps1', 'utf8');
+  assert.match(windows, /--stage-directory \(Join-Path \$build "plugins"\)/);
+  const installer = await readFile('apps/desktop/gpui/installer/windows/explorie.iss', 'utf8');
+  const installDelete = installer.slice(installer.indexOf('[InstallDelete]'), installer.indexOf('[Files]'));
+  assert.equal((installDelete.match(/Type: files;/g) ?? []).length, PLUGINS.length);
+  assert.doesNotMatch(installDelete, /filesandordirs|Type: dir/);
+  for (const id of PLUGINS) {
+    assert.ok(installer.includes(`plugins\\explorie-plugin-${id}-{#AppVersion}-x86_64-pc-windows-msvc.zip"; DestDir: "{app}\\plugins"`));
+    assert.ok(installDelete.includes(`Type: files; Name: "{app}\\plugins\\explorie-plugin-${id}-*-x86_64-pc-windows-msvc.zip"`));
+  }
+  const macPackage = await readFile('scripts/package-gpui-macos.sh', 'utf8');
+  assert.match(macPackage, /--stage-directory "\$app\/Contents\/Resources\/plugins"/);
+  assert.ok(macPackage.indexOf('--stage-directory') < macPackage.indexOf('sign com.omershatz.explorie "$app"'));
+  assert.match(workflow, /--verify-directory \(Join-Path \$installDir "plugins"\)/);
+  assert.match(workflow, /--verify-directory "\$installed_app\/Contents\/Resources\/plugins"/);
+  const ci = await readFile('.github/workflows/ci.yml', 'utf8');
+  for (const pipeline of [workflow, ci]) {
+    assert.equal((pipeline.match(/cargo test --locked -p explorie-native-services plugins::tests::official_bundled_packages_install_and_execute_through_native_manager -- --ignored --exact --nocapture/g) ?? []).length, 2);
+  }
 });

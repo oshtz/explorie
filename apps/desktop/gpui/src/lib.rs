@@ -3142,6 +3142,7 @@ pub struct DirectoryWindow {
     locations_task: Option<Task<()>>,
     disk_info_task: Option<Task<()>>,
     watcher_task: Option<Task<()>>,
+    watcher_refresh_pending: bool,
     column_tasks: Vec<Task<()>>,
     integration_tasks: Vec<Task<()>>,
     integration_generation: u64,
@@ -3579,6 +3580,7 @@ impl DirectoryWindow {
             locations_task: None,
             disk_info_task: None,
             watcher_task: None,
+            watcher_refresh_pending: false,
             column_tasks: Vec::new(),
             integration_tasks: Vec::new(),
             integration_generation: 0,
@@ -7295,6 +7297,7 @@ impl DirectoryWindow {
     }
 
     fn start_listing_with_scroll_reset(&mut self, reset_scroll: bool, cx: &mut Context<Self>) {
+        self.watcher_refresh_pending = false;
         self.request_generation = self.request_generation.wrapping_add(1);
         self.reset_scroll_on_result = reset_scroll;
         let generation = self.request_generation;
@@ -7346,6 +7349,7 @@ impl DirectoryWindow {
             }
             DirectoryEvent::Listed { .. } | DirectoryEvent::Failed { .. } => {}
         }
+        self.finish_watcher_refresh(cx);
     }
 
     pub fn start_system_locations(&mut self, cx: &mut Context<Self>) {
@@ -7385,6 +7389,7 @@ impl DirectoryWindow {
     }
 
     fn start_smart_search(&mut self, criteria: SearchCriteria, cx: &mut Context<Self>) {
+        self.watcher_refresh_pending = false;
         self.services.search.cancel();
         self.search_generation = self.search_generation.wrapping_add(1);
         let generation = self.search_generation;
@@ -7455,6 +7460,7 @@ impl DirectoryWindow {
                         "Search stopped • {} partial result(s)",
                         self.browser.visible_entries().len()
                     ));
+                    self.watcher_refresh_pending = false;
                     return;
                 }
                 self.record_error("Smart-folder search failed", error.to_string());
@@ -7463,6 +7469,7 @@ impl DirectoryWindow {
             }
             SearchEvent::Completed { .. } | SearchEvent::Failed { .. } => {}
         }
+        self.finish_watcher_refresh(cx);
     }
 
     fn apply_search_progress(&mut self, progress: SearchProgressEvent, cx: &mut Context<Self>) {
@@ -7500,6 +7507,7 @@ impl DirectoryWindow {
     }
 
     fn cancel_smart_search(&mut self, cx: &mut Context<Self>) {
+        self.watcher_refresh_pending = false;
         if self.search_task.is_none() {
             return;
         }
@@ -7538,6 +7546,7 @@ impl DirectoryWindow {
     }
 
     fn start_column_listings(&mut self, reset_stack: bool, cx: &mut Context<Self>) {
+        self.watcher_refresh_pending = false;
         self.column_generation = self.column_generation.wrapping_add(1);
         let generation = self.column_generation;
         if reset_stack {
@@ -7635,6 +7644,24 @@ impl DirectoryWindow {
                 }
             }
             DirectoryEvent::Listed { .. } | DirectoryEvent::Failed { .. } => {}
+        }
+        self.finish_watcher_refresh(cx);
+    }
+
+    fn listing_in_flight(&self) -> bool {
+        if self.browser.active_smart_folder().is_some() {
+            self.search_task.is_some()
+        } else if self.browser.view_mode() == ViewMode::Column {
+            self.columns.columns().iter().any(|column| column.loading())
+        } else {
+            matches!(self.state, ListingState::Loading)
+        }
+    }
+
+    fn finish_watcher_refresh(&mut self, cx: &mut Context<Self>) {
+        if self.watcher_refresh_pending && !self.listing_in_flight() {
+            self.watcher_refresh_pending = false;
+            self.refresh(cx);
         }
     }
 
@@ -7797,7 +7824,14 @@ impl DirectoryWindow {
                 self.watch_status = WatchStatus::Watching;
                 self.invalidate_changed_preview(&event.paths);
                 self.services.search.invalidate(&event.paths);
-                self.refresh(cx);
+                // Let the current listing finish before refreshing. Restarting it for
+                // every filesystem event can starve slow folders indefinitely.
+                // Search invalidation cancels the active search, so restart it now.
+                if self.browser.active_smart_folder().is_none() && self.listing_in_flight() {
+                    self.watcher_refresh_pending = true;
+                } else {
+                    self.refresh(cx);
+                }
                 cx.notify();
                 true
             }
@@ -16984,6 +17018,7 @@ impl DirectoryWindow {
         div()
             .id("mutation-prompt-backdrop")
             .debug_selector(|| "mutation-prompt-backdrop".to_string())
+            .occlude()
             .absolute()
             .inset_0()
             .flex()
@@ -25685,7 +25720,7 @@ impl DirectoryWindow {
         }
 
         let content = match &self.state {
-            ListingState::Loading => div()
+            ListingState::Loading if self.browser.entries().is_empty() => div()
                 .id("listing-loading")
                 .flex()
                 .flex_1()
@@ -25812,10 +25847,12 @@ impl DirectoryWindow {
                     })
                     .into_any_element()
             }
-            ListingState::Ready if self.browser.visible_entries().is_empty() => {
+            ListingState::Ready | ListingState::Loading
+                if self.browser.visible_entries().is_empty() =>
+            {
                 self.render_empty_listing("listing-empty", false, cx)
             }
-            ListingState::Ready => match self.browser.view_mode() {
+            ListingState::Ready | ListingState::Loading => match self.browser.view_mode() {
                 ViewMode::List => self.render_list_view(cx),
                 ViewMode::Grid => self.render_grid_view(cx),
                 ViewMode::Column => unreachable!("column view is handled before listing state"),
@@ -37941,6 +37978,186 @@ mod tests {
             watcher_disposition(7, &paths, 7, &paths, &failed),
             WatcherDisposition::Stop("watch access denied".to_string())
         );
+    }
+
+    #[gpui::test]
+    fn watcher_bursts_allow_in_flight_listings_to_finish(cx: &mut TestAppContext) {
+        let directory = fixture_dir();
+        let services = NativeServices::new(ResourcePaths::test(&directory));
+        let (view, window) =
+            cx.add_window_view(|_, cx| DirectoryWindow::new(directory.clone(), services, cx));
+        view.update(window, |view, cx| {
+            for mode in [ViewMode::List, ViewMode::Grid, ViewMode::Column] {
+                view.browser.set_view_mode(mode);
+                view.start_listing(cx);
+                let generation = if mode == ViewMode::Column {
+                    view.column_generation
+                } else {
+                    view.request_generation
+                };
+                let paths = view.watched_paths();
+                for _ in 0..20 {
+                    assert!(view.apply_watcher_event(
+                        view.watcher_generation,
+                        &paths,
+                        WatcherEvent {
+                            registration_id: 1,
+                            state: WatcherState::Changed,
+                            paths: vec![directory.join("changed.txt")],
+                            error: None,
+                        },
+                        cx,
+                    ));
+                }
+                let current = if mode == ViewMode::Column {
+                    view.column_generation
+                } else {
+                    view.request_generation
+                };
+                assert_eq!(current, generation, "watcher canceled {mode:?} listing");
+                assert!(view.watcher_refresh_pending);
+
+                let stale = DirectoryEvent::Failed {
+                    generation: generation.wrapping_sub(1),
+                    request: ListRequest {
+                        path: directory.clone(),
+                        calc_dir_size: false,
+                    },
+                    error: ServiceError::new(ErrorCode::Io, "stale failure"),
+                };
+                if mode == ViewMode::Column {
+                    view.apply_column_event(stale, cx);
+                } else {
+                    view.apply_event(stale, cx);
+                }
+                assert!(view.watcher_refresh_pending);
+                assert!(view.listing_in_flight());
+
+                // Deliver a held listing result after the burst, without relying on
+                // filesystem speed or test-executor scheduling to produce the race.
+                let listing_paths = if mode == ViewMode::Column {
+                    view.columns.paths()
+                } else {
+                    vec![directory.clone()]
+                };
+                for path in &listing_paths {
+                    if mode == ViewMode::Column && path != &directory {
+                        view.apply_column_event(
+                            DirectoryEvent::Failed {
+                                generation,
+                                request: ListRequest {
+                                    path: path.clone(),
+                                    calc_dir_size: false,
+                                },
+                                error: ServiceError::new(ErrorCode::Io, "ancestor unavailable"),
+                            },
+                            cx,
+                        );
+                        continue;
+                    }
+                    let event = DirectoryEvent::Listed {
+                        generation,
+                        request: ListRequest {
+                            path: path.clone(),
+                            calc_dir_size: false,
+                        },
+                        entries: vec![absolute_entry(path.join("before-refresh.txt"))],
+                    };
+                    if mode == ViewMode::Column {
+                        view.apply_column_event(event, cx);
+                    } else {
+                        view.apply_event(event, cx);
+                    }
+                }
+                assert_eq!(
+                    view.browser.entries()[0].path,
+                    directory.join("before-refresh.txt")
+                );
+                assert!(!view.watcher_refresh_pending);
+                let refreshed = if mode == ViewMode::Column {
+                    view.column_generation
+                } else {
+                    view.request_generation
+                };
+                assert_eq!(refreshed, generation + 1, "burst must schedule one refresh");
+                for path in listing_paths {
+                    let event = DirectoryEvent::Listed {
+                        generation: refreshed,
+                        request: ListRequest {
+                            path: path.clone(),
+                            calc_dir_size: false,
+                        },
+                        entries: vec![absolute_entry(path.join("after-refresh.txt"))],
+                    };
+                    if mode == ViewMode::Column {
+                        view.apply_column_event(event, cx);
+                    } else {
+                        view.apply_event(event, cx);
+                    }
+                }
+                assert!(!view.listing_in_flight());
+                assert!(matches!(view.state, ListingState::Ready));
+                assert_eq!(
+                    view.browser.entries()[0].path,
+                    directory.join("after-refresh.txt")
+                );
+                view.watcher_refresh_pending = true;
+                view.start_listing(cx);
+                assert!(
+                    !view.watcher_refresh_pending,
+                    "new navigation clears old refresh"
+                );
+                view.listing_task = None;
+                view.column_tasks.clear();
+            }
+        });
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[gpui::test]
+    fn watcher_invalidated_smart_search_restarts_but_user_cancel_stays_stopped(
+        cx: &mut TestAppContext,
+    ) {
+        let directory = fixture_dir();
+        let services = NativeServices::new(ResourcePaths::test(&directory));
+        let (view, window) =
+            cx.add_window_view(|_, cx| DirectoryWindow::new(directory.clone(), services, cx));
+        view.update(window, |view, cx| {
+            let id = view.browser.save_smart_folder(
+                "Text".into(),
+                SearchCriteria {
+                    search_paths: vec![directory.clone()],
+                    ..SearchCriteria::default()
+                },
+            );
+            assert!(view.browser.activate_smart_folder(id));
+            view.start_listing(cx);
+            let generation = view.search_generation;
+            assert!(view.apply_watcher_event(
+                view.watcher_generation,
+                &view.watched_paths(),
+                WatcherEvent {
+                    registration_id: 1,
+                    state: WatcherState::Changed,
+                    paths: vec![directory.join("new.txt")],
+                    error: None,
+                },
+                cx
+            ));
+            assert_eq!(view.search_generation, generation + 1);
+            view.apply_search_event(
+                SearchEvent::Failed {
+                    generation,
+                    error: ServiceError::new(ErrorCode::Cancelled, "invalidated search"),
+                },
+                cx,
+            );
+            assert!(view.search_task.is_some());
+            view.cancel_smart_search(cx);
+            assert!(view.search_task.is_none());
+            assert!(!view.watcher_refresh_pending);
+        });
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[gpui::test]

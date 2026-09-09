@@ -1,7 +1,9 @@
 # Explorie integrations
 
-Integrations are opt-in executable plugins. Settings → Integrations controls installation,
-configuration, enablement, updates and removal. No plugin is selected by default.
+Git, Obsidian and Syncthing integrations ship with Explorie as opt-in executable plugins.
+Settings → Integrations offers **Enable integration** and configuration. All three start
+disabled; no plugin process or connection starts until you enable it. Enabling requires
+no download, including in draft builds. Their integration versions update with Explorie.
 Syncthing, Git and Obsidian can contribute to the same folder. Remote Drives remains
 the existing native feature, linked from integration settings.
 
@@ -12,20 +14,24 @@ access. They are **trusted programs, not a sandbox**. Capability descriptions di
 intended use; they are not enforced permissions. Only install or load code you trust.
 The host owns every badge, decoration, detail row and action; plugins cannot supply UI code.
 
-Official provenance comes from the catalog embedded in the installed Explorie app,
+Bundled provenance comes from the catalog embedded in the installed Explorie app,
 never from a field a plugin can claim in its manifest. The catalog pins each package's
 target, version, exact HTTPS release URL and SHA-256. Third-party public installation
 and a marketplace are outside v1. Explicitly loaded local plugins are marked Development.
 
-Installation and enablement are separate from connecting Syncthing. Its plugin can detect
+Settings distinguishes integration enablement from passive detection of an existing Git
+executable, Obsidian application/URI handler, or Syncthing configuration. Detection starts
+no applications or connections, and configuration presence does not mean a daemon is running.
+
+Enablement is separate from connecting Syncthing. Its plugin can detect
 folder markers without connecting. An explicit connection reads the selected/discovered
 local Syncthing configuration; Explorie retains its path, not the API key. Git reads local
 repository state and does not fetch. Obsidian actions use its URI handler and do not edit
 vault configuration. Plugins are not bundled copies of these applications.
 
-Updates preserve enablement and configuration, including a previous Disable. Installation
-progress is shared across windows; downloading one integration does not lock another's
-settings. Obsidian vault actions address the vault by its folder name using the documented
+Updates preserve enablement and configuration, including a previous Disable. Bundled
+integrations can be disabled; their files are managed with the app. Obsidian vault actions
+address the vault by its folder name using the documented
 `vault` URI parameter; note actions use an encoded absolute file path. Vaults with identical
 folder names can be ambiguous for Open Vault; opening a selected note addresses its path.
 
@@ -111,22 +117,19 @@ local packages; use the same catalog that built the app.
 Each ZIP contains exactly `plugin.json` and its executable, preserving executable mode
 and signed bytes. The builder validates all inputs before emitting packages and requires
 plugin versions to equal the app version. Output includes three ZIPs, a platform catalog
-and a platform checksum file. Asset URLs use the immutable `vVERSION` GitHub release;
-unpublished versions cannot be installed from the official catalog until their assets exist.
+and a platform checksum file. The exact verified ZIPs ship inside the desktop installer
+alongside the embedded catalog. First launch verifies and extracts them into Explorie's
+integration storage without enabling them. Later app upgrades refresh bundled versions
+while preserving enablement and configuration. Published ZIP assets remain available for
+developer use; bundled activation does not depend on their URLs.
 
 ### Personal testing from a draft release
 
-GitHub draft assets require an authenticated download. The app's anonymous catalog URLs
-cannot install plugins from a draft, so Settings → Install will remain unavailable until
-publication. For personal testing, download the matching platform ZIPs from the draft while
-signed in as the repository owner (or use `gh release download v0.3.2 --repo oshtz/explorie
---pattern 'explorie-plugin-*.zip'`). Extract each plugin to its own directory, then launch
-the packaged app with `--load-plugin-dir <extracted-directory>` for each plugin to test.
-These packages appear as Development and can be enabled in Settings → Integrations.
-Quit the running app before relaunching with these flags.
-
-This exercises the plugin behavior without publishing the release. It does not establish
-official catalog download/install/update proof; that remains a separate release check.
+Download the desktop installer while signed into GitHub as the repository owner. In
+Settings → Integrations, choose **Enable integration** for the integrations you want.
+No separate plugin download or developer flag is required. Syncthing live status still
+requires an explicit connection in Configure. Test disable/re-enable and settings persistence
+as well as upgrading from a prior build with enabled integrations.
 
 The release workflow packages plugins before compiling the app. On macOS it signs each
 executable with the existing Developer ID identity and hardened runtime, submits each ZIP
@@ -137,10 +140,10 @@ retrieves tickets for notarized executable bytes. See Apple's
 
 Existing draft-release, checksum, signing and publication gates remain in force. Candidate
 and publication jobs verify all desktop and plugin assets. Real-machine attestations include
-downloading/enabling plugins from the packaged app. Neither fixture ZIP tests nor a local
+enabling bundled plugins from the packaged app. Neither fixture ZIP tests nor a local
 build establishes macOS readiness: verify downloaded execution on macOS before release.
-Also exercise Windows downloaded installation, disable/re-enable, failed update recovery,
-uninstall and settings persistence in the packaged application.
+Also exercise Windows installer upgrades, disable/re-enable, failed update recovery,
+and settings persistence in the packaged application.
 
 Run `node --test scripts/package-plugins.test.mjs` for packaging compatibility, byte/mode
 preservation, integrity failure, input failure recovery and release-order tests. The runtime

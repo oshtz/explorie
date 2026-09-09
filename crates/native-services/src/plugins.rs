@@ -37,6 +37,7 @@ pub fn platform_target() -> &'static str {
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub enum PluginSource {
     Official,
+    Bundled,
     Development,
 }
 
@@ -50,6 +51,7 @@ pub struct PluginStatus {
     pub configuration: Value,
     pub error: Option<String>,
     pub update_available: bool,
+    pub dependency_status: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -66,6 +68,8 @@ struct Installed {
     source: PluginSource,
     #[serde(default)]
     preferences: Preferences,
+    #[serde(default)]
+    package_sha256: Option<String>,
 }
 
 #[derive(Default, Deserialize, Serialize)]
@@ -89,6 +93,9 @@ pub struct PluginManager {
     runtimes: Mutex<HashMap<String, Arc<Mutex<Runtime>>>>,
     mutations: Mutex<()>,
     installing: Mutex<HashSet<String>>,
+    bundled_catalog: Mutex<HashSet<String>>,
+    // Persisted bundled packages must be checked against this application's catalog each launch.
+    verified_bundled: Mutex<HashSet<String>>,
     shutting_down: AtomicBool,
 }
 
@@ -137,6 +144,8 @@ impl PluginService {
                 runtimes: Mutex::new(HashMap::new()),
                 mutations: Mutex::new(()),
                 installing: Mutex::new(HashSet::new()),
+                bundled_catalog: Mutex::new(HashSet::new()),
+                verified_bundled: Mutex::new(HashSet::new()),
                 shutting_down: AtomicBool::new(false),
             }),
         }
@@ -157,6 +166,7 @@ impl PluginService {
             let catalog = service.catalog();
             let installed = lock(&service.manager.registry).installed.clone();
             let installing = lock(&service.manager.installing).clone();
+            let bundled_catalog = lock(&service.manager.bundled_catalog).clone();
             let mut statuses = BTreeMap::new();
             for entry in catalog
                 .iter()
@@ -166,35 +176,58 @@ impl PluginService {
                     entry.manifest.id.clone(),
                     PluginStatus {
                         manifest: entry.manifest.clone(),
-                        source: PluginSource::Official,
+                        source: if bundled_catalog.contains(&entry.manifest.id) {
+                            PluginSource::Bundled
+                        } else {
+                            PluginSource::Official
+                        },
                         installed: false,
                         installing: installing.contains(&entry.manifest.id),
                         enabled: false,
                         configuration: Value::Null,
-                        error: service.manager.registry_error.clone(),
+                        error: service.manager.registry_error.clone().or_else(|| {
+                            bundled_catalog.contains(&entry.manifest.id).then(|| {
+                                "Bundled integration is unavailable; repair or reinstall Explorie".into()
+                            })
+                        }),
                         update_available: false,
+                        dependency_status: super::plugin_detection::detect_dependency(
+                            &entry.manifest.id,
+                        ),
                     },
                 );
             }
             for (id, record) in installed {
                 let runtime = service.runtime(&id);
                 let runtime = lock(&runtime);
+                let bundled = record.source == PluginSource::Bundled
+                    || (record.source != PluginSource::Development && bundled_catalog.contains(&id));
                 statuses.insert(
                     id.clone(),
                     PluginStatus {
                         manifest: record.manifest.clone(),
-                        source: record.source,
+                        source: if bundled { PluginSource::Bundled } else { record.source },
                         installed: true,
                         installing: installing.contains(&id),
                         enabled: record.preferences.enabled,
                         configuration: record.preferences.configuration,
-                        error: runtime.error.clone(),
-                        update_available: record.source == PluginSource::Official
+                        error: if bundled
+                            && !lock(&service.manager.verified_bundled).contains(&id)
+                        {
+                            Some(
+                                "Bundled integration is unavailable; repair or reinstall Explorie"
+                                    .into(),
+                            )
+                        } else {
+                            runtime.error.clone()
+                        },
+                        update_available: !bundled && record.source == PluginSource::Official
                             && catalog.iter().any(|entry| {
                                 entry.target == platform_target()
                                     && entry.manifest.id == id
                                     && entry.manifest.version != record.manifest.version
                             }),
+                        dependency_status: super::plugin_detection::detect_dependency(&id),
                     },
                 );
             }
@@ -261,6 +294,12 @@ impl PluginService {
         let service = self.clone();
         self.context.spawn_blocking(move || {
             service.require_registry()?;
+            if lock(&service.manager.bundled_catalog).contains(&id)
+                || lock(&service.manager.registry).installed.get(&id)
+                    .is_some_and(|record| record.source == PluginSource::Bundled)
+            {
+                return Err(failure("Bundled integrations cannot be downloaded separately; repair or reinstall Explorie"));
+            }
             let entry = service
                 .catalog()
                 .into_iter()
@@ -319,6 +358,66 @@ impl PluginService {
         })
     }
 
+    /// Registers the packages shipped with this app, without launching or downloading them.
+    /// Hashes come from the host's embedded catalog, never from the package directory.
+    pub fn load_bundled(&self, directory: PathBuf) -> BlockingTask<()> {
+        let service = self.clone();
+        self.context.spawn_blocking(move || {
+            let _mutation = lock(&service.manager.mutations);
+            let entries: Vec<_> = service
+                .catalog()
+                .into_iter()
+                .filter(|entry| entry.target == platform_target())
+                .collect();
+            let bundled_catalog: HashSet<_> = entries
+                .iter()
+                .map(|entry| entry.manifest.id.clone())
+                .collect();
+            *lock(&service.manager.bundled_catalog) = bundled_catalog.clone();
+            service.require_registry()?;
+            lock(&service.manager.verified_bundled).clear();
+            let bundled_ids: Vec<_> = lock(&service.manager.registry)
+                .installed
+                .iter()
+                .filter(|(id, record)| {
+                    record.source == PluginSource::Bundled
+                        || (record.source != PluginSource::Development
+                            && bundled_catalog.contains(*id))
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in bundled_ids {
+                service.stop(&id);
+            }
+            let mut first_error = None;
+            for entry in entries {
+                let id = entry.manifest.id.clone();
+                if lock(&service.manager.registry)
+                    .installed
+                    .get(&id)
+                    .is_some_and(|record| record.source == PluginSource::Development)
+                {
+                    continue;
+                }
+                let result = (|| {
+                    let filename = entry.asset_url.rsplit('/').next().unwrap_or_default();
+                    if !is_root_filename(Path::new(filename)) {
+                        return Err(failure("Invalid bundled integration package filename"));
+                    }
+                    let bytes = read_bounded(&directory.join(filename), MAX_PACKAGE_BYTES)?;
+                    service.install_package(&entry, &bytes, PluginSource::Bundled)?;
+                    lock(&service.manager.verified_bundled).insert(id.clone());
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    first_error.get_or_insert(error);
+                }
+            }
+            service.changed();
+            first_error.map_or(Ok(()), Err)
+        })
+    }
+
     pub fn configure(&self, id: String, configuration: Value) -> BlockingTask<()> {
         self.change_record(id, move |record| {
             record.preferences.configuration = configuration;
@@ -354,6 +453,14 @@ impl PluginService {
             let removed = records
                 .remove(&id)
                 .ok_or_else(|| failure("Integration is not installed"))?;
+            if removed.source == PluginSource::Bundled
+                || (removed.source != PluginSource::Development
+                    && lock(&service.manager.bundled_catalog).contains(&id))
+            {
+                return Err(failure(
+                    "Bundled integrations cannot be uninstalled; disable the integration instead",
+                ));
+            }
             commit_plugin_change(&service, records, &id)?;
             if removed.source == PluginSource::Official {
                 remove_owned_directory(&service.manager.root, &removed.directory)?;
@@ -372,11 +479,12 @@ impl PluginService {
             let _mutation = lock(&service.manager.mutations);
             let id = manifest.id.clone();
             if lock(&service.manager.registry).installed.contains_key(&id) {
-                return Err(failure("An integration with this identity is already loaded; disable or uninstall it first"));
+                return Err(failure("An integration with this identity is already loaded; use a distinct development integration identity"));
             }
             lock(&service.manager.registry).installed.insert(id, Installed {
                 manifest, directory, source: PluginSource::Development,
                 preferences: Preferences::default(),
+                package_sha256: None,
             });
             service.changed();
             Ok(())
@@ -456,7 +564,7 @@ impl PluginService {
         let persisted = Registry {
             installed: records
                 .iter()
-                .filter(|(_, record)| record.source == PluginSource::Official)
+                .filter(|(_, record)| record.source != PluginSource::Development)
                 .map(|(id, record)| (id.clone(), record.clone()))
                 .collect(),
         };
@@ -472,6 +580,16 @@ impl PluginService {
     }
 
     fn install_bytes(&self, entry: &CatalogEntry, bytes: &[u8]) -> ServiceResult<()> {
+        self.install_package(entry, bytes, PluginSource::Official)
+    }
+
+    fn install_package(
+        &self,
+        entry: &CatalogEntry,
+        bytes: &[u8],
+        source: PluginSource,
+    ) -> ServiceResult<()> {
+        self.require_registry()?;
         entry.manifest.validate().map_err(failure)?;
         if entry.target != platform_target() {
             return Err(failure("Package platform is incompatible"));
@@ -480,6 +598,30 @@ impl PluginService {
             || !format!("{:x}", Sha256::digest(bytes)).eq_ignore_ascii_case(&entry.sha256)
         {
             return Err(failure("Integration package failed its integrity check"));
+        }
+        let old = lock(&self.manager.registry)
+            .installed
+            .get(&entry.manifest.id)
+            .cloned();
+        if old
+            .as_ref()
+            .is_some_and(|record| record.source == PluginSource::Development)
+        {
+            return Err(failure(
+                "Uninstall the development integration before installing the official package",
+            ));
+        }
+        if source == PluginSource::Bundled
+            && let Some(record) = &old
+            && record.source == PluginSource::Bundled
+            && record.manifest == entry.manifest
+            && record
+                .package_sha256
+                .as_deref()
+                .is_some_and(|hash| hash.eq_ignore_ascii_case(&entry.sha256))
+            && cached_package_matches(&self.manager.root, record, bytes).unwrap_or(false)
+        {
+            return Ok(());
         }
         fs::create_dir_all(&self.manager.root)?;
         let name = PathBuf::from(format!("{}-{}", entry.manifest.id, uuid::Uuid::new_v4()));
@@ -495,20 +637,11 @@ impl PluginService {
             }
             validate_executable(&directory, &manifest)?;
             let mut records = lock(&self.manager.registry).installed.clone();
-            let old = records.get(&manifest.id).cloned();
-            if old
-                .as_ref()
-                .is_some_and(|old| old.source == PluginSource::Development)
-            {
-                return Err(failure(
-                    "Uninstall the development integration before installing the official package",
-                ));
-            }
             let preferences =
                 old.as_ref()
                     .map(|old| old.preferences.clone())
                     .unwrap_or(Preferences {
-                        enabled: true,
+                        enabled: source == PluginSource::Official,
                         ..Preferences::default()
                     });
             records.insert(
@@ -516,8 +649,9 @@ impl PluginService {
                 Installed {
                     manifest,
                     directory: name.clone(),
-                    source: PluginSource::Official,
+                    source,
                     preferences,
+                    package_sha256: Some(entry.sha256.clone()),
                 },
             );
             commit_plugin_change(self, records, &entry.manifest.id)?;
@@ -585,12 +719,21 @@ impl PluginService {
             .cloned()
             .filter(|record| record.preferences.enabled)
             .ok_or_else(|| failure("Integration is disabled or uninstalled"))?;
+        if (record.source == PluginSource::Bundled
+            || (record.source != PluginSource::Development
+                && lock(&self.manager.bundled_catalog).contains(id)))
+            && !lock(&self.manager.verified_bundled).contains(id)
+        {
+            return Err(failure(
+                "Bundled integration is unavailable; repair or reinstall Explorie",
+            ));
+        }
         if let Some(error) = &runtime.error {
             return Err(failure(error.clone()));
         }
         let result = (|| {
             if runtime.process.is_none() {
-                let directory = if record.source == PluginSource::Official {
+                let directory = if record.source != PluginSource::Development {
                     self.manager.root.join(&record.directory)
                 } else {
                     record.directory.clone()
@@ -655,7 +798,7 @@ fn read_registry(root: &Path) -> ServiceResult<Registry> {
     for (id, record) in &registry.installed {
         record.manifest.validate().map_err(failure)?;
         if id != &record.manifest.id
-            || record.source != PluginSource::Official
+            || record.source == PluginSource::Development
             || !is_root_filename(&record.directory)
         {
             return Err(failure(
@@ -683,6 +826,28 @@ fn read_manifest(directory: &Path) -> ServiceResult<Manifest> {
             .map_err(|_| failure("Invalid integration manifest"))?;
     manifest.validate().map_err(failure)?;
     Ok(manifest)
+}
+
+fn cached_package_matches(root: &Path, record: &Installed, bytes: &[u8]) -> ServiceResult<bool> {
+    let root = root.canonicalize()?;
+    let directory = root.join(&record.directory);
+    if fs::symlink_metadata(&directory)?.file_type().is_symlink()
+        || directory.canonicalize()?.parent() != Some(root.as_path())
+        || read_manifest(&directory)? != record.manifest
+    {
+        return Ok(false);
+    }
+    let executable = validate_executable(&directory, &record.manifest)?;
+    let cached = read_bounded(&executable, MAX_PACKAGE_BYTES)?;
+    let mut package = zip::ZipArchive::new(std::io::Cursor::new(bytes))
+        .map_err(|_| failure("Invalid integration archive"))?;
+    let mut expected = Vec::new();
+    package
+        .by_name(&record.manifest.executables[platform_target()])
+        .map_err(|_| failure("Integration archive executable is missing"))?
+        .take(MAX_PACKAGE_BYTES + 1)
+        .read_to_end(&mut expected)?;
+    Ok(cached == expected)
 }
 
 fn validate_executable(directory: &Path, manifest: &Manifest) -> ServiceResult<PathBuf> {
@@ -1097,6 +1262,10 @@ mod tests {
     }
 
     fn archive(manifest: &Manifest) -> Vec<u8> {
+        archive_with_executable(manifest, b"placeholder executable")
+    }
+
+    fn archive_with_executable(manifest: &Manifest, executable: &[u8]) -> Vec<u8> {
         let mut archive = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
         let options = zip::write::SimpleFileOptions::default();
         archive.start_file("plugin.json", options).unwrap();
@@ -1109,7 +1278,7 @@ mod tests {
                 options.unix_permissions(0o755),
             )
             .unwrap();
-        archive.write_all(b"placeholder executable").unwrap();
+        archive.write_all(executable).unwrap();
         archive.finish().unwrap().into_inner()
     }
 
@@ -1180,6 +1349,387 @@ fn main() {
         );
         assert!(lock(&service.manager.runtimes).is_empty());
         assert!(!service.manager.root.exists());
+    }
+
+    fn bundled_fixture(
+        service: &PluginService,
+        directory: &Path,
+        manifest: Manifest,
+        bytes: &[u8],
+    ) {
+        fs::write(directory.join("package.zip"), bytes).unwrap();
+        service.set_catalog(vec![catalog(manifest, bytes)]);
+    }
+
+    #[test]
+    fn bundled_package_is_offline_opt_in_and_executes_after_enablement() {
+        let root = tempfile::tempdir().unwrap();
+        let packages = tempfile::tempdir().unwrap();
+        let service = service(root.path());
+        let executable =
+            fs::read(fixture_directory().join(&manifest().executables[platform_target()])).unwrap();
+        let bytes = archive_with_executable(&manifest(), &executable);
+        bundled_fixture(&service, packages.path(), manifest(), &bytes);
+        service
+            .load_bundled(packages.path().to_owned())
+            .wait()
+            .unwrap();
+        let status = service.list().wait().unwrap().remove(0);
+        assert!(status.installed);
+        assert_eq!(status.source, PluginSource::Bundled);
+        assert!(!status.enabled);
+        assert!(!status.update_available);
+        assert!(
+            service
+                .inspect(Inspection::default())
+                .wait()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            lock(&service.manager.runtimes)
+                .values()
+                .all(|runtime| lock(runtime).process.is_none())
+        );
+        service.set_enabled("fixture".into(), true).wait().unwrap();
+        let result = service
+            .inspect(Inspection::default())
+            .wait()
+            .unwrap()
+            .remove(0);
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert_eq!(
+            result.contribution.unwrap().badge.as_deref(),
+            Some("Fixture")
+        );
+        assert!(service.uninstall("fixture".into()).wait().is_err());
+        service.shutdown().wait().unwrap();
+    }
+
+    #[test]
+    fn missing_or_corrupt_bundles_never_offer_a_download_on_a_fresh_profile() {
+        for corrupt in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let packages = tempfile::tempdir().unwrap();
+            let service = service(root.path());
+            let bytes = archive(&manifest());
+            service.set_catalog(vec![catalog(manifest(), &bytes)]);
+            if corrupt {
+                fs::write(packages.path().join("package.zip"), b"corrupt").unwrap();
+            }
+            assert!(
+                service
+                    .load_bundled(packages.path().to_owned())
+                    .wait()
+                    .is_err()
+            );
+            let status = service.list().wait().unwrap().remove(0);
+            assert_eq!(status.source, PluginSource::Bundled);
+            assert!(!status.installed);
+            assert!(!status.enabled);
+            assert!(!status.update_available);
+            assert!(status.error.unwrap().contains("repair or reinstall"));
+            let error = service.install("fixture".into()).wait().unwrap_err();
+            assert!(error.message.contains("cannot be downloaded separately"));
+            assert!(!service.manager.root.exists());
+            assert!(lock(&service.manager.runtimes).is_empty());
+        }
+    }
+
+    #[test]
+    fn bundled_updates_preserve_preferences_and_skip_only_matching_valid_packages() {
+        let root = tempfile::tempdir().unwrap();
+        let packages = tempfile::tempdir().unwrap();
+        let service = service(root.path());
+        let bytes = archive(&manifest());
+        bundled_fixture(&service, packages.path(), manifest(), &bytes);
+        service
+            .load_bundled(packages.path().to_owned())
+            .wait()
+            .unwrap();
+        service.set_enabled("fixture".into(), true).wait().unwrap();
+        service
+            .configure("fixture".into(), json!({"folder":"chosen"}))
+            .wait()
+            .unwrap();
+        let first_directory = lock(&service.manager.registry).installed["fixture"]
+            .directory
+            .clone();
+        let restored = PluginService::new(service.context.clone(), service.catalog());
+        restored
+            .load_bundled(packages.path().to_owned())
+            .wait()
+            .unwrap();
+        assert_eq!(
+            lock(&restored.manager.registry).installed["fixture"].directory,
+            first_directory
+        );
+        let cached_executable = restored
+            .manager
+            .root
+            .join(&first_directory)
+            .join(&manifest().executables[platform_target()]);
+        let mut corrupted = fs::read(&cached_executable).unwrap();
+        corrupted[0] ^= 1; // Same filename and length must not conceal corruption.
+        fs::write(cached_executable, corrupted).unwrap();
+        restored
+            .load_bundled(packages.path().to_owned())
+            .wait()
+            .unwrap();
+        let repaired_directory = lock(&restored.manager.registry).installed["fixture"]
+            .directory
+            .clone();
+        assert_ne!(first_directory, repaired_directory);
+        assert_eq!(
+            fs::read(
+                restored
+                    .manager
+                    .root
+                    .join(&repaired_directory)
+                    .join(&manifest().executables[platform_target()])
+            )
+            .unwrap(),
+            b"placeholder executable"
+        );
+        let changed_bytes =
+            archive_with_executable(&manifest(), b"updated executable bytes, same version");
+        bundled_fixture(&restored, packages.path(), manifest(), &changed_bytes);
+        restored
+            .load_bundled(packages.path().to_owned())
+            .wait()
+            .unwrap();
+        let replaced_directory = lock(&restored.manager.registry).installed["fixture"]
+            .directory
+            .clone();
+        assert_ne!(repaired_directory, replaced_directory);
+        assert!(!restored.manager.root.join(first_directory).exists());
+        fs::remove_file(
+            restored
+                .manager
+                .root
+                .join(&replaced_directory)
+                .join(&manifest().executables[platform_target()]),
+        )
+        .unwrap();
+        restored
+            .load_bundled(packages.path().to_owned())
+            .wait()
+            .unwrap();
+        assert_ne!(
+            lock(&restored.manager.registry).installed["fixture"].directory,
+            replaced_directory
+        );
+        let mut updated = manifest();
+        updated.version = "2.0.0".into();
+        let updated_bytes = archive(&updated);
+        bundled_fixture(&restored, packages.path(), updated, &updated_bytes);
+        restored
+            .load_bundled(packages.path().to_owned())
+            .wait()
+            .unwrap();
+        let status = restored.list().wait().unwrap().remove(0);
+        assert_eq!(status.manifest.version, "2.0.0");
+        assert!(status.enabled);
+        assert_eq!(status.configuration["folder"], "chosen");
+        assert!(!status.update_available);
+        restored
+            .set_enabled("fixture".into(), false)
+            .wait()
+            .unwrap();
+        let restarted = PluginService::new(restored.context.clone(), restored.catalog());
+        restarted
+            .load_bundled(packages.path().to_owned())
+            .wait()
+            .unwrap();
+        assert!(!restarted.list().wait().unwrap()[0].enabled);
+    }
+
+    #[test]
+    fn bundled_migration_preserves_official_preferences_and_development_provenance() {
+        let root = tempfile::tempdir().unwrap();
+        let packages = tempfile::tempdir().unwrap();
+        let service = service(root.path());
+        let bytes = archive(&manifest());
+        service
+            .install_bytes(&catalog(manifest(), &bytes), &bytes)
+            .unwrap();
+        service
+            .configure("fixture".into(), json!({"configured":true}))
+            .wait()
+            .unwrap();
+        bundled_fixture(&service, packages.path(), manifest(), &bytes);
+        service
+            .load_bundled(packages.path().to_owned())
+            .wait()
+            .unwrap();
+        let status = service.list().wait().unwrap().remove(0);
+        assert_eq!(status.source, PluginSource::Bundled);
+        assert!(status.enabled);
+        assert_eq!(status.configuration["configured"], true);
+
+        let other_root = tempfile::tempdir().unwrap();
+        let development = self::service(other_root.path());
+        development
+            .load_development(fixture_directory().to_owned())
+            .wait()
+            .unwrap();
+        bundled_fixture(&development, packages.path(), manifest(), &bytes);
+        development
+            .load_bundled(packages.path().to_owned())
+            .wait()
+            .unwrap();
+        assert_eq!(
+            development.list().wait().unwrap()[0].source,
+            PluginSource::Development
+        );
+        assert!(!development.manager.root.exists());
+    }
+
+    #[test]
+    fn missing_or_invalid_bundle_cannot_run_a_persisted_package_or_replace_it() {
+        let root = tempfile::tempdir().unwrap();
+        let packages = tempfile::tempdir().unwrap();
+        let service = service(root.path());
+        let executable =
+            fs::read(fixture_directory().join(&manifest().executables[platform_target()])).unwrap();
+        let bytes = archive_with_executable(&manifest(), &executable);
+        bundled_fixture(&service, packages.path(), manifest(), &bytes);
+        service
+            .load_bundled(packages.path().to_owned())
+            .wait()
+            .unwrap();
+        service.set_enabled("fixture".into(), true).wait().unwrap();
+        assert!(
+            service.inspect(Inspection::default()).wait().unwrap()[0]
+                .error
+                .is_none()
+        );
+        let registry_before = fs::read(service.manager.root.join("registry.json")).unwrap();
+        let directory = lock(&service.manager.registry).installed["fixture"]
+            .directory
+            .clone();
+
+        let restored = PluginService::new(service.context.clone(), service.catalog());
+        assert!(
+            restored.inspect(Inspection::default()).wait().unwrap()[0]
+                .error
+                .is_some()
+        );
+        fs::write(packages.path().join("package.zip"), b"invalid archive").unwrap();
+        assert!(
+            service
+                .load_bundled(packages.path().to_owned())
+                .wait()
+                .is_err()
+        );
+        assert!(
+            service.inspect(Inspection::default()).wait().unwrap()[0]
+                .error
+                .is_some()
+        );
+        assert!(lock(&service.runtime("fixture")).process.is_none());
+        let unavailable = service.list().wait().unwrap().remove(0);
+        assert!(unavailable.error.is_some());
+        assert!(
+            unavailable.enabled,
+            "Unavailability must preserve the user's opt-in preference"
+        );
+        service.retry("fixture".into()).wait().unwrap();
+        assert!(
+            service.inspect(Inspection::default()).wait().unwrap()[0]
+                .error
+                .is_some()
+        );
+        assert_eq!(
+            fs::read(service.manager.root.join("registry.json")).unwrap(),
+            registry_before
+        );
+        assert!(
+            service
+                .manager
+                .root
+                .join(directory)
+                .join("plugin.json")
+                .is_file()
+        );
+        assert!(
+            restored
+                .load_bundled(packages.path().join("missing"))
+                .wait()
+                .is_err()
+        );
+        assert!(
+            restored.inspect(Inspection::default()).wait().unwrap()[0]
+                .error
+                .is_some()
+        );
+
+        fs::write(packages.path().join("package.zip"), bytes).unwrap();
+        service
+            .load_bundled(packages.path().to_owned())
+            .wait()
+            .unwrap();
+        assert!(
+            service.inspect(Inspection::default()).wait().unwrap()[0]
+                .error
+                .is_none()
+        );
+        service.shutdown().wait().unwrap();
+    }
+
+    #[test]
+    fn failed_bundled_migration_blocks_the_previous_downloaded_executable() {
+        let root = tempfile::tempdir().unwrap();
+        let packages = tempfile::tempdir().unwrap();
+        let service = service(root.path());
+        let executable =
+            fs::read(fixture_directory().join(&manifest().executables[platform_target()])).unwrap();
+        let bytes = archive_with_executable(&manifest(), &executable);
+        service
+            .install_bytes(&catalog(manifest(), &bytes), &bytes)
+            .unwrap();
+        assert!(
+            service.inspect(Inspection::default()).wait().unwrap()[0]
+                .error
+                .is_none()
+        );
+        let registry_before = fs::read(service.manager.root.join("registry.json")).unwrap();
+        bundled_fixture(&service, packages.path(), manifest(), &bytes);
+        fs::write(packages.path().join("package.zip"), b"corrupt").unwrap();
+        assert!(
+            service
+                .load_bundled(packages.path().to_owned())
+                .wait()
+                .is_err()
+        );
+        assert!(lock(&service.runtime("fixture")).process.is_none());
+        assert!(
+            service.inspect(Inspection::default()).wait().unwrap()[0]
+                .error
+                .is_some()
+        );
+        let status = service.list().wait().unwrap().remove(0);
+        assert_eq!(status.source, PluginSource::Bundled);
+        assert!(status.enabled);
+        assert!(status.error.is_some());
+        assert!(!status.update_available);
+        assert!(service.install("fixture".into()).wait().is_err());
+        assert!(service.uninstall("fixture".into()).wait().is_err());
+        assert_eq!(
+            fs::read(service.manager.root.join("registry.json")).unwrap(),
+            registry_before
+        );
+        fs::write(packages.path().join("package.zip"), bytes).unwrap();
+        service
+            .load_bundled(packages.path().to_owned())
+            .wait()
+            .unwrap();
+        assert!(
+            service.inspect(Inspection::default()).wait().unwrap()[0]
+                .error
+                .is_none()
+        );
+        service.shutdown().wait().unwrap();
     }
 
     #[test]
@@ -1316,6 +1866,7 @@ fn main() {
         fs::write(directory.join("registry.json"), b"broken").unwrap();
         let service = service(root.path());
         assert!(service.set_enabled("fixture".into(), true).wait().is_err());
+        assert!(service.load_bundled(root.path().to_owned()).wait().is_err());
         assert_eq!(
             fs::read(directory.join("registry.json")).unwrap(),
             b"broken"
@@ -1572,6 +2123,16 @@ fn main() {
     #[test]
     #[ignore = "Set EXPLORIE_PLUGIN_SMOKE_CATALOG to a locally built official catalog"]
     fn official_packages_install_and_execute_through_native_manager() {
+        real_packages_execute(false);
+    }
+
+    #[test]
+    #[ignore = "Set EXPLORIE_PLUGIN_SMOKE_CATALOG and optionally EXPLORIE_PLUGIN_SMOKE_DIRECTORY to bundled packages"]
+    fn official_bundled_packages_install_and_execute_through_native_manager() {
+        real_packages_execute(true);
+    }
+
+    fn real_packages_execute(bundled: bool) {
         let catalog_path = PathBuf::from(
             std::env::var_os("EXPLORIE_PLUGIN_SMOKE_CATALOG")
                 .expect("Set EXPLORIE_PLUGIN_SMOKE_CATALOG"),
@@ -1582,11 +2143,44 @@ fn main() {
         let root = tempfile::tempdir().unwrap();
         let service = service(root.path());
         service.set_catalog(entries.clone());
-        for entry in &entries {
-            let filename = entry.asset_url.rsplit('/').next().unwrap();
-            assert!(is_root_filename(Path::new(filename)));
-            let bytes = fs::read(catalog_path.parent().unwrap().join(filename)).unwrap();
-            service.install_bytes(entry, &bytes).unwrap();
+        if bundled {
+            let package_directory = std::env::var_os("EXPLORIE_PLUGIN_SMOKE_DIRECTORY")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| catalog_path.parent().unwrap().to_owned());
+            service.load_bundled(package_directory).wait().unwrap();
+            assert!(
+                service
+                    .list()
+                    .wait()
+                    .unwrap()
+                    .iter()
+                    .all(|status| status.installed && !status.enabled)
+            );
+            assert!(
+                service
+                    .inspect(Inspection::default())
+                    .wait()
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                lock(&service.manager.runtimes)
+                    .values()
+                    .all(|runtime| lock(runtime).process.is_none())
+            );
+            for entry in &entries {
+                service
+                    .set_enabled(entry.manifest.id.clone(), true)
+                    .wait()
+                    .unwrap();
+            }
+        } else {
+            for entry in &entries {
+                let filename = entry.asset_url.rsplit('/').next().unwrap();
+                assert!(is_root_filename(Path::new(filename)));
+                let bytes = fs::read(catalog_path.parent().unwrap().join(filename)).unwrap();
+                service.install_bytes(entry, &bytes).unwrap();
+            }
         }
         let folder = root.path().join("fixture-folder");
         fs::create_dir_all(folder.join(".stfolder")).unwrap();
@@ -1624,7 +2218,11 @@ fn main() {
                     .find(|status| status.manifest.id == result.id)
                     .unwrap()
                     .source,
-                PluginSource::Official
+                if bundled {
+                    PluginSource::Bundled
+                } else {
+                    PluginSource::Official
+                }
             );
         }
         service.shutdown().wait().unwrap();

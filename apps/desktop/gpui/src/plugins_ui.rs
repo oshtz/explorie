@@ -35,6 +35,26 @@ pub fn initialize_plugins(
     services: &NativeServices,
     args: impl IntoIterator<Item = OsString>,
 ) -> Result<(), String> {
+    let executable = std::env::current_exe().map_err(|e| e.to_string())?;
+    initialize_plugins_at(services, args, Some(bundled_plugin_directory(&executable)))
+}
+
+fn bundled_plugin_directory(executable: &Path) -> PathBuf {
+    let parent = executable
+        .parent()
+        .expect("Executable has a parent directory");
+    if parent.file_name().is_some_and(|name| name == "MacOS") {
+        parent.join("../Resources/plugins")
+    } else {
+        parent.join("plugins")
+    }
+}
+
+fn initialize_plugins_at(
+    services: &NativeServices,
+    args: impl IntoIterator<Item = OsString>,
+    bundled_directory: Option<PathBuf>,
+) -> Result<(), String> {
     let mut catalog: Vec<CatalogEntry> = serde_json::from_str(include_str!(concat!(
         env!("OUT_DIR"),
         "/plugin-catalog.json"
@@ -62,6 +82,15 @@ pub fn initialize_plugins(
         }
     }
     services.plugins.set_catalog(catalog);
+    if let Some(directory) = bundled_directory
+        && (directory.is_dir() || !cfg!(debug_assertions))
+    {
+        services
+            .plugins
+            .load_bundled(directory)
+            .wait()
+            .map_err(|e| e.to_string())?;
+    }
     let mut args = args.into_iter().skip(1);
     while let Some(arg) = args.next() {
         if arg == "--load-plugin" {
@@ -568,11 +597,12 @@ impl DirectoryWindow {
             let id = status.manifest.id.clone();
             let busy = status.installing || self.plugin_ui.busy.contains(&id);
             let source = match status.source {
+                PluginSource::Bundled => "Included with Explorie",
                 PluginSource::Official => "Official",
                 PluginSource::Development => "Development — local trusted code",
             };
             let mut buttons = Vec::new();
-            if !status.installed {
+            if !status.enabled && (status.installed || status.source != PluginSource::Bundled) {
                 let selected = self.plugin_ui.selected.contains(&id);
                 let select_id = id.clone();
                 buttons.push(
@@ -593,14 +623,18 @@ impl DirectoryWindow {
                     }))
                     .into_any_element(),
                 );
+            }
+            if !status.installed && status.source != PluginSource::Bundled {
                 let install_id = id.clone();
+                let install_selector = format!("plugin-install-{id}");
                 buttons.push(
                     toolbar_button_enabled(
                         ElementId::Name(format!("plugin-install-{id}").into()),
-                        "Install and Enable",
+                        "Install integration",
                         self.palette.control,
                         !busy,
                     )
+                    .debug_selector(move || install_selector.clone())
                     .on_click(cx.listener(move |view, _, _, cx| {
                         if view.plugin_ui.busy.contains(&install_id) {
                             return;
@@ -610,16 +644,22 @@ impl DirectoryWindow {
                     }))
                     .into_any_element(),
                 );
-            } else {
+            } else if status.installed {
                 let enable_id = id.clone();
                 let enabled = status.enabled;
+                let enable_selector = format!("plugin-enable-{id}");
                 buttons.push(
                     toolbar_button_enabled(
                         ElementId::Name(format!("plugin-enable-{id}").into()),
-                        if enabled { "Disable" } else { "Enable" },
+                        if enabled {
+                            "Disable integration"
+                        } else {
+                            "Enable integration"
+                        },
                         self.palette.control,
                         !busy,
                     )
+                    .debug_selector(move || enable_selector.clone())
                     .on_click(cx.listener(move |view, _, _, cx| {
                         if view.plugin_ui.busy.contains(&enable_id) {
                             return;
@@ -657,33 +697,37 @@ impl DirectoryWindow {
                     }))
                     .into_any_element(),
                 );
-                let uninstall_id = id.clone();
-                buttons.push(
-                    toolbar_button_enabled(
-                        ElementId::Name(format!("plugin-uninstall-{id}").into()),
-                        "Uninstall",
-                        self.palette.control,
-                        !busy,
-                    )
-                    .on_click(cx.listener(move |view, _, _, cx| {
-                        if view.plugin_ui.busy.contains(&uninstall_id) {
-                            return;
-                        }
-                        view.plugin_ui.results.remove(&uninstall_id);
-                        if let Some(status) = view
-                            .plugin_ui
-                            .statuses
-                            .iter_mut()
-                            .find(|s| s.manifest.id == uninstall_id)
-                        {
-                            status.enabled = false;
-                        }
-                        view.rebuild_plugin_decorations();
-                        let task = view.services.plugins.uninstall(uninstall_id.clone());
-                        view.run_plugin_change(uninstall_id.clone(), task, cx);
-                    }))
-                    .into_any_element(),
-                );
+                if status.source != PluginSource::Bundled {
+                    let uninstall_id = id.clone();
+                    let uninstall_selector = format!("plugin-uninstall-{id}");
+                    buttons.push(
+                        toolbar_button_enabled(
+                            ElementId::Name(format!("plugin-uninstall-{id}").into()),
+                            "Uninstall",
+                            self.palette.control,
+                            !busy,
+                        )
+                        .debug_selector(move || uninstall_selector.clone())
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            if view.plugin_ui.busy.contains(&uninstall_id) {
+                                return;
+                            }
+                            view.plugin_ui.results.remove(&uninstall_id);
+                            if let Some(status) = view
+                                .plugin_ui
+                                .statuses
+                                .iter_mut()
+                                .find(|s| s.manifest.id == uninstall_id)
+                            {
+                                status.enabled = false;
+                            }
+                            view.rebuild_plugin_decorations();
+                            let task = view.services.plugins.uninstall(uninstall_id.clone());
+                            view.run_plugin_change(uninstall_id.clone(), task, cx);
+                        }))
+                        .into_any_element(),
+                    );
+                }
                 if status.update_available {
                     let update_id = id.clone();
                     buttons.push(
@@ -827,19 +871,45 @@ impl DirectoryWindow {
                     .clone()
                     .or_else(|| result.contribution.as_ref().and_then(|c| c.badge.clone()))
             });
+            let connection_status = (id == "syncthing").then(|| {
+                if !status.enabled
+                    || status
+                        .configuration
+                        .get("connected")
+                        .and_then(Value::as_bool)
+                        != Some(true)
+                {
+                    "Connection: Not connected".to_owned()
+                } else {
+                    self.plugin_ui
+                        .results
+                        .get(&id)
+                        .and_then(|result| result.contribution.as_ref())
+                        .and_then(|contribution| {
+                            contribution.details.iter().find(|detail| {
+                                detail.label == "Connection" || detail.label == "Local state"
+                            })
+                        })
+                        .map(|detail| format!("{}: {}", detail.label, detail.value))
+                        .unwrap_or_else(|| "Connection: Enabled · Awaiting status".into())
+                }
+            });
             let state = if busy {
                 "Working…"
             } else if status.enabled {
                 "Enabled"
             } else if status.installed {
                 "Disabled"
+            } else if status.source == PluginSource::Bundled {
+                "Integration unavailable"
             } else {
-                "Not installed"
+                "Integration not installed"
             };
+            let card_id = id.clone();
             cards.push(
                 div()
                     .id(ElementId::Name(format!("plugin-card-{id}").into()))
-                    .debug_selector(move || format!("plugin-card-{id}"))
+                    .debug_selector(move || format!("plugin-card-{card_id}"))
                     .flex()
                     .flex_col()
                     .gap_2()
@@ -858,6 +928,15 @@ impl DirectoryWindow {
                             .child(format!("{source} · {state}")),
                     )
                     .child(div().text_sm().child(status.manifest.description))
+                    .when_some(status.dependency_status, |card, detection| {
+                        card.child(
+                            div()
+                                .id(ElementId::Name(format!("plugin-detection-{id}").into()))
+                                .debug_selector(move || format!("plugin-detection-{id}"))
+                                .text_xs()
+                                .child(detection),
+                        )
+                    })
                     .children(
                         status
                             .manifest
@@ -877,6 +956,9 @@ impl DirectoryWindow {
                     .when_some(live_status, |card, status| {
                         card.child(div().text_xs().child(status))
                     })
+                    .when_some(connection_status, |card, status| {
+                        card.child(div().text_xs().child(status))
+                    })
                     .child(div().flex().flex_wrap().gap_2().children(buttons))
                     .children(fields)
                     .into_any_element(),
@@ -885,7 +967,7 @@ impl DirectoryWindow {
         let text_input = self.native_text_input_element(TextInputTarget::PluginSetting);
         div().id("settings-plugins").debug_selector(|| "settings-plugins".into()).flex().flex_col().gap_3().p_3()
             .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child("Integrations"))
-            .child(div().text_sm().child("Install only integrations you trust. Plugins run programs with your user account's filesystem and network access; capability descriptions are not a sandbox."))
+            .child(div().text_sm().child("Git, Obsidian and Syncthing integrations are included. Enable the ones you want to use with your existing apps. They run with your account's access and stay off until enabled."))
             .when_some(self.plugin_ui.error.clone(), |panel, error| panel.child(div().text_sm().child(error)))
             .children(cards)
             .when_some(text_input, |panel, input| panel.child(input).child(toolbar_button("save-plugin-setting", "Save setting", self.palette.control)
@@ -894,9 +976,14 @@ impl DirectoryWindow {
                     view.deactivate_native_text_input(); cx.notify();
                 }))))
             .child(div().flex().flex_wrap().gap_2()
-                .child(toolbar_button("install-selected-plugins", "Install selected", self.palette.control).on_click(cx.listener(|view, _, _, cx| {
+                .child(toolbar_button("enable-selected-plugins", "Enable selected", self.palette.control).on_click(cx.listener(|view, _, _, cx| {
                     for id in std::mem::take(&mut view.plugin_ui.selected) {
-                        if !view.plugin_ui.busy.contains(&id) { let task = view.services.plugins.install(id.clone()); view.run_plugin_change(id, task, cx); }
+                        if !view.plugin_ui.busy.contains(&id) {
+                            let task = if view.plugin_ui.statuses.iter().any(|s| s.manifest.id == id && s.installed) {
+                                view.services.plugins.set_enabled(id.clone(), true)
+                            } else { view.services.plugins.install(id.clone()) };
+                            view.run_plugin_change(id, task, cx);
+                        }
                     }
                     view.settings.integrations_onboarding_complete = true; view.persist_settings(); cx.notify();
                 })))
@@ -920,7 +1007,7 @@ mod tests {
             std::env::temp_dir().join(format!("explorie-integrations-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let services = NativeServices::new(ResourcePaths::test(&root));
-        initialize_plugins(&services, [OsString::from("explorie")]).unwrap();
+        initialize_plugins_at(&services, [OsString::from("explorie")], None).unwrap();
         (root, services)
     }
 
@@ -973,6 +1060,66 @@ mod tests {
         window.run_until_parked();
         assert!(window.debug_bounds("integrations-invitation").is_none());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn bundled_settings_offer_enablement_and_separate_detection(cx: &mut TestAppContext) {
+        let (root, services) = test_services();
+        let mut statuses = services.plugins.list().wait().unwrap();
+        for status in &mut statuses {
+            status.source = PluginSource::Bundled;
+            status.installed = true;
+        }
+        let (_, window) = cx.add_window_view(|_, cx| {
+            let mut view = DirectoryWindow::new(root.clone(), services, cx);
+            view.plugin_ui.statuses = statuses;
+            view.settings_panel_open = true;
+            view.settings_tab = SettingsTab::Plugins;
+            view
+        });
+        window.simulate_resize(gpui::size(px(1100.0), px(1000.0)));
+        window.run_until_parked();
+        for selector in [
+            "plugin-enable-git",
+            "plugin-enable-obsidian",
+            "plugin-enable-syncthing",
+            "plugin-detection-git",
+            "plugin-detection-obsidian",
+            "plugin-detection-syncthing",
+        ] {
+            assert!(
+                window.debug_bounds(selector).is_some(),
+                "Missing {selector}"
+            );
+        }
+        for selector in [
+            "plugin-install-git",
+            "plugin-install-obsidian",
+            "plugin-install-syncthing",
+            "plugin-uninstall-git",
+            "plugin-uninstall-obsidian",
+            "plugin-uninstall-syncthing",
+        ] {
+            assert!(
+                window.debug_bounds(selector).is_none(),
+                "Unexpected {selector}"
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bundled_paths_match_installer_layouts() {
+        assert_eq!(
+            bundled_plugin_directory(Path::new(
+                "/Applications/explorie.app/Contents/MacOS/explorie-gpui"
+            )),
+            PathBuf::from("/Applications/explorie.app/Contents/MacOS/../Resources/plugins")
+        );
+        assert_eq!(
+            bundled_plugin_directory(Path::new("/apps/explorie/Explorie.exe")),
+            PathBuf::from("/apps/explorie/plugins")
+        );
     }
 
     #[gpui::test]
@@ -1099,6 +1246,132 @@ mod tests {
             ])
             .is_none()
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    #[ignore = "requires packaged integrations via EXPLORIE_PLUGIN_SMOKE_CATALOG and EXPLORIE_PLUGIN_SMOKE_DIRECTORY"]
+    fn bundled_integrations_do_not_stall_column_navigation(cx: &mut TestAppContext) {
+        let catalog = std::env::var_os("EXPLORIE_PLUGIN_SMOKE_CATALOG")
+            .expect("set the packaged integration catalog path");
+        let packages = std::env::var_os("EXPLORIE_PLUGIN_SMOKE_DIRECTORY")
+            .expect("set the bundled integration package directory");
+        let root = std::env::temp_dir().join(format!(
+            "explorie-plugin-navigation-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let folder = root.join("vault");
+        let nested = folder.join("notes");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir(folder.join(".obsidian")).unwrap();
+        std::fs::write(nested.join("note.md"), "fixture note").unwrap();
+        let mut git = std::process::Command::new("git");
+        git.args(["init", "--quiet"]).arg(&folder);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            git.creation_flags(0x08000000);
+        }
+        assert!(
+            git.output()
+                .expect("Git is required for this smoke test")
+                .status
+                .success()
+        );
+        let services = NativeServices::new(ResourcePaths::test(&root));
+        services
+            .plugins
+            .set_catalog(serde_json::from_slice(&std::fs::read(catalog).unwrap()).unwrap());
+        services
+            .plugins
+            .load_bundled(packages.into())
+            .wait()
+            .unwrap();
+        for id in ["git", "obsidian", "syncthing"] {
+            services
+                .plugins
+                .set_enabled(id.into(), true)
+                .wait()
+                .unwrap();
+        }
+        let statuses = services.plugins.list().wait().unwrap();
+        assert_eq!(statuses.len(), 3);
+        assert!(
+            statuses
+                .iter()
+                .all(|status| status.installed && status.enabled)
+        );
+        let (view, window) = cx.add_window_view(|_, cx| {
+            let mut view = DirectoryWindow::new(folder.clone(), services.clone(), cx);
+            view.plugin_ui.statuses = statuses;
+            view.browser.set_view_mode(ViewMode::Column);
+            view.start_service_events(cx);
+            view.start_listing(cx);
+            view.start_watching(cx);
+            view
+        });
+        let mut destinations = vec![folder.clone(), nested.clone()];
+        if let Some(path) = std::env::var_os("EXPLORIE_PLUGIN_NAVIGATION_PATH") {
+            let path = PathBuf::from(path);
+            assert!(
+                path.is_absolute() && path.is_dir(),
+                "navigation path must be an existing absolute directory"
+            );
+            destinations.extend([path, folder.clone(), nested]);
+        }
+        for destination in destinations {
+            view.update(window, |view, cx| view.navigate_to(destination.clone(), cx));
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                window.run_until_parked();
+                window.executor().advance_clock(Duration::from_millis(10));
+                let ready = view.update(window, |view, _| {
+                    matches!(view.state, ListingState::Ready)
+                        && view
+                            .columns
+                            .columns()
+                            .iter()
+                            .all(|column| !column.loading())
+                        && !view.plugin_ui.scan_running
+                        && view.plugin_ui.results.len() == 3
+                });
+                if ready || std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            view.update(window, |view, _| {
+                assert!(
+                    view.columns.columns().iter().all(|column| !column.loading()),
+                    "columns remained loading at {} (column generation {}, plugin generation {}): {:?}",
+                    destination.display(),
+                    view.column_generation,
+                    view.plugin_ui.generation,
+                    view.columns
+                );
+                assert!(matches!(view.state, ListingState::Ready));
+                assert_eq!(
+                    view.plugin_ui.results.len(),
+                    3,
+                    "all integrations should finish"
+                );
+                assert!(!view.plugin_ui.scan_running);
+                if destination.starts_with(&folder) {
+                    for result in view.plugin_ui.results.values() {
+                        assert!(result.error.is_none(), "{} failed: {:?}", result.id, result.error);
+                    }
+                    let git = view.plugin_ui.results["git"].contribution.as_ref().unwrap();
+                    assert_eq!(git.root.as_deref(), Some(folder.as_path()));
+                    assert!(git.badge.is_some());
+                }
+            });
+        }
+        view.update(window, |view, _| {
+            view.plugin_ui.statuses.clear();
+            view.plugin_ui.scan = None;
+            view.watcher_task = None;
+        });
+        services.plugins.shutdown().wait().unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -12,13 +12,38 @@ fn main() {
 }
 
 fn embed_plugin_catalog() {
-    use std::{env, fs, path::PathBuf};
+    use std::{env, fs, path::PathBuf, process::Command};
 
     println!("cargo:rerun-if-env-changed=EXPLORIE_PLUGIN_CATALOG");
     let catalog = match env::var_os("EXPLORIE_PLUGIN_CATALOG") {
         Some(path) => {
             let path = PathBuf::from(path);
             println!("cargo:rerun-if-changed={}", path.display());
+            let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
+            let script = manifest.join("../../../scripts/package-plugins.mjs");
+            println!("cargo:rerun-if-changed={}", script.display());
+            let target = env::var("TARGET").unwrap();
+            let version = env::var("CARGO_PKG_VERSION").unwrap();
+            for plugin in ["syncthing", "git", "obsidian"] {
+                let archive = path
+                    .parent()
+                    .unwrap()
+                    .join(format!("explorie-plugin-{plugin}-{version}-{target}.zip"));
+                println!("cargo:rerun-if-changed={}", archive.display());
+            }
+            let output = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+            let profile = output.ancestors().nth(3).expect("Cargo profile directory");
+            let status = Command::new("node")
+                .arg(script)
+                .arg("--verify-catalog")
+                .arg(&path)
+                .arg("--target")
+                .arg(target)
+                .arg("--stage-directory")
+                .arg(profile.join("plugins"))
+                .status()
+                .expect("Node.js is required to verify and stage official plugin packages");
+            assert!(status.success(), "Official plugin package staging failed");
             let contents = fs::read_to_string(path).expect("read official plugin catalog");
             assert!(
                 contents.trim() != "[]",

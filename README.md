@@ -31,7 +31,7 @@ Current features:
 - **Settings panel:** Comprehensive appearance and behavior customization.
 - **OS integration:** Native window controls and platform file opening.
 - **Persistent Remote Drives:** Reconnect existing rclone remotes as native Windows drive letters or macOS volumes while explorie is running.
-- **Optional integrations:** Install and enable Syncthing, Git, and Obsidian plugins in Settings → Integrations. Recognize overlapping folder types, inspect local status, and open related applications without leaving the native file browser. See [integration setup and plugin development](docs/plugins.md).
+- **Optional integrations:** Syncthing, Git, and Obsidian integrations are included and start disabled. Enable them in Settings → Integrations, with separate detection of existing local apps and connection status. Recognize overlapping folder types, inspect local status, and open related applications without leaving the native file browser. See [integration setup and plugin development](docs/plugins.md).
 
 ---
 
@@ -225,6 +225,8 @@ The release workflow publishes an explicitly named unsigned per-user Windows x64
 
 Each `v<version>` draft contains `explorie-<version>-windows-x64-setup-unsigned.exe`, `explorie-<version>-macos-arm64.dmg`, `SHA256SUMS-windows.txt`, and `SHA256SUMS-macos.txt`.
 
+The complete release currently has 17 assets: those four desktop files; `7z2603-src.tar.xz`, `7zip-NOTICE.txt`, and `SHA256SUMS-7zip.txt`; and, for each platform, the three integration ZIPs, their catalog, and their checksum manifest. The installer/DMG includes the integrations, so normal users only download their platform installer. Separate integration assets retain the verified catalog/package distribution contract.
+
 Before creating a new tag, manually verify:
 
 - Launch the generated app on the target OS.
@@ -237,6 +239,10 @@ Before creating a new tag, manually verify:
 - Install the previous public version on each platform, accept the in-app update, and verify it replaces the app, preserves settings, removes the update payload and backup, and reopens at the new version. Install the Windows package, verify the completion-page cleanup removes the downloaded installer, run `cargo test -p explorie-native-services integration::tests::windows_system_open_produces_a_real_shell_side_effect -- --exact --ignored` from an interactive Windows session, verify the System Integration toggle routes folder opens to Explorie and restores the prior handler when disabled or uninstalled, and confirm the unsigned warning is expected. Install the macOS package, verify Explorie offers to eject the mounted release image and moves its DMG to Trash, and verify signing/notarization plus both SHA-256 manifests.
 
 Create a per-candidate real-machine evidence file with `pnpm platform:proof:init`, fill in the exact artifact names and SHA-256 hashes, then mark each observed check. `pnpm platform:proof:verify` rejects wrong artifact names, missing Windows multi-window/DnD/mixed-DPI/crash/folder-handler proof, and missing macOS multi-window/DnD/multi-monitor/crash/signing/notarization/Gatekeeper proof. It prints the two tested hashes to paste into the protected publication dispatch. The evidence stays under ignored `.release-checks/`; archive it alongside the candidate checksums before enabling the workflow attestations.
+
+Both platforms also require remote-drive lifecycle and bundled-integration activation proof. Enable each included integration from a fresh profile with no package downloads, verify disabled defaults and persistence after restart, and exercise Git folder navigation during filesystem changes. Use disposable files for remote writes and confirm disconnect/reconnect behavior.
+
+Only the first `bildhaus/explorie` release at `0.1.0` may record an updater exemption: add `"firstRelease": { "reason": "First public Bildhaus release; no previous GPUI release to upgrade from" }` to the evidence file and set each platform's `automaticUpdateReplacedCleanedAndReopened` check to `"not-applicable"`. Every other check remains mandatory. Omit `firstRelease` for subsequent releases; `0.1.1` and later must pass the real upgrade check.
 
 ---
 

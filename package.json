@@ -23,7 +23,7 @@
     "rust:check": "cargo check --workspace",
     "lint": "cargo fmt --all --check && cargo clippy --locked --workspace --all-targets --all-features -- -D warnings",
     "release:check": "node scripts/release-check.mjs",
-    "release:check:test": "node --test scripts/release-check.test.mjs scripts/prepare-7zip.test.mjs scripts/package-plugins.test.mjs",
+    "release:check:test": "node --test scripts/release-check.test.mjs scripts/prepare-7zip.test.mjs scripts/package-plugins.test.mjs scripts/platform-proof.test.mjs",
     "plugins:package": "node scripts/package-plugins.mjs",
     "platform:proof:init": "node scripts/platform-proof.mjs init",
     "platform:proof:verify": "node scripts/platform-proof.mjs verify",
