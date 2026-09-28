@@ -1,14 +1,32 @@
+//! Structured previews for documents, fonts, databases and tables.
+//!
+//! Fonts, email, SQLite and Parquet/Arrow need optional backends (the
+//! `preview-fonts`, `preview-mail`, `preview-sqlite` and `preview-columnar`
+//! cargo features). A build without one still routes those files here and
+//! answers with an Unsupported error that names what is missing.
+
 use crate::{ErrorCode, ServiceError, ServiceResult};
+#[cfg(feature = "preview-columnar")]
 use arrow_cast::display::array_value_to_string;
+#[cfg(feature = "preview-fonts")]
 use fontdue::{Font, FontSettings};
+#[cfg(feature = "preview-mail")]
 use mail_parser::MessageParser;
+#[cfg(feature = "preview-columnar")]
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use pulldown_cmark::{Options, Parser, html};
+#[cfg(feature = "preview-sqlite")]
+use rusqlite::config::DbConfig;
+#[cfg(feature = "preview-sqlite")]
+use rusqlite::limits::Limit;
+#[cfg(feature = "preview-sqlite")]
 use rusqlite::{Connection, OpenFlags, types::ValueRef};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "preview-sqlite")]
+use std::time::{Duration, Instant};
 use zip::ZipArchive;
 
 const MAX_RICH_SOURCE_BYTES: u64 = 256 * 1024 * 1024;
@@ -16,8 +34,16 @@ const MAX_TEXT_SOURCE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRY_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_BLOCKS: usize = 240;
 const MAX_BLOCK_TEXT: usize = 8 * 1024;
+#[cfg(any(feature = "preview-sqlite", feature = "preview-columnar"))]
 const MAX_TABLE_COLUMNS: usize = 16;
+#[cfg(any(feature = "preview-sqlite", feature = "preview-columnar"))]
 const MAX_TABLE_ROWS: usize = 24;
+#[cfg(feature = "preview-sqlite")]
+const SQLITE_PREVIEW_BUDGET: Duration = Duration::from_secs(3);
+#[cfg(feature = "preview-sqlite")]
+const SQLITE_PROGRESS_INTERVAL: i32 = 10_000;
+#[cfg(feature = "preview-sqlite")]
+const MAX_SQLITE_VALUE_BYTES: i32 = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RichBlockKind {
@@ -163,6 +189,7 @@ fn html_preview(path: &Path) -> ServiceResult<RichPreview> {
     })
 }
 
+#[cfg(feature = "preview-mail")]
 fn email_preview(path: &Path) -> ServiceResult<RichPreview> {
     let bytes = bounded_read(path, MAX_TEXT_SOURCE_BYTES)?;
     let message = MessageParser::default().parse(&bytes).ok_or_else(|| {
@@ -211,6 +238,15 @@ fn email_preview(path: &Path) -> ServiceResult<RichPreview> {
     })
 }
 
+#[cfg(not(feature = "preview-mail"))]
+fn email_preview(_path: &Path) -> ServiceResult<RichPreview> {
+    Err(ServiceError::new(
+        ErrorCode::Unsupported,
+        "Email previews aren't included in this build",
+    ))
+}
+
+#[cfg(feature = "preview-mail")]
 fn format_address(label: &str, name: Option<&str>, address: Option<&str>) -> String {
     match (name, address) {
         (Some(name), Some(address)) => format!("{label} · {name} <{address}>"),
@@ -352,17 +388,50 @@ fn extract_archive_image(
     Ok(output)
 }
 
-fn sqlite_preview(path: &Path) -> ServiceResult<RichPreview> {
-    let connection = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|error| {
+/// Open an untrusted database so that its schema cannot run side-effecting
+/// functions, nothing can be written, oversized values fail instead of being
+/// materialized, and every statement is interrupted once `budget` elapses.
+#[cfg(feature = "preview-sqlite")]
+fn open_untrusted_sqlite(path: &Path, budget: Duration) -> ServiceResult<Connection> {
+    let open_error = |error: rusqlite::Error| {
         ServiceError::new(
             ErrorCode::InvalidInput,
             format!("Unable to open SQLite database read-only: {error}"),
         )
-    })?;
+    };
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(open_error)?;
+    connection
+        .set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)
+        .map_err(open_error)?;
+    connection
+        .set_db_config(DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA, false)
+        .map_err(open_error)?;
+    connection
+        .pragma_update(None, "trusted_schema", false)
+        .map_err(open_error)?;
+    connection
+        .pragma_update(None, "query_only", true)
+        .map_err(open_error)?;
+    connection
+        .set_limit(Limit::SQLITE_LIMIT_LENGTH, MAX_SQLITE_VALUE_BYTES)
+        .map_err(open_error)?;
+    let deadline = Instant::now() + budget;
+    connection
+        .progress_handler(
+            SQLITE_PROGRESS_INTERVAL,
+            Some(move || Instant::now() >= deadline),
+        )
+        .map_err(open_error)?;
+    Ok(connection)
+}
+
+#[cfg(feature = "preview-sqlite")]
+fn sqlite_preview(path: &Path) -> ServiceResult<RichPreview> {
+    let connection = open_untrusted_sqlite(path, SQLITE_PREVIEW_BUDGET)?;
     let mut statement = connection
         .prepare(
             "SELECT name, type FROM sqlite_master WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%' ORDER BY type, name LIMIT 100",
@@ -425,6 +494,15 @@ fn sqlite_preview(path: &Path) -> ServiceResult<RichPreview> {
     })
 }
 
+#[cfg(not(feature = "preview-sqlite"))]
+fn sqlite_preview(_path: &Path) -> ServiceResult<RichPreview> {
+    Err(ServiceError::new(
+        ErrorCode::Unsupported,
+        "SQLite previews aren't included in this build",
+    ))
+}
+
+#[cfg(feature = "preview-sqlite")]
 fn sqlite_error(error: rusqlite::Error) -> ServiceError {
     ServiceError::new(
         ErrorCode::InvalidInput,
@@ -432,6 +510,7 @@ fn sqlite_error(error: rusqlite::Error) -> ServiceError {
     )
 }
 
+#[cfg(feature = "preview-sqlite")]
 fn sqlite_value(value: ValueRef<'_>) -> String {
     match value {
         ValueRef::Null => "NULL".to_string(),
@@ -442,6 +521,7 @@ fn sqlite_value(value: ValueRef<'_>) -> String {
     }
 }
 
+#[cfg(feature = "preview-columnar")]
 fn parquet_preview(path: &Path) -> ServiceResult<RichPreview> {
     let reader = SerializedFileReader::new(File::open(path).map_err(ServiceError::from)?).map_err(
         |error| {
@@ -496,6 +576,7 @@ fn parquet_preview(path: &Path) -> ServiceResult<RichPreview> {
     })
 }
 
+#[cfg(feature = "preview-columnar")]
 fn arrow_preview(path: &Path) -> ServiceResult<RichPreview> {
     let file = File::open(path).map_err(ServiceError::from)?;
     let mut reader = arrow_ipc::reader::FileReader::try_new(file, None).map_err(|error| {
@@ -565,6 +646,23 @@ fn arrow_preview(path: &Path) -> ServiceResult<RichPreview> {
     })
 }
 
+#[cfg(not(feature = "preview-columnar"))]
+fn parquet_preview(_path: &Path) -> ServiceResult<RichPreview> {
+    Err(ServiceError::new(
+        ErrorCode::Unsupported,
+        "Parquet previews aren't included in this build",
+    ))
+}
+
+#[cfg(not(feature = "preview-columnar"))]
+fn arrow_preview(_path: &Path) -> ServiceResult<RichPreview> {
+    Err(ServiceError::new(
+        ErrorCode::Unsupported,
+        "Arrow previews aren't included in this build",
+    ))
+}
+
+#[cfg(feature = "preview-fonts")]
 fn font_preview(path: &Path, cache: &Path) -> ServiceResult<RichPreview> {
     let bytes = bounded_read(path, 64 * 1024 * 1024)?;
     let bytes = match extension(path).as_str() {
@@ -612,6 +710,15 @@ fn font_preview(path: &Path, cache: &Path) -> ServiceResult<RichPreview> {
     })
 }
 
+#[cfg(not(feature = "preview-fonts"))]
+fn font_preview(_path: &Path, _cache: &Path) -> ServiceResult<RichPreview> {
+    Err(ServiceError::new(
+        ErrorCode::Unsupported,
+        "Font previews aren't included in this build",
+    ))
+}
+
+#[cfg(feature = "preview-fonts")]
 fn font_decode_error(error: impl std::fmt::Display) -> ServiceError {
     ServiceError::new(
         ErrorCode::InvalidInput,
@@ -619,6 +726,7 @@ fn font_decode_error(error: impl std::fmt::Display) -> ServiceError {
     )
 }
 
+#[cfg(feature = "preview-fonts")]
 fn draw_font_line(
     image: &mut image::RgbaImage,
     font: &Font,
@@ -709,6 +817,7 @@ fn is_archive_image(path: &str) -> bool {
     matches_extension(path, &["png", "jpg", "jpeg", "gif", "webp", "bmp"])
 }
 
+#[cfg(any(feature = "preview-sqlite", feature = "preview-columnar"))]
 fn truncate_cell(value: &str) -> String {
     let mut value = value.replace(['\r', '\n'], " ");
     if value.chars().count() > 160 {
@@ -718,6 +827,7 @@ fn truncate_cell(value: &str) -> String {
     value
 }
 
+#[cfg(feature = "preview-sqlite")]
 fn uppercase_first(value: &str) -> String {
     let mut characters = value.chars();
     characters
@@ -757,6 +867,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "preview-mail")]
     fn email_preview_extracts_headers_body_and_attachment_count() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("message.eml");
@@ -782,6 +893,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "preview-sqlite")]
     fn sqlite_preview_is_read_only_and_samples_rows() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("sample.sqlite");
@@ -806,6 +918,100 @@ mod tests {
                 .iter()
                 .any(|block| block.text.contains("alpha"))
         );
+    }
+
+    #[test]
+    #[cfg(feature = "preview-sqlite")]
+    fn untrusted_sqlite_connections_are_defensive_read_only_and_time_boxed() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("hostile.sqlite");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE items (name TEXT);
+                 CREATE TRIGGER audit AFTER INSERT ON items BEGIN SELECT 1; END;
+                 CREATE VIEW everything AS SELECT * FROM items;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let connection = open_untrusted_sqlite(&path, Duration::from_millis(250)).unwrap();
+        assert!(
+            connection
+                .db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE)
+                .unwrap()
+        );
+        assert!(
+            !connection
+                .db_config(DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA)
+                .unwrap()
+        );
+        let pragma = |name: &str| -> i64 {
+            connection
+                .query_row(&format!("PRAGMA {name}"), [], |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(pragma("trusted_schema"), 0);
+        assert_eq!(pragma("query_only"), 1);
+        assert_eq!(
+            connection.limit(Limit::SQLITE_LIMIT_LENGTH).unwrap(),
+            MAX_SQLITE_VALUE_BYTES
+        );
+        assert!(
+            connection
+                .execute("INSERT INTO items VALUES ('x')", [])
+                .is_err()
+        );
+        assert!(
+            connection
+                .query_row("SELECT length(zeroblob(33554432))", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .is_err()
+        );
+
+        let started = Instant::now();
+        let runaway = connection.query_row(
+            "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n) \
+             SELECT count(*) FROM n",
+            [],
+            |row| row.get::<_, i64>(0),
+        );
+        assert!(runaway.is_err());
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    /// A backend left out by its cargo feature still claims its files, and
+    /// says so instead of failing as if the file were malformed.
+    #[test]
+    fn previews_left_out_of_the_build_are_unsupported() {
+        let temp = tempfile::tempdir().unwrap();
+        for (included, name) in [
+            (cfg!(feature = "preview-fonts"), "font.woff2"),
+            (cfg!(feature = "preview-mail"), "message.eml"),
+            (cfg!(feature = "preview-sqlite"), "data.sqlite"),
+            (cfg!(feature = "preview-columnar"), "table.parquet"),
+            (cfg!(feature = "preview-columnar"), "table.feather"),
+        ] {
+            let path = temp.path().join(name);
+            fs::write(&path, b"not a real file").unwrap();
+            let result = preview(&path, temp.path());
+            if included {
+                if let Err(error) = result {
+                    assert!(
+                        !error.message.contains("in this build"),
+                        "{name}: {error:?}"
+                    );
+                }
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(error.code, ErrorCode::Unsupported, "{name}");
+                assert!(
+                    error.message.ends_with("aren't included in this build"),
+                    "{name}: {error:?}"
+                );
+            }
+        }
     }
 
     #[test]

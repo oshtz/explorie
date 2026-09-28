@@ -10,12 +10,16 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+#[cfg(any(windows, target_os = "macos"))]
 use crate::APP_IDENTIFIER;
 
 const ENDPOINT_FILE: &str = "single-instance-v1.json";
 const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(2);
 const RETRY_DELAY: Duration = Duration::from_millis(25);
+const READ_TIMEOUT: Duration = Duration::from_secs(2);
+const WAKE_TIMEOUT: Duration = Duration::from_millis(500);
+const ACCEPT_ERROR_DELAY: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SingleInstanceRequest {
@@ -49,6 +53,7 @@ struct WireRequest {
 #[derive(Debug)]
 struct SingleInstanceServer {
     endpoint_path: PathBuf,
+    port: u16,
     token: String,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
@@ -57,7 +62,16 @@ struct SingleInstanceServer {
 impl Drop for SingleInstanceServer {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
-        if let Some(thread) = self.thread.take() {
+        // The listener blocks in `accept`; a local connection wakes it so it can
+        // observe `stop`. If that fails, detach rather than hang on join.
+        let woke = TcpStream::connect_timeout(
+            &SocketAddrV4::new(Ipv4Addr::LOCALHOST, self.port).into(),
+            WAKE_TIMEOUT,
+        )
+        .is_ok();
+        if let Some(thread) = self.thread.take()
+            && woke
+        {
             let _ = thread.join();
         }
 
@@ -95,7 +109,6 @@ impl SingleInstanceServer {
         fs::create_dir_all(config_dir)?;
         let endpoint_path = config_dir.join(ENDPOINT_FILE);
         let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
-        listener.set_nonblocking(true)?;
         let port = listener.local_addr()?.port();
         let token = Uuid::new_v4().to_string();
         let descriptor = EndpointDescriptor {
@@ -115,6 +128,7 @@ impl SingleInstanceServer {
         Ok((
             Self {
                 endpoint_path,
+                port,
                 token,
                 stop,
                 thread: Some(thread),
@@ -130,22 +144,28 @@ fn listen(
     stop: &AtomicBool,
     sender: mpsc::Sender<SingleInstanceRequest>,
 ) {
-    while !stop.load(Ordering::Acquire) {
-        match listener.accept() {
-            Ok((stream, _)) => {
+    for stream in listener.incoming() {
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+        match stream {
+            Ok(stream) => {
                 if let Some(request) = read_request(stream, token) {
                     let _ = sender.send(request);
                 }
             }
-            Err(_) => {
-                thread::sleep(Duration::from_millis(10));
-            }
+            // Back off on persistent failures such as descriptor exhaustion.
+            Err(_) => thread::sleep(ACCEPT_ERROR_DELAY),
         }
     }
 }
 
 fn read_request(mut stream: TcpStream, expected_token: &str) -> Option<SingleInstanceRequest> {
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    // Accepted sockets inherit a non-blocking listener's mode on macOS and
+    // Windows, where an early read would fail with WouldBlock and drop the
+    // request. Always read in blocking mode, bounded by a timeout.
+    stream.set_nonblocking(false).ok()?;
+    stream.set_read_timeout(Some(READ_TIMEOUT)).ok()?;
     let mut bytes = Vec::new();
     let mut reader = io::BufReader::new(&mut stream).take(MAX_REQUEST_BYTES + 2);
     if reader.read_until(b'\n', &mut bytes).is_err() {
@@ -399,5 +419,57 @@ mod tests {
             read_request(server_stream, "test-token"),
             Some(SingleInstanceRequest { path: None })
         );
+    }
+
+    #[test]
+    fn request_written_after_accept_on_a_non_blocking_listener_is_not_dropped() {
+        let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(endpoint).unwrap();
+        let started = Instant::now();
+        let server_stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(started.elapsed() < REQUEST_DELIVERY_TIMEOUT);
+                    thread::yield_now();
+                }
+                Err(error) => panic!("accept failed: {error}"),
+            }
+        };
+        // A loaded client can be descheduled between connect and write; the
+        // accepted socket must wait for the data instead of failing early.
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            let mut bytes = serde_json::to_vec(&WireRequest {
+                token: "test-token".to_string(),
+                path: None,
+            })
+            .unwrap();
+            bytes.push(b'\n');
+            client.write_all(&bytes).unwrap();
+            client
+        });
+
+        assert_eq!(
+            read_request(server_stream, "test-token"),
+            Some(SingleInstanceRequest { path: None })
+        );
+        drop(writer.join().unwrap());
+    }
+
+    #[test]
+    fn dropping_the_server_stops_the_blocking_listener_promptly() {
+        let config_dir = fixture_dir();
+        let (server, requests) = SingleInstanceServer::start(&config_dir).unwrap();
+        let started = Instant::now();
+        drop(server);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(matches!(
+            requests.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ));
+        fs::remove_dir_all(config_dir).unwrap();
     }
 }

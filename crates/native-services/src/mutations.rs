@@ -484,20 +484,11 @@ fn ensure_extension(name: &str, extension: &str) -> String {
     }
 }
 
+/// Symbolic links and, on Windows, junctions: std reports a link only for
+/// name-surrogate reparse tags, so cloud-file placeholders (OneDrive) and
+/// deduplicated files are treated as the files and folders they are.
 fn metadata_is_link(metadata: &fs::Metadata) -> bool {
-    if metadata.file_type().is_symlink() {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
+    metadata.file_type().is_symlink()
 }
 
 #[cfg(target_os = "macos")]
@@ -665,10 +656,114 @@ fn rename_path_impl(source: &Path, new_base_name: &str) -> io::Result<String> {
     })?;
     validate_real_directory(parent)?;
     let name = validate_file_name(new_base_name)?;
+    if source.file_name() == Some(std::ffi::OsStr::new(&name)) {
+        // Submitting the unchanged name is not a rename.
+        return Ok(source.to_string_lossy().into_owned());
+    }
+    // On case- or normalization-insensitive volumes (APFS, NTFS, exFAT) a name
+    // that differs only in case or Unicode form still denotes the source:
+    // rename it in place rather than choosing "name (2)".
+    let requested = parent.join(&name);
+    if is_same_entry(source, &metadata, &requested)? {
+        rename_same_entry(source, &requested)?;
+        return Ok(requested.to_string_lossy().into_owned());
+    }
     let destination = create_unique_path(parent, &name, true, |candidate| {
         explorie_core::rename_noreplace(source, candidate)
     })?;
     Ok(destination.to_string_lossy().into_owned())
+}
+
+/// Whether `candidate` resolves to the source entry itself (without following
+/// a final link).
+#[cfg(unix)]
+fn is_same_entry(
+    _source: &Path,
+    source_metadata: &fs::Metadata,
+    candidate: &Path,
+) -> io::Result<bool> {
+    match fs::symlink_metadata(candidate) {
+        Ok(candidate) => Ok(entry_identity(&candidate) == entry_identity(source_metadata)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(windows)]
+fn is_same_entry(
+    source: &Path,
+    _source_metadata: &fs::Metadata,
+    candidate: &Path,
+) -> io::Result<bool> {
+    match (windows_file_id(source)?, windows_file_id(candidate)?) {
+        (Some(source), Some(candidate)) => Ok(source == candidate),
+        _ => Ok(false),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn is_same_entry(
+    _source: &Path,
+    _source_metadata: &fs::Metadata,
+    _candidate: &Path,
+) -> io::Result<bool> {
+    Ok(false)
+}
+
+/// Volume serial number and file index, which identify an entry on Windows.
+#[cfg(windows)]
+fn windows_file_id(path: &Path) -> io::Result<Option<(u32, u64)>> {
+    use std::mem::MaybeUninit;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        GetFileInformationByHandle,
+    };
+
+    let file = match OpenOptions::new()
+        .access_mode(0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mut information = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), information.as_mut_ptr()) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let information = unsafe { information.assume_init() };
+    Ok(Some((
+        information.dwVolumeSerialNumber,
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
+    )))
+}
+
+/// Renames an entry to another spelling of its own name. The exclusive rename
+/// handles case-only renames on APFS and NTFS; filesystems without it (exFAT)
+/// report the name as taken, which is safe to override because it was just
+/// verified to be the source itself.
+fn rename_same_entry(source: &Path, destination: &Path) -> io::Result<()> {
+    match explorie_core::rename_noreplace(source, destination) {
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            fs::rename(source, destination)
+        }
+        result => result,
+    }
+}
+
+/// Device and inode, which identify an entry on Unix.
+#[cfg(unix)]
+fn entry_identity(metadata: &fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    Some((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(unix))]
+fn entry_identity(_metadata: &fs::Metadata) -> Option<(u64, u64)> {
+    None
 }
 
 const BATCH_RENAME_JOURNAL: &str = "batch-rename-recovery-v1.json";
@@ -1048,6 +1143,7 @@ fn batch_rename_impl(
     }
 
     let mut sources = HashSet::with_capacity(items.len());
+    let mut source_identities = HashSet::with_capacity(items.len());
     let mut targets = HashSet::with_capacity(items.len());
     let mut plan = Vec::with_capacity(items.len());
     for item in items {
@@ -1074,6 +1170,7 @@ fn batch_rename_impl(
                 "Unsupported filesystem entry in batch rename",
             ));
         }
+        source_identities.extend(entry_identity(&metadata));
         let parent = source.parent().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1109,9 +1206,16 @@ fn batch_rename_impl(
         ));
     }
 
+    // A target that already exists is acceptable only when it is one of the
+    // sources, which are staged away first. Case-insensitive volumes report
+    // "Foo.txt" as existing when renaming "foo.txt", so compare identities too.
     for (_, target) in &plan {
         match fs::symlink_metadata(target) {
-            Ok(_) if !sources.contains(&normalize_path(target)) => {
+            Ok(metadata)
+                if !sources.contains(&normalize_path(target))
+                    && !entry_identity(&metadata)
+                        .is_some_and(|identity| source_identities.contains(&identity)) =>
+            {
                 return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
                     format!("Batch rename target already exists: {}", target.display()),
@@ -1430,6 +1534,111 @@ mod tests {
                 .create_website_link(root, "unsafe".into(), "javascript:alert(1)".into())
                 .wait()
                 .is_err()
+        );
+    }
+
+    fn names_in(directory: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn rename_to_the_unchanged_name_is_a_no_op() {
+        let temp = temp_dir();
+        let directory = temp.path().join("files");
+        let source = directory.join("notes.txt");
+        fs::create_dir(&directory).unwrap();
+        fs::write(&source, "keep").unwrap();
+        let services = NativeServices::new(ResourcePaths::test(temp.path()));
+
+        let renamed = services
+            .mutations
+            .rename_path(source.clone(), " notes.txt ".into())
+            .wait()
+            .unwrap();
+
+        assert_eq!(PathBuf::from(renamed), source);
+        assert_eq!(names_in(&directory), ["notes.txt"]);
+    }
+
+    #[test]
+    fn case_only_rename_renames_in_place() {
+        let temp = temp_dir();
+        let directory = temp.path().join("files");
+        fs::create_dir_all(directory.join("folder")).unwrap();
+        fs::write(directory.join("notes.txt"), "keep").unwrap();
+        let services = NativeServices::new(ResourcePaths::test(temp.path()));
+
+        for (before, after) in [("notes.txt", "Notes.txt"), ("folder", "FOLDER")] {
+            let renamed = services
+                .mutations
+                .rename_path(directory.join(before), after.into())
+                .wait()
+                .unwrap();
+            assert_eq!(PathBuf::from(renamed), directory.join(after));
+        }
+
+        assert_eq!(names_in(&directory), ["FOLDER", "Notes.txt"]);
+        assert_eq!(
+            fs::read_to_string(directory.join("Notes.txt")).unwrap(),
+            "keep"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unicode_normalization_only_rename_renames_in_place() {
+        let temp = temp_dir();
+        let directory = temp.path().join("files");
+        let composed = "caf\u{e9}.txt";
+        let decomposed = "cafe\u{301}.txt";
+        fs::create_dir(&directory).unwrap();
+        fs::write(directory.join(composed), "keep").unwrap();
+        let services = NativeServices::new(ResourcePaths::test(temp.path()));
+
+        let renamed = services
+            .mutations
+            .rename_path(directory.join(composed), decomposed.into())
+            .wait()
+            .unwrap();
+
+        assert_eq!(PathBuf::from(renamed), directory.join(decomposed));
+        assert_eq!(names_in(&directory), [decomposed]);
+    }
+
+    #[test]
+    fn batch_rename_changes_letter_case() {
+        let temp = temp_dir();
+        let directory = temp.path().join("files");
+        fs::create_dir(&directory).unwrap();
+        fs::write(directory.join("alpha.txt"), "alpha").unwrap();
+        fs::write(directory.join("Beta.txt"), "beta").unwrap();
+        let services = NativeServices::new(ResourcePaths::test(temp.path()));
+
+        let result = services
+            .mutations
+            .batch_rename(vec![
+                BatchRenameItem {
+                    source_path: directory.join("alpha.txt"),
+                    new_base_name: "ALPHA.txt".to_string(),
+                },
+                BatchRenameItem {
+                    source_path: directory.join("Beta.txt"),
+                    new_base_name: "beta.txt".to_string(),
+                },
+            ])
+            .wait()
+            .unwrap();
+
+        assert_eq!(result.renamed.len(), 2);
+        assert_eq!(names_in(&directory), ["ALPHA.txt", "beta.txt"]);
+        assert_eq!(
+            fs::read_to_string(directory.join("ALPHA.txt")).unwrap(),
+            "alpha"
         );
     }
 

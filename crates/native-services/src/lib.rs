@@ -17,6 +17,9 @@ use std::task::{Context, Poll, Waker};
 
 pub mod archive;
 pub mod audio;
+mod blocking;
+pub mod clipboard;
+pub mod helper;
 pub mod image_metadata;
 pub mod integration;
 pub mod listing;
@@ -37,6 +40,7 @@ pub mod watcher;
 pub use archive::{ArchiveFormat, ArchiveInfo, CompressionLevel};
 pub use archive::{ArchiveService, CompressRequest, CompressResult, ExtractRequest, ExtractResult};
 pub use audio::{AudioBackend, AudioPlayback, AudioService, AudioStatus};
+pub use blocking::{BlockingTask, CancellationToken, job_cancelled};
 pub use explorie_core::{
     ConflictPolicy, FileEntry, FileOperationKind, FileOperationProgress, FileOperationRequest,
     FileOperationResult, FileTreeSnapshot,
@@ -48,7 +52,7 @@ pub use integration::{
     AppInfo, FinderTagsBackend, InstallCleanupOffer, IntegrationService, PlatformActionsBackend,
     SystemIntegrationStatus,
 };
-pub use listing::{DirInfo, DiskInfo, ListRequest, SystemLocations};
+pub use listing::{DirInfo, DiskInfo, ListRequest, ListResponse, SystemLocations, VolumeLocation};
 pub use metadata::MetadataService;
 pub use model_preview::{ModelCamera, ModelFrame, ModelPreview};
 pub use mutations::{
@@ -69,7 +73,7 @@ pub use remote_drives::{
 pub use rich_preview::{RichBlock, RichBlockKind, RichPreview};
 pub use search::{
     CombineMode, SearchCriteria, SearchIndexHealth, SearchProgressEvent, SearchResult,
-    SearchService, SearchType,
+    SearchService, SearchSource, SearchType,
 };
 pub use updater::{DownloadedUpdate, UpdateInfo, UpdateService};
 pub use video::{VideoBackend, VideoFrame, VideoPlayback, VideoService, VideoStatus};
@@ -484,6 +488,14 @@ pub enum WatcherState {
     Stopped,
 }
 
+// Worker, preview-decoder, and archive callbacks rely on `catch_unwind` to turn
+// panics from untrusted input into errors. `panic = "abort"` would silently turn
+// every one of them into a whole-app crash, so refuse to build that way.
+#[cfg(not(panic = "unwind"))]
+compile_error!(
+    "explorie-native-services requires panic = \"unwind\"; its catch_unwind crash guards do nothing under panic = \"abort\""
+);
+
 /// Host context shared by all native services.
 #[derive(Clone)]
 pub struct ServiceContext {
@@ -515,90 +527,33 @@ impl ServiceContext {
         self.events.subscribe_async()
     }
 
+    /// Run blocking work on the shared worker pool. The job runs to
+    /// completion even if the returned task is dropped; see
+    /// [`BlockingTask::cancel_on_drop`] and [`Self::spawn_cancellable`] for work
+    /// that may be abandoned.
     pub fn spawn_blocking<T, F>(&self, operation: F) -> BlockingTask<T>
     where
         T: Send + 'static,
         F: FnOnce() -> ServiceResult<T> + Send + 'static,
     {
-        let (sender, receiver) = mpsc::sync_channel(1);
-        let waker = Arc::new(Mutex::new(None::<Waker>));
+        BlockingTask::spawn(blocking::BlockingPool::global(), operation)
+    }
 
-        let worker_waker = Arc::clone(&waker);
-        std::thread::spawn(move || {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation))
-                .unwrap_or_else(|_| {
-                    Err(ServiceError::new(
-                        ErrorCode::Internal,
-                        "Native service worker panicked",
-                    ))
-                });
-            let _ = sender.send(result);
-            if let Some(waker) = worker_waker
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take()
-            {
-                waker.wake();
-            }
-        });
-        BlockingTask { receiver, waker }
+    /// Run side-effect-free blocking work that stops being useful once its
+    /// caller loses interest. Dropping the task skips the job if it is still
+    /// queued and cancels the token it receives if it is running.
+    pub fn spawn_cancellable<T, F>(&self, operation: F) -> BlockingTask<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&CancellationToken) -> ServiceResult<T> + Send + 'static,
+    {
+        BlockingTask::spawn_cancellable(blocking::BlockingPool::global(), operation)
     }
 }
 
 impl Default for ServiceContext {
     fn default() -> Self {
         Self::new(ResourcePaths::default())
-    }
-}
-
-/// A standard-thread task used by GPUI adapters for blocking service work.
-pub struct BlockingTask<T> {
-    receiver: mpsc::Receiver<ServiceResult<T>>,
-    waker: Arc<Mutex<Option<Waker>>>,
-}
-
-impl<T> BlockingTask<T> {
-    /// Block a non-UI caller until the worker completes. UI adapters should
-    /// await this task instead.
-    pub fn wait(self) -> ServiceResult<T> {
-        self.receiver.recv().unwrap_or_else(|_| {
-            Err(ServiceError::new(
-                ErrorCode::Internal,
-                "Native service worker stopped before returning a result",
-            ))
-        })
-    }
-}
-
-impl<T> Unpin for BlockingTask<T> {}
-
-impl<T> Future for BlockingTask<T> {
-    type Output = ServiceResult<T>;
-
-    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        let task = self.get_mut();
-        match task.receiver.try_recv() {
-            Ok(result) => Poll::Ready(result),
-            Err(mpsc::TryRecvError::Disconnected) => Poll::Ready(Err(ServiceError::new(
-                ErrorCode::Internal,
-                "Native service worker stopped before returning a result",
-            ))),
-            Err(mpsc::TryRecvError::Empty) => {
-                *task
-                    .waker
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    Some(context.waker().clone());
-                match task.receiver.try_recv() {
-                    Ok(result) => Poll::Ready(result),
-                    Err(mpsc::TryRecvError::Disconnected) => Poll::Ready(Err(ServiceError::new(
-                        ErrorCode::Internal,
-                        "Native service worker stopped before returning a result",
-                    ))),
-                    Err(mpsc::TryRecvError::Empty) => Poll::Pending,
-                }
-            }
-        }
     }
 }
 
@@ -1004,6 +959,10 @@ mod tests {
             is_junction: false,
             link_target: None,
             has_xattrs: false,
+            is_package: false,
+            link_target_is_dir: false,
+            is_cloud_placeholder: false,
+            tags: Vec::new(),
         };
         search_queue.publish(ServiceEvent::SearchProgress(SearchProgressEvent {
             request_id: "search".into(),
@@ -1059,9 +1018,18 @@ mod tests {
             name: "Preview".into(),
             path: PathBuf::from("/Applications/Preview.app"),
             bundle_id: Some("com.apple.Preview".into()),
+            is_default: true,
         })
         .unwrap();
         assert!(app.get("bundle_id").is_some());
+        assert_eq!(app.get("is_default"), Some(&serde_json::Value::Bool(true)));
+        let legacy: AppInfo = serde_json::from_value(serde_json::json!({
+            "name": "Preview",
+            "path": "/Applications/Preview.app",
+            "bundle_id": null
+        }))
+        .unwrap();
+        assert!(!legacy.is_default);
 
         let archive = serde_json::to_value(CompressResult {
             output_path: PathBuf::from("bundle.zip"),

@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use explorie_native_services::{
     FileOperationEvent, FileOperationProgress, FileOperationRequest, FileOperationResult,
@@ -11,6 +11,8 @@ const OPERATION_HISTORY_LIMIT: usize = 50;
 const UNDO_HISTORY_LIMIT: usize = 50;
 const UNDO_HISTORY_BYTES: usize = 24 * 1024 * 1024;
 pub const UNDO_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// Minimum spacing between redraws caused only by transfer progress (~10 Hz).
+pub const PROGRESS_REDRAW_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OperationStatus {
@@ -58,12 +60,60 @@ impl OperationRecord {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProgressRedraw {
+    /// Redraw immediately.
+    Now,
+    /// Skip this redraw and schedule a single catch-up redraw after the delay.
+    After(Duration),
+    /// A catch-up redraw is already scheduled and will show this update.
+    Pending,
+}
+
+/// Coalesces progress-only redraws, which arrive once per copied chunk, while
+/// guaranteeing the latest progress is drawn within one interval.
+#[derive(Debug, Default)]
+pub struct ProgressThrottle {
+    last_redraw: Option<Instant>,
+    catch_up_scheduled: bool,
+}
+
+impl ProgressThrottle {
+    pub fn progress(&mut self, now: Instant) -> ProgressRedraw {
+        if self.catch_up_scheduled {
+            return ProgressRedraw::Pending;
+        }
+        match self.last_redraw {
+            Some(last) if now.saturating_duration_since(last) < PROGRESS_REDRAW_INTERVAL => {
+                self.catch_up_scheduled = true;
+                ProgressRedraw::After(
+                    PROGRESS_REDRAW_INTERVAL - now.saturating_duration_since(last),
+                )
+            }
+            _ => {
+                self.last_redraw = Some(now);
+                ProgressRedraw::Now
+            }
+        }
+    }
+
+    pub fn caught_up(&mut self, now: Instant) {
+        self.catch_up_scheduled = false;
+        self.last_redraw = Some(now);
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct OperationQueue {
     operations: Vec<OperationRecord>,
+    progress_throttle: ProgressThrottle,
 }
 
 impl OperationQueue {
+    pub fn progress_throttle(&mut self) -> &mut ProgressThrottle {
+        &mut self.progress_throttle
+    }
+
     pub fn track(&mut self, id: String, request: FileOperationRequest) {
         self.operations.retain(|operation| operation.id != id);
         self.operations.push(OperationRecord {
@@ -223,7 +273,7 @@ pub enum ClipboardKind {
     Cut,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClipboardState {
     pub kind: ClipboardKind,
     pub paths: Vec<PathBuf>,
@@ -625,6 +675,33 @@ mod tests {
             destination: Some(PathBuf::from("destination")),
             conflict_policy: ConflictPolicy::Rename,
         }
+    }
+
+    #[test]
+    fn progress_redraws_are_coalesced_to_the_interval_with_one_catch_up() {
+        let mut throttle = ProgressThrottle::default();
+        let start = Instant::now();
+        assert_eq!(throttle.progress(start), ProgressRedraw::Now);
+        assert_eq!(
+            throttle.progress(start + Duration::from_millis(30)),
+            ProgressRedraw::After(Duration::from_millis(70))
+        );
+        for offset in [40, 60, 99] {
+            assert_eq!(
+                throttle.progress(start + Duration::from_millis(offset)),
+                ProgressRedraw::Pending
+            );
+        }
+        throttle.caught_up(start + Duration::from_millis(100));
+        assert!(matches!(
+            throttle.progress(start + Duration::from_millis(150)),
+            ProgressRedraw::After(_)
+        ));
+        throttle.caught_up(start + Duration::from_millis(200));
+        assert_eq!(
+            throttle.progress(start + Duration::from_millis(300)),
+            ProgressRedraw::Now
+        );
     }
 
     #[test]

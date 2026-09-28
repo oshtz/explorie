@@ -18,12 +18,28 @@ use syntect::easy::ScopeRegionIterator;
 use syntect::parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet};
 use syntect::util::LinesWithEndings;
 
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(any(windows, test))]
+mod windows_icon;
+
 const MAX_TEXT_PREVIEW_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_TEXT_HIGHLIGHTS: usize = 50_000;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 const MAX_ICON_CACHE_ENTRIES: usize = 256;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 const MAX_ICON_CACHE_BYTES: u64 = 32 * 1024 * 1024;
+/// Edge of cached system icons: the largest Grid icon (60 points) on a 2x
+/// display, so one rendering serves every listing view.
+#[cfg(any(windows, target_os = "macos"))]
+const SYSTEM_ICON_PIXELS: u32 = 128;
+#[cfg(target_os = "macos")]
+const SYSTEM_ICON_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(target_os = "macos")]
+const QUICKLOOK_THUMBNAIL_TIMEOUT: Duration = Duration::from_secs(5);
+/// Office documents can take Quick Look several seconds at preview size.
+#[cfg(target_os = "macos")]
+const QUICKLOOK_PREVIEW_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_THUMBNAIL_ENTRIES: usize = 256;
 const MAX_THUMBNAIL_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_PDF_BYTES: u64 = 256 * 1024 * 1024;
@@ -39,6 +55,18 @@ const DETECTION_BYTES: u64 = 8 * 1024;
 const HEX_PREVIEW_BYTES: usize = 16 * 12;
 const HELPER_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const HELPER_CONVERSION_TIMEOUT: Duration = Duration::from_secs(45);
+const FFMPEG_INPUT_PROTOCOLS: &str = "file,pipe";
+const IMAGEMAGICK_POLICY: &str = include_str!("../assets/imagemagick-policy.xml");
+const IMAGEMAGICK_LIMITS: [(&str, &str); 7] = [
+    ("memory", "256MiB"),
+    ("map", "512MiB"),
+    ("disk", "1GiB"),
+    ("area", "128MP"),
+    ("width", "16KP"),
+    ("height", "16KP"),
+    ("time", "60"),
+];
+const LIBREOFFICE_REGISTRY: &str = include_str!("../assets/libreoffice-registrymodifications.xcu");
 #[cfg(windows)]
 const SHELL_ICON_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_HELPER_STDOUT_BYTES: usize = 64 * 1024;
@@ -247,7 +275,9 @@ impl PreviewService {
             let _thumbnail_guard = thumbnail_locks[lane]
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if is_model_preview_path(&path) {
+            // Without `preview-3d`, models take the generic path, which has no
+            // thumbnailer for them, so they keep their file icon.
+            if cfg!(feature = "preview-3d") && is_model_preview_path(&path) {
                 get_model_thumbnail(&path, max_size, &cache, &model_cache)
             } else {
                 get_file_thumbnail(&path, max_size, &cache)
@@ -1218,100 +1248,198 @@ fn prune_pdf_cache(cache: &Path) {
 fn get_file_icon(path: &Path, cache: &Path) -> ServiceResult<Option<PathBuf>> {
     #[cfg(windows)]
     {
-        if !path.exists() {
-            return Ok(None);
-        }
-        let output = cache_output(cache, path, "icon", "png");
-        if output.metadata().is_ok_and(|metadata| metadata.len() > 0) {
-            return Ok(Some(output));
-        }
-        fs::create_dir_all(cache).map_err(ServiceError::from)?;
-        let script = r#"Add-Type -AssemblyName System.Drawing
-Add-Type -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-
-namespace ExplorieShellIcon {
-    public static class NativeMethods {
-        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-        public struct SHFILEINFO {
-            public IntPtr hIcon;
-            public int iIcon;
-            public uint dwAttributes;
-            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string szDisplayName;
-            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 80)] public string szTypeName;
-        }
-
-        [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
-        public static extern IntPtr SHGetFileInfo(
-            string path,
-            uint attributes,
-            ref SHFILEINFO info,
-            uint infoSize,
-            uint flags
-        );
-
-        [DllImport("user32.dll")]
-        public static extern bool DestroyIcon(IntPtr icon);
+        get_windows_file_icon(path, cache)
     }
-}
-'@
-$info = New-Object ExplorieShellIcon.NativeMethods+SHFILEINFO
-$result = [ExplorieShellIcon.NativeMethods]::SHGetFileInfo(
-    $env:EXPLORIE_ICON_INPUT,
-    0,
-    [ref]$info,
-    [Runtime.InteropServices.Marshal]::SizeOf($info),
-    0x100
-)
-if ($result -eq [IntPtr]::Zero -or $info.hIcon -eq [IntPtr]::Zero) { exit 2 }
-try {
-    $borrowed = [System.Drawing.Icon]::FromHandle($info.hIcon)
-    try {
-        $icon = $borrowed.Clone()
-        try {
-            $bitmap = $icon.ToBitmap()
-            try { $bitmap.Save($env:EXPLORIE_ICON_OUTPUT, [System.Drawing.Imaging.ImageFormat]::Png) }
-            finally { $bitmap.Dispose() }
-        }
-        finally { $icon.Dispose() }
+    #[cfg(target_os = "macos")]
+    {
+        get_macos_file_icon(path, cache)
     }
-    finally { $borrowed.Dispose() }
-}
-finally { [void][ExplorieShellIcon.NativeMethods]::DestroyIcon($info.hIcon) }"#;
-        let status = run_helper_with_timeout(
-            command("powershell.exe")
-                .args([
-                    "-NoLogo",
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-Command",
-                    script,
-                ])
-                .env("EXPLORIE_ICON_INPUT", path)
-                .env("EXPLORIE_ICON_OUTPUT", &output)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null()),
-            SHELL_ICON_TIMEOUT,
-            false,
-        )?
-        .status;
-        if status.success() && output.metadata().is_ok_and(|metadata| metadata.len() > 0) {
-            prune_icon_cache(cache);
-            Ok(Some(output))
-        } else {
-            let _ = fs::remove_file(output);
-            Ok(None)
-        }
-    }
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = (path, cache);
         Ok(None)
     }
 }
 
+/// The shell's icon for `path`, extracted in process and cached per source
+/// identity.
 #[cfg(windows)]
+fn get_windows_file_icon(path: &Path, cache: &Path) -> ServiceResult<Option<PathBuf>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    // A new name so 32-pixel icons cached by the former PowerShell extractor
+    // are not reused.
+    let output = cache_output(cache, path, "shell-icon", "png");
+    if output.metadata().is_ok_and(|metadata| metadata.len() > 0) {
+        return Ok(Some(output));
+    }
+    fs::create_dir_all(cache).map_err(ServiceError::from)?;
+    let Some(icon) = windows_icon::shell_icon_with_timeout(path, SHELL_ICON_TIMEOUT)
+        .and_then(|icon| icon.fit_within(SYSTEM_ICON_PIXELS))
+    else {
+        return Ok(None);
+    };
+    if icon.save_png(&output).is_err() {
+        let _ = fs::remove_file(&output);
+        return Ok(None);
+    }
+    prune_icon_cache(cache);
+    Ok(Some(output))
+}
+
+/// Whether macOS draws this entry with an icon of its own — applications and
+/// other packages, symbolic links, Finder aliases and special folders such as
+/// Desktop, Downloads or Applications — rather than the icon every item of
+/// its kind shares.
+///
+/// The UI keys its icon cache with this, and [`PreviewService::file_icon`]
+/// follows the same rule, so an item-specific icon is never shared by kind.
+#[cfg(target_os = "macos")]
+pub fn has_item_specific_icon(entry: &explorie_core::FileEntry) -> bool {
+    if entry.is_symlink || entry.is_package {
+        return true;
+    }
+    if entry.is_dir {
+        return is_special_folder(&entry.path);
+    }
+    // Finder aliases keep their Finder info in an extended attribute and have
+    // no real extension ("Report alias", "Report.pdf alias").
+    entry.has_xattrs
+        && entry
+            .path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_none_or(|extension| extension.is_empty() || extension.contains(' '))
+}
+
+/// Folders Finder shows with their own icon: the home folder and its standard
+/// children, system locations, iCloud Drive, cloud-storage providers and
+/// mounted volumes.
+#[cfg(target_os = "macos")]
+pub fn is_special_folder(path: &Path) -> bool {
+    struct SpecialFolders {
+        exact: Vec<PathBuf>,
+        parents: Vec<PathBuf>,
+    }
+    static FOLDERS: OnceLock<SpecialFolders> = OnceLock::new();
+    let folders = FOLDERS.get_or_init(|| {
+        let mut exact: Vec<PathBuf> = [
+            "/",
+            "/Applications",
+            "/Applications/Utilities",
+            "/Library",
+            "/System",
+            "/System/Applications",
+            "/System/Applications/Utilities",
+            "/Users",
+            "/Users/Shared",
+            "/Volumes",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+        let mut parents = vec![PathBuf::from("/Volumes")];
+        if let Some(home) = dirs::home_dir() {
+            exact.extend(
+                [
+                    ".Trash",
+                    "Applications",
+                    "Desktop",
+                    "Documents",
+                    "Downloads",
+                    "Library",
+                    "Library/Mobile Documents/com~apple~CloudDocs",
+                    "Movies",
+                    "Music",
+                    "Pictures",
+                    "Public",
+                    "Sites",
+                ]
+                .into_iter()
+                .map(|child| home.join(child)),
+            );
+            parents.push(home.join("Library/CloudStorage"));
+            exact.push(home);
+        }
+        SpecialFolders { exact, parents }
+    });
+    folders.exact.iter().any(|folder| folder == path)
+        || path
+            .parent()
+            .is_some_and(|parent| folders.parents.iter().any(|folder| folder == parent))
+}
+
+/// The icon Finder would show for `path`. Items with their own icon (see
+/// [`has_item_specific_icon`]) are rendered from the item and cached per
+/// source identity; everything else gets its kind's shared icon, cached per
+/// extension. Both are also keyed by the light or dark appearance they were
+/// drawn in. Cloud placeholders always get the kind icon because inspecting
+/// the item could download it.
+#[cfg(target_os = "macos")]
+fn get_macos_file_icon(path: &Path, cache: &Path) -> ServiceResult<Option<PathBuf>> {
+    let Ok(entry) = explorie_core::entry_for_path(path) else {
+        return Ok(None);
+    };
+    fs::create_dir_all(cache).map_err(ServiceError::from)?;
+    let placeholder = treat_as_cloud_placeholder(path, entry.is_cloud_placeholder);
+    let dark = macos::icons_draw_dark();
+    let (output, rendered) = if has_item_specific_icon(&entry) && !placeholder {
+        let suffix = if dark { "dark-icon" } else { "icon" };
+        let output = cache_output(cache, path, suffix, "png");
+        if output.metadata().is_ok_and(|metadata| metadata.len() > 0) {
+            return Ok(Some(output));
+        }
+        let rendered = macos::file_icon(path, SYSTEM_ICON_PIXELS, SYSTEM_ICON_TIMEOUT, &output);
+        (output, rendered)
+    } else {
+        let container = if entry.is_package {
+            macos::IconContainer::Package
+        } else if entry.is_dir {
+            macos::IconContainer::Folder
+        } else {
+            macos::IconContainer::File
+        };
+        let extension = if container == macos::IconContainer::Folder {
+            String::new()
+        } else {
+            extension(path)
+        };
+        let output = kind_icon_cache_path(cache, container, &extension, dark);
+        if output.metadata().is_ok_and(|metadata| metadata.len() > 0) {
+            return Ok(Some(output));
+        }
+        let rendered = macos::type_icon(
+            &extension,
+            container,
+            SYSTEM_ICON_PIXELS,
+            SYSTEM_ICON_TIMEOUT,
+            &output,
+        );
+        (output, rendered)
+    };
+    if rendered.is_ok() && output.metadata().is_ok_and(|metadata| metadata.len() > 0) {
+        prune_icon_cache(cache);
+        Ok(Some(output))
+    } else {
+        let _ = fs::remove_file(&output);
+        Ok(None)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn kind_icon_cache_path(
+    cache: &Path,
+    container: macos::IconContainer,
+    extension: &str,
+    dark: bool,
+) -> PathBuf {
+    let mut digest = Sha256::new();
+    digest.update(format!("{container:?}\0{extension}\0{SYSTEM_ICON_PIXELS}\0{dark}").as_bytes());
+    cache.join(format!("{}-kind-icon.png", hex_digest(digest.finalize())))
+}
+
+#[cfg(any(windows, target_os = "macos"))]
 fn prune_icon_cache(cache: &Path) {
     let Ok(entries) = fs::read_dir(cache) else {
         return;
@@ -1341,21 +1469,48 @@ fn prune_icon_cache(cache: &Path) {
     }
 }
 
-fn get_file_thumbnail(path: &Path, max_size: u32, cache: &Path) -> ServiceResult<Option<PathBuf>> {
-    let Ok(metadata) = fs::symlink_metadata(path) else {
-        return Ok(None);
-    };
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return Ok(None);
+/// Whether to treat `path` as a cloud placeholder whose contents must not be
+/// read. Tests can mark ordinary files, since real placeholders need a cloud
+/// provider.
+fn treat_as_cloud_placeholder(path: &Path, is_cloud_placeholder: bool) -> bool {
+    #[cfg(test)]
+    if tests::forced_cloud_placeholder(path) {
+        return true;
     }
-    let is_image = matches!(
-        extension(path).as_str(),
+    let _ = path;
+    is_cloud_placeholder
+}
+
+/// How a file's thumbnail is produced.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ThumbnailSource {
+    Svg,
+    Psd,
+    /// Formats the bundled image decoder reads.
+    NativeImage,
+    /// HEIC, AVIF, JPEG XL and camera RAW.
+    ExternalImage,
+    Video,
+    /// Documents, fonts and 3D scenes only Quick Look renders (macOS).
+    QuickLook,
+}
+
+fn thumbnail_source(path: &Path) -> Option<ThumbnailSource> {
+    let extension = extension(path);
+    if is_svg_image(path) {
+        Some(ThumbnailSource::Svg)
+    } else if extension == "psd" {
+        Some(ThumbnailSource::Psd)
+    } else if is_external_image(path) {
+        Some(ThumbnailSource::ExternalImage)
+    } else if matches!(
+        extension.as_str(),
         "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp"
     ) || is_native_image(path)
-        || is_external_image(path)
-        || is_svg_image(path);
-    let is_video = matches!(
-        extension(path).as_str(),
+    {
+        Some(ThumbnailSource::NativeImage)
+    } else if matches!(
+        extension.as_str(),
         "mp4"
             | "webm"
             | "m4v"
@@ -1372,24 +1527,99 @@ fn get_file_thumbnail(path: &Path, max_size: u32, cache: &Path) -> ServiceResult
             | "ogv"
             | "ts"
             | "vob"
-    );
-    if !is_image && !is_video {
+    ) {
+        Some(ThumbnailSource::Video)
+    } else if cfg!(target_os = "macos") && is_quicklook_document(path) {
+        Some(ThumbnailSource::QuickLook)
+    } else {
+        None
+    }
+}
+
+/// Documents, fonts and scenes macOS Quick Look thumbnails without any
+/// helper application.
+fn is_quicklook_document(path: &Path) -> bool {
+    matches!(
+        extension(path).as_str(),
+        "pdf"
+            | "doc"
+            | "docx"
+            | "xls"
+            | "xlsx"
+            | "ppt"
+            | "pptx"
+            | "rtf"
+            | "odt"
+            | "pages"
+            | "numbers"
+            | "key"
+            | "ttf"
+            | "otf"
+            | "ttc"
+            | "usdz"
+            | "usd"
+            | "usda"
+            | "usdc"
+            | "reality"
+            | "icns"
+            | "exr"
+            | "jp2"
+    )
+}
+
+/// Camera RAW formats. Most are TIFF containers whose first image is only a
+/// small embedded preview.
+fn is_camera_raw(path: &Path) -> bool {
+    matches!(
+        extension(path).as_str(),
+        "dng" | "cr2" | "cr3" | "nef" | "arw" | "orf" | "rw2" | "raf"
+    )
+}
+
+/// iWork documents, which have no renderer besides Quick Look.
+fn is_iwork_document(path: &Path) -> bool {
+    matches!(extension(path).as_str(), "pages" | "numbers" | "key")
+}
+
+/// A thumbnail PNG for `path`, cached per source identity and size. Formats
+/// the bundled decoders read are decoded natively; on macOS Quick Look covers
+/// what they cannot (HEIC, RAW, video poster frames, PDF, Office, iWork,
+/// fonts, USDZ...); FFmpeg and ImageMagick are the last resort. Cloud
+/// placeholders get no thumbnail because reading them would download them.
+fn get_file_thumbnail(path: &Path, max_size: u32, cache: &Path) -> ServiceResult<Option<PathBuf>> {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return Ok(None);
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
         return Ok(None);
     }
+    if treat_as_cloud_placeholder(path, explorie_core::is_cloud_placeholder(&metadata)) {
+        return Ok(None);
+    }
+    let Some(source) = thumbnail_source(path) else {
+        return Ok(None);
+    };
     let max_size = max_size.clamp(64, 512);
     let output = cache_output(cache, path, &format!("thumbnail-{max_size}"), "png");
     if output.metadata().is_ok_and(|metadata| metadata.len() > 0) {
         return Ok(Some(output));
     }
     fs::create_dir_all(cache).map_err(ServiceError::from)?;
-    if is_svg_image(path) {
-        render_svg_preview(path, &output, max_size)?;
-    } else if is_external_image(path) {
-        generate_external_image_thumbnail(path, &output, max_size)?;
-    } else if is_image {
-        generate_native_thumbnail(path, &output, max_size)?;
-    } else {
-        generate_video_thumbnail(path, &output, max_size)?;
+    match source {
+        ThumbnailSource::Svg => render_svg_preview(path, &output, max_size)?,
+        ThumbnailSource::Psd => render_psd_preview(path, &output, max_size)
+            .or_else(|error| quicklook_thumbnail_after(path, &output, max_size, error))?,
+        ThumbnailSource::NativeImage => generate_native_thumbnail(path, &output, max_size)
+            .or_else(|error| quicklook_thumbnail_after(path, &output, max_size, error))?,
+        ThumbnailSource::ExternalImage => {
+            quicklook_thumbnail_before(path, &output, max_size, || {
+                generate_external_image_thumbnail(path, &output, max_size, cache)
+            })?
+        }
+        ThumbnailSource::Video => quicklook_thumbnail_before(path, &output, max_size, || {
+            generate_video_thumbnail(path, &output, max_size)
+        })?,
+        ThumbnailSource::QuickLook => quicklook_thumbnail(path, &output, max_size)?,
     }
     if !output.metadata().is_ok_and(|metadata| metadata.len() > 0) {
         return Err(ServiceError::new(
@@ -1399,6 +1629,74 @@ fn get_file_thumbnail(path: &Path, max_size: u32, cache: &Path) -> ServiceResult
     }
     prune_thumbnail_cache(cache);
     Ok(Some(output))
+}
+
+/// Quick Look's thumbnail (macOS only).
+fn quicklook_thumbnail(path: &Path, output: &Path, max_size: u32) -> ServiceResult<()> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::quicklook_thumbnail(path, max_size, QUICKLOOK_THUMBNAIL_TIMEOUT, output, None)
+            .map_err(|error| quicklook_error(error, QUICKLOOK_THUMBNAIL_TIMEOUT))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (path, output, max_size);
+        Err(ServiceError::new(
+            ErrorCode::Unsupported,
+            "Quick Look thumbnails are only available on macOS",
+        ))
+    }
+}
+
+/// Try Quick Look when a native decoder failed with `error` (macOS); keep
+/// `error` when Quick Look cannot help either.
+fn quicklook_thumbnail_after(
+    path: &Path,
+    output: &Path,
+    max_size: u32,
+    error: ServiceError,
+) -> ServiceResult<()> {
+    if cfg!(target_os = "macos") {
+        quicklook_thumbnail(path, output, max_size).map_err(|_| error)
+    } else {
+        Err(error)
+    }
+}
+
+/// Try Quick Look first (macOS), then the helper-backed `fallback`.
+fn quicklook_thumbnail_before(
+    path: &Path,
+    output: &Path,
+    max_size: u32,
+    fallback: impl FnOnce() -> ServiceResult<()>,
+) -> ServiceResult<()> {
+    if cfg!(target_os = "macos") && quicklook_thumbnail(path, output, max_size).is_ok() {
+        return Ok(());
+    }
+    fallback()
+}
+
+#[cfg(target_os = "macos")]
+fn quicklook_error(error: macos::NativeImageError, timeout: Duration) -> ServiceError {
+    match error {
+        macos::NativeImageError::Unavailable => {
+            ServiceError::new(ErrorCode::Unsupported, "Quick Look cannot render this file")
+        }
+        macos::NativeImageError::TimedOut => ServiceError::new(
+            ErrorCode::Internal,
+            format!("Quick Look timed out after {} seconds", timeout.as_secs()),
+        ),
+        macos::NativeImageError::Cancelled => ServiceError::new(
+            ErrorCode::Cancelled,
+            "Preview helper superseded by a newer preview",
+        ),
+        macos::NativeImageError::WriteFailed => {
+            ServiceError::new(ErrorCode::Internal, "Unable to save the Quick Look image")
+        }
+        macos::NativeImageError::InvalidInput => {
+            ServiceError::new(ErrorCode::InvalidInput, "Quick Look cannot open this path")
+        }
+    }
 }
 
 fn is_model_preview_path(path: &Path) -> bool {
@@ -1418,6 +1716,9 @@ fn get_model_thumbnail(
         return Ok(None);
     };
     if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Ok(None);
+    }
+    if treat_as_cloud_placeholder(path, explorie_core::is_cloud_placeholder(&metadata)) {
         return Ok(None);
     }
     let max_size = max_size.clamp(64, 512);
@@ -1476,25 +1777,28 @@ fn generate_external_image_thumbnail(
     input: &Path,
     output: &Path,
     max_size: u32,
+    cache: &Path,
 ) -> ServiceResult<()> {
     if extension(input) == "psd" {
         return render_psd_preview(input, output, max_size);
     }
+    let coder = imagemagick_coder(input, None).ok_or_else(unsupported_imagemagick_input)?;
     let tool = first_available_tool(&["magick"], "--version").ok_or_else(|| {
         ServiceError::new(
             ErrorCode::HelperMissing,
             "Install ImageMagick to preview this image format.",
         )
     })?;
+    let thumbnail = format!("{max_size}x{max_size}>");
     let status = run_helper_with_timeout(
-        command(&tool)
-            .arg(input)
-            .arg("-auto-orient")
-            .arg("-thumbnail")
-            .arg(format!("{max_size}x{max_size}>"))
-            .arg(format!("png:{}", output.display()))
-            .stdout(Stdio::null())
-            .stderr(Stdio::null()),
+        &mut imagemagick_command(
+            &tool,
+            cache,
+            coder,
+            input,
+            &["-auto-orient", "-thumbnail", &thumbnail],
+            output,
+        )?,
         HELPER_CONVERSION_TIMEOUT,
         false,
     )?
@@ -1625,10 +1929,8 @@ fn generate_video_thumbnail(input: &Path, output: &Path, max_size: u32) -> Servi
         format!("thumbnail,scale={max_size}:{max_size}:force_original_aspect_ratio=decrease");
     let status = run_helper_with_timeout(
         command(&tool)
-            .args(["-y", "-i"])
-            .arg(input)
-            .args(["-frames:v", "1", "-vf", &filter])
-            .arg(output)
+            .args(ffmpeg_frame_arguments(input, &filter, output))
+            .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null()),
         HELPER_CONVERSION_TIMEOUT,
@@ -1702,8 +2004,16 @@ fn generate_preview_artifact(
             DetectedPreviewKind::Image => {
                 return match detection.mime_type.as_deref() {
                     Some(
-                        "image/avif" | "image/heif" | "image/jxl" | "image/vnd.adobe.photoshop",
-                    ) => convert_image_preview(path, cache, helper_generation, ticket),
+                        mime @ ("image/avif"
+                        | "image/heif"
+                        | "image/jxl"
+                        | "image/vnd.adobe.photoshop"),
+                    ) => convert_image_preview(path, Some(mime), cache, helper_generation, ticket),
+                    // TIFF-based camera RAW would decode natively as its small
+                    // embedded preview; macOS develops the RAW data instead.
+                    Some("image/tiff") if cfg!(target_os = "macos") && is_camera_raw(path) => {
+                        convert_image_preview(path, None, cache, helper_generation, ticket)
+                    }
                     _ => convert_native_image_preview(path, cache),
                 };
             }
@@ -1712,6 +2022,9 @@ fn generate_preview_artifact(
     }
     if is_external_document(path) {
         return convert_document_preview(path, cache, helper_generation, ticket);
+    }
+    if cfg!(target_os = "macos") && is_iwork_document(path) {
+        return convert_quicklook_preview(path, cache, Some((helper_generation, ticket)));
     }
     if is_external_video(path) {
         return convert_video_preview(path, cache, helper_generation, ticket);
@@ -1723,7 +2036,7 @@ fn generate_preview_artifact(
         return convert_native_image_preview(path, cache);
     }
     if is_external_image(path) {
-        return convert_image_preview(path, cache, helper_generation, ticket);
+        return convert_image_preview(path, None, cache, helper_generation, ticket);
     }
     Err(ServiceError::new(
         ErrorCode::Unsupported,
@@ -1749,6 +2062,16 @@ fn convert_document_preview(
     helper_generation: &AtomicU64,
     ticket: u64,
 ) -> ServiceResult<PreviewArtifact> {
+    convert_libreoffice_preview(path, cache, helper_generation, ticket)
+        .or_else(|error| quicklook_preview_fallback(path, cache, helper_generation, ticket, error))
+}
+
+fn convert_libreoffice_preview(
+    path: &Path,
+    cache: &Path,
+    helper_generation: &AtomicU64,
+    ticket: u64,
+) -> ServiceResult<PreviewArtifact> {
     let tool = first_available_tool(&["soffice", "libreoffice"], "--version").ok_or_else(|| {
         ServiceError::new(
             ErrorCode::HelperMissing,
@@ -1768,14 +2091,14 @@ fn convert_document_preview(
     if output.exists() {
         fs::remove_file(&output).map_err(ServiceError::from)?;
     }
+    let profile = prepare_libreoffice_profile(cache)?;
     let isolated_output = cache.join(format!(".document-{}", uuid::Uuid::new_v4()));
     fs::create_dir(&isolated_output).map_err(ServiceError::from)?;
     let conversion = (|| {
         let status = run_helper_with_cancellation(
             command(&tool)
-                .args(["--headless", "--convert-to", "pdf", "--outdir"])
-                .arg(&isolated_output)
-                .arg(path)
+                .args(libreoffice_arguments(&profile, &isolated_output, path))
+                .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null()),
             HELPER_CONVERSION_TIMEOUT,
@@ -1830,10 +2153,12 @@ fn convert_video_preview(
     let output = cache_output(cache, path, "video", "png");
     let status = run_helper_with_cancellation(
         command(&tool)
-            .args(["-y", "-i"])
-            .arg(path)
-            .args(["-frames:v", "1", "-vf", "thumbnail,scale=1280:-1"])
-            .arg(&output)
+            .args(ffmpeg_frame_arguments(
+                path,
+                "thumbnail,scale=1280:-1",
+                &output,
+            ))
+            .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null()),
         HELPER_CONVERSION_TIMEOUT,
@@ -1873,8 +2198,17 @@ fn convert_native_image_preview(path: &Path, cache: &Path) -> ServiceResult<Prev
     validate_preview_image(path, MAX_IMAGE_PREVIEW_BYTES)?;
     fs::create_dir_all(cache).map_err(ServiceError::from)?;
     let output = cache_output(cache, path, "native-image", "png");
-    if !output.metadata().is_ok_and(|metadata| metadata.len() > 0) {
-        generate_native_thumbnail(path, &output, IMAGE_PREVIEW_DIMENSION)?;
+    if !output.metadata().is_ok_and(|metadata| metadata.len() > 0)
+        && let Err(error) = generate_native_thumbnail(path, &output, IMAGE_PREVIEW_DIMENSION)
+    {
+        let _ = fs::remove_file(&output);
+        // Variants the bundled decoder rejects (for example some TIFF
+        // compressions) may still render through Quick Look on macOS.
+        return if cfg!(target_os = "macos") {
+            convert_quicklook_preview(path, cache, None).map_err(|_| error)
+        } else {
+            Err(error)
+        };
     }
     prune_generated_artifact_cache(cache, &output);
     Ok(PreviewArtifact {
@@ -1887,22 +2221,41 @@ fn convert_native_image_preview(path: &Path, cache: &Path) -> ServiceResult<Prev
 
 fn convert_image_preview(
     path: &Path,
+    detected_mime: Option<&str>,
     cache: &Path,
     helper_generation: &AtomicU64,
     ticket: u64,
 ) -> ServiceResult<PreviewArtifact> {
-    if extension(path) == "psd" {
-        fs::create_dir_all(cache).map_err(ServiceError::from)?;
-        let output = cache_output(cache, path, "image", "png");
-        render_psd_preview(path, &output, IMAGE_PREVIEW_DIMENSION)?;
-        prune_generated_artifact_cache(cache, &output);
-        return Ok(PreviewArtifact {
-            kind: "image".into(),
-            path: output,
-            mime_type: "image/png".into(),
-            tool: "Explorie PSD decoder".into(),
-        });
-    }
+    let converted = if extension(path) == "psd" {
+        convert_psd_preview(path, cache)
+    } else {
+        convert_imagemagick_preview(path, detected_mime, cache, helper_generation, ticket)
+    };
+    converted
+        .or_else(|error| quicklook_preview_fallback(path, cache, helper_generation, ticket, error))
+}
+
+fn convert_psd_preview(path: &Path, cache: &Path) -> ServiceResult<PreviewArtifact> {
+    fs::create_dir_all(cache).map_err(ServiceError::from)?;
+    let output = cache_output(cache, path, "image", "png");
+    render_psd_preview(path, &output, IMAGE_PREVIEW_DIMENSION)?;
+    prune_generated_artifact_cache(cache, &output);
+    Ok(PreviewArtifact {
+        kind: "image".into(),
+        path: output,
+        mime_type: "image/png".into(),
+        tool: "Explorie PSD decoder".into(),
+    })
+}
+
+fn convert_imagemagick_preview(
+    path: &Path,
+    detected_mime: Option<&str>,
+    cache: &Path,
+    helper_generation: &AtomicU64,
+    ticket: u64,
+) -> ServiceResult<PreviewArtifact> {
+    let coder = imagemagick_coder(path, detected_mime).ok_or_else(unsupported_imagemagick_input)?;
     let tool = first_available_tool(&["magick"], "--version").ok_or_else(|| {
         ServiceError::new(
             ErrorCode::HelperMissing,
@@ -1911,13 +2264,8 @@ fn convert_image_preview(
     })?;
     fs::create_dir_all(cache).map_err(ServiceError::from)?;
     let output = cache_output(cache, path, "image", "png");
-    let input = path.to_string_lossy().into_owned();
     let status = run_helper_with_cancellation(
-        command(&tool)
-            .arg(input)
-            .arg(&output)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null()),
+        &mut imagemagick_command(&tool, cache, coder, path, &[], &output)?,
         HELPER_CONVERSION_TIMEOUT,
         false,
         Some((helper_generation, ticket)),
@@ -1936,6 +2284,258 @@ fn convert_image_preview(
         mime_type: "image/png".into(),
         tool,
     })
+}
+
+/// Quick Look's rendering of `path`, fitted within the preview dimension, as
+/// the preview image (macOS only). With `cancellation`, a newer preview stops
+/// the wait.
+fn convert_quicklook_preview(
+    path: &Path,
+    cache: &Path,
+    cancellation: Option<(&AtomicU64, u64)>,
+) -> ServiceResult<PreviewArtifact> {
+    #[cfg(target_os = "macos")]
+    {
+        validate_preview_image(path, MAX_IMAGE_PREVIEW_BYTES)?;
+        if let Some((generation, ticket)) = cancellation {
+            ensure_helper_current(generation, ticket)?;
+        }
+        fs::create_dir_all(cache).map_err(ServiceError::from)?;
+        let output = cache_output(cache, path, "quicklook", "png");
+        if !output.metadata().is_ok_and(|metadata| metadata.len() > 0) {
+            macos::quicklook_thumbnail(
+                path,
+                IMAGE_PREVIEW_DIMENSION,
+                QUICKLOOK_PREVIEW_TIMEOUT,
+                &output,
+                cancellation,
+            )
+            .map_err(|error| quicklook_error(error, QUICKLOOK_PREVIEW_TIMEOUT))?;
+        }
+        prune_generated_artifact_cache(cache, &output);
+        Ok(PreviewArtifact {
+            kind: "image".into(),
+            path: output,
+            mime_type: "image/png".into(),
+            tool: "Quick Look".into(),
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (path, cache, cancellation);
+        Err(ServiceError::new(
+            ErrorCode::Unsupported,
+            "Quick Look previews are only available on macOS",
+        ))
+    }
+}
+
+/// On macOS, answer a failed or unavailable helper conversion with Quick
+/// Look's rendering instead. `error` stays the result when Quick Look cannot
+/// render the file either, so its guidance (such as which helper to install)
+/// still reaches the user; a superseded preview stays cancelled.
+fn quicklook_preview_fallback(
+    path: &Path,
+    cache: &Path,
+    helper_generation: &AtomicU64,
+    ticket: u64,
+    error: ServiceError,
+) -> ServiceResult<PreviewArtifact> {
+    if !cfg!(target_os = "macos") || error.code == ErrorCode::Cancelled {
+        return Err(error);
+    }
+    convert_quicklook_preview(path, cache, Some((helper_generation, ticket))).map_err(
+        |quicklook_error| {
+            if quicklook_error.code == ErrorCode::Cancelled {
+                quicklook_error
+            } else {
+                error
+            }
+        },
+    )
+}
+
+/// Arguments for extracting one frame with FFmpeg. `-nostdin` keeps FFmpeg from
+/// reading the terminal, and the input protocol whitelist stops a crafted
+/// container or playlist from reaching network, `concat:` or `subfile:` URLs.
+fn ffmpeg_frame_arguments(input: &Path, filter: &str, output: &Path) -> Vec<std::ffi::OsString> {
+    let mut arguments: Vec<std::ffi::OsString> = [
+        "-nostdin",
+        "-hide_banner",
+        "-y",
+        "-protocol_whitelist",
+        FFMPEG_INPUT_PROTOCOLS,
+        "-i",
+    ]
+    .into_iter()
+    .map(Into::into)
+    .collect();
+    arguments.push(input.into());
+    arguments.extend(["-frames:v", "1", "-vf", filter].map(Into::into));
+    arguments.push(output.into());
+    arguments
+}
+
+/// The ImageMagick decoder for a file, chosen explicitly so ImageMagick never
+/// picks one by sniffing content (for example Ghostscript for a disguised
+/// PostScript file). A signature-detected type wins over the extension.
+fn imagemagick_coder(path: &Path, detected_mime: Option<&str>) -> Option<&'static str> {
+    match detected_mime {
+        Some("image/avif") => return Some("AVIF"),
+        Some("image/heif") => return Some("HEIC"),
+        Some("image/jxl") => return Some("JXL"),
+        Some("image/vnd.adobe.photoshop") => return Some("PSD"),
+        _ => {}
+    }
+    Some(match extension(path).as_str() {
+        "heic" | "heif" => "HEIC",
+        "avif" => "AVIF",
+        "jxl" | "jpegxl" => "JXL",
+        "psd" => "PSD",
+        "dng" => "DNG",
+        "cr2" => "CR2",
+        "cr3" => "CR3",
+        "nef" => "NEF",
+        "arw" => "ARW",
+        "orf" => "ORF",
+        "rw2" => "RW2",
+        "raf" => "RAF",
+        _ => return None,
+    })
+}
+
+fn unsupported_imagemagick_input() -> ServiceError {
+    ServiceError::new(
+        ErrorCode::Unsupported,
+        "No safe ImageMagick decoder is configured for this file type.",
+    )
+}
+
+/// Write Explorie's restrictive ImageMagick policy into the preview cache and
+/// return the directory to use as `MAGICK_CONFIGURE_PATH`.
+fn prepare_imagemagick_config(cache: &Path) -> ServiceResult<PathBuf> {
+    let directory = cache.join("imagemagick");
+    write_if_changed(&directory.join("policy.xml"), IMAGEMAGICK_POLICY.as_bytes())?;
+    Ok(directory)
+}
+
+fn imagemagick_arguments(
+    coder: &str,
+    input: &Path,
+    operations: &[&str],
+    output: &Path,
+) -> Vec<std::ffi::OsString> {
+    let mut arguments = Vec::<std::ffi::OsString>::new();
+    for (resource, limit) in IMAGEMAGICK_LIMITS {
+        arguments.extend(["-limit", resource, limit].map(Into::into));
+    }
+    let mut source = std::ffi::OsString::from(format!("{coder}:"));
+    source.push(input);
+    arguments.push(source);
+    arguments.extend(operations.iter().map(Into::into));
+    let mut destination = std::ffi::OsString::from("PNG:");
+    destination.push(output);
+    arguments.push(destination);
+    arguments
+}
+
+fn imagemagick_command(
+    tool: &str,
+    cache: &Path,
+    coder: &str,
+    input: &Path,
+    operations: &[&str],
+    output: &Path,
+) -> ServiceResult<Command> {
+    let config = prepare_imagemagick_config(cache)?;
+    let mut command = command(tool);
+    command
+        .args(imagemagick_arguments(coder, input, operations, output))
+        .env("MAGICK_CONFIGURE_PATH", config)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    Ok(command)
+}
+
+/// Create (or repair) the dedicated LibreOffice profile used for previews. It
+/// keeps conversions away from the user's own profile, macros and trusted
+/// locations, and pins macro security to its highest level with link updates,
+/// active content and recalculation of external data turned off.
+fn prepare_libreoffice_profile(cache: &Path) -> ServiceResult<PathBuf> {
+    let profile = cache.join("libreoffice-profile");
+    let registry = profile.join("user").join("registrymodifications.xcu");
+    let current = fs::read_to_string(&registry).unwrap_or_default();
+    let seeded = LIBREOFFICE_REGISTRY
+        .lines()
+        .filter(|line| line.starts_with("<item "))
+        .all(|line| current.contains(line));
+    if !seeded {
+        write_if_changed(&registry, LIBREOFFICE_REGISTRY.as_bytes())?;
+    }
+    Ok(profile)
+}
+
+fn libreoffice_arguments(
+    profile: &Path,
+    output_dir: &Path,
+    input: &Path,
+) -> Vec<std::ffi::OsString> {
+    let mut arguments: Vec<std::ffi::OsString> = vec![
+        format!("-env:UserInstallation={}", file_url(profile)).into(),
+        "--headless".into(),
+        "--norestore".into(),
+        "--nolockcheck".into(),
+        "--nodefault".into(),
+        "--nologo".into(),
+        "--convert-to".into(),
+        "pdf".into(),
+        "--outdir".into(),
+    ];
+    arguments.push(output_dir.into());
+    arguments.push(input.into());
+    arguments
+}
+
+/// A `file://` URL for an absolute local path, percent-encoding everything
+/// outside the unreserved set so profile paths with spaces or non-ASCII text
+/// survive LibreOffice's URL parsing.
+fn file_url(path: &Path) -> String {
+    let bytes = path.as_os_str().as_encoded_bytes();
+    let mut url = String::from("file://");
+    if !bytes.starts_with(b"/") {
+        url.push('/');
+    }
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        match byte {
+            b'\\' if cfg!(windows) => url.push('/'),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                url.push(char::from(byte));
+            }
+            // Keep a Windows drive separator (`C:`) literal.
+            b':' if index == 1 => url.push(':'),
+            _ => url.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    url
+}
+
+fn write_if_changed(path: &Path, contents: &[u8]) -> ServiceResult<()> {
+    if fs::read(path).is_ok_and(|current| current == contents) {
+        return Ok(());
+    }
+    let parent = path.parent().ok_or_else(|| {
+        ServiceError::new(ErrorCode::Internal, "Helper configuration has no parent")
+    })?;
+    fs::create_dir_all(parent).map_err(ServiceError::from)?;
+    let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+    let result = fs::write(&temporary, contents)
+        .and_then(|()| fs::rename(&temporary, path))
+        .map_err(ServiceError::from);
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn render_psd_preview(input: &Path, output: &Path, max_dimension: u32) -> ServiceResult<()> {
@@ -2007,6 +2607,7 @@ fn prune_generated_artifact_cache(cache: &Path, protected: &Path) {
                 "-svg.",
                 "-native-image.",
                 "-image.",
+                "-quicklook.",
             ]
             .iter()
             .any(|marker| name.contains(marker))
@@ -2178,6 +2779,97 @@ fn command(program: &str) -> Command {
         command.process_group(0);
     }
     command
+}
+
+/// Largest decoded size, in pixels, that a direct image preview hands to the
+/// UI unchanged. Bigger images are downscaled to fit
+/// [`IMAGE_PREVIEW_DIMENSION`] on their longest edge, which is roughly twice
+/// the largest preview viewport (Quick Look).
+const DISPLAY_IMAGE_MAX_PIXELS: u64 =
+    IMAGE_PREVIEW_DIMENSION as u64 * IMAGE_PREVIEW_DIMENSION as u64;
+
+impl PreviewService {
+    /// Resolve the file the UI should decode for a direct (PNG, JPEG, GIF,
+    /// BMP, WebP) image preview. Images up to [`DISPLAY_IMAGE_MAX_PIXELS`] are
+    /// returned unchanged; larger ones go through the native image preview
+    /// path, which decodes under the service's decode limits and writes a
+    /// downscaled copy to the preview cache. The UI therefore never decodes a
+    /// 100-megapixel photo at full resolution.
+    ///
+    /// Dropping the returned task abandons work that has not started yet.
+    pub fn display_image(&self, path: PathBuf) -> BlockingTask<PathBuf> {
+        let cache = self.cache_dir();
+        let cache_gate = Arc::clone(&self.cache_gate);
+        let artifact_lock = Arc::clone(&self.artifact_lock);
+        self.context.spawn_cancellable(move |token| {
+            let Some((width, height)) = image_header_dimensions(&path) else {
+                // Unreadable headers keep the historical behaviour: the UI
+                // decoder reports what it cannot display.
+                return Ok(path);
+            };
+            if u64::from(width) * u64::from(height) <= DISPLAY_IMAGE_MAX_PIXELS {
+                return Ok(path);
+            }
+            let superseded =
+                || ServiceError::new(ErrorCode::Cancelled, "Image preview was superseded");
+            if token.is_cancelled() {
+                return Err(superseded());
+            }
+            let _cache_guard = cache_gate
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _artifact_guard = artifact_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if token.is_cancelled() {
+                return Err(superseded());
+            }
+            convert_native_image_preview(&path, &cache).map(|artifact| artifact.path)
+        })
+    }
+}
+
+/// Read an image's dimensions from its header without decoding pixels.
+fn image_header_dimensions(path: &Path) -> Option<(u32, u32)> {
+    image::ImageReader::open(path)
+        .ok()?
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()
+}
+
+#[cfg(test)]
+mod display_image_tests {
+    use super::*;
+    use crate::ResourcePaths;
+
+    #[test]
+    fn small_images_stay_direct_and_large_ones_are_downscaled_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = PreviewService::new(ServiceContext::new(ResourcePaths::test(temp.path())));
+
+        let small = temp.path().join("small.png");
+        image::RgbImage::new(64, 48).save(&small).unwrap();
+        assert_eq!(service.display_image(small.clone()).wait().unwrap(), small);
+
+        let unreadable = temp.path().join("unreadable.png");
+        fs::write(&unreadable, b"not an image").unwrap();
+        assert_eq!(
+            service.display_image(unreadable.clone()).wait().unwrap(),
+            unreadable
+        );
+
+        let large = temp.path().join("large.png");
+        image::RgbImage::new(2_400, 1_800).save(&large).unwrap();
+        let shown = service.display_image(large.clone()).wait().unwrap();
+        assert_ne!(shown, large);
+        assert!(shown.starts_with(service.cache_dir()));
+        let (width, height) = image::image_dimensions(&shown).unwrap();
+        assert_eq!(width, IMAGE_PREVIEW_DIMENSION);
+        assert!(height < IMAGE_PREVIEW_DIMENSION);
+        assert_eq!(service.display_image(large).wait().unwrap(), shown);
+    }
 }
 
 #[cfg(test)]
@@ -2392,9 +3084,18 @@ mod tests {
             .expect("descendant pid should be recorded before timeout")
             .parse()
             .unwrap();
+        // A killed process stays a zombie until its new parent reaps it, which
+        // never happens under a PID 1 that doesn't reap (e.g. in a container).
+        let is_zombie = |pid: i32| {
+            fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+                stat.rsplit_once(')')
+                    .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'))
+            })
+        };
         let stopped = (0..100).any(|_| {
-            let alive = unsafe { libc::kill(descendant_pid, 0) } == 0
-                || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+            let alive = (unsafe { libc::kill(descendant_pid, 0) } == 0
+                || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
+                && !is_zombie(descendant_pid);
             if alive {
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -2808,6 +3509,637 @@ mod tests {
         assert_eq!(&fs::read(&file_icon).unwrap()[..8], b"\x89PNG\r\n\x1a\n");
         assert_eq!(&fs::read(&folder_icon).unwrap()[..8], b"\x89PNG\r\n\x1a\n");
         assert_eq!(folder_icon, cached_folder_icon);
+    }
+
+    fn os(values: &[&str]) -> Vec<std::ffi::OsString> {
+        values.iter().map(Into::into).collect()
+    }
+
+    #[test]
+    fn imagemagick_commands_pin_the_decoder_limits_and_policy() {
+        for (name, coder) in [
+            ("photo.HEIC", "HEIC"),
+            ("photo.heif", "HEIC"),
+            ("photo.avif", "AVIF"),
+            ("photo.jpegxl", "JXL"),
+            ("raw.cr2", "CR2"),
+            ("raw.CR3", "CR3"),
+            ("raw.dng", "DNG"),
+            ("raw.raf", "RAF"),
+        ] {
+            assert_eq!(imagemagick_coder(Path::new(name), None), Some(coder));
+        }
+        assert_eq!(
+            imagemagick_coder(Path::new("misnamed.jpg"), Some("image/heif")),
+            Some("HEIC")
+        );
+        for name in [
+            "document.ps",
+            "vector.svg",
+            "script.mvg",
+            "notes.txt",
+            "noext",
+        ] {
+            assert_eq!(imagemagick_coder(Path::new(name), None), None, "{name}");
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("disguised postscript.cr2");
+        let output = temp.path().join("thumb.png");
+        let command = imagemagick_command(
+            "magick",
+            temp.path(),
+            "CR2",
+            &input,
+            &["-thumbnail", "256x256>"],
+            &output,
+        )
+        .unwrap();
+        let arguments: Vec<_> = command.get_args().map(ToOwned::to_owned).collect();
+        let mut expected = os(&[
+            "-limit", "memory", "256MiB", "-limit", "map", "512MiB", "-limit", "disk", "1GiB",
+            "-limit", "area", "128MP", "-limit", "width", "16KP", "-limit", "height", "16KP",
+            "-limit", "time", "60",
+        ]);
+        expected.push(format!("CR2:{}", input.display()).into());
+        expected.extend(os(&["-thumbnail", "256x256>"]));
+        expected.push(format!("PNG:{}", output.display()).into());
+        assert_eq!(arguments, expected);
+
+        let config = temp.path().join("imagemagick");
+        assert!(command.get_envs().any(
+            |(key, value)| key == "MAGICK_CONFIGURE_PATH" && value == Some(config.as_os_str())
+        ));
+        let policy = fs::read_to_string(config.join("policy.xml")).unwrap();
+        assert_eq!(policy, IMAGEMAGICK_POLICY);
+        for denied in [
+            r#"<policy domain="coder" rights="none" pattern="*"/>"#,
+            r#"<policy domain="delegate" rights="none" pattern="*"/>"#,
+            r#"<policy domain="path" rights="none" pattern="@*"/>"#,
+            r#"<policy domain="resource" name="time" value="60"/>"#,
+        ] {
+            assert!(policy.contains(denied), "{denied}");
+        }
+        for module in [
+            "PS", "EPS", "PDF", "XPS", "MVG", "MSL", "TEXT", "URL", "HTTP", "HTTPS", "FTP",
+        ] {
+            assert!(
+                policy
+                    .lines()
+                    .filter(|line| line.contains(r#"domain="module" rights="none""#))
+                    .any(|line| line.contains(&format!("{{{module},"))
+                        || line.contains(&format!(",{module},"))
+                        || line.contains(&format!(",{module}}}"))),
+                "{module} is not denied"
+            );
+        }
+        // The allow list must come after the blanket coder denial because the
+        // last matching ImageMagick policy wins.
+        let deny = policy.find(r#"domain="coder" rights="none""#).unwrap();
+        assert!(policy.find(r#"domain="coder" rights="read""#).unwrap() > deny);
+        assert!(
+            policy
+                .find(r#"domain="coder" rights="write" pattern="PNG""#)
+                .unwrap()
+                > deny
+        );
+
+        fs::write(config.join("policy.xml"), "<policymap/>").unwrap();
+        prepare_imagemagick_config(temp.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(config.join("policy.xml")).unwrap(),
+            IMAGEMAGICK_POLICY
+        );
+    }
+
+    #[test]
+    fn libreoffice_uses_a_hardened_dedicated_profile() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("preview cache");
+        let profile = prepare_libreoffice_profile(&cache).unwrap();
+        assert_eq!(profile, cache.join("libreoffice-profile"));
+        let registry = profile.join("user").join("registrymodifications.xcu");
+        let seeded = fs::read_to_string(&registry).unwrap();
+        for setting in [
+            r#"<prop oor:name="MacroSecurityLevel" oor:op="fuse"><value>3</value></prop>"#,
+            r#"<prop oor:name="DisableMacrosExecution" oor:op="fuse"><value>true</value></prop>"#,
+            r#"<prop oor:name="SecureURL" oor:op="fuse"><value/></prop>"#,
+            r#"<prop oor:name="DisableActiveContent" oor:op="fuse"><value>true</value></prop>"#,
+        ] {
+            assert!(seeded.contains(setting), "{setting}");
+        }
+        // Writer stores link updates as NEVER = 0; Calc uses 1 for never.
+        assert!(seeded.contains(
+            r#"<item oor:path="/org.openoffice.Office.Writer/Content/Update"><prop oor:name="Link" oor:op="fuse"><value>0</value>"#
+        ));
+        assert!(seeded.contains(
+            r#"<item oor:path="/org.openoffice.Office.Calc/Content/Update"><prop oor:name="Link" oor:op="fuse"><value>1</value>"#
+        ));
+
+        // LibreOffice rewrites the file with its own additions; keep those as
+        // long as every hardening entry survives, and repair it otherwise.
+        let extended = seeded.replace(
+            "</oor:items>",
+            "<item oor:path=\"/org.openoffice.Setup/Office\"><prop oor:name=\"ooSetupInstCompleted\" oor:op=\"fuse\"><value>true</value></prop></item>\n</oor:items>",
+        );
+        fs::write(&registry, &extended).unwrap();
+        prepare_libreoffice_profile(&cache).unwrap();
+        assert_eq!(fs::read_to_string(&registry).unwrap(), extended);
+        fs::write(
+            &registry,
+            extended.replace("<value>3</value>", "<value>0</value>"),
+        )
+        .unwrap();
+        prepare_libreoffice_profile(&cache).unwrap();
+        assert_eq!(fs::read_to_string(&registry).unwrap(), LIBREOFFICE_REGISTRY);
+
+        let output = temp.path().join("out");
+        let input = temp.path().join("report.docx");
+        let arguments = libreoffice_arguments(&profile, &output, &input);
+        let mut expected = vec![std::ffi::OsString::from(format!(
+            "-env:UserInstallation={}",
+            file_url(&profile)
+        ))];
+        expected.extend(os(&[
+            "--headless",
+            "--norestore",
+            "--nolockcheck",
+            "--nodefault",
+            "--nologo",
+            "--convert-to",
+            "pdf",
+            "--outdir",
+        ]));
+        expected.push(output.into());
+        expected.push(input.into());
+        assert_eq!(arguments, expected);
+        assert!(file_url(&profile).contains("/preview%20cache/libreoffice-profile"));
+    }
+
+    #[test]
+    fn file_urls_percent_encode_profile_paths() {
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                file_url(Path::new("/Users/Zoë Q/Caches/x#1%/lo")),
+                "file:///Users/Zo%C3%AB%20Q/Caches/x%231%25/lo"
+            );
+            assert_eq!(file_url(Path::new("/tmp/a\\b")), "file:///tmp/a%5Cb");
+        }
+        #[cfg(windows)]
+        assert_eq!(
+            file_url(Path::new(r"C:\Users\Zoë\AppData\lo")),
+            "file:///C:/Users/Zo%C3%AB/AppData/lo"
+        );
+    }
+
+    #[test]
+    fn ffmpeg_frame_arguments_disable_stdin_and_network_protocols() {
+        let input = Path::new("/videos/clip.mkv");
+        let output = Path::new("/cache/frame.png");
+        let arguments = ffmpeg_frame_arguments(input, "thumbnail", output);
+        let mut expected = os(&[
+            "-nostdin",
+            "-hide_banner",
+            "-y",
+            "-protocol_whitelist",
+            "file,pipe",
+            "-i",
+        ]);
+        expected.push(input.into());
+        expected.extend(os(&["-frames:v", "1", "-vf", "thumbnail"]));
+        expected.push(output.into());
+        assert_eq!(arguments, expected);
+    }
+
+    static FORCED_CLOUD_PLACEHOLDERS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    /// Whether a test marked `path` as a cloud placeholder.
+    pub(super) fn forced_cloud_placeholder(path: &Path) -> bool {
+        FORCED_CLOUD_PLACEHOLDERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|forced| forced == path)
+    }
+
+    fn force_cloud_placeholder(path: &Path) {
+        FORCED_CLOUD_PLACEHOLDERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(path.to_path_buf());
+    }
+
+    fn cached_files_containing(cache: &Path, marker: &str) -> usize {
+        fs::read_dir(cache).map_or(0, |entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().contains(marker))
+                .count()
+        })
+    }
+
+    #[test]
+    fn thumbnails_prefer_bundled_decoders_and_leave_documents_to_quick_look() {
+        for (name, expected) in [
+            ("photo.JPG", Some(ThumbnailSource::NativeImage)),
+            ("scan.tiff", Some(ThumbnailSource::NativeImage)),
+            ("design.psd", Some(ThumbnailSource::Psd)),
+            ("diagram.svg", Some(ThumbnailSource::Svg)),
+            ("photo.heic", Some(ThumbnailSource::ExternalImage)),
+            ("raw.cr2", Some(ThumbnailSource::ExternalImage)),
+            ("clip.mov", Some(ThumbnailSource::Video)),
+            ("notes.txt", None),
+        ] {
+            assert_eq!(thumbnail_source(Path::new(name)), expected, "{name}");
+        }
+        for name in [
+            "manual.pdf",
+            "letter.docx",
+            "report.pages",
+            "font.otf",
+            "scene.usdz",
+        ] {
+            let expected = cfg!(target_os = "macos").then_some(ThumbnailSource::QuickLook);
+            assert_eq!(thumbnail_source(Path::new(name)), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn models_render_only_with_the_3d_backend_and_otherwise_keep_their_icon() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = PreviewService::new(ServiceContext::new(ResourcePaths::test(temp.path())));
+        let scene = temp.path().join("triangle.obj");
+        fs::write(&scene, "v -1 -1 0\nv 1 -1 0\nv 0 1 0\nf 1 2 3\n").unwrap();
+
+        let thumbnail = service.thumbnail(scene.clone(), 128).wait().unwrap();
+        assert_eq!(thumbnail.is_some(), cfg!(feature = "preview-3d"));
+        let preview = service
+            .model(scene, ModelCamera::default(), 480, 320)
+            .wait();
+        if cfg!(feature = "preview-3d") {
+            assert_eq!(preview.unwrap().triangle_count, 1);
+        } else {
+            let error = preview.unwrap_err();
+            assert_eq!(error.code, ErrorCode::Unsupported);
+            assert_eq!(error.message, "3D previews aren't included in this build");
+        }
+    }
+
+    #[test]
+    fn cloud_placeholders_never_get_thumbnails() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = PreviewService::new(ServiceContext::new(ResourcePaths::test(temp.path())));
+        let photo = temp.path().join("evicted.png");
+        write_test_image(&photo, 320, 180, [40, 120, 220, 255]);
+        let scene = temp.path().join("evicted.obj");
+        fs::write(&scene, b"not a model").unwrap();
+        force_cloud_placeholder(&photo);
+        force_cloud_placeholder(&scene);
+
+        assert_eq!(service.thumbnail(photo, 128).wait().unwrap(), None);
+        assert_eq!(service.thumbnail(scene, 128).wait().unwrap(), None);
+        assert_eq!(
+            cached_files_containing(&service.cache_dir(), "-thumbnail-"),
+            0
+        );
+
+        let local = temp.path().join("local.png");
+        write_test_image(&local, 320, 180, [40, 120, 220, 255]);
+        assert!(service.thumbnail(local, 128).wait().unwrap().is_some());
+    }
+
+    #[cfg(target_os = "macos")]
+    fn assert_png_within(path: &Path, limit: u32) -> (u32, u32) {
+        assert_eq!(&fs::read(path).unwrap()[..8], b"\x89PNG\r\n\x1a\n");
+        let (width, height) = image::image_dimensions(path).unwrap();
+        assert!(width > 0 && height > 0 && width <= limit && height <= limit);
+        (width, height)
+    }
+
+    /// Converts a PNG to HEIC with the system `sips` tool.
+    #[cfg(target_os = "macos")]
+    fn write_test_heic(directory: &Path, name: &str) -> PathBuf {
+        let png = directory.join(format!("{name}.png"));
+        write_test_image(&png, 320, 180, [40, 120, 220, 255]);
+        let heic = directory.join(format!("{name}.heic"));
+        let converted = Command::new("sips")
+            .args(["-s", "format", "heic"])
+            .arg(&png)
+            .arg("--out")
+            .arg(&heic)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(converted.success(), "sips could not create a HEIC");
+        fs::remove_file(png).unwrap();
+        heic
+    }
+
+    /// A short MPEG-4 clip transcoded with `avconvert` from a movie macOS
+    /// ships, or `None` when neither is available.
+    #[cfg(target_os = "macos")]
+    fn write_test_video(directory: &Path) -> Option<PathBuf> {
+        let source = [
+            "/System/Applications/FindMy.app/Contents/Resources/BatterySwap_loop.mov",
+            "/System/Library/CoreServices/ControlCenter.app/Contents/Resources/BentoGalleryIntroduction.mov",
+        ]
+        .into_iter()
+        .map(Path::new)
+        .find(|path| path.is_file())?;
+        let clip = directory.join("clip.mp4");
+        let converted = Command::new("avconvert")
+            .args([
+                "--preset",
+                "PresetLowQuality",
+                "--duration",
+                "1",
+                "--source",
+            ])
+            .arg(source)
+            .arg("--output")
+            .arg(&clip)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .ok()?;
+        (converted.success() && clip.is_file()).then_some(clip)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn quick_look_thumbnails_cover_heic_pdf_and_video_without_helpers() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = PreviewService::new(ServiceContext::new(ResourcePaths::test(temp.path())));
+
+        let heic = write_test_heic(temp.path(), "photo");
+        let thumbnail = service
+            .thumbnail(heic.clone(), 128)
+            .wait()
+            .unwrap()
+            .unwrap();
+        assert_eq!(assert_png_within(&thumbnail, 128), (128, 72));
+        assert_eq!(
+            service.thumbnail(heic, 128).wait().unwrap().unwrap(),
+            thumbnail,
+            "Quick Look thumbnails are cached like native ones"
+        );
+
+        let pdf = temp.path().join("manual.pdf");
+        fs::write(&pdf, minimal_pdf_with_dimensions(1, 400, 200)).unwrap();
+        let thumbnail = service.thumbnail(pdf, 256).wait().unwrap().unwrap();
+        let (width, height) = assert_png_within(&thumbnail, 256);
+        assert!(width > height, "landscape page stays landscape");
+
+        match write_test_video(temp.path()) {
+            Some(video) => {
+                let thumbnail = service.thumbnail(video, 128).wait().unwrap().unwrap();
+                assert_png_within(&thumbnail, 128);
+            }
+            None => eprintln!("skipping video poster frame: no sample movie or avconvert"),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn quick_look_waits_are_bounded_and_cancellable() {
+        let temp = tempfile::tempdir().unwrap();
+        let pdf = temp.path().join("slow.pdf");
+        fs::write(&pdf, minimal_pdf(3)).unwrap();
+        let output = temp.path().join("slow.png");
+
+        assert_eq!(
+            macos::quicklook_thumbnail(&pdf, 256, Duration::ZERO, &output, None),
+            Err(macos::NativeImageError::TimedOut)
+        );
+        assert!(!output.exists(), "a late result must not be written");
+        let service_error =
+            quicklook_error(macos::NativeImageError::TimedOut, Duration::from_secs(5));
+        assert!(service_error.message.contains("timed out after 5 seconds"));
+
+        let generation = AtomicU64::new(2);
+        assert_eq!(
+            macos::quicklook_thumbnail(
+                &pdf,
+                256,
+                QUICKLOOK_THUMBNAIL_TIMEOUT,
+                &output,
+                Some((&generation, 1))
+            ),
+            Err(macos::NativeImageError::Cancelled)
+        );
+
+        // The generator keeps working after abandoned requests.
+        macos::quicklook_thumbnail(&pdf, 256, QUICKLOOK_THUMBNAIL_TIMEOUT, &output, None).unwrap();
+        assert_png_within(&output, 256);
+
+        let unsupported = temp.path().join("server.key");
+        fs::write(
+            &unsupported,
+            "-----BEGIN PRIVATE KEY-----\nMIIabc\n-----END PRIVATE KEY-----\n",
+        )
+        .unwrap();
+        assert_eq!(
+            macos::quicklook_thumbnail(
+                &unsupported,
+                256,
+                QUICKLOOK_THUMBNAIL_TIMEOUT,
+                &temp.path().join("key.png"),
+                None
+            ),
+            Err(macos::NativeImageError::Unavailable),
+            "files Quick Look can only draw as an icon get no thumbnail"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn quick_look_previews_stand_in_for_missing_helpers() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = PreviewService::new(ServiceContext::new(ResourcePaths::test(temp.path())));
+
+        let heic = write_test_heic(temp.path(), "preview");
+        let artifact = service.artifact(heic).wait().unwrap();
+        assert_eq!(artifact.kind, "image");
+        assert_eq!(artifact.mime_type, "image/png");
+        if first_available_tool(&["magick"], "--version").is_none() {
+            assert_eq!(artifact.tool, "Quick Look");
+            assert_eq!(
+                assert_png_within(&artifact.path, IMAGE_PREVIEW_DIMENSION),
+                (320, 180)
+            );
+        }
+
+        let text = temp.path().join("letter.txt");
+        fs::write(&text, "Dear reader,\nQuick Look renders this letter.\n").unwrap();
+        let docx = temp.path().join("letter.docx");
+        let converted = Command::new("textutil")
+            .args(["-convert", "docx"])
+            .arg(&text)
+            .arg("-output")
+            .arg(&docx)
+            .status()
+            .unwrap();
+        assert!(converted.success());
+        let artifact = service.artifact(docx).wait().unwrap();
+        if first_available_tool(&["soffice", "libreoffice"], "--version").is_none() {
+            assert_eq!(artifact.kind, "image");
+            assert_eq!(artifact.tool, "Quick Look");
+            // Document generators decide how large a page thumbnail they render
+            // (CI runners return far smaller pages than a desktop Mac), so only
+            // check that a portrait page, not a square icon, came back.
+            let (width, height) = assert_png_within(&artifact.path, IMAGE_PREVIEW_DIMENSION);
+            assert!(height > width, "the first page renders in portrait");
+        }
+
+        // Files Quick Look cannot draw keep the helper's guidance.
+        let broken = temp.path().join("broken.docx");
+        fs::write(&broken, b"not a document").unwrap();
+        if first_available_tool(&["soffice", "libreoffice"], "--version").is_none() {
+            let error = service.artifact(broken).wait().unwrap_err();
+            assert_eq!(error.code, ErrorCode::HelperMissing);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_system_icons_render_apps_folders_and_file_kinds() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = PreviewService::new(ServiceContext::new(ResourcePaths::test(temp.path())));
+        let folder = temp.path().join("folder");
+        fs::create_dir(&folder).unwrap();
+        let notes = temp.path().join("notes.txt");
+        let other_notes = temp.path().join("other.TXT");
+        fs::write(&notes, "local").unwrap();
+        fs::write(&other_notes, "local").unwrap();
+        let text_edit = PathBuf::from("/System/Applications/TextEdit.app");
+
+        let app_icon = service
+            .file_icon(text_edit.clone())
+            .wait()
+            .unwrap()
+            .unwrap();
+        let folder_icon = service.file_icon(folder).wait().unwrap().unwrap();
+        let text_icon = service.file_icon(notes).wait().unwrap().unwrap();
+        for icon in [&app_icon, &folder_icon, &text_icon] {
+            assert_eq!(&fs::read(icon).unwrap()[..8], b"\x89PNG\r\n\x1a\n");
+            assert_eq!(
+                image::image_dimensions(icon).unwrap(),
+                (SYSTEM_ICON_PIXELS, SYSTEM_ICON_PIXELS)
+            );
+        }
+        let app = image::open(&app_icon).unwrap().into_rgba8();
+        assert!(
+            app.pixels().any(|pixel| pixel.0[3] == 0),
+            "icons keep transparency"
+        );
+        assert!(app.pixels().any(|pixel| pixel.0[3] == 255));
+        assert_ne!(
+            fs::read(&app_icon).unwrap(),
+            fs::read(&folder_icon).unwrap()
+        );
+        assert_ne!(
+            fs::read(&folder_icon).unwrap(),
+            fs::read(&text_icon).unwrap()
+        );
+
+        // Plain files share their kind's icon; applications keep their own.
+        assert_eq!(
+            service.file_icon(other_notes).wait().unwrap().unwrap(),
+            text_icon
+        );
+        assert!(text_icon.to_string_lossy().contains("-kind-icon."));
+        assert!(!app_icon.to_string_lossy().contains("-kind-icon."));
+        assert_eq!(
+            service
+                .file_icon(text_edit.clone())
+                .wait()
+                .unwrap()
+                .unwrap(),
+            app_icon
+        );
+
+        // A link shows its target's icon with Finder's alias arrow.
+        let link = temp.path().join("Editor");
+        std::os::unix::fs::symlink(&text_edit, &link).unwrap();
+        let link_icon = service.file_icon(link).wait().unwrap().unwrap();
+        assert!(!link_icon.to_string_lossy().contains("-kind-icon."));
+        assert_eq!(
+            image::image_dimensions(&link_icon).unwrap(),
+            (SYSTEM_ICON_PIXELS, SYSTEM_ICON_PIXELS)
+        );
+        assert_ne!(fs::read(link_icon).unwrap(), fs::read(&app_icon).unwrap());
+
+        assert_eq!(
+            service
+                .file_icon(temp.path().join("missing"))
+                .wait()
+                .unwrap(),
+            None
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn item_specific_macos_icons_cover_packages_links_aliases_and_special_folders() {
+        let temp = tempfile::tempdir().unwrap();
+        let app =
+            explorie_core::entry_for_path(Path::new("/System/Applications/TextEdit.app")).unwrap();
+        assert!(app.is_package && has_item_specific_icon(&app));
+
+        let folder = temp.path().join("folder");
+        fs::create_dir(&folder).unwrap();
+        assert!(!has_item_specific_icon(
+            &explorie_core::entry_for_path(&folder).unwrap()
+        ));
+
+        let home = dirs::home_dir().unwrap();
+        for special in ["Desktop", "Documents", "Downloads", "Library"] {
+            assert!(is_special_folder(&home.join(special)), "{special}");
+        }
+        assert!(is_special_folder(&home));
+        assert!(is_special_folder(Path::new("/Applications")));
+        assert!(is_special_folder(Path::new("/Volumes/Backup")));
+        assert!(!is_special_folder(&home.join("Desktop/Projects")));
+        assert!(!is_special_folder(&folder));
+
+        let mut entry = explorie_core::entry_for_path(&temp.path().join("folder")).unwrap();
+        entry.is_dir = false;
+        for (name, has_xattrs, expected) in [
+            ("Report alias", true, true),
+            ("Report.pdf alias", true, true),
+            ("Report alias", false, false),
+            ("notes.txt", true, false),
+        ] {
+            entry.path = temp.path().join(name);
+            entry.has_xattrs = has_xattrs;
+            assert_eq!(
+                has_item_specific_icon(&entry),
+                expected,
+                "{name} {has_xattrs}"
+            );
+        }
+        entry.path = temp.path().join("notes.txt");
+        entry.is_symlink = true;
+        assert!(has_item_specific_icon(&entry));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cloud_placeholder_packages_get_kind_icons_without_being_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = PreviewService::new(ServiceContext::new(ResourcePaths::test(temp.path())));
+        let evicted = temp.path().join("Evicted.app");
+        let local = temp.path().join("Local.app");
+        fs::create_dir(&evicted).unwrap();
+        fs::create_dir(&local).unwrap();
+        force_cloud_placeholder(&evicted);
+
+        let evicted_icon = service.file_icon(evicted).wait().unwrap().unwrap();
+        let local_icon = service.file_icon(local).wait().unwrap().unwrap();
+        assert!(evicted_icon.to_string_lossy().contains("-kind-icon."));
+        assert!(!local_icon.to_string_lossy().contains("-kind-icon."));
     }
 
     #[test]

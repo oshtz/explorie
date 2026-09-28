@@ -134,6 +134,23 @@ test('macOS GPUI platform enables native font rendering', async () => {
   );
 });
 
+test('release builds unwind so catch_unwind crash guards keep working', async () => {
+  const workspace = await readFile(path.join(process.cwd(), 'Cargo.toml'), 'utf8');
+  const release = workspace.match(/^\[profile\.release\]\r?\n([\s\S]*?)(?=^\[|(?![\s\S]))/m);
+  assert.ok(release, 'Cargo.toml must define [profile.release]');
+  assert.match(release[1], /^panic = "unwind"\r?$/m);
+  assert.doesNotMatch(workspace, /^\s*panic\s*=\s*"abort"/m);
+});
+
+test('the CI profile is an optimized release derivative without LTO', async () => {
+  const workspace = await readFile(path.join(process.cwd(), 'Cargo.toml'), 'utf8');
+  const ci = workspace.match(/^\[profile\.ci\]\r?\n([\s\S]*?)(?=^\[|(?![\s\S]))/m);
+  assert.ok(ci, 'Cargo.toml must define [profile.ci]');
+  // Inheriting release keeps panic = "unwind" and makes build.rs see PROFILE=release.
+  assert.match(ci[1], /^inherits = "release"\r?$/m);
+  assert.match(ci[1], /^lto = false\r?$/m);
+});
+
 function sampleContext() {
   return {
     generatedAt: fixedDate.toISOString(),
@@ -442,15 +459,15 @@ test('workflows block audits and publish the exact attested draft assets', async
   assert.match(ci, /save-if: \$\{\{ github\.ref == 'refs\/heads\/main' \}\}/);
   assert.match(
     ci,
-    /name: Windows Tests, Lint & Release Contracts[\s\S]*?runs-on: windows-latest[\s\S]*?timeout-minutes: 60/
+    /name: Windows Tests, Lint & Release Contracts[\s\S]*?runs-on: windows-latest[\s\S]*?timeout-minutes: 120/
   );
   assert.match(
     ci,
-    /Test native Rust crates on Windows[\s\S]*?timeout-minutes: 15[\s\S]*?cargo test --locked -p explorie-core -p explorie-native-services -p explorie-ffmpeg-wrapper -p explorie-cli --no-fail-fast -- --test-threads=1/
+    /Test native Rust crates on Windows[\s\S]*?timeout-minutes: 40[\s\S]*?cargo test --locked -p explorie-core -p explorie-native-services -p explorie-ffmpeg-wrapper -p explorie-cli --no-fail-fast -- --test-threads=1/
   );
   assert.match(
     ci,
-    /Test GPUI application on Windows[\s\S]*?timeout-minutes: 15[\s\S]*?cargo test --locked -p explorie-gpui -- --test-threads=1/
+    /Test GPUI application on Windows[\s\S]*?timeout-minutes: 40[\s\S]*?cargo test --locked -p explorie-gpui -- --test-threads=1/
   );
   assert.match(ci, /name: Rust Coverage[\s\S]*?runs-on: windows-latest/);
   assert.match(
@@ -461,11 +478,20 @@ test('workflows block audits and publish the exact attested draft assets', async
     ci,
     /Generate native Rust coverage\s+run:[^\n]*explorie-gpui/
   );
+  // PR/main CI builds the optimized `ci` profile; only tagged releases pay for LTO.
   assert.match(
     ci,
-    /Build GPUI Windows release[\s\S]*?cargo build -p explorie-gpui --release --locked/
+    /Build GPUI Windows release[\s\S]*?cargo build -p explorie-gpui --profile ci --locked[\s\S]*?"target\/ci\/plugins"/
   );
-  assert.match(ci, /Smoke test GPUI Windows release[\s\S]*?scripts\/smoke-gpui-release\.ps1/);
+  assert.doesNotMatch(ci, /cargo build -p explorie-gpui --release/);
+  assert.match(
+    ci,
+    /Smoke test GPUI Windows release[\s\S]*?scripts\/smoke-gpui-release\.ps1 -Executable target\/ci\/explorie-gpui\.exe/
+  );
+  assert.match(
+    ci,
+    /Test crash guards in an optimized build[\s\S]*?cargo test --locked --profile ci -p explorie-native-services -p explorie-gpui --test panic_guards/
+  );
   assert.match(ci, /name: macOS GPUI Tests & Build[\s\S]*?runs-on: macos-latest/);
   assert.match(ci, /name: Unix Safety Regression Tests[\s\S]*?runs-on: ubuntu-latest/);
   assert.match(
@@ -482,7 +508,7 @@ test('workflows block audits and publish the exact attested draft assets', async
   );
   assert.match(
     ci,
-    /Build GPUI macOS application[\s\S]*?cargo build -p explorie-gpui --release --locked/
+    /Build GPUI macOS application[\s\S]*?cargo build -p explorie-gpui --profile ci --locked[\s\S]*?\/target\/ci\/plugins"/
   );
   assert.doesNotMatch(ci, /tauri build/);
   assert.equal((ci.match(/name: Prepare native dependencies/g) ?? []).length, 2);
@@ -661,14 +687,125 @@ test('workflows block audits and publish the exact attested draft assets', async
   assert.match(updater, /backup_installed_update[\s\S]*?replace_installed_update/);
   assert.match(updater, /remove_directory_with_retries[\s\S]*?remove_file_with_retries/);
   assert.match(updater, /rejects_portable_fallbacks_wrong_platform_sizes_and_foreign_urls/);
+  assert.match(updater, /minisign_verify/);
+  assert.match(updater, /include_str!\("\.\.\/update-signing-key\.pub"\)/);
+  assert.match(updater, /signed_releases_require_a_valid_signature_for_the_exact_asset/);
+  assert.match(
+    release,
+    /UPDATE_SIGNING_KEY: \$\{\{ secrets\.UPDATE_SIGNING_KEY \}\}[\s\S]*?node scripts\/update-signatures\.mjs sign --notes[\s\S]*?gh release edit[^\n]+--notes-file[\s\S]*?verify-release-assets\.mjs/
+  );
   assert.match(mountDaemon, /kSecGuestAttributePid/);
   assert.match(mountDaemon, /connection\.processIdentifier/);
   assert.doesNotMatch(mountDaemon, /\.auditToken/);
+  assert.match(mountDaemon, /\[connection setCodeSigningRequirement:requirement\]/);
+  assert.match(mountDaemon, /certificate leaf\[subject\.OU\]/);
+  assert.match(mountDaemon, /nosuid,nodev,port=/);
+  assert.match(mountDaemon, /@"127\.0\.0\.1:\/"/);
+  assert.doesNotMatch(mountDaemon, /@"localhost:\/"/);
+  assert.match(mountDaemon, /ExplorieValidateServer\(port, connection\.effectiveUserIdentifier\)/);
   assert.match(macosPackage, /CFBundleIdentifier<\/key><string>com\.omershatz\.explorie/);
   assert.match(macosPackage, /codesign --verify --deep --strict/);
   assert.match(macosPackage, /hdiutil create/);
   assert.match(macosPackage, /Contents\/Resources\/explorie-mountd/);
   assert.match(macosPackage, /Contents\/MacOS\/rclone/);
+});
+
+test('supply-chain policy runs on every PR and advisories are rechecked weekly', async () => {
+  const [ci, audit, dependabot, deny] = await Promise.all(
+    ['.github/workflows/ci.yml', '.github/workflows/security-audit.yml', '.github/dependabot.yml', 'deny.toml']
+      .map(file => readFile(path.join(process.cwd(), file), 'utf8'))
+  );
+
+  assert.match(ci, /name: Security Audit[\s\S]*?cargo deny --locked check bans licenses sources/);
+  assert.match(audit, /schedule:\s*\n\s*(#[^\n]*\n\s*)*- cron: '[^']+'/);
+  assert.match(audit, /workflow_dispatch:/);
+  assert.match(audit, /cargo audit 2>&1/);
+  assert.match(audit, /cargo deny --locked check advisories/);
+  assert.doesNotMatch(audit, /uses:[^\n]+@(v\d+|stable|cargo-)/);
+  assert.match(dependabot, /package-ecosystem: cargo[\s\S]*?update-types:[\s\S]*?- minor[\s\S]*?- patch/);
+  for (const crate of ['gpui', 'gpui_platform', 'gpui_windows']) {
+    assert.match(dependabot, new RegExp(`dependency-name: ${crate}\\n`));
+  }
+  assert.match(deny, /^multiple-versions = "warn"$/m);
+  assert.match(deny, /^unknown-git = "deny"$/m);
+  assert.match(deny, /\[sources\.allow-org\]\ngithub = \["zed-industries"\]/);
+});
+
+test('tagged release builds restore, but never save, the main CI rust cache', async () => {
+  const [ci, release] = await Promise.all(
+    ['.github/workflows/ci.yml', '.github/workflows/build-release.yml']
+      .map(file => readFile(path.join(process.cwd(), file), 'utf8'))
+  );
+
+  for (const [ciJob, releaseJob, key] of [
+    ['macOS GPUI Tests & Build', 'Package macOS', 'desktop-macos'],
+    ['Windows Tests, Lint & Release Contracts', 'Package Windows', 'desktop-windows'],
+  ]) {
+    assert.match(
+      ci,
+      new RegExp(`name: ${ciJob}[\\s\\S]*?rust-cache@[\\s\\S]*?shared-key: ${key}\\n\\s*save-if: \\$\\{\\{ github\\.ref == 'refs/heads/main' \\}\\}`)
+    );
+    assert.match(
+      release,
+      new RegExp(`name: ${releaseJob}[\\s\\S]*?rust-cache@[\\s\\S]*?shared-key: ${key}\\n\\s*save-if: false`)
+    );
+  }
+  assert.doesNotMatch(release, /save-if: \$\{\{/);
+});
+
+test('CI lints macOS-only code without enabling runtime shaders', async () => {
+  const ci = await readFile(path.join(process.cwd(), '.github/workflows/ci.yml'), 'utf8');
+  const macos = ci.match(/name: macOS GPUI Tests & Build[\s\S]*?(?=\n  [a-z-]+:\n)/)?.[0] ?? '';
+
+  assert.match(macos, /cargo clippy --locked --workspace --all-targets -- -D warnings/);
+  // CI runners have the Metal toolchain; runtime shaders are for local builds only.
+  assert.doesNotMatch(macos, /run: cargo clippy[^\n]*--all-features/);
+  assert.doesNotMatch(ci, /--features[^\n]*runtime-shaders/);
+});
+
+test('CI keeps the GPUI application compiling on Linux', async () => {
+  const ci = await readFile(path.join(process.cwd(), '.github/workflows/ci.yml'), 'utf8');
+
+  assert.match(
+    ci,
+    /name: Linux Workspace Clippy[\s\S]*?runs-on: ubuntu-latest[\s\S]*?libxkbcommon-x11-dev[\s\S]*?cargo clippy --locked --workspace --all-targets -- -D warnings/
+  );
+  assert.match(ci, /name: CI Gate[\s\S]*?needs: \[[^\]]*check-rust-linux[^\]]*\][\s\S]*?"\$LINUX"/);
+});
+
+test('CI lints the build without optional preview backends, and releases ship them all', async () => {
+  const [ci, release, gpuiManifest] = await Promise.all(
+    ['.github/workflows/ci.yml', '.github/workflows/build-release.yml', 'apps/desktop/gpui/Cargo.toml']
+      .map(file => readFile(path.join(process.cwd(), file), 'utf8'))
+  );
+  const linux = ci.match(/name: Linux Workspace Clippy[\s\S]*?(?=\n  [a-z-]+:\n)/)?.[0] ?? '';
+
+  assert.match(
+    linux,
+    /cargo clippy --locked -p explorie-native-services -p explorie-gpui --no-default-features --all-targets -- -D warnings/
+  );
+  // Release builds rely on the default features carrying every preview backend.
+  assert.doesNotMatch(release, /--no-default-features/);
+  assert.match(gpuiManifest, /^default = \["full-previews"\]$/m);
+  for (const feature of ['preview-3d', 'preview-audio', 'preview-columnar', 'preview-fonts', 'preview-mail', 'preview-sqlite']) {
+    assert.match(gpuiManifest, new RegExp(`^full-previews = \\[[^\\]]*"${feature}"`, 'm'), feature);
+  }
+});
+
+test('fuzz targets stay outside the product workspace and run on a schedule', async () => {
+  const [workspace, fuzzManifest, fuzz] = await Promise.all(
+    ['Cargo.toml', 'fuzz/Cargo.toml', '.github/workflows/fuzz.yml']
+      .map(file => readFile(path.join(process.cwd(), file), 'utf8'))
+  );
+
+  assert.match(workspace, /^exclude = \["fuzz"\]$/m);
+  assert.match(fuzzManifest, /^\[workspace\]$/m);
+  assert.match(fuzz, /schedule:[\s\S]*?workflow_dispatch:/);
+  assert.match(fuzz, /-max_total_time=/);
+  assert.doesNotMatch(fuzz, /uses:[^\n]+@(v\d+|stable|cargo-)/);
+  for (const target of fuzzManifest.matchAll(/^name = "([a-z_]+)"\npath = "fuzz_targets\//gm)) {
+    assert.match(fuzz, new RegExp(`target: \\[[^\\]]*\\b${target[1]}\\b`));
+  }
 });
 
 test('writeReleaseReports writes timestamped and latest JSON/Markdown files', async () => {

@@ -3,8 +3,11 @@ import { createReadStream } from 'node:fs';
 import { readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { loadPublicKey, parseSignatureLines, verifyAsset } from './update-signatures.mjs';
 
-export async function verifyReleaseAssets(release, directory, repository, tag, attestations) {
+// `publicKey` is the configured update signing key (null when signing is not
+// configured); with a key, both installers need valid signatures in the notes.
+export async function verifyReleaseAssets(release, directory, repository, tag, attestations, publicKey = null) {
   if (!/^[\w.-]+\/[\w.-]+$/.test(repository) || !/^v\d+\.\d+\.\d+(?:-[\w.-]+)?$/.test(tag)) {
     throw new Error('Invalid repository or release tag');
   }
@@ -18,6 +21,7 @@ export async function verifyReleaseAssets(release, directory, repository, tag, a
   if (!Array.isArray(release.assets) || release.assets.length !== 2) {
     throw new Error('Release must contain exactly the two installers');
   }
+  const signatures = publicKey ? parseSignatureLines(release.body ?? '') : null;
   for (const [platform, name] of Object.entries(names)) {
     const matches = release.assets.filter(asset => asset.name === name);
     if (matches.length !== 1) throw new Error(`Missing or duplicate ${platform} installer`);
@@ -41,16 +45,20 @@ export async function verifyReleaseAssets(release, directory, repository, tag, a
         throw new Error(`${platform} draft asset is not the real-machine-tested artifact`);
       }
     }
+    if (signatures) await verifyAsset(filename, name, signatures.get(name), publicKey);
   }
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const [metadata, directory, repository, tag, mode] = process.argv.slice(2);
   if (!tag || (mode && mode !== '--attested')) throw new Error('Expected metadata, directory, repository, tag and optional --attested');
+  const publicKey = await loadPublicKey();
   await verifyReleaseAssets(JSON.parse(await readFile(metadata, 'utf8')), directory, repository, tag,
     mode === '--attested' ? {
       windows: process.env.WINDOWS_ATTESTED_SHA256,
       macos: process.env.MACOS_ATTESTED_SHA256,
-    } : undefined);
-  console.log('Verified both installer assets and their SHA-256 digests');
+    } : undefined, publicKey);
+  console.log(publicKey
+    ? 'Verified both installer assets, their SHA-256 digests and update signatures'
+    : 'Verified both installer assets and their SHA-256 digests');
 }

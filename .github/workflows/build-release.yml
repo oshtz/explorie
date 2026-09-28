@@ -165,7 +165,10 @@ jobs:
         uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: './ -> target'
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          # Same key as the CI job on main, whose caches tag runs can read.
+          # Release refs only restore: caches are saved from main alone.
+          shared-key: desktop-windows
+          save-if: false
 
       - name: Prepare native dependencies
         run: |
@@ -377,7 +380,10 @@ jobs:
         uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: './ -> target'
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          # Same key as the CI job on main, whose caches tag runs can read.
+          # Release refs only restore: caches are saved from main alone.
+          shared-key: desktop-macos
+          save-if: false
 
       - name: Verify CoreText glyphs reach the Metal renderer
         env:
@@ -700,6 +706,8 @@ jobs:
     needs: [validate, build-windows, build-macos]
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # UPDATE_SIGNING_KEY lives with the other release-signing secrets.
+    environment: release-signing
     permissions:
       actions: read
       contents: write
@@ -720,9 +728,11 @@ jobs:
           path: release-artifacts
           merge-multiple: true
 
-      - name: Verify packages and create draft
+      - name: Verify packages, create the draft and sign update payloads
         env:
           GH_TOKEN: ${{ github.token }}
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+          UPDATE_SIGNING_KEY_PASSWORD: ${{ secrets.UPDATE_SIGNING_KEY_PASSWORD }}
         run: |
           set -euo pipefail
           cd release-artifacts
@@ -745,6 +755,14 @@ jobs:
             --title "$GITHUB_REF_NAME" \
             --generate-notes
           cd ..
+          # Detached ed25519 signatures travel as machine-readable lines in the
+          # release notes, keeping the release at exactly two assets. The script
+          # fails when the checked-in update public key and UPDATE_SIGNING_KEY
+          # disagree, and leaves the notes untouched when neither is configured.
+          notes="$RUNNER_TEMP/candidate-notes.md"
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json body --jq .body > "$notes"
+          node scripts/update-signatures.mjs sign --notes "$notes" "release-artifacts/$windows" "release-artifacts/$macos"
+          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --notes-file "$notes"
           release_id=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json databaseId --jq '.databaseId')
           gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" > "$RUNNER_TEMP/candidate-release.json"
           node scripts/verify-release-assets.mjs "$RUNNER_TEMP/candidate-release.json" release-artifacts "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME"

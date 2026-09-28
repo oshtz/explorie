@@ -14,6 +14,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub const COALESCE_DELAY: Duration = Duration::from_millis(200);
+/// Past this many changed paths in one batch, the batch reports the watched
+/// roots instead. Consumers treat a changed root as "re-list everything",
+/// which is also how backend overflow and rescan notices are delivered.
 const MAX_CHANGED_PATHS: usize = 4_096;
 
 #[derive(Clone)]
@@ -44,6 +47,8 @@ pub struct WatchSubscription {
 
 #[derive(Default)]
 struct WatchEventQueue {
+    /// The subscription's watched paths, reported when merged events overflow.
+    roots: Vec<PathBuf>,
     events: Mutex<VecDeque<WatcherEvent>>,
     waker: Mutex<Option<Waker>>,
     closed: AtomicBool,
@@ -65,7 +70,10 @@ impl WatchEventQueue {
                 pending.paths.extend(event.paths.iter().cloned());
                 pending.paths.sort();
                 pending.paths.dedup();
-                pending.paths.truncate(MAX_CHANGED_PATHS);
+                if pending.paths.len() > MAX_CHANGED_PATHS {
+                    // Dropping paths would hide changes; report the roots.
+                    pending.paths.clone_from(&self.roots);
+                }
                 true
             })
         } else {
@@ -186,7 +194,10 @@ impl WatcherService {
             .map(|path| format!("{mode_key}:{}", normalize_path(path)))
             .collect();
         let cancelled = Arc::new(AtomicBool::new(false));
-        let event_queue = Arc::new(WatchEventQueue::default());
+        let event_queue = Arc::new(WatchEventQueue {
+            roots: paths.clone(),
+            ..WatchEventQueue::default()
+        });
         let (sender, receiver) = mpsc::channel();
         let mut registrations = self
             .inner
@@ -400,7 +411,7 @@ fn coalescing_worker(
             return;
         }
         let mut changed = HashSet::new();
-        if let Err(error) = collect_event(first, &mut changed) {
+        if let Err(error) = collect_event(first, &mut changed, &watched_paths) {
             let event = WatcherEvent {
                 registration_id: id,
                 state: WatcherState::Failed,
@@ -421,7 +432,7 @@ fn coalescing_worker(
             if cancelled.load(Ordering::Acquire) {
                 return;
             }
-            if let Err(error) = collect_event(next, &mut changed) {
+            if let Err(error) = collect_event(next, &mut changed, &watched_paths) {
                 let event = WatcherEvent {
                     registration_id: id,
                     state: WatcherState::Failed,
@@ -489,10 +500,16 @@ fn bound_changed_paths(changed: &mut HashSet<PathBuf>, watched_paths: &[PathBuf]
 fn collect_event(
     event: Result<Event, String>,
     changed: &mut HashSet<PathBuf>,
+    watched_paths: &[PathBuf],
 ) -> ServiceResult<()> {
     let event = event.map_err(|error| watcher_message("receive filesystem event", error))?;
     if is_access_only(&event.kind) {
         return Ok(());
+    }
+    if event.need_rescan() {
+        // The backend lost track of individual changes (FSEvents
+        // MustScanSubDirs, a Windows buffer overflow): report the roots.
+        changed.extend(watched_paths.iter().cloned());
     }
     changed.extend(event.paths);
     Ok(())
@@ -545,6 +562,44 @@ mod tests {
             .collect::<HashSet<_>>();
         bound_changed_paths(&mut changed, &watched);
         assert_eq!(changed, HashSet::from([PathBuf::from("root")]));
+    }
+
+    #[test]
+    fn merged_bursts_past_the_bound_report_the_roots_instead_of_dropping_paths() {
+        let queue = WatchEventQueue {
+            roots: vec![PathBuf::from("root")],
+            ..WatchEventQueue::default()
+        };
+        for batch in 0..2 {
+            queue.publish(WatcherEvent {
+                registration_id: 7,
+                state: WatcherState::Changed,
+                paths: (0..MAX_CHANGED_PATHS)
+                    .map(|index| PathBuf::from(format!("root/{batch}-{index}")))
+                    .collect(),
+                error: None,
+            });
+        }
+        let events = queue.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events.front().unwrap().paths, [PathBuf::from("root")]);
+    }
+
+    #[test]
+    fn rescan_notices_report_the_watched_roots() {
+        let watched = vec![PathBuf::from("root")];
+        let mut changed = HashSet::new();
+        let rescan = Event::new(EventKind::Other)
+            .set_flag(notify::event::Flag::Rescan)
+            .add_path(PathBuf::from("root/child"));
+        collect_event(Ok(rescan), &mut changed, &watched).unwrap();
+        assert!(changed.contains(&PathBuf::from("root")));
+
+        let mut changed = HashSet::new();
+        let modified = Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
+            .add_path(PathBuf::from("root/child"));
+        collect_event(Ok(modified), &mut changed, &watched).unwrap();
+        assert_eq!(changed, HashSet::from([PathBuf::from("root/child")]));
     }
 
     #[test]

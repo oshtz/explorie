@@ -181,6 +181,128 @@ pub struct AppearanceSettings {
     pub icon_size: u8,
     pub reduce_motion: bool,
     pub high_contrast: bool,
+    /// The OS preference `reduce_motion` was last adopted from; `None` until
+    /// the OS first asked for a different value than the current one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reduce_motion_system_default: Option<bool>,
+    /// The OS preference `high_contrast` was last adopted from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub high_contrast_system_default: Option<bool>,
+}
+
+/// The operating system's accessibility display preferences.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SystemAccessibility {
+    pub reduce_motion: bool,
+    pub high_contrast: bool,
+}
+
+impl AppearanceSettings {
+    /// Follows the OS for accessibility preferences the user has not set in
+    /// explorie. A value still at its default, or still equal to the value last
+    /// adopted from the OS, tracks the OS; any other value is the user's choice
+    /// and is kept.
+    pub fn adopt_system_accessibility(&mut self, system: SystemAccessibility) {
+        adopt_system_preference(
+            &mut self.reduce_motion,
+            &mut self.reduce_motion_system_default,
+            system.reduce_motion,
+        );
+        adopt_system_preference(
+            &mut self.high_contrast,
+            &mut self.high_contrast_system_default,
+            system.high_contrast,
+        );
+    }
+}
+
+fn adopt_system_preference(value: &mut bool, adopted: &mut Option<bool>, system: bool) {
+    let follows_system = adopted.map_or(!*value, |adopted| *value == adopted);
+    if follows_system && *value != system {
+        *value = system;
+        *adopted = Some(system);
+    }
+}
+
+/// Reads the OS accessibility preferences. Unit tests always see the defaults
+/// so their results do not depend on the machine's settings.
+pub(crate) fn system_accessibility() -> SystemAccessibility {
+    if cfg!(test) {
+        return SystemAccessibility::default();
+    }
+    query_system_accessibility()
+}
+
+#[cfg(target_os = "macos")]
+#[allow(unexpected_cfgs)]
+fn query_system_accessibility() -> SystemAccessibility {
+    use objc::runtime::{BOOL, NO, Object};
+    use objc::{class, msg_send, sel, sel_impl};
+
+    // SAFETY: NSWorkspace's shared instance and these read-only properties
+    // (macOS 10.10+ / 10.12+) are safe to query from the main thread.
+    unsafe {
+        let workspace: *mut Object = msg_send![class!(NSWorkspace), sharedWorkspace];
+        if workspace.is_null() {
+            return SystemAccessibility::default();
+        }
+        let reduce_motion: BOOL = msg_send![workspace, accessibilityDisplayShouldReduceMotion];
+        let high_contrast: BOOL = msg_send![workspace, accessibilityDisplayShouldIncreaseContrast];
+        SystemAccessibility {
+            reduce_motion: reduce_motion != NO,
+            high_contrast: high_contrast != NO,
+        }
+    }
+}
+
+#[cfg(windows)]
+fn query_system_accessibility() -> SystemAccessibility {
+    use windows_sys::Win32::Foundation::BOOL;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SPI_GETCLIENTAREAANIMATION, SPI_GETHIGHCONTRAST, SystemParametersInfoW,
+    };
+
+    /// `HIGHCONTRASTW`, declared here to avoid another windows-sys feature.
+    #[repr(C)]
+    struct HighContrast {
+        size: u32,
+        flags: u32,
+        default_scheme: *mut u16,
+    }
+    const HCF_HIGHCONTRASTON: u32 = 0x1;
+
+    let mut animations: BOOL = 1;
+    // SAFETY: both calls write only into the correctly sized buffers passed.
+    let animations_known = unsafe {
+        SystemParametersInfoW(
+            SPI_GETCLIENTAREAANIMATION,
+            0,
+            (&mut animations as *mut BOOL).cast(),
+            0,
+        )
+    } != 0;
+    let mut contrast = HighContrast {
+        size: std::mem::size_of::<HighContrast>() as u32,
+        flags: 0,
+        default_scheme: std::ptr::null_mut(),
+    };
+    let contrast_known = unsafe {
+        SystemParametersInfoW(
+            SPI_GETHIGHCONTRAST,
+            contrast.size,
+            (&mut contrast as *mut HighContrast).cast(),
+            0,
+        )
+    } != 0;
+    SystemAccessibility {
+        reduce_motion: animations_known && animations == 0,
+        high_contrast: contrast_known && contrast.flags & HCF_HIGHCONTRASTON != 0,
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn query_system_accessibility() -> SystemAccessibility {
+    SystemAccessibility::default()
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -268,6 +390,8 @@ impl Default for AppearanceSettings {
             icon_size: 14,
             reduce_motion: false,
             high_contrast: false,
+            reduce_motion_system_default: None,
+            high_contrast_system_default: None,
         }
     }
 }
@@ -366,6 +490,8 @@ impl AppSettings {
             remote_profiles,
             ..Self::default()
         };
+        self.appearance
+            .adopt_system_accessibility(system_accessibility());
     }
 
     fn validate(mut self) -> Result<Self, String> {
@@ -411,6 +537,9 @@ impl AppSettings {
         normalize_recent_commands(&mut self.recent_commands);
         validate_remote_profiles(&self.remote_profiles)?;
         self.named_themes = validate_theme_map(std::mem::take(&mut self.named_themes))?;
+        for id in crate::shortcut::retain_compatible_overrides(&mut self.shortcut_bindings) {
+            eprintln!("dropped the {id} shortcut override: its keys now belong to a default");
+        }
         crate::shortcut::validate_shortcut_overrides(&self.shortcut_bindings)?;
         Ok(self)
     }
@@ -843,7 +972,7 @@ impl SettingsStore {
         let path = config_dir.join("settings-v1.json");
         let legacy_path = config_dir.join(LEGACY_EXPORT_FILE);
         let mut save_initial = false;
-        let (settings, warning) = match fs::read(&path) {
+        let (mut settings, warning) = match fs::read(&path) {
             Ok(bytes) => {
                 let source_version = settings_schema_version(&bytes).unwrap_or(1);
                 match decode_settings(&bytes) {
@@ -939,6 +1068,10 @@ impl SettingsStore {
                 Some(format!("Settings recovery unavailable: {error}")),
             ),
         };
+
+        settings
+            .appearance
+            .adopt_system_accessibility(system_accessibility());
 
         let (sender, receiver) = mpsc::channel();
         let last_error = Arc::new(Mutex::new(None));
@@ -1165,6 +1298,75 @@ mod tests {
     use super::*;
     use uuid::Uuid;
 
+    #[test]
+    fn accessibility_follows_the_os_until_the_user_chooses_otherwise() {
+        let on = SystemAccessibility {
+            reduce_motion: true,
+            high_contrast: true,
+        };
+        let off = SystemAccessibility::default();
+
+        // A fresh profile adopts the OS, and keeps tracking it both ways.
+        let mut appearance = AppearanceSettings::default();
+        appearance.adopt_system_accessibility(off);
+        assert_eq!(appearance, AppearanceSettings::default());
+        appearance.adopt_system_accessibility(on);
+        assert!(appearance.reduce_motion && appearance.high_contrast);
+        appearance.adopt_system_accessibility(off);
+        assert!(!appearance.reduce_motion && !appearance.high_contrast);
+
+        // Turning an OS-provided preference off in explorie is kept.
+        let mut appearance = AppearanceSettings::default();
+        appearance.adopt_system_accessibility(on);
+        appearance.reduce_motion = false;
+        appearance.adopt_system_accessibility(on);
+        assert!(!appearance.reduce_motion);
+        assert!(appearance.high_contrast);
+
+        // Turning one on in explorie survives the OS having it off, including
+        // settings saved before the OS preference was tracked.
+        let mut appearance = AppearanceSettings {
+            high_contrast: true,
+            ..AppearanceSettings::default()
+        };
+        appearance.adopt_system_accessibility(off);
+        assert!(appearance.high_contrast);
+        let mut legacy: AppearanceSettings = serde_json::from_value({
+            let mut value = serde_json::to_value(AppearanceSettings::default()).unwrap();
+            value["reduceMotion"] = serde_json::Value::Bool(true);
+            value
+        })
+        .unwrap();
+        legacy.adopt_system_accessibility(off);
+        assert!(legacy.reduce_motion);
+    }
+
+    #[test]
+    fn adopted_accessibility_defaults_round_trip() {
+        let mut appearance = AppearanceSettings::default();
+        assert!(
+            !serde_json::to_string(&appearance)
+                .unwrap()
+                .contains("SystemDefault")
+        );
+        appearance.adopt_system_accessibility(SystemAccessibility {
+            reduce_motion: true,
+            high_contrast: false,
+        });
+        let restored: AppearanceSettings =
+            serde_json::from_str(&serde_json::to_string(&appearance).unwrap()).unwrap();
+        assert_eq!(restored, appearance);
+        assert_eq!(restored.reduce_motion_system_default, Some(true));
+        assert_eq!(restored.high_contrast_system_default, None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_accessibility_preferences_are_readable() {
+        // Values depend on the machine; this checks the AppKit calls resolve.
+        let _ = query_system_accessibility();
+    }
+
     fn fixture_dir() -> PathBuf {
         let path = std::env::temp_dir().join(format!("explorie-settings-{}", Uuid::new_v4()));
         fs::create_dir(&path).unwrap();
@@ -1320,10 +1522,33 @@ mod tests {
         );
         drop(store);
 
+        // An override that collides with another command's default (for
+        // example after a platform default changed) is dropped, not fatal.
+        let mut shadowed = AppSettings::default();
+        shadowed
+            .shortcut_bindings
+            .insert("settings-open".to_string(), "secondary-c".to_string());
+        shadowed.shortcut_bindings.insert(
+            "workspace-manager".to_string(),
+            "secondary-alt-k".to_string(),
+        );
+        let shadowed = shadowed.validate().unwrap();
+        assert_eq!(
+            shadowed.shortcut_bindings,
+            BTreeMap::from([(
+                "workspace-manager".to_string(),
+                "secondary-alt-k".to_string()
+            )])
+        );
+
         let mut conflict = AppSettings::default();
         conflict
             .shortcut_bindings
-            .insert("settings-open".to_string(), "secondary-c".to_string());
+            .insert("settings-open".to_string(), "secondary-alt-k".to_string());
+        conflict.shortcut_bindings.insert(
+            "workspace-manager".to_string(),
+            "secondary-alt-k".to_string(),
+        );
         assert!(conflict.validate().unwrap_err().contains("conflicts"));
         fs::remove_dir_all(root).unwrap();
     }

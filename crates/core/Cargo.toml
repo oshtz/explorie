@@ -27,6 +27,9 @@ trash = "5.2.6"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+plist = { version = "1.10.1", default-features = false }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem"] }
 

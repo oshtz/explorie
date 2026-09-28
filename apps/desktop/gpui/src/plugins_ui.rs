@@ -425,7 +425,7 @@ impl DirectoryWindow {
     }
 
     pub(super) fn render_plugin_details(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        if !self.plugin_ui.details_open || self.settings_panel_open {
+        if !self.plugin_ui.details_open || self.settings_ui.panel_open {
             return div().into_any_element();
         }
         let mut sections = Vec::new();
@@ -573,8 +573,8 @@ impl DirectoryWindow {
                     self.palette.control,
                 )
                 .on_click(cx.listener(|view, _, _, cx| {
-                    view.settings_panel_open = true;
-                    view.settings_tab = SettingsTab::Plugins;
+                    view.settings_ui.panel_open = true;
+                    view.settings_ui.tab = SettingsTab::Plugins;
                     view.start_plugin_status(cx);
                     cx.notify();
                 })),
@@ -1027,8 +1027,8 @@ mod tests {
         assert!(window.debug_bounds("integrations-invitation").is_some());
         view.update(window, |view, cx| {
             assert!(view.plugin_ui.selected.is_empty());
-            view.settings_panel_open = true;
-            view.settings_tab = SettingsTab::Plugins;
+            view.settings_ui.panel_open = true;
+            view.settings_ui.tab = SettingsTab::Plugins;
             cx.notify();
         });
         window.run_until_parked();
@@ -1054,7 +1054,7 @@ mod tests {
         );
         view.update(window, |view, cx| {
             view.settings.integrations_onboarding_complete = true;
-            view.settings_panel_open = false;
+            view.settings_ui.panel_open = false;
             cx.notify();
         });
         window.run_until_parked();
@@ -1073,8 +1073,8 @@ mod tests {
         let (_, window) = cx.add_window_view(|_, cx| {
             let mut view = DirectoryWindow::new(root.clone(), services, cx);
             view.plugin_ui.statuses = statuses;
-            view.settings_panel_open = true;
-            view.settings_tab = SettingsTab::Plugins;
+            view.settings_ui.panel_open = true;
+            view.settings_ui.tab = SettingsTab::Plugins;
             view
         });
         window.simulate_resize(gpui::size(px(1100.0), px(1000.0)));
@@ -1137,7 +1137,7 @@ mod tests {
             view.plugin_ui.generation = 11;
             view.plugin_ui.statuses = statuses;
             view.settings.integrations_onboarding_complete = true;
-            view.state = ListingState::Ready;
+            view.listing.state = ListingState::Ready;
             view
         });
         view.update(window, |view, cx| {
@@ -1326,8 +1326,9 @@ mod tests {
                 window.run_until_parked();
                 window.executor().advance_clock(Duration::from_millis(10));
                 let ready = view.update(window, |view, _| {
-                    matches!(view.state, ListingState::Ready)
+                    matches!(view.listing.state, ListingState::Ready)
                         && view
+                            .column_view
                             .columns
                             .columns()
                             .iter()
@@ -1342,14 +1343,14 @@ mod tests {
             }
             view.update(window, |view, _| {
                 assert!(
-                    view.columns.columns().iter().all(|column| !column.loading()),
+                    view.column_view.columns.columns().iter().all(|column| !column.loading()),
                     "columns remained loading at {} (column generation {}, plugin generation {}): {:?}",
                     destination.display(),
-                    view.column_generation,
+                    view.column_view.generation,
                     view.plugin_ui.generation,
-                    view.columns
+                    view.column_view.columns
                 );
-                assert!(matches!(view.state, ListingState::Ready));
+                assert!(matches!(view.listing.state, ListingState::Ready));
                 assert_eq!(
                     view.plugin_ui.results.len(),
                     3,
@@ -1369,7 +1370,7 @@ mod tests {
         view.update(window, |view, _| {
             view.plugin_ui.statuses.clear();
             view.plugin_ui.scan = None;
-            view.watcher_task = None;
+            view.watcher.task = None;
         });
         services.plugins.shutdown().wait().unwrap();
         std::fs::remove_dir_all(root).unwrap();

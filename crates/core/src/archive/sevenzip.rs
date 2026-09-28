@@ -419,6 +419,16 @@ fn parse_listing(text: &str, archive: &Path, max_entries: usize) -> io::Result<V
     Ok(entries)
 }
 
+/// Untrusted-listing entry point for `crate::fuzzing`.
+pub(crate) fn parse_listing_entries(
+    text: &str,
+    archive: &Path,
+    max_entries: usize,
+) -> io::Result<Vec<ArchiveEntry>> {
+    let entries = parse_listing(text, archive, max_entries)?;
+    Ok(entries.into_iter().map(|listed| listed.entry).collect())
+}
+
 fn listing(
     program: &Path,
     archive: &Path,
@@ -554,6 +564,7 @@ pub(super) fn extract_into(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(windows, target_os = "macos"))]
     use tempfile::TempDir;
 
     #[test]
@@ -665,6 +676,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(windows, target_os = "macos"))]
     fn fixture(root: &Path, format: &str, extension: &str) -> PathBuf {
         let source = root.join("input");
         fs::create_dir_all(&source).unwrap();
@@ -718,12 +730,10 @@ mod tests {
 
     #[test]
     #[cfg(any(windows, target_os = "macos"))]
-    fn bundled_engine_failure_limits_and_cancellation_preserve_destination() {
+    fn bundled_engine_failure_limits_and_cancellation_publish_nothing() {
         let temporary = TempDir::new().unwrap();
         let archive = fixture(temporary.path(), "bzip2", "bz2");
         let output = temporary.path().join("output");
-        fs::create_dir(&output).unwrap();
-        fs::write(output.join("keep.txt"), "original").unwrap();
         let cancelled = AtomicBool::new(false);
         for limits in [
             ExtractionLimits {
@@ -745,7 +755,7 @@ mod tests {
                 )
                 .is_err()
             );
-            assert_eq!(fs::read_dir(&output).unwrap().count(), 1);
+            assert!(!output.exists());
         }
         cancelled.store(true, Ordering::Release);
         assert_eq!(
@@ -760,12 +770,23 @@ mod tests {
             .kind(),
             io::ErrorKind::Interrupted
         );
-        fs::write(&archive, "not an archive").unwrap();
-        assert!(extract_archive(&archive, &output).is_err());
+        // A single-stream archive (one file) also never lands in an existing
+        // folder.
+        cancelled.store(false, Ordering::Release);
+        fs::create_dir(&output).unwrap();
+        fs::write(output.join("input"), "original").unwrap();
         assert_eq!(
-            fs::read_to_string(output.join("keep.txt")).unwrap(),
+            extract_archive(&archive, &output).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(
+            fs::read_to_string(output.join("input")).unwrap(),
             "original"
         );
+        fs::remove_dir_all(&output).unwrap();
+        fs::write(&archive, "not an archive").unwrap();
+        assert!(extract_archive(&archive, &output).is_err());
+        assert!(!output.exists());
         assert!(fs::read_dir(temporary.path()).unwrap().all(|entry| {
             !entry
                 .unwrap()
@@ -812,7 +833,9 @@ mod tests {
             .unwrap();
         zip.write_all(b"bad").unwrap();
         zip.finish().unwrap();
-        assert!(extract_archive(&archive, &output).is_err());
+        let traversal_output = temporary.path().join("traversal-output");
+        assert!(extract_archive(&archive, &traversal_output).is_err());
+        assert!(!traversal_output.exists());
         assert!(!temporary.path().join("escape").exists());
         assert_eq!(
             fs::read_to_string(output.join("@list.txt")).unwrap(),

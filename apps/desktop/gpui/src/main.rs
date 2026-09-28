@@ -1,4 +1,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
+// Linux builds only compile-check the app; its `main` has no product, so the
+// desktop imports below are unused there by design.
+#![cfg_attr(not(any(windows, target_os = "macos")), allow(unused_imports))]
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
@@ -10,7 +13,7 @@ use explorie_gpui::{
     initial_window_bounds, parse_startup_path,
 };
 use explorie_native_services::{NativeServices, ResourcePaths};
-use gpui::{App, AppContext, Bounds, Focusable, px, size};
+use gpui::{App, AppContext, Bounds, Focusable, WindowHandle, px, size};
 #[cfg(not(target_os = "windows"))]
 use gpui_platform::application;
 
@@ -38,6 +41,7 @@ enum PrimaryWindowOpen {
 
 #[cfg(any(windows, target_os = "macos"))]
 fn main() {
+    explorie_native_services::helper::run_if_requested();
     #[cfg(target_os = "macos")]
     if let Some(result) =
         explorie_native_services::updater::apply_macos_update_command(std::env::args_os())
@@ -163,6 +167,26 @@ fn main() {
             }
         })
         .detach();
+        #[cfg(target_os = "macos")]
+        {
+            let menu_path = path.clone();
+            let menu_services = services.clone();
+            let menu_runtime = window_runtime.clone();
+            let menu_requests = request_sources.clone();
+            explorie_gpui::install_app_menus(cx, services.clone(), move |cx| {
+                open_primary_window(
+                    cx,
+                    menu_path.clone(),
+                    false,
+                    menu_services.clone(),
+                    menu_runtime.clone(),
+                    menu_requests.clone(),
+                    PrimaryWindowOpen::Reopen,
+                )
+                .map_err(|error| eprintln!("unable to reopen Explorie window: {error}"))
+                .ok()
+            });
+        }
         if let Some(marker) = recovery_marker.clone() {
             cx.on_app_quit(move |_| {
                 let marker = marker.clone();
@@ -241,7 +265,7 @@ fn open_primary_window(
     runtime: WindowRuntime,
     request_sources: Vec<SharedRequests>,
     open: PrimaryWindowOpen,
-) -> Result<(), String> {
+) -> Result<WindowHandle<DirectoryWindow>, String> {
     let fallback_bounds = Bounds::centered(
         None,
         size(px(DEFAULT_WINDOW_WIDTH), px(DEFAULT_WINDOW_HEIGHT)),
@@ -305,7 +329,6 @@ fn open_primary_window(
         window.focus(&view.focus_handle(cx), cx);
         view
     })
-    .map(|_| ())
     .map_err(|error| error.to_string())
 }
 

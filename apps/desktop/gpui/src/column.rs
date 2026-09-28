@@ -1,15 +1,51 @@
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use explorie_core::FileEntry;
 
-use crate::browser::{BrowserState, filtered_sorted_entries};
+use crate::browser::{BrowserState, EntryListing, SortedOrder, ViewSpec};
 
 #[derive(Debug)]
 pub struct ColumnData {
     path: PathBuf,
-    entries: Vec<FileEntry>,
+    listing: EntryListing,
     loading: bool,
     error: Option<String>,
+    view: RefCell<ColumnView>,
+}
+
+/// The column's sorted, filtered rows, rebuilt only when its listing or the
+/// browser's filter, sort, hidden or search settings change.
+#[derive(Debug, Default)]
+struct ColumnView {
+    order: SortedOrder,
+    visible: Option<(ViewSpec, Arc<[Arc<FileEntry>]>)>,
+    /// The last row looked up by path, which rendering repeats every frame.
+    lookup: Option<(PathBuf, Option<Arc<FileEntry>>)>,
+}
+
+impl ColumnView {
+    fn rows(&mut self, listing: &EntryListing, browser: &BrowserState) -> Arc<[Arc<FileEntry>]> {
+        if let Some((spec, rows)) = &self.visible
+            && browser.view_matches(spec)
+        {
+            return Arc::clone(rows);
+        }
+        let spec = browser.view_spec();
+        let order = self
+            .order
+            .ensure(listing, &spec.sort_key, spec.sort_direction);
+        let rows: Arc<[Arc<FileEntry>]> = listing.visible_for(order, &spec).into();
+        self.visible = Some((spec, Arc::clone(&rows)));
+        self.lookup = None;
+        rows
+    }
+
+    fn invalidate_rows(&mut self) {
+        self.visible = None;
+        self.lookup = None;
+    }
 }
 
 impl ColumnData {
@@ -25,20 +61,48 @@ impl ColumnData {
         self.error.as_deref()
     }
 
-    pub fn entries(&self) -> &[FileEntry] {
-        &self.entries
+    pub fn entries(&self) -> &[Arc<FileEntry>] {
+        self.listing.entries()
     }
 
-    pub fn visible_entries(&self, browser: &BrowserState) -> Vec<FileEntry> {
-        filtered_sorted_entries(
-            &self.entries,
-            browser.show_hidden(),
-            browser.show_system_files(),
-            browser.filter(),
-            &browser.sort_key(),
-            browser.sort_direction(),
-            browser.search_query(),
-        )
+    /// The rows this column shows for the browser's current view. Repeated
+    /// calls share one cached slice until the listing or view settings change.
+    pub fn visible_entries(&self, browser: &BrowserState) -> Arc<[Arc<FileEntry>]> {
+        self.view.borrow_mut().rows(&self.listing, browser)
+    }
+
+    /// The visible row for `path`, if this column shows it.
+    pub fn visible_entry(&self, browser: &BrowserState, path: &Path) -> Option<Arc<FileEntry>> {
+        if path.parent() != Some(self.path.as_path()) {
+            return None;
+        }
+        let mut view = self.view.borrow_mut();
+        let rows = view.rows(&self.listing, browser);
+        if let Some((cached, entry)) = &view.lookup
+            && cached == path
+        {
+            return entry.clone();
+        }
+        let entry = rows.iter().find(|entry| entry.path == path).cloned();
+        view.lookup = Some((path.to_path_buf(), entry.clone()));
+        entry
+    }
+
+    fn replace_listing(&mut self, entries: Vec<Arc<FileEntry>>) {
+        self.listing = EntryListing::new(entries);
+        let view = self.view.get_mut();
+        view.order.invalidate();
+        view.invalidate_rows();
+    }
+
+    fn apply_changes(&mut self, changes: Vec<(PathBuf, Option<FileEntry>)>) -> bool {
+        let Some(patch) = self.listing.apply_changes(changes) else {
+            return false;
+        };
+        let view = self.view.get_mut();
+        view.order.apply_patch(&self.listing, &patch);
+        view.invalidate_rows();
+        true
     }
 }
 
@@ -90,14 +154,27 @@ impl ColumnState {
         &self.columns
     }
 
-    pub fn apply_listed(&mut self, path: &Path, entries: Vec<FileEntry>) -> bool {
+    pub fn apply_listed<E: Into<Arc<FileEntry>>>(&mut self, path: &Path, entries: Vec<E>) -> bool {
         let Some(column) = self.columns.iter_mut().find(|column| column.path == path) else {
             return false;
         };
-        column.entries = entries;
+        column.replace_listing(entries.into_iter().map(Into::into).collect());
         column.loading = false;
         column.error = None;
         true
+    }
+
+    /// Patch one column's listing with re-read entries (`None` for removed
+    /// paths). Returns false when no column lists `path` or nothing changed.
+    pub fn apply_changes(
+        &mut self,
+        path: &Path,
+        changes: Vec<(PathBuf, Option<FileEntry>)>,
+    ) -> bool {
+        self.columns
+            .iter_mut()
+            .find(|column| column.path == path)
+            .is_some_and(|column| column.apply_changes(changes))
     }
 
     pub fn apply_failed(&mut self, path: &Path, error: String) -> bool {
@@ -117,9 +194,10 @@ impl ColumnState {
 fn empty_column(path: PathBuf) -> ColumnData {
     ColumnData {
         path,
-        entries: Vec::new(),
+        listing: EntryListing::default(),
         loading: true,
         error: None,
+        view: RefCell::default(),
     }
 }
 
@@ -158,6 +236,10 @@ mod tests {
             is_junction: false,
             link_target: None,
             has_xattrs: false,
+            is_package: false,
+            link_target_is_dir: false,
+            is_cloud_placeholder: false,
+            tags: Vec::new(),
         }
     }
 
@@ -204,11 +286,75 @@ mod tests {
         assert_eq!(state.columns()[0].entries().len(), 2);
     }
 
+    fn names(rows: &[Arc<FileEntry>]) -> Vec<String> {
+        rows.iter()
+            .map(|entry| crate::browser::file_name(entry))
+            .collect()
+    }
+
+    #[test]
+    fn visible_rows_are_cached_until_the_listing_or_view_changes() {
+        let root = PathBuf::from("root");
+        let mut state = ColumnState::new(&root);
+        let file = |name: &str| FileEntry {
+            is_dir: false,
+            ..entry(&root, name)
+        };
+        state.apply_listed(
+            &root,
+            vec![
+                file("file10.txt"),
+                file("file9.txt"),
+                entry(&root, "folder"),
+            ],
+        );
+        let mut browser = BrowserState::new(root.clone());
+        let column = &state.columns()[0];
+        let rows = column.visible_entries(&browser);
+        assert_eq!(names(&rows), ["folder", "file9.txt", "file10.txt"]);
+        assert!(Arc::ptr_eq(&rows, &column.visible_entries(&browser)));
+
+        browser.set_sort(crate::browser::SortKey::Name);
+        let descending = column.visible_entries(&browser);
+        assert!(!Arc::ptr_eq(&rows, &descending));
+        assert_eq!(names(&descending), ["folder", "file10.txt", "file9.txt"]);
+
+        browser.push_search_text("FILE1");
+        assert_eq!(names(&column.visible_entries(&browser)), ["file10.txt"]);
+        assert!(
+            column
+                .visible_entry(&browser, &root.join("file10.txt"))
+                .is_some()
+        );
+        assert!(
+            column
+                .visible_entry(&browser, &root.join("file9.txt"))
+                .is_none()
+        );
+        assert!(
+            column
+                .visible_entry(&browser, Path::new("elsewhere/file10.txt"))
+                .is_none()
+        );
+        browser.clear_search();
+        assert!(
+            column
+                .visible_entry(&browser, &root.join("file9.txt"))
+                .is_some()
+        );
+
+        state.apply_listed(&root, vec![file("only.txt")]);
+        assert_eq!(
+            names(&state.columns()[0].visible_entries(&browser)),
+            ["only.txt"]
+        );
+    }
+
     #[test]
     fn results_for_paths_outside_the_current_stack_are_rejected() {
         let path = PathBuf::from("root").join("one");
         let mut state = ColumnState::new(&path);
-        assert!(!state.apply_listed(Path::new("other"), Vec::new()));
+        assert!(!state.apply_listed(Path::new("other"), Vec::<FileEntry>::new()));
         assert!(!state.apply_failed(Path::new("other"), "late".to_string()));
     }
 }

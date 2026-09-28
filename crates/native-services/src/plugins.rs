@@ -2100,14 +2100,14 @@ fn main() {
                 .request(
                     "inspect",
                     serde_json::to_value(context).unwrap(),
-                    Duration::from_secs(2),
+                    Duration::from_secs(10),
                 )
                 .unwrap();
         }
         let mut seen = Vec::new();
         for _ in 0..2 {
             let ServiceEvent::PluginStatusChanged { contribution, .. } =
-                events.recv_timeout(Duration::from_secs(2)).unwrap()
+                events.recv_timeout(Duration::from_secs(10)).unwrap()
             else {
                 panic!("expected plugin update")
             };

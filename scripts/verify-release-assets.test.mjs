@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
+import { createHash, generateKeyPairSync, randomBytes } from 'node:crypto';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { signAsset, withSignatureBlock } from './update-signatures.mjs';
 import { verifyReleaseAssets } from './verify-release-assets.mjs';
 
 async function fixture(t) {
@@ -67,5 +68,27 @@ test('publication requires both exact tested hashes', async t => {
   for (const proof of [{}, { windows: f.attestations.windows },
     { ...f.attestations, macos: 'b'.repeat(64) }, { ...f.attestations, windows: 'bad' }]) {
     await assert.rejects(verifyReleaseAssets(f.release, f.directory, f.repository, f.tag, proof), /real-machine-tested/);
+  }
+});
+
+test('a configured update key requires valid signatures for both installers', async t => {
+  const f = await fixture(t);
+  const { privateKey, publicKey } = generateKeyPairSync('ed25519');
+  const keyId = randomBytes(8);
+  const key = publicKey.export({ format: 'der', type: 'spki' }).subarray(12);
+  const secret = { keyId, key, privateKey };
+  const lines = [];
+  for (const asset of f.release.assets) {
+    lines.push(await signAsset(path.join(f.directory, asset.name), asset.name, secret));
+  }
+  const signed = { ...f.release, body: withSignatureBlock('Notes', lines) };
+  await verifyReleaseAssets(signed, f.directory, f.repository, f.tag, f.attestations, { keyId, key });
+  // Without a configured key the notes are not consulted.
+  await verifyReleaseAssets({ ...f.release, body: 'Notes' }, f.directory, f.repository, f.tag);
+  for (const body of ['Notes', withSignatureBlock('Notes', lines.slice(0, 1)),
+    withSignatureBlock('Notes', [lines[0], lines[1].replace(f.release.assets[1].name, f.release.assets[0].name)])]) {
+    await assert.rejects(
+      verifyReleaseAssets({ ...f.release, body }, f.directory, f.repository, f.tag, undefined, { keyId, key }),
+    );
   }
 });

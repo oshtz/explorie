@@ -1,6 +1,10 @@
 //! Local video playback owned by the native desktop runtime.
+//!
+//! Soundtracks play through rodio, behind the `preview-audio` cargo feature;
+//! without it videos play silently and report no audio.
 
 use std::io::Read;
+#[cfg(feature = "preview-audio")]
 use std::num::{NonZeroU16, NonZeroU32};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -9,6 +13,7 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "preview-audio")]
 use rodio::{DeviceSinkBuilder, Player, buffer::SamplesBuffer};
 use serde_json::Value;
 
@@ -19,9 +24,13 @@ const FRAME_RATE: u64 = 15;
 const MAX_FRAME_WIDTH: u32 = 960;
 const MAX_FRAME_HEIGHT: u32 = 540;
 const FRAME_QUEUE_DEPTH: usize = 3;
+#[cfg(feature = "preview-audio")]
 const AUDIO_CHANNELS: u16 = 2;
+#[cfg(feature = "preview-audio")]
 const AUDIO_SAMPLE_RATE: u32 = 48_000;
+#[cfg(feature = "preview-audio")]
 const AUDIO_CHUNK_FRAMES: usize = 4_800;
+#[cfg(feature = "preview-audio")]
 const MAX_QUEUED_AUDIO_CHUNKS: usize = 8;
 const DEFAULT_VOLUME: f32 = 0.8;
 const TOOL_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
@@ -79,6 +88,8 @@ struct VideoMetadata {
     source_height: u32,
     frame_width: u32,
     frame_height: u32,
+    /// Whether the soundtrack will be heard: the file has an audio stream and
+    /// this build can play it.
     has_audio: bool,
 }
 
@@ -103,10 +114,19 @@ struct DecoderSession {
     stop: Arc<AtomicBool>,
     frame_rx: Option<mpsc::Receiver<VideoFrame>>,
     video_child: Child,
-    audio_child: Option<Child>,
-    player: Option<Arc<Player>>,
-    _device: Option<rodio::MixerDeviceSink>,
+    #[cfg(feature = "preview-audio")]
+    soundtrack: Option<Soundtrack>,
     threads: Vec<JoinHandle<()>>,
+}
+
+/// A second FFmpeg process decoding the audio stream into a rodio player on
+/// the default output device.
+#[cfg(feature = "preview-audio")]
+struct Soundtrack {
+    child: Child,
+    player: Arc<Player>,
+    reader: JoinHandle<()>,
+    _device: rodio::MixerDeviceSink,
 }
 
 impl Drop for DecoderSession {
@@ -114,19 +134,14 @@ impl Drop for DecoderSession {
         self.stop.store(true, Ordering::Release);
         self.frame_rx.take();
         let _ = self.video_child.kill();
-        if let Some(child) = &mut self.audio_child {
-            let _ = child.kill();
-        }
-        if let Some(player) = &self.player {
-            player.stop();
+        #[cfg(feature = "preview-audio")]
+        if let Some(soundtrack) = self.soundtrack.take() {
+            soundtrack.finish();
         }
         for thread in self.threads.drain(..) {
             let _ = thread.join();
         }
         let _ = self.video_child.wait();
-        if let Some(child) = &mut self.audio_child {
-            let _ = child.wait();
-        }
     }
 }
 
@@ -144,7 +159,8 @@ impl DecoderSession {
             metadata.frame_width, metadata.frame_height
         );
         let mut video_child = helper_command(ffmpeg)
-            .args(["-nostdin", "-v", "error", "-ss", &seek, "-i"])
+            .args(["-nostdin", "-v", "error", "-ss", &seek])
+            .args(["-protocol_whitelist", "file,pipe", "-i"])
             .arg(path)
             .args([
                 "-map", "0:v:0", "-an", "-vf", &scale, "-pix_fmt", "bgra", "-f", "rawvideo",
@@ -179,47 +195,22 @@ impl DecoderSession {
             );
         });
 
-        let mut threads = vec![video_thread];
-        let mut audio_child = None;
-        let mut player = None;
-        let mut device = None;
-        if metadata.has_audio
-            && let Ok(mut output) = DeviceSinkBuilder::open_default_sink()
-        {
-            output.log_on_drop(false);
-            let output_player = Arc::new(Player::connect_new(output.mixer()));
-            output_player.set_volume(volume);
-            let child = helper_command(ffmpeg)
-                .args(["-nostdin", "-v", "error", "-ss", &seek, "-i"])
-                .arg(path)
-                .args([
-                    "-map", "0:a:0", "-vn", "-ac", "2", "-ar", "48000", "-f", "f32le", "pipe:1",
-                ])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn();
-            if let Ok(mut child) = child
-                && let Some(audio_stdout) = child.stdout.take()
-            {
-                let audio_stop = Arc::clone(&stop);
-                let thread_player = Arc::clone(&output_player);
-                threads.push(thread::spawn(move || {
-                    read_audio_samples(audio_stdout, thread_player, audio_stop);
-                }));
-                audio_child = Some(child);
-                player = Some(output_player);
-                device = Some(output);
-            }
-        }
+        #[cfg(feature = "preview-audio")]
+        let soundtrack = if metadata.has_audio {
+            Soundtrack::start(path, ffmpeg, &seek, volume, &stop)
+        } else {
+            None
+        };
+        #[cfg(not(feature = "preview-audio"))]
+        let _ = volume;
 
         Ok(Self {
             stop,
             frame_rx: Some(frame_rx),
             video_child,
-            audio_child,
-            player,
-            _device: device,
-            threads,
+            #[cfg(feature = "preview-audio")]
+            soundtrack,
+            threads: vec![video_thread],
         })
     }
 
@@ -233,6 +224,55 @@ impl DecoderSession {
             }
         }
         latest
+    }
+}
+
+#[cfg(feature = "preview-audio")]
+impl Soundtrack {
+    /// Start the soundtrack at `seek`, or `None` (silent playback) when there
+    /// is no output device or the FFmpeg audio decoder cannot start.
+    fn start(
+        path: &Path,
+        ffmpeg: &Path,
+        seek: &str,
+        volume: f32,
+        stop: &Arc<AtomicBool>,
+    ) -> Option<Self> {
+        let mut output = DeviceSinkBuilder::open_default_sink().ok()?;
+        output.log_on_drop(false);
+        let player = Arc::new(Player::connect_new(output.mixer()));
+        player.set_volume(volume);
+        let mut child = helper_command(ffmpeg)
+            .args(["-nostdin", "-v", "error", "-ss", seek])
+            .args(["-protocol_whitelist", "file,pipe", "-i"])
+            .arg(path)
+            .args([
+                "-map", "0:a:0", "-vn", "-ac", "2", "-ar", "48000", "-f", "f32le", "pipe:1",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let audio_stdout = child.stdout.take()?;
+        let audio_stop = Arc::clone(stop);
+        let thread_player = Arc::clone(&player);
+        let reader = thread::spawn(move || {
+            read_audio_samples(audio_stdout, thread_player, audio_stop);
+        });
+        Some(Self {
+            child,
+            player,
+            reader,
+            _device: output,
+        })
+    }
+
+    /// Silence the output and reap the decoder process and its reader.
+    fn finish(mut self) {
+        let _ = self.child.kill();
+        self.player.stop();
+        let _ = self.reader.join();
+        let _ = self.child.wait();
     }
 }
 
@@ -266,6 +306,7 @@ fn read_video_frames(
     }
 }
 
+#[cfg(feature = "preview-audio")]
 fn read_audio_samples(mut stdout: impl Read, player: Arc<Player>, stop: Arc<AtomicBool>) {
     let bytes_per_chunk = AUDIO_CHUNK_FRAMES * usize::from(AUDIO_CHANNELS) * size_of::<f32>();
     let channels = NonZeroU16::new(AUDIO_CHANNELS).expect("audio channel count is nonzero");
@@ -502,12 +543,13 @@ impl VideoPlayback for FfmpegVideoPlayback {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(player) = state
+        #[cfg(feature = "preview-audio")]
+        if let Some(soundtrack) = state
             .decoder
             .as_ref()
-            .and_then(|decoder| decoder.player.as_ref())
+            .and_then(|decoder| decoder.soundtrack.as_ref())
         {
-            player.set_volume(volume);
+            soundtrack.player.set_volume(volume);
         }
         Ok(self.status_locked(&mut state))
     }
@@ -807,6 +849,8 @@ fn probe_video(path: &Path, ffprobe: &Path) -> ServiceResult<VideoMetadata> {
             .args([
                 "-v",
                 "error",
+                "-protocol_whitelist",
+                "file,pipe",
                 "-show_entries",
                 "stream=codec_type,width,height:format=duration",
                 "-of",
@@ -878,9 +922,10 @@ fn probe_video(path: &Path, ffprobe: &Path) -> ServiceResult<VideoMetadata> {
         source_height,
         frame_width,
         frame_height,
-        has_audio: streams
-            .iter()
-            .any(|stream| stream.get("codec_type").and_then(Value::as_str) == Some("audio")),
+        has_audio: cfg!(feature = "preview-audio")
+            && streams
+                .iter()
+                .any(|stream| stream.get("codec_type").and_then(Value::as_str) == Some("audio")),
     })
 }
 
@@ -909,7 +954,8 @@ fn extract_frame(
         })?;
     let output = run_with_timeout(
         helper_command(ffmpeg)
-            .args(["-nostdin", "-v", "error", "-ss", &seek, "-i"])
+            .args(["-nostdin", "-v", "error", "-ss", &seek])
+            .args(["-protocol_whitelist", "file,pipe", "-i"])
             .arg(path)
             .args([
                 "-map",
@@ -1211,7 +1257,7 @@ mod tests {
             VideoService::new(ServiceContext::new(crate::ResourcePaths::test(root.path())));
         let loaded = pollster::block_on(service.load(path)).unwrap();
         assert_eq!((loaded.width, loaded.height), (160, 90));
-        assert!(loaded.has_audio);
+        assert_eq!(loaded.has_audio, cfg!(feature = "preview-audio"));
         let poster = service.take_frame().unwrap().unwrap();
         assert_eq!(poster.bgra.len(), 160 * 90 * 4);
         assert!(pollster::block_on(service.play()).unwrap().playing);
