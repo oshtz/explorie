@@ -161,6 +161,30 @@ fn fixture_dir() -> PathBuf {
     path
 }
 
+/// Removes a fixture directory. On Windows a file sent to the Recycle Bin or a
+/// directory watch can hold a handle for a moment after an operation has
+/// finished, so deletion is retried briefly there.
+fn remove_fixture(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match fs::remove_dir_all(path) {
+            Ok(()) => return,
+            Err(error)
+                if cfg!(windows)
+                    && Instant::now() < deadline
+                    && matches!(
+                        error.kind(),
+                        std::io::ErrorKind::PermissionDenied
+                            | std::io::ErrorKind::DirectoryNotEmpty
+                    ) =>
+            {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => panic!("failed to remove {}: {error}", path.display()),
+        }
+    }
+}
+
 fn secondary_keystroke(keys: &str) -> Keystroke {
     let modifier = if cfg!(target_os = "macos") {
         "cmd"
@@ -3767,7 +3791,8 @@ fn conflict_prompt_apply_to_all_replaces_every_unresolved_item(cx: &mut TestAppC
         assert!(view.operations.latest_retryable_id().is_none());
         assert!(!view.undo_ledger.can_undo(SystemTime::now()));
     });
-    fs::remove_dir_all(directory).unwrap();
+    // Replaced files go to the Recycle Bin, whose shell handles can linger.
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
