@@ -22,12 +22,19 @@ export async function verifyReleaseAssets(release, directory, repository, tag, a
     throw new Error('Release must contain exactly the two installers');
   }
   const signatures = publicKey ? parseSignatureLines(release.body ?? '') : null;
+  const downloadBase = `https://github.com/${repository}/releases/download/`;
+  // Until publication, GitHub serves a draft's assets from an
+  // `untagged-<token>` path instead of the tag's.
+  const isDownloadUrl = (url, name) => typeof url === 'string' && url.startsWith(downloadBase)
+    && (url === `${downloadBase}${tag}/${name}`
+      || /^untagged-[a-f0-9]+$/.test(url.slice(downloadBase.length, -(name.length + 1)))
+        && url.endsWith(`/${name}`));
   for (const [platform, name] of Object.entries(names)) {
     const matches = release.assets.filter(asset => asset.name === name);
     if (matches.length !== 1) throw new Error(`Missing or duplicate ${platform} installer`);
     const asset = matches[0];
     if (asset.state !== 'uploaded'
-        || asset.browser_download_url !== `https://github.com/${repository}/releases/download/${tag}/${name}`
+        || !isDownloadUrl(asset.browser_download_url, name)
         || !Number.isSafeInteger(asset.size) || asset.size <= 0
         || !/^sha256:[a-f0-9]{64}$/.test(asset.digest ?? '')) {
       throw new Error(`Invalid ${platform} asset metadata or SHA-256 digest`);
