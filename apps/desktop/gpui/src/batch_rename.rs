@@ -506,6 +506,10 @@ mod tests {
             is_junction: false,
             link_target: None,
             has_xattrs: false,
+            is_package: false,
+            link_target_is_dir: false,
+            is_cloud_placeholder: false,
+            tags: Vec::new(),
         }
     }
 

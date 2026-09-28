@@ -12,6 +12,7 @@ use explorie_plugin_protocol::{
     Plugin, PluginAction, unix_time,
 };
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use serde_json::Value;
 
@@ -174,7 +175,7 @@ fn load_connection(path: &Path) -> Result<Connection, String> {
         if bytes.len() as u64 > MAX_RESPONSE {
             return Err("Local HTTPS certificate exceeds the supported size".into());
         }
-        let certificate = rustls_pemfile::certs(&mut std::io::Cursor::new(bytes))
+        let certificate = CertificateDer::pem_slice_iter(&bytes)
             .next()
             .ok_or("Local HTTPS certificate is missing")?
             .map_err(|_| "Local HTTPS certificate is invalid")?;
@@ -734,13 +735,11 @@ mod tests {
         for (selected_certificate, should_connect) in
             [(CERTIFICATE, true), (WRONG_CERTIFICATE, false)]
         {
-            let certificate = rustls_pemfile::certs(&mut std::io::Cursor::new(CERTIFICATE))
+            let certificate = CertificateDer::pem_slice_iter(CERTIFICATE)
                 .next()
                 .unwrap()
                 .unwrap();
-            let key = rustls_pemfile::private_key(&mut std::io::Cursor::new(PRIVATE_KEY))
-                .unwrap()
-                .unwrap();
+            let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(PRIVATE_KEY).unwrap();
             let config = rustls::ServerConfig::builder_with_provider(Arc::new(
                 rustls::crypto::ring::default_provider(),
             ))

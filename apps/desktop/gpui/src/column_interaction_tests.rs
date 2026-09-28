@@ -38,8 +38,8 @@ impl ColumnFixture {
         let services = NativeServices::new(ResourcePaths::test(&self.root));
         let mut view = DirectoryWindow::new(active.to_path_buf(), services, cx);
         view.browser.set_view_mode(ViewMode::Column);
-        view.columns = ColumnState::new(active);
-        for path in view.columns.paths() {
+        view.column_view.columns = ColumnState::new(active);
+        for path in view.column_view.columns.paths() {
             let entries = if path.starts_with(&self.parent) {
                 fs::read_dir(&path)
                     .unwrap()
@@ -58,6 +58,10 @@ impl ColumnFixture {
                             is_junction: false,
                             link_target: None,
                             has_xattrs: false,
+                            is_package: false,
+                            link_target_is_dir: false,
+                            is_cloud_placeholder: false,
+                            tags: Vec::new(),
                         }
                     })
                     .collect()
@@ -67,17 +71,18 @@ impl ColumnFixture {
             if path == active {
                 view.browser.replace_entries(entries.clone());
             }
-            assert!(view.columns.apply_listed(&path, entries));
+            assert!(view.column_view.columns.apply_listed(&path, entries));
         }
-        view.column_scroll_handles = view
+        view.column_view.scroll_handles = view
+            .column_view
             .columns
             .columns()
             .iter()
             .map(|_| UniformListScrollHandle::new())
             .collect();
-        view.column_scroll_to_leaf_attempts = 0;
+        view.column_view.scroll_to_leaf_attempts = 0;
         view.settings.view.show_preview_panel = false;
-        view.state = ListingState::Ready;
+        view.listing.state = ListingState::Ready;
         window.focus(&view.focus_handle, cx);
         view
     }
@@ -89,7 +94,7 @@ impl ColumnFixture {
     fn row_selector(&self, view: &DirectoryWindow, name: &str) -> &'static str {
         let column_index = self.parent_index();
         let path = self.parent.join(name);
-        let row_index = view.columns.columns()[column_index]
+        let row_index = view.column_view.columns.columns()[column_index]
             .visible_entries(&view.browser)
             .iter()
             .position(|entry| entry.path == path)
@@ -127,11 +132,17 @@ fn ancestor_background_click_activates_column_and_clears_selection(cx: &mut Test
 
     view.update(window, |view, _| {
         assert_eq!(view.browser.path(), fixture.parent);
-        assert_eq!(view.columns.paths().last(), Some(&fixture.parent));
-        assert_eq!(view.columns.columns().len(), fixture.parent_index() + 1);
+        assert_eq!(
+            view.column_view.columns.paths().last(),
+            Some(&fixture.parent)
+        );
+        assert_eq!(
+            view.column_view.columns.columns().len(),
+            fixture.parent_index() + 1
+        );
         assert!(view.browser.selected_paths().is_empty());
         assert!(view.effective_selected_paths().is_empty());
-        assert!(view.pending_column_selection.is_none());
+        assert!(view.column_view.pending_selection.is_none());
     });
 }
 
@@ -236,7 +247,7 @@ fn column_select_all_updates_effective_selection_and_copy(cx: &mut TestAppContex
             view.effective_selected_paths()
         );
         assert_eq!(
-            view.clipboard.as_ref().unwrap().paths,
+            view.clipboard.state.as_ref().unwrap().paths,
             view.effective_selected_paths()
         );
     });
@@ -262,9 +273,12 @@ fn ancestor_background_context_menu_targets_clicked_column(cx: &mut TestAppConte
 
     view.update(window, |view, _| {
         assert_eq!(view.browser.path(), fixture.parent);
-        assert_eq!(view.columns.paths().last(), Some(&fixture.parent));
+        assert_eq!(
+            view.column_view.columns.paths().last(),
+            Some(&fixture.parent)
+        );
         assert!(view.effective_selected_paths().is_empty());
-        assert!(view.context_menu.as_ref().unwrap().paths.is_empty());
+        assert!(view.context_menu.menu.as_ref().unwrap().paths.is_empty());
         assert_eq!(
             view.context_menu_actions(),
             vec![(ContextMenuAction::Paste, false)]
@@ -292,7 +306,7 @@ fn column_type_selection_updates_terminal_preview(cx: &mut TestAppContext) {
         view.settings.view.show_preview_panel = true;
         view.browser.select(fixture.parent.join("alpha.txt"));
         view.sync_column_selection_from_browser();
-        view.preview_state = PreviewState::Loading {
+        view.preview.state = PreviewState::Loading {
             path: fixture.parent.join("alpha.txt"),
         };
         view
@@ -305,7 +319,7 @@ fn column_type_selection_updates_terminal_preview(cx: &mut TestAppContext) {
         let selected = fixture.parent.join("beta.txt");
         assert_eq!(view.browser.selected_path(), Some(selected.as_path()));
         assert_eq!(view.effective_selected_paths(), vec![selected.clone()]);
-        assert_eq!(view.preview_state.path(), Some(selected.as_path()));
+        assert_eq!(view.preview.state.path(), Some(selected.as_path()));
     });
 }
 
@@ -351,9 +365,9 @@ fn empty_column_background_clears_pending_selection_and_preview(cx: &mut TestApp
     let empty = fixture.parent.join("other");
     let (view, window) = cx.add_window_view(|window, cx| {
         let mut view = fixture.view(&empty, window, cx);
-        view.pending_column_selection = Some(ColumnSelectionTarget::First);
+        view.column_view.pending_selection = Some(ColumnSelectionTarget::First);
         view.set_column_selection(fixture.parent.join("alpha.txt"));
-        view.preview_state = PreviewState::Loading {
+        view.preview.state = PreviewState::Loading {
             path: fixture.parent.join("alpha.txt"),
         };
         view
@@ -372,10 +386,10 @@ fn empty_column_background_clears_pending_selection_and_preview(cx: &mut TestApp
     window.run_until_parked();
     view.update(window, |view, _| {
         assert_eq!(view.browser.path(), empty);
-        assert!(view.pending_column_selection.is_none());
-        assert!(view.column_selection.is_empty());
+        assert!(view.column_view.pending_selection.is_none());
+        assert!(view.column_view.selection.is_empty());
         assert!(view.browser.selected_paths().is_empty());
-        assert!(matches!(view.preview_state, PreviewState::Closed));
+        assert!(matches!(view.preview.state, PreviewState::Closed));
     });
 }
 
@@ -449,7 +463,7 @@ fn navigating_child_preserves_parent_column_vertical_scroll(cx: &mut TestAppCont
     window.simulate_resize(gpui::size(px(4000.0), px(720.0)));
     window.run_until_parked();
     let handle = view.update(window, |view, _| {
-        view.column_scroll_handles[fixture.parent_index()]
+        view.column_view.scroll_handles[fixture.parent_index()]
             .0
             .borrow()
             .base_handle
@@ -464,7 +478,7 @@ fn navigating_child_preserves_parent_column_vertical_scroll(cx: &mut TestAppCont
     view.update(window, |view, _| {
         assert_eq!(view.browser.path(), fixture.child);
         assert_eq!(
-            view.column_scroll_handles[fixture.parent_index()]
+            view.column_view.scroll_handles[fixture.parent_index()]
                 .0
                 .borrow()
                 .base_handle
@@ -480,7 +494,7 @@ fn navigating_child_preserves_parent_column_vertical_scroll(cx: &mut TestAppCont
     view.update(window, |view, _| {
         assert_eq!(view.browser.path(), fixture.parent);
         assert_eq!(
-            view.column_scroll_handles[fixture.parent_index()]
+            view.column_view.scroll_handles[fixture.parent_index()]
                 .0
                 .borrow()
                 .base_handle

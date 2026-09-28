@@ -13,11 +13,21 @@ use serde_json::Value;
 
 const OUTPUT_LIMIT: u64 = 8 * 1024 * 1024;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(8);
+const UNTRUSTED_CONFIGURATION: &str = "Untrusted repository configuration";
 
 // Arguments never pass through a shell. Git errors can contain credential-bearing remotes.
+//
+// A browsed repository may be hostile (for example an extracted archive), so the
+// plugin only runs commands that do not execute repository-controlled programs:
+// `--no-optional-locks` keeps `status` from writing the index (so no hooks run),
+// `--no-pager` rules out pager configuration, and the command-line
+// `core.fsmonitor=false` outranks any repository value. Filter drivers cannot be
+// neutralized that way because their names are open-ended, so `repository`
+// refuses repositories whose own configuration defines them.
 fn git(path: &Path, arguments: &[&OsStr]) -> Result<Option<Vec<u8>>, String> {
     let mut command = Command::new("git");
     command
+        .arg("--no-pager")
         .arg("--no-optional-locks")
         .args(["-c", "core.fsmonitor=false"])
         .arg("-C")
@@ -111,6 +121,105 @@ struct Status {
     conflicted: usize,
     entries: Vec<(PathBuf, String)>,
     github: Option<String>,
+    /// Repository-controlled configuration keys that could make Git run a
+    /// program. When non-empty, Git status was not run.
+    untrusted: Vec<String>,
+}
+
+struct ConfigEntry {
+    scope: String,
+    key: String,
+    value: String,
+}
+
+/// Parse `git config --list --show-scope --show-origin -z` output. Reading
+/// configuration never executes repository-defined commands.
+fn parse_config_listing(bytes: &[u8]) -> Result<Vec<ConfigEntry>, String> {
+    let mut fields = bytes.split(|byte| *byte == 0);
+    let mut entries = Vec::new();
+    while let Some(scope) = fields.next() {
+        if scope.is_empty() {
+            continue;
+        }
+        let (Some(_origin), Some(item)) = (fields.next(), fields.next()) else {
+            return Err("Malformed Git configuration listing".into());
+        };
+        let item = String::from_utf8_lossy(item);
+        let (key, value) = item.split_once('\n').unwrap_or((&item, ""));
+        entries.push(ConfigEntry {
+            scope: String::from_utf8_lossy(scope).into_owned(),
+            key: key.to_string(),
+            value: value.to_string(),
+        });
+    }
+    Ok(entries)
+}
+
+/// Keys from the repository's own configuration (including files it includes)
+/// that name programs Git could run while inspecting it.
+fn untrusted_configuration(entries: &[ConfigEntry]) -> Vec<String> {
+    let mut keys: Vec<String> = entries
+        .iter()
+        .filter(|entry| matches!(entry.scope.as_str(), "local" | "worktree"))
+        .filter(|entry| {
+            let key = entry.key.as_str();
+            let Some((section, rest)) = key.split_once('.') else {
+                return false;
+            };
+            let (subsection, variable) = match rest.rsplit_once('.') {
+                Some((subsection, variable)) => (Some(subsection), variable),
+                None => (None, rest),
+            };
+            let section = section.to_ascii_lowercase();
+            let variable = variable.to_ascii_lowercase();
+            matches!(
+                (section.as_str(), subsection, variable.as_str()),
+                ("filter", Some(_), "clean" | "smudge" | "process")
+                    | ("diff", None, "external")
+                    | ("diff", Some(_), "command" | "textconv")
+                    | ("include", None, "path")
+                    | ("includeif", Some(_), "path")
+            )
+        })
+        .map(|entry| entry.key.clone())
+        .collect();
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+fn github_from_config(entries: &[ConfigEntry]) -> Option<String> {
+    let mut remotes: Vec<_> = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .key
+                .strip_prefix("remote.")
+                .and_then(|rest| rest.strip_suffix(".url"))
+                .is_some_and(|name| !name.is_empty())
+        })
+        .collect();
+    remotes.sort_by_key(|entry| entry.key != "remote.origin.url");
+    remotes
+        .into_iter()
+        .find_map(|entry| github_remote(&entry.value))
+}
+
+fn untrusted_message(keys: &[String]) -> String {
+    const SHOWN: usize = 4;
+    let mut listed = keys
+        .iter()
+        .take(SHOWN)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if keys.len() > SHOWN {
+        listed.push_str(&format!(" and {} more", keys.len() - SHOWN));
+    }
+    format!(
+        "{UNTRUSTED_CONFIGURATION}: Git status was not run because this repository's own \
+         configuration defines commands ({listed}). Review .git/config before trusting it."
+    )
 }
 
 fn parse_status(bytes: &[u8]) -> Result<Status, String> {
@@ -259,6 +368,31 @@ impl GitPlugin {
         {
             return Ok(Some((root, status.clone())));
         }
+        let config = run(
+            &root,
+            &[
+                "config",
+                "--list",
+                "--includes",
+                "--show-origin",
+                "--show-scope",
+                "-z",
+            ],
+        )?
+        .ok_or(
+            "Git could not read this repository's configuration; checking it requires Git 2.26 \
+             or newer",
+        )?;
+        let config = parse_config_listing(&config)?;
+        let untrusted = untrusted_configuration(&config);
+        if !untrusted.is_empty() {
+            let status = Status {
+                untrusted,
+                ..Status::default()
+            };
+            self.remember(&root, &status);
+            return Ok(Some((root, status)));
+        }
         let bytes = run(
             &root,
             &[
@@ -272,23 +406,17 @@ impl GitPlugin {
         )?
         .ok_or("Git could not inspect this repository")?;
         let mut status = parse_status(&bytes)?;
-        if let Some(bytes) = run(&root, &["config", "--get-regexp", "^remote\\..*\\.url$"])? {
-            let remotes = String::from_utf8_lossy(&bytes);
-            let mut remotes: Vec<_> = remotes
-                .lines()
-                .filter_map(|line| line.split_once(' '))
-                .collect();
-            remotes.sort_by_key(|(name, _)| *name != "remote.origin.url");
-            status.github = remotes
-                .into_iter()
-                .find_map(|(_, remote)| github_remote(remote));
-        }
+        status.github = github_from_config(&config);
+        self.remember(&root, &status);
+        Ok(Some((root, status)))
+    }
+
+    fn remember(&mut self, root: &Path, status: &Status) {
         if self.cache.len() >= 32 {
             self.cache.clear();
         }
         self.cache
-            .insert(root.clone(), (Instant::now(), status.clone()));
-        Ok(Some((root, status)))
+            .insert(root.to_path_buf(), (Instant::now(), status.clone()));
     }
 }
 
@@ -306,6 +434,18 @@ impl Plugin for GitPlugin {
             return Ok(result);
         };
         result.root = Some(root.clone());
+        if !status.untrusted.is_empty() {
+            result.badge = Some("Git · Untrusted configuration".into());
+            result.details.push(Detail {
+                label: "Status".into(),
+                value: untrusted_message(&status.untrusted),
+            });
+            result.actions.push(PluginAction {
+                id: "refresh".into(),
+                label: "Refresh".into(),
+            });
+            return Ok(result);
+        }
         result.badge = Some(format!(
             "Git · {}",
             if status.branch == "(detached)" {
@@ -389,6 +529,9 @@ impl Plugin for GitPlugin {
         let (root, status) = self
             .repository(&request.context)?
             .ok_or("This folder is not in a Git repository")?;
+        if !status.untrusted.is_empty() {
+            return Err(untrusted_message(&status.untrusted));
+        }
         let link = status.github.ok_or("No recognized GitHub remote")?;
         match request.action_id.as_str() {
             "open-repository" => Ok(ActionEffect::OpenUrl(link)),
@@ -454,6 +597,181 @@ mod tests {
         assert!(github_remote("https://github.com.evil/owner/repo").is_none());
         assert!(github_remote("https://github.com/../repo").is_none());
     }
+    fn commit_fixture(root: &Path) {
+        run(root, &["init", "--initial-branch=main"])
+            .unwrap()
+            .unwrap();
+        std::fs::write(root.join("note.txt"), "hello").unwrap();
+        std::fs::write(root.join(".gitattributes"), "*.txt filter=evil diff=evil\n").unwrap();
+        run(root, &["add", "."]).unwrap().unwrap();
+        run(
+            root,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-m",
+                "fixture",
+            ],
+        )
+        .unwrap()
+        .unwrap();
+    }
+
+    /// Make the index stat data stale without changing the size, so a status
+    /// refresh has to re-hash the file through its clean filter.
+    fn make_stat_dirty(path: &Path) {
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(std::time::SystemTime::now() + Duration::from_secs(120))
+            .unwrap();
+    }
+
+    fn shell_path(path: &Path) -> String {
+        path.to_string_lossy().replace('\\', "/")
+    }
+
+    #[test]
+    fn repository_filter_commands_never_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repository");
+        std::fs::create_dir(&root).unwrap();
+        commit_fixture(&root);
+        let marker = temp.path().join("filter-ran");
+        let command = format!("touch '{}'; cat", shell_path(&marker));
+        for key in ["filter.evil.clean", "filter.evil.smudge"] {
+            run(&root, &["config", key, &command]).unwrap().unwrap();
+        }
+        make_stat_dirty(&root.join("note.txt"));
+
+        let context = Inspection {
+            path: root.clone(),
+            entries: vec![explorie_plugin_protocol::EntryContext {
+                path: root.join("note.txt"),
+                is_dir: false,
+            }],
+            force: true,
+            ..Default::default()
+        };
+        let mut plugin = GitPlugin::default();
+        let contribution = plugin.inspect(context.clone()).unwrap();
+        assert_eq!(
+            contribution.badge.as_deref(),
+            Some("Git · Untrusted configuration")
+        );
+        assert!(contribution.decorations.is_empty());
+        assert!(contribution.details[0].value.contains("filter.evil.clean"));
+        assert!(
+            plugin
+                .invoke(ActionRequest {
+                    action_id: "open-repository".into(),
+                    context,
+                })
+                .unwrap_err()
+                .contains(UNTRUSTED_CONFIGURATION)
+        );
+        assert!(!marker.exists(), "a repository filter command ran");
+
+        // Prove the fixture is a real attack: the plugin's own status command
+        // runs the filter when the configuration check is bypassed.
+        #[cfg(unix)]
+        {
+            run(&root, &["status", "--porcelain=v2", "-z"])
+                .unwrap()
+                .unwrap();
+            assert!(
+                marker.exists(),
+                "the fixture filter should run without the guard"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn repository_fsmonitor_hook_is_overridden_without_refusing_status() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repository");
+        std::fs::create_dir(&root).unwrap();
+        commit_fixture(&root);
+        std::fs::remove_file(root.join(".gitattributes")).unwrap();
+        let marker = temp.path().join("fsmonitor-ran");
+        let hook = temp.path().join("fsmonitor-hook");
+        std::fs::write(
+            &hook,
+            format!("#!/bin/sh\ntouch '{}'\n", shell_path(&marker)),
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        run(&root, &["config", "core.fsmonitor", hook.to_str().unwrap()])
+            .unwrap()
+            .unwrap();
+        make_stat_dirty(&root.join("note.txt"));
+        let contribution = GitPlugin::default()
+            .inspect(Inspection {
+                path: root.clone(),
+                force: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(contribution.badge.as_deref(), Some("Git · main"));
+        assert!(!marker.exists(), "a repository fsmonitor hook ran");
+    }
+
+    #[test]
+    fn configuration_trust_is_scoped_to_the_repository() {
+        let listing = [
+            ("global", "filter.lfs.clean", "git-lfs clean -- %f"),
+            ("system", "diff.external", "difftool"),
+            ("local", "core.fsmonitor", "true"),
+            (
+                "local",
+                "remote.upstream.url",
+                "https://github.com/other/fork.git",
+            ),
+            (
+                "local",
+                "remote.origin.url",
+                "git@github.com:owner/repo.git",
+            ),
+            ("local", "filter.Evil.Process", "evil"),
+            ("worktree", "diff.pdf.textconv", "evil"),
+            ("local", "diff.external", "evil"),
+            ("local", "include.path", "../shared.cfg"),
+            ("local", "includeif.gitdir:/tmp/.path", "shared.cfg"),
+            ("local", "filter.evil.required", "true"),
+            ("command", "filter.cli.clean", "cat"),
+        ]
+        .iter()
+        .flat_map(|(scope, key, value)| {
+            format!("{scope}\0file:.git/config\0{key}\n{value}\0").into_bytes()
+        })
+        .chain(b"local\0file:.git/config\0core.bare\0".iter().copied())
+        .collect::<Vec<u8>>();
+        let entries = parse_config_listing(&listing).unwrap();
+        assert_eq!(entries.len(), 13);
+        assert_eq!(entries[12].key, "core.bare");
+        assert_eq!(
+            untrusted_configuration(&entries),
+            [
+                "diff.external",
+                "diff.pdf.textconv",
+                "filter.Evil.Process",
+                "include.path",
+                "includeif.gitdir:/tmp/.path",
+            ]
+        );
+        assert_eq!(
+            github_from_config(&entries).as_deref(),
+            Some("https://github.com/owner/repo")
+        );
+        assert!(parse_config_listing(b"local\0file:.git/config").is_err());
+        let message = untrusted_message(&untrusted_configuration(&entries));
+        assert!(message.starts_with(UNTRUSTED_CONFIGURATION));
+        assert!(message.ends_with("and 1 more). Review .git/config before trusting it."));
+    }
+
     #[test]
     #[cfg(unix)]
     fn repository_alias_keeps_listing_paths_and_decorations() {

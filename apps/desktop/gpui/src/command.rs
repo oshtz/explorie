@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CommandId {
     GoBack,
@@ -35,6 +37,18 @@ pub(crate) enum CommandId {
     SaveSmartFolder,
     ShowShortcuts,
     ShowDiagnostics,
+    OpenSelected,
+    Compress,
+    DeletePermanently,
+    Find,
+    GoHome,
+    GoDesktop,
+    GoDocuments,
+    GoDownloads,
+    ToggleSidebar,
+    NextTab,
+    PreviousTab,
+    About,
 }
 
 impl CommandId {
@@ -75,6 +89,18 @@ impl CommandId {
             Self::SaveSmartFolder => "search-save-smart-folder",
             Self::ShowShortcuts => "help-shortcuts",
             Self::ShowDiagnostics => "help-diagnostics",
+            Self::OpenSelected => "file-open",
+            Self::Compress => "file-compress",
+            Self::DeletePermanently => "file-delete-permanently",
+            Self::Find => "search-focus",
+            Self::GoHome => "go-home",
+            Self::GoDesktop => "go-desktop",
+            Self::GoDocuments => "go-documents",
+            Self::GoDownloads => "go-downloads",
+            Self::ToggleSidebar => "view-toggle-sidebar",
+            Self::NextTab => "tab-next",
+            Self::PreviousTab => "tab-previous",
+            Self::About => "help-about",
         }
     }
 
@@ -122,6 +148,7 @@ pub(crate) struct CommandContext {
     pub(crate) show_hidden: bool,
     pub(crate) show_preview: bool,
     pub(crate) show_status: bool,
+    pub(crate) sidebar_collapsed: bool,
     pub(crate) favorite: bool,
 }
 
@@ -129,11 +156,16 @@ pub(crate) fn all_commands(context: CommandContext) -> Vec<CommandSpec> {
     use CommandCategory::{File, Help, Navigation, Settings, Tabs, View};
     use CommandId::*;
     vec![
-        command(GoBack, "Go back", Some("Alt+Left"), Navigation),
-        command(GoForward, "Go forward", Some("Alt+Right"), Navigation),
-        command(GoUp, "Go up one directory", Some("Alt+Up"), Navigation),
-        command(GoToFolder, "Go to folder…", Some("Ctrl+G"), Navigation),
-        command(ClearHistory, "Clear navigation history", None, Navigation),
+        command(GoBack, "Go back", Navigation),
+        command(GoForward, "Go forward", Navigation),
+        command(GoUp, "Go up one directory", Navigation),
+        command(GoToFolder, "Go to folder…", Navigation),
+        command(GoHome, "Go to Home folder", Navigation),
+        command(GoDesktop, "Go to Desktop", Navigation),
+        command(GoDocuments, "Go to Documents", Navigation),
+        command(GoDownloads, "Go to Downloads", Navigation),
+        command(Find, "Search filenames", Navigation),
+        command(ClearHistory, "Clear navigation history", Navigation),
         command(
             ToggleFavorite,
             if context.favorite {
@@ -141,39 +173,30 @@ pub(crate) fn all_commands(context: CommandContext) -> Vec<CommandSpec> {
             } else {
                 "Add current folder to favorites"
             },
-            Some("Ctrl+D"),
             Navigation,
         ),
         command(
             SaveSmartFolder,
             "Save current search as smart folder",
-            Some("Ctrl+Shift+G"),
             Navigation,
         ),
-        command(NewFolder, "New folder", Some("Ctrl+Shift+N"), File),
-        command(Rename, "Rename selected item", Some("F2"), File),
-        command(Copy, "Copy selected items", Some("Ctrl+C"), File),
-        command(Cut, "Cut selected items", Some("Ctrl+X"), File),
-        command(Paste, "Paste items", Some("Ctrl+V"), File),
-        command(Trash, "Move selected items to trash", Some("Delete"), File),
-        command(Undo, "Undo", Some("Ctrl+Z"), File),
-        command(Redo, "Redo", Some("Ctrl+Y"), File),
-        command(
-            NewWindow,
-            "Open current folder in new window",
-            Some("Ctrl+N"),
-            Tabs,
-        ),
-        command(
-            MoveTabToNewWindow,
-            "Move current tab to new window",
-            None,
-            Tabs,
-        ),
-        command(Refresh, "Refresh", Some("F5"), View),
-        command(ListView, "Switch to list view", Some("Ctrl+1"), View),
-        command(GridView, "Switch to grid view", Some("Ctrl+2"), View),
-        command(ColumnView, "Switch to column view", Some("Ctrl+3"), View),
+        command(NewFolder, "New folder", File),
+        command(OpenSelected, "Open selected item", File),
+        command(Rename, "Rename selected item", File),
+        command(Compress, "Compress selected items", File),
+        command(Copy, "Copy selected items", File),
+        command(Cut, "Cut selected items", File),
+        command(Paste, "Paste items", File),
+        command(Trash, "Move selected items to trash", File),
+        command(DeletePermanently, "Delete selected items permanently", File),
+        command(Undo, "Undo", File),
+        command(Redo, "Redo", File),
+        command(NewWindow, "Open current folder in new window", Tabs),
+        command(MoveTabToNewWindow, "Move current tab to new window", Tabs),
+        command(Refresh, "Refresh", View),
+        command(ListView, "Switch to list view", View),
+        command(GridView, "Switch to grid view", View),
+        command(ColumnView, "Switch to column view", View),
         command(
             ToggleHidden,
             if context.show_hidden {
@@ -181,7 +204,6 @@ pub(crate) fn all_commands(context: CommandContext) -> Vec<CommandSpec> {
             } else {
                 "Show hidden files"
             },
-            Some("Ctrl+H"),
             View,
         ),
         command(
@@ -191,7 +213,6 @@ pub(crate) fn all_commands(context: CommandContext) -> Vec<CommandSpec> {
             } else {
                 "Pin preview panel"
             },
-            None,
             View,
         ),
         command(
@@ -201,48 +222,53 @@ pub(crate) fn all_commands(context: CommandContext) -> Vec<CommandSpec> {
             } else {
                 "Show status bar"
             },
-            None,
             View,
         ),
-        command(NewTab, "New tab", Some("Ctrl+T"), Tabs),
-        command(CloseTab, "Close current tab", Some("Ctrl+W"), Tabs),
-        command(OpenSettings, "Open settings", Some("Ctrl+,"), Settings),
         command(
-            ManageWorkspaces,
-            "Manage workspaces",
-            Some("Ctrl+Shift+W"),
-            Settings,
+            ToggleSidebar,
+            if context.sidebar_collapsed {
+                "Show sidebar"
+            } else {
+                "Hide sidebar"
+            },
+            View,
         ),
-        command(SaveWorkspace, "Save current workspace", None, Settings),
-        command(
-            ManageRemoteDrives,
-            "Manage remote drives",
-            Some("Ctrl+Shift+R"),
-            Settings,
-        ),
-        command(ThemeDark, "Switch to dark theme", None, Settings),
-        command(ThemeLight, "Switch to light theme", None, Settings),
-        command(ThemeSystem, "Use system theme", None, Settings),
-        command(ShowShortcuts, "Show keyboard shortcuts", Some("?"), Help),
-        command(
-            ShowDiagnostics,
-            "Show native diagnostics",
-            Some("Ctrl+Alt+D"),
-            Help,
-        ),
+        command(NewTab, "New tab", Tabs),
+        command(CloseTab, "Close current tab", Tabs),
+        command(NextTab, "Next tab", Tabs),
+        command(PreviousTab, "Previous tab", Tabs),
+        command(OpenSettings, "Open settings", Settings),
+        command(ManageWorkspaces, "Manage workspaces", Settings),
+        command(SaveWorkspace, "Save current workspace", Settings),
+        command(ManageRemoteDrives, "Manage remote drives", Settings),
+        command(ThemeDark, "Switch to dark theme", Settings),
+        command(ThemeLight, "Switch to light theme", Settings),
+        command(ThemeSystem, "Use system theme", Settings),
+        command(ShowShortcuts, "Show keyboard shortcuts", Help),
+        command(ShowDiagnostics, "Show native diagnostics", Help),
+        command(About, "About explorie", Help),
     ]
 }
 
-fn command(
-    id: CommandId,
-    name: &str,
-    shortcut: Option<&'static str>,
-    category: CommandCategory,
-) -> CommandSpec {
+/// Commands with the effective (platform default or user-overridden) shortcut
+/// of each one, formatted for display.
+pub(crate) fn all_commands_with_shortcuts(
+    context: CommandContext,
+    overrides: &BTreeMap<String, String>,
+) -> Vec<CommandSpec> {
+    let mut commands = all_commands(context);
+    for command in &mut commands {
+        command.shortcut = crate::shortcut::command_binding(overrides, command.id.as_str())
+            .map(|binding| crate::shortcut::display_binding(&binding));
+    }
+    commands
+}
+
+fn command(id: CommandId, name: &str, category: CommandCategory) -> CommandSpec {
     CommandSpec {
         id,
         name: name.to_string(),
-        shortcut: shortcut.map(str::to_string),
+        shortcut: None,
         category,
     }
 }
@@ -328,15 +354,37 @@ mod tests {
     }
 
     #[test]
-    fn command_palette_advertises_native_bindings() {
-        let commands = all_commands(CommandContext::default());
+    fn command_palette_advertises_effective_platform_bindings() {
+        let shortcut = |overrides: &BTreeMap<String, String>, id| {
+            all_commands_with_shortcuts(CommandContext::default(), overrides)
+                .into_iter()
+                .find(|command| command.id == id)
+                .and_then(|command| command.shortcut)
+        };
+        let defaults = BTreeMap::new();
         assert_eq!(
-            commands
-                .iter()
-                .find(|command| command.id == CommandId::OpenSettings)
-                .and_then(|command| command.shortcut.as_deref()),
-            Some("Ctrl+,")
+            shortcut(&defaults, CommandId::OpenSettings).as_deref(),
+            Some(if cfg!(target_os = "macos") {
+                "⌘,"
+            } else {
+                "Ctrl + ,"
+            })
         );
+        assert_eq!(
+            shortcut(&defaults, CommandId::GoBack).as_deref(),
+            Some(if cfg!(target_os = "macos") {
+                "⌘["
+            } else {
+                "Alt + Left"
+            })
+        );
+        let overrides = BTreeMap::from([("nav-back".to_string(), "secondary-alt-j".to_string())]);
+        assert_eq!(
+            shortcut(&overrides, CommandId::GoBack),
+            Some(crate::shortcut::display_binding("secondary-alt-j"))
+        );
+        assert_eq!(shortcut(&defaults, CommandId::ClearHistory), None);
+        let commands = all_commands(CommandContext::default());
         assert!(
             commands
                 .iter()

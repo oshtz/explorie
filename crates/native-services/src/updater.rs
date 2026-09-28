@@ -1,6 +1,7 @@
 #[cfg(target_os = "macos")]
 use crate::process::{ProcessError, run_with_timeout};
 use crate::{BlockingTask, ErrorCode, ServiceContext, ServiceError, ServiceResult};
+use minisign_verify::{PublicKey, Signature};
 use semver::Version;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -9,6 +10,7 @@ use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+#[cfg(any(windows, target_os = "macos"))]
 use std::process::{Command, Stdio};
 #[cfg(target_os = "macos")]
 use std::thread;
@@ -19,6 +21,16 @@ const RELEASE_DOWNLOAD_PREFIX: &str = "https://github.com/oshtz/explorie/release
 const MAX_RELEASE_METADATA_BYTES: u64 = 1024 * 1024;
 const MAX_UPDATE_BYTES: u64 = 512 * 1024 * 1024;
 const MIN_UPDATE_BYTES: u64 = 1024 * 1024;
+/// The minisign public key that update payloads must be signed with. The
+/// checked-in file carries no key until a maintainer configures signing (see
+/// "Update signing" in README.md); `EXPLORIE_UPDATE_PUBLIC_KEY` can override it
+/// at build time. Once a key is compiled in, every update needs a valid
+/// signature on every platform; without one, updates rely on GitHub's
+/// SHA-256 digest alone.
+const UPDATE_PUBLIC_KEY_FILE: &str = include_str!("../update-signing-key.pub");
+const SIGNATURE_LINE_PREFIX: &str = "explorie-signature";
+const SIGNATURE_BLOCK_START: &str = "<!-- explorie-update-signatures";
+const SIGNATURE_BLOCK_END: &str = "-->";
 #[cfg(any(windows, test))]
 const WINDOWS_INSTALLER_ARGUMENTS: [&str; 6] = [
     "/SP-",
@@ -73,6 +85,8 @@ pub struct UpdateInfo {
     pub download_url: String,
     pub sha256: String,
     pub size: u64,
+    /// The minisign signature published for this asset, when present.
+    pub signature: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -98,15 +112,18 @@ impl UpdateService {
             let Some(platform) = UpdatePlatform::current() else {
                 return Ok(None);
             };
+            let key = configured_update_key()?;
             let release = get_bytes(RELEASE_API_URL, MAX_RELEASE_METADATA_BYTES)?;
-            discover_update(&current_version, &release, platform)
+            discover_update(&current_version, &release, platform, key.as_ref())
         })
     }
 
     pub fn download(&self, update: UpdateInfo) -> BlockingTask<DownloadedUpdate> {
         let cache_dir = self.context.resources().cache_dir.join("updates");
         self.context.spawn_blocking(move || {
+            let key = configured_update_key()?;
             validate_update_info(&update)?;
+            require_signature(&update, key.as_ref())?;
             fs::create_dir_all(&cache_dir).map_err(ServiceError::from)?;
 
             let expected_sha256 = update.sha256.clone();
@@ -118,6 +135,7 @@ impl UpdateService {
                     .map(|value| value.len())
                     .unwrap_or(0)
                     == update.size
+                && verify_update_signature(&installer_path, &update, key.as_ref()).is_ok()
             {
                 return Ok(DownloadedUpdate {
                     info: update,
@@ -133,7 +151,8 @@ impl UpdateService {
                 &staged_path,
                 update.size,
                 &expected_sha256,
-            );
+            )
+            .and_then(|()| verify_update_signature(&staged_path, &update, key.as_ref()));
             if let Err(error) = result {
                 let _ = fs::remove_file(&staged_path);
                 return Err(error);
@@ -156,7 +175,7 @@ impl UpdateService {
         #[cfg(target_os = "macos")]
         let resources = self.context.resources().clone();
         self.context.spawn_blocking(move || {
-            validate_downloaded_update(&cache_dir, &update)?;
+            validate_signed_downloaded_update(&cache_dir, &update)?;
             #[cfg(windows)]
             return launch_installer(&update.installer_path);
             #[cfg(target_os = "macos")]
@@ -189,6 +208,7 @@ fn discover_update(
     current_version: &str,
     release_json: &[u8],
     platform: UpdatePlatform,
+    key: Option<&PublicKey>,
 ) -> ServiceResult<Option<UpdateInfo>> {
     let current = Version::parse(current_version).map_err(|_| {
         ServiceError::new(
@@ -239,16 +259,163 @@ fn discover_update(
             "The update payload has an invalid size",
         ));
     }
+    let body = release.body.unwrap_or_default();
+    let signature = match key {
+        Some(_) => release_signature(&body, &asset_name)?,
+        None => None,
+    };
+    let notes = release_notes(&body);
     let update = UpdateInfo {
         version: version_text.to_string(),
-        notes: release.body.filter(|body| !body.trim().is_empty()),
+        notes: (!notes.is_empty()).then_some(notes),
         asset_name,
         download_url: installer.browser_download_url.clone(),
         sha256: sha256_from_digest(installer.digest.as_deref())?,
         size: installer.size,
+        signature,
     };
     validate_update_info_for_platform(&update, platform)?;
+    require_signature(&update, key)?;
     Ok(Some(update))
+}
+
+fn configured_update_key() -> ServiceResult<Option<PublicKey>> {
+    parse_update_key(
+        option_env!("EXPLORIE_UPDATE_PUBLIC_KEY")
+            .filter(|key| !key.trim().is_empty())
+            .unwrap_or(UPDATE_PUBLIC_KEY_FILE),
+    )
+}
+
+/// Parse a minisign public key file (or a bare base64 key). Comment-only
+/// input means signing is not configured.
+fn parse_update_key(text: &str) -> ServiceResult<Option<PublicKey>> {
+    let mut keys = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("untrusted comment:"));
+    let Some(key) = keys.next() else {
+        return Ok(None);
+    };
+    let invalid = || {
+        ServiceError::new(
+            ErrorCode::Internal,
+            "The embedded update signing key is invalid; updates are disabled",
+        )
+    };
+    if keys.next().is_some() {
+        return Err(invalid());
+    }
+    PublicKey::from_base64(key).map(Some).map_err(|_| invalid())
+}
+
+fn signature_trusted_comment(asset_name: &str) -> String {
+    format!("explorie-update {asset_name}")
+}
+
+/// Find the `explorie-signature <asset> <signature> <global-signature>` line for
+/// `asset_name` and rebuild the minisign signature it stands for. The trusted
+/// comment is derived from the expected asset name, so a signature published
+/// for any other asset (including an older release) cannot verify.
+fn release_signature(body: &str, asset_name: &str) -> ServiceResult<Option<String>> {
+    let malformed = || {
+        ServiceError::new(
+            ErrorCode::InvalidInput,
+            "The release notes contain a malformed update signature",
+        )
+    };
+    let mut found = None;
+    for line in body.lines() {
+        let mut fields = line.split_whitespace();
+        if fields.next() != Some(SIGNATURE_LINE_PREFIX) {
+            continue;
+        }
+        let (Some(name), Some(signature), Some(global), None) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            return Err(malformed());
+        };
+        if name != asset_name {
+            continue;
+        }
+        if found.is_some() {
+            return Err(ServiceError::new(
+                ErrorCode::InvalidInput,
+                "The release notes contain more than one signature for this update",
+            ));
+        }
+        let text = format!(
+            "untrusted comment: explorie update signature\n{signature}\ntrusted comment: {}\n{global}\n",
+            signature_trusted_comment(asset_name)
+        );
+        Signature::decode(&text).map_err(|_| malformed())?;
+        found = Some(text);
+    }
+    Ok(found)
+}
+
+/// Release notes without the machine-readable signature block.
+fn release_notes(body: &str) -> String {
+    let mut kept = Vec::new();
+    let mut inside = false;
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if !inside && trimmed == SIGNATURE_BLOCK_START {
+            inside = true;
+        } else if inside {
+            inside = trimmed != SIGNATURE_BLOCK_END;
+        } else if !trimmed.starts_with(SIGNATURE_LINE_PREFIX) {
+            kept.push(line);
+        }
+    }
+    kept.join("\n").trim().to_string()
+}
+
+fn require_signature(update: &UpdateInfo, key: Option<&PublicKey>) -> ServiceResult<()> {
+    if key.is_some() && update.signature.is_none() {
+        return Err(ServiceError::new(
+            ErrorCode::PermissionDenied,
+            "The update is not signed with the Explorie update key",
+        ));
+    }
+    Ok(())
+}
+
+/// Check the payload's detached ed25519 signature when a key is configured.
+fn verify_update_signature(
+    path: &Path,
+    update: &UpdateInfo,
+    key: Option<&PublicKey>,
+) -> ServiceResult<()> {
+    let Some(key) = key else {
+        return Ok(());
+    };
+    require_signature(update, Some(key))?;
+    let rejected = || {
+        ServiceError::new(
+            ErrorCode::PermissionDenied,
+            "The update payload failed its Explorie signature check",
+        )
+    };
+    let signature = update
+        .signature
+        .as_deref()
+        .and_then(|text| Signature::decode(text).ok())
+        .filter(|signature| {
+            signature.trusted_comment() == signature_trusted_comment(&update.asset_name)
+        })
+        .ok_or_else(rejected)?;
+    let mut verifier = key.verify_stream(&signature).map_err(|_| rejected())?;
+    let mut file = File::open(path).map_err(ServiceError::from)?;
+    let mut buffer = vec![0_u8; 128 * 1024];
+    loop {
+        let count = file.read(&mut buffer).map_err(ServiceError::from)?;
+        if count == 0 {
+            break;
+        }
+        verifier.update(&buffer[..count]);
+    }
+    verifier.finalize().map_err(|_| rejected())
 }
 
 fn validate_update_info(update: &UpdateInfo) -> ServiceResult<()> {
@@ -411,6 +578,18 @@ fn validate_downloaded_update(cache_dir: &Path, update: &DownloadedUpdate) -> Se
     validate_downloaded_update_for_platform(cache_dir, update, platform)
 }
 
+fn validate_signed_downloaded_update(
+    cache_dir: &Path,
+    update: &DownloadedUpdate,
+) -> ServiceResult<()> {
+    validate_downloaded_update(cache_dir, update)?;
+    verify_update_signature(
+        &update.installer_path,
+        &update.info,
+        configured_update_key()?.as_ref(),
+    )
+}
+
 fn validate_downloaded_update_for_platform(
     cache_dir: &Path,
     update: &DownloadedUpdate,
@@ -569,6 +748,7 @@ fn apply_macos_update(
         download_url: release_asset_url(&version, &macos_dmg_name(&version)),
         sha256: sha256.clone(),
         size,
+        signature: None,
     };
     let update = DownloadedUpdate {
         info,
@@ -949,6 +1129,48 @@ fn network_error(error: ureq::Error) -> ServiceError {
 mod tests {
     use super::*;
 
+    // Test-only ed25519 keys generated for these fixtures by
+    // scripts/update-signatures.mjs; their secret halves were discarded. Both
+    // fixture signatures cover the 1 MiB zero-filled payload.
+    const TEST_KEY: &str = "RWTZ6T/8eOBV4I3UjVXPu0uZMs2rrD1h2YJl5nxr/rMj90e6Axd/pfaQ";
+    const OTHER_TEST_KEY: &str = "RWSWD5kmw0r/1aKrqjoe/CciS3d3f9fiMVSC5MRbS+vmMSN472uabYGa";
+    const WINDOWS_SIGNATURE: &str = "explorie-signature explorie-0.2.9-windows-x64-setup-unsigned.exe RUTZ6T/8eOBV4Ivm4P0yttgnHE8ExHfPtBreSiD5z57uWPnLe6xFbZoLoydb6RVnyejriXKYmL7irFjHh7RuytRVJaJCJGo0mAI= YN/t82kCrv4Oi9h74EqSsYKd3tBgQa51spyEmrt0mS8IYtUfFCPAJzXzgOENT791Hsd4bLsp06fK9Z00xpk6Cw==";
+    const MACOS_SIGNATURE: &str = "explorie-signature explorie-0.2.9-macos-arm64.dmg RUTZ6T/8eOBV4Ivm4P0yttgnHE8ExHfPtBreSiD5z57uWPnLe6xFbZoLoydb6RVnyejriXKYmL7irFjHh7RuytRVJaJCJGo0mAI= GOi6x7crwLKbFX9DcBkSvLeRr1IdjAZP2IzHEqztuMm+rFX7VdyJmo5ElRjolZkjrbzQJAotnwrfr5ZSm+OwDg==";
+    const OTHER_KEY_MACOS_SIGNATURE: &str = "explorie-signature explorie-0.2.9-macos-arm64.dmg RUSWD5kmw0r/1YSeBE+bgVAhJasY+21J7gLUKjY+V9zFrFvpdqvykDedyf3eTEekFzmBXLY9Xo5J+ngBx0QXKtflgOPYsZNlZwA= xQw3JOolO+e4AyW9qOpuRPNUYwNhBxNNrdVEG4PYSMCfcUx3rt4RjBzbNQjfPkzYf1I+dT5Ry86rSyMmJgAXBg==";
+
+    // Made by an independent minisign implementation (rsign2 0.6.7) over the
+    // same payload with `-t "explorie-update explorie-0.2.9-macos-arm64.dmg"`.
+    const RSIGN_TEST_KEY: &str = "RWQqqwbfKtw2IClva6awfwNN/7AzqRTTVAulQk++WRgrJZ0RD+XsBR0q";
+    const RSIGN_MACOS_SIGNATURE: &str = "explorie-signature explorie-0.2.9-macos-arm64.dmg RUQqqwbfKtw2IJPoJiMeXyujyiSp3ul9o6REHxLg/9E5ZaMBebq6mzVf8m5d3dw/4C+KPzVzghOpZ+wjkqdGH7wd3Ywj/jeqkgo= +d7rrucTgXOacdm0Bvru90Qr4Qyz9J/fu80g07W9Hr5aHp/rOKN01tcn/Yt4hhnL7rQw9MDjMt8ZWAmOGWopAg==";
+
+    /// Discovery as it behaves in builds without an update signing key.
+    fn discover_update(
+        current_version: &str,
+        release_json: &[u8],
+        platform: UpdatePlatform,
+    ) -> ServiceResult<Option<UpdateInfo>> {
+        super::discover_update(current_version, release_json, platform, None)
+    }
+
+    fn test_key(key: &str) -> PublicKey {
+        parse_update_key(key).unwrap().unwrap()
+    }
+
+    fn signature_line(platform: UpdatePlatform) -> &'static str {
+        match platform {
+            UpdatePlatform::Windows => WINDOWS_SIGNATURE,
+            UpdatePlatform::Macos => MACOS_SIGNATURE,
+        }
+    }
+
+    fn signed_release_json(platform: UpdatePlatform, body: &str) -> Vec<u8> {
+        let name = platform.asset_name("0.2.9");
+        let mut release: serde_json::Value =
+            serde_json::from_slice(&release_json("0.2.9", MIN_UPDATE_BYTES, &name)).unwrap();
+        release["body"] = serde_json::json!(body);
+        serde_json::to_vec(&release).unwrap()
+    }
+
     fn release_json(version: &str, size: u64, asset_name: &str) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
             "tag_name": format!("v{version}"),
@@ -1113,6 +1335,7 @@ mod tests {
                     download_url: release_asset_url("0.2.9", &name),
                     sha256: sha256.clone(),
                     size: MIN_UPDATE_BYTES,
+                    signature: None,
                 },
                 installer_path: path.clone(),
                 sha256,
@@ -1123,6 +1346,164 @@ mod tests {
             update.sha256 = hash_file(&path).unwrap();
             assert!(validate_downloaded_update_for_platform(&cache, &update, platform).is_err());
         }
+    }
+
+    #[test]
+    fn checked_in_update_key_is_absent_or_valid() {
+        parse_update_key(UPDATE_PUBLIC_KEY_FILE).unwrap();
+        assert!(
+            parse_update_key("untrusted comment: none\n\n")
+                .unwrap()
+                .is_none()
+        );
+        assert!(parse_update_key("untrusted comment: key\nnot-a-key\n").is_err());
+        assert!(parse_update_key(&format!("{TEST_KEY}\n{OTHER_TEST_KEY}")).is_err());
+        assert!(
+            parse_update_key(&format!(
+                "untrusted comment: minisign public key\n{TEST_KEY}\n"
+            ))
+            .unwrap()
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn unsigned_releases_follow_the_digest_only_path_without_a_key() {
+        for platform in [UpdatePlatform::Windows, UpdatePlatform::Macos] {
+            let update = discover_update(
+                "0.2.8",
+                &signed_release_json(platform, "Fixes\nexplorie-signature malformed"),
+                platform,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(update.signature, None);
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join(&update.asset_name);
+            fs::write(&path, b"any payload").unwrap();
+            assert!(verify_update_signature(&path, &update, None).is_ok());
+        }
+    }
+
+    #[test]
+    fn signed_releases_require_a_valid_signature_for_the_exact_asset() {
+        let key = test_key(TEST_KEY);
+        let temp = tempfile::tempdir().unwrap();
+        for platform in [UpdatePlatform::Windows, UpdatePlatform::Macos] {
+            let name = platform.asset_name("0.2.9");
+            let path = temp.path().join(&name);
+            fs::write(&path, vec![0_u8; MIN_UPDATE_BYTES as usize]).unwrap();
+            let body = format!(
+                "## Changes\n\nFixes\n\n<!-- explorie-update-signatures\n{WINDOWS_SIGNATURE}\n{MACOS_SIGNATURE}\n-->\n"
+            );
+            let update = super::discover_update(
+                "0.2.8",
+                &signed_release_json(platform, &body),
+                platform,
+                Some(&key),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(update.notes.as_deref(), Some("## Changes\n\nFixes"));
+            assert!(update.signature.is_some());
+            verify_update_signature(&path, &update, Some(&key)).unwrap();
+
+            // Tampered payload.
+            let tampered = temp.path().join(format!("tampered-{name}"));
+            let mut bytes = vec![0_u8; MIN_UPDATE_BYTES as usize];
+            bytes[4096] = 1;
+            fs::write(&tampered, bytes).unwrap();
+            assert_eq!(
+                verify_update_signature(&tampered, &update, Some(&key))
+                    .unwrap_err()
+                    .code,
+                ErrorCode::PermissionDenied
+            );
+
+            // A key the release was not signed with.
+            assert!(
+                verify_update_signature(&path, &update, Some(&test_key(OTHER_TEST_KEY))).is_err()
+            );
+
+            // Missing signature: refused at discovery and again before use.
+            assert_eq!(
+                super::discover_update(
+                    "0.2.8",
+                    &signed_release_json(platform, "Fixes"),
+                    platform,
+                    Some(&key),
+                )
+                .unwrap_err()
+                .code,
+                ErrorCode::PermissionDenied
+            );
+            let unsigned = UpdateInfo {
+                signature: None,
+                ..update.clone()
+            };
+            assert!(verify_update_signature(&path, &unsigned, Some(&key)).is_err());
+            assert!(require_signature(&unsigned, Some(&key)).is_err());
+
+            // The same bytes signed for the other platform's asset name do not
+            // verify: the trusted comment binds each signature to its asset.
+            let other = match platform {
+                UpdatePlatform::Windows => UpdatePlatform::Macos,
+                UpdatePlatform::Macos => UpdatePlatform::Windows,
+            };
+            let replayed = signature_line(other).replacen(&other.asset_name("0.2.9"), &name, 1);
+            let replayed = super::discover_update(
+                "0.2.8",
+                &signed_release_json(platform, &replayed),
+                platform,
+                Some(&key),
+            )
+            .unwrap()
+            .unwrap();
+            assert!(verify_update_signature(&path, &replayed, Some(&key)).is_err());
+
+            // Malformed or duplicated signature lines are rejected outright.
+            for body in [
+                format!("explorie-signature {name} not-base64 still-not-base64"),
+                format!("explorie-signature {name}"),
+                format!("{}\n{}", signature_line(platform), signature_line(platform)),
+            ] {
+                assert!(
+                    super::discover_update(
+                        "0.2.8",
+                        &signed_release_json(platform, &body),
+                        platform,
+                        Some(&key),
+                    )
+                    .is_err(),
+                    "{body}"
+                );
+            }
+        }
+
+        let other_key = super::discover_update(
+            "0.2.8",
+            &signed_release_json(UpdatePlatform::Macos, OTHER_KEY_MACOS_SIGNATURE),
+            UpdatePlatform::Macos,
+            Some(&key),
+        )
+        .unwrap()
+        .unwrap();
+        let path = temp.path().join(UpdatePlatform::Macos.asset_name("0.2.9"));
+        assert!(verify_update_signature(&path, &other_key, Some(&key)).is_err());
+
+        let rsign_key = test_key(RSIGN_TEST_KEY);
+        let rsign = super::discover_update(
+            "0.2.8",
+            &signed_release_json(UpdatePlatform::Macos, RSIGN_MACOS_SIGNATURE),
+            UpdatePlatform::Macos,
+            Some(&rsign_key),
+        )
+        .unwrap()
+        .unwrap();
+        verify_update_signature(&path, &rsign, Some(&rsign_key)).unwrap();
+        assert!(
+            verify_update_signature(&path, &other_key, Some(&test_key(OTHER_TEST_KEY))).is_ok()
+        );
     }
 
     #[test]

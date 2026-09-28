@@ -12,6 +12,7 @@ pub(crate) enum SmartFolderField {
     ExcludePattern,
     Extensions,
     ContentSearch,
+    Tag,
     SizeMin,
     SizeMax,
     ModifiedAfter,
@@ -19,13 +20,14 @@ pub(crate) enum SmartFolderField {
 }
 
 impl SmartFolderField {
-    pub(crate) const ALL: [Self; 10] = [
+    pub(crate) const ALL: [Self; 11] = [
         Self::Name,
         Self::SearchPaths,
         Self::NamePattern,
         Self::ExcludePattern,
         Self::Extensions,
         Self::ContentSearch,
+        Self::Tag,
         Self::SizeMin,
         Self::SizeMax,
         Self::ModifiedAfter,
@@ -40,6 +42,7 @@ impl SmartFolderField {
             Self::ExcludePattern => "Exclude pattern",
             Self::Extensions => "Extensions",
             Self::ContentSearch => "Contains text",
+            Self::Tag => "Tag",
             Self::SizeMin => "Minimum size",
             Self::SizeMax => "Maximum size",
             Self::ModifiedAfter => "Modified after",
@@ -55,6 +58,7 @@ impl SmartFolderField {
             Self::ExcludePattern => "Names matching this are omitted",
             Self::Extensions => "Comma-separated, for example: rs, md, txt",
             Self::ContentSearch => "Local text files up to 5 MB",
+            Self::Tag => "A Finder tag name, for example: Work",
             Self::SizeMin | Self::SizeMax => "Bytes; leave empty for no limit",
             Self::ModifiedAfter | Self::ModifiedBefore => "YYYY-MM-DD; leave empty for no limit",
         }
@@ -68,6 +72,7 @@ impl SmartFolderField {
             Self::ExcludePattern => "smart-folder-field-exclude",
             Self::Extensions => "smart-folder-field-extensions",
             Self::ContentSearch => "smart-folder-field-content",
+            Self::Tag => "smart-folder-field-tag",
             Self::SizeMin => "smart-folder-field-size-min",
             Self::SizeMax => "smart-folder-field-size-max",
             Self::ModifiedAfter => "smart-folder-field-modified-after",
@@ -95,6 +100,7 @@ pub(crate) struct SmartFolderDraft {
     pub(crate) exclude_pattern: String,
     pub(crate) extensions: String,
     pub(crate) content_search: String,
+    pub(crate) tag: String,
     pub(crate) size_min: String,
     pub(crate) size_max: String,
     pub(crate) modified_after: String,
@@ -121,6 +127,7 @@ impl SmartFolderDraft {
             exclude_pattern: criteria.exclude_pattern.unwrap_or_default(),
             extensions: criteria.extensions.join(", "),
             content_search: criteria.content_search.unwrap_or_default(),
+            tag: criteria.tag.unwrap_or_default(),
             size_min: optional_number(criteria.size_min),
             size_max: optional_number(criteria.size_max),
             modified_after: optional_date(criteria.modified_after),
@@ -140,6 +147,7 @@ impl SmartFolderDraft {
             SmartFolderField::ExcludePattern => &self.exclude_pattern,
             SmartFolderField::Extensions => &self.extensions,
             SmartFolderField::ContentSearch => &self.content_search,
+            SmartFolderField::Tag => &self.tag,
             SmartFolderField::SizeMin => &self.size_min,
             SmartFolderField::SizeMax => &self.size_max,
             SmartFolderField::ModifiedAfter => &self.modified_after,
@@ -155,6 +163,7 @@ impl SmartFolderDraft {
             SmartFolderField::ExcludePattern => self.exclude_pattern = value,
             SmartFolderField::Extensions => self.extensions = value,
             SmartFolderField::ContentSearch => self.content_search = value,
+            SmartFolderField::Tag => self.tag = value,
             SmartFolderField::SizeMin => self.size_min = value,
             SmartFolderField::SizeMax => self.size_max = value,
             SmartFolderField::ModifiedAfter => self.modified_after = value,
@@ -215,6 +224,14 @@ impl SmartFolderDraft {
             return Err(format!("Invalid extension: {extension}"));
         }
 
+        let tag = optional_text(&self.tag);
+        if tag
+            .as_deref()
+            .is_some_and(|tag| tag.chars().any(char::is_control))
+        {
+            return Err("Tag names cannot contain line breaks or control characters".to_string());
+        }
+
         let size_min = optional_u64(&self.size_min, "Minimum size")?;
         let size_max = optional_u64(&self.size_max, "Maximum size")?;
         if matches!((size_min, size_max), (Some(minimum), Some(maximum)) if minimum > maximum) {
@@ -244,6 +261,7 @@ impl SmartFolderDraft {
                 recursive: self.recursive,
                 combine_mode: self.combine_mode,
                 exclude_pattern,
+                tag,
             },
         ))
     }
@@ -335,6 +353,7 @@ mod tests {
         draft.exclude_pattern = "generated$".to_string();
         draft.extensions = ".RS, md, rs".to_string();
         draft.content_search = "needle".to_string();
+        draft.tag = " Work ".to_string();
         draft.size_min = "12".to_string();
         draft.size_max = "4096".to_string();
         draft.modified_after = "2026-01-02".to_string();
@@ -350,6 +369,7 @@ mod tests {
         assert_eq!(criteria.exclude_pattern.as_deref(), Some("generated$"));
         assert_eq!(criteria.extensions, ["rs", "md", "rs"]);
         assert_eq!(criteria.content_search.as_deref(), Some("needle"));
+        assert_eq!(criteria.tag.as_deref(), Some("Work"));
         assert_eq!(criteria.size_min, Some(12));
         assert_eq!(criteria.size_max, Some(4096));
         assert!(criteria.modified_before.unwrap() > criteria.modified_after.unwrap());
@@ -402,6 +422,15 @@ mod tests {
         assert_eq!(draft.validate().unwrap_err(), "Dates must use YYYY-MM-DD");
 
         draft.modified_after.clear();
+        draft.tag = "Two\nLines".to_string();
+        assert_eq!(
+            draft.validate().unwrap_err(),
+            "Tag names cannot contain line breaks or control characters"
+        );
+
+        draft.tag = "   ".to_string();
+        assert_eq!(draft.validate().unwrap().1.tag, None);
+
         draft.search_paths = root.join("missing").to_string_lossy().into_owned();
         assert!(
             draft

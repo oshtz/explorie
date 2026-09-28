@@ -1,9 +1,14 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use explorie_native_services::{
-    DetectedPreviewKind, ImageMetadata, ModelPreview, PdfPagePreview, PreviewArtifact,
-    PreviewDetection, RichPreview, ServiceError, TextPreview,
+    DetectedPreviewKind, ImageMetadata, PdfPagePreview, PreviewArtifact, PreviewDetection,
+    RichPreview, ServiceError,
 };
+use gpui::Task;
+
+use crate::text_highlight::TextPreviewDocument;
 
 const TEXT_PREVIEW_BYTES: u64 = 512 * 1024;
 
@@ -43,7 +48,7 @@ impl PreviewTab {
 
 #[derive(Clone, Debug)]
 pub enum PreviewContent {
-    Text(TextPreview),
+    Text(Arc<TextPreviewDocument>),
     Audio,
     Video,
     Pdf {
@@ -53,9 +58,13 @@ pub enum PreviewContent {
     BlockedScript,
     Image(PathBuf),
     Artifact(PreviewArtifact),
-    Model(ModelPreview),
+    /// A 3D model; the window's media player holds the model and its frames.
+    Model,
     Rich(RichPreview),
     Archive,
+    /// The file's contents live in the cloud; reading them for a preview
+    /// would download the file, so only its metadata is shown.
+    CloudPlaceholder,
     Fallback {
         detection: PreviewDetection,
         error: Option<ServiceError>,
@@ -76,6 +85,19 @@ pub enum PreviewState {
         path: PathBuf,
         error: ServiceError,
     },
+}
+
+/// How long keyboard-driven selection has to settle before a burst of
+/// selection changes starts loading the preview.
+pub const KEYBOARD_PREVIEW_DEBOUNCE: Duration = Duration::from_millis(75);
+
+/// Deferred preview loading while keyboard selection moves quickly.
+#[derive(Default)]
+pub struct PreviewDebounce {
+    /// When the last keyboard-driven selection change happened.
+    pub last_keyboard_change: Option<Instant>,
+    /// Fires the deferred preview once the selection settles.
+    pub task: Option<Task<()>>,
 }
 
 #[derive(Clone, Debug)]
@@ -153,21 +175,11 @@ pub struct FinderTag {
 
 impl FinderTag {
     pub fn parse(raw: String) -> Self {
-        let (name, color_index) = raw.split_once('\n').map_or_else(
-            || (raw.clone(), 0),
-            |(name, color)| {
-                let color_index = color
-                    .parse::<u8>()
-                    .ok()
-                    .filter(|index| *index <= 7)
-                    .unwrap_or(0);
-                (name.to_string(), color_index)
-            },
-        );
+        let tag = explorie_core::FinderTag::from_raw(&raw);
         Self {
             raw,
-            name,
-            color_index,
+            name: tag.name,
+            color_index: tag.color,
         }
     }
 
@@ -307,10 +319,19 @@ pub fn cache_backed_preview_path(
     preview_executable_scripts: bool,
 ) -> Option<&Path> {
     let path = state.path()?;
-    matches!(
-        route(path, preview_executable_scripts),
-        PreviewRoute::Pdf | PreviewRoute::GeneratedArtifact | PreviewRoute::Rich
-    )
+    // Large direct images display a downscaled copy from the preview cache.
+    let downscaled_image = matches!(
+        state,
+        PreviewState::Ready {
+            content: PreviewContent::Image(image),
+            ..
+        } if image != path
+    );
+    (downscaled_image
+        || matches!(
+            route(path, preview_executable_scripts),
+            PreviewRoute::Pdf | PreviewRoute::GeneratedArtifact | PreviewRoute::Rich
+        ))
     .then_some(path)
 }
 
@@ -588,6 +609,9 @@ pub fn route_with_detection(
     if matches!(hinted, PreviewRoute::Model | PreviewRoute::Rich) {
         return hinted;
     }
+    if cfg!(target_os = "macos") && renders_through_quick_look(path, detection) {
+        return PreviewRoute::GeneratedArtifact;
+    }
     match detection.kind {
         DetectedPreviewKind::Pdf => PreviewRoute::Pdf,
         DetectedPreviewKind::Svg => PreviewRoute::GeneratedArtifact,
@@ -605,6 +629,25 @@ pub fn route_with_detection(
         }
         DetectedPreviewKind::Unknown => PreviewRoute::External,
         _ => hinted,
+    }
+}
+
+/// Files the macOS preview service renders with Quick Look whose containers
+/// signature sniffing misreads: camera RAW (TIFF, MPEG-4 or unrecognized
+/// signatures), legacy Office (OLE compound files) and iWork documents (ZIP).
+/// Keynote's `key` extension only counts for ZIP content, so PEM private keys
+/// keep their text preview.
+fn renders_through_quick_look(path: &Path, detection: &PreviewDetection) -> bool {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "dng" | "cr2" | "cr3" | "nef" | "arw" | "orf" | "rw2" | "raf" => true,
+        "doc" | "xls" | "ppt" => detection.kind == DetectedPreviewKind::Unknown,
+        "pages" | "numbers" | "key" => detection.kind == DetectedPreviewKind::Archive,
+        _ => false,
     }
 }
 
@@ -670,6 +713,59 @@ mod tests {
             route(Path::new("unknown.bin"), false),
             PreviewRoute::External
         );
+    }
+
+    #[test]
+    fn quick_look_documents_reach_generated_previews_on_macos() {
+        let detection = |kind, mime: &str| PreviewDetection {
+            kind,
+            description: String::new(),
+            mime_type: Some(mime.to_string()),
+            byte_sample: None,
+        };
+        let zip = detection(DetectedPreviewKind::Archive, "application/zip");
+        let unknown = detection(DetectedPreviewKind::Unknown, "application/octet-stream");
+        let tiff = detection(DetectedPreviewKind::Image, "image/tiff");
+        let mp4 = detection(DetectedPreviewKind::Video, "video/mp4");
+        let text = detection(DetectedPreviewKind::Text, "text/plain");
+        let quick_look = if cfg!(target_os = "macos") {
+            PreviewRoute::GeneratedArtifact
+        } else {
+            PreviewRoute::Archive
+        };
+        for name in ["report.pages", "budget.numbers", "deck.key"] {
+            assert_eq!(
+                route_with_detection(Path::new(name), false, &zip),
+                quick_look,
+                "{name}"
+            );
+        }
+        assert_eq!(
+            route_with_detection(Path::new("server.key"), false, &text),
+            PreviewRoute::Text
+        );
+        assert_eq!(
+            route_with_detection(Path::new("photo.nef"), false, &tiff),
+            PreviewRoute::GeneratedArtifact
+        );
+        let expected = |fallback| {
+            if cfg!(target_os = "macos") {
+                PreviewRoute::GeneratedArtifact
+            } else {
+                fallback
+            }
+        };
+        assert_eq!(
+            route_with_detection(Path::new("photo.cr3"), false, &mp4),
+            expected(PreviewRoute::Video)
+        );
+        for name in ["photo.rw2", "letter.doc", "budget.xls", "deck.ppt"] {
+            assert_eq!(
+                route_with_detection(Path::new(name), false, &unknown),
+                expected(PreviewRoute::External),
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -893,6 +989,15 @@ mod tests {
             cache_reload_path(&direct, 7, 7, Some(Path::new("photo.png")), false),
             None,
             "direct source images survive cache clearing without a reload"
+        );
+        let downscaled = PreviewState::Ready {
+            path: PathBuf::from("photo.png"),
+            content: PreviewContent::Image(PathBuf::from("cache/photo-native-image.png")),
+        };
+        assert_eq!(
+            cache_reload_path(&downscaled, 7, 7, Some(Path::new("photo.png")), false),
+            Some(PathBuf::from("photo.png")),
+            "a downscaled copy lives in the cache and must be regenerated"
         );
     }
 

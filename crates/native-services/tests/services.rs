@@ -237,7 +237,6 @@ fn archive_preview_and_platform_services_use_background_tasks() {
     let archive = temp.path().join("bundle.zip");
     let extracted = temp.path().join("extracted");
     fs::write(&source, "archive me").unwrap();
-    fs::create_dir(&extracted).unwrap();
     let native = services(temp.path());
     let receiver = native.subscribe();
 
@@ -260,20 +259,30 @@ fn archive_preview_and_platform_services_use_background_tasks() {
         .wait()
         .unwrap();
     assert_eq!(listed.entry_count, 1);
-    native
-        .archives
-        .extract(explorie_native_services::ExtractRequest {
-            archive_path: result.output_path,
-            output_dir: extracted.clone(),
-            password: None,
-            allow_extended_limits: false,
-            operation_id: "extract-test".into(),
-        })
-        .wait()
-        .unwrap();
+    let extract = |operation_id: &str| {
+        native
+            .archives
+            .extract(explorie_native_services::ExtractRequest {
+                archive_path: result.output_path.clone(),
+                output_dir: extracted.clone(),
+                password: None,
+                allow_extended_limits: false,
+                operation_id: operation_id.into(),
+            })
+            .wait()
+    };
+    extract("extract-test").unwrap();
     assert_eq!(
         fs::read_to_string(extracted.join("source.txt")).unwrap(),
         "archive me"
+    );
+    // Extracting again never merges into (and overwrites) the existing folder.
+    fs::write(extracted.join("source.txt"), "edited").unwrap();
+    let error = extract("extract-again").unwrap_err();
+    assert_eq!(error.code, explorie_native_services::ErrorCode::Conflict);
+    assert_eq!(
+        fs::read_to_string(extracted.join("source.txt")).unwrap(),
+        "edited"
     );
 
     let progress = receiver
@@ -605,4 +614,89 @@ fn forced_disconnect_reports_cleanup_errors_and_keeps_root_protected() {
     native.remotes.disconnect_all().wait().unwrap();
     assert!(native.remotes.statuses().is_empty());
     assert!(!native.remotes.is_mount_root(&mount_path));
+}
+
+/// Case-only renames and batch renames on a real exFAT volume, which lacks
+/// an exclusive rename and treats "notes.txt" and "Notes.txt" as one name.
+/// Run with `cargo test --test services -- --ignored exfat`.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "creates and attaches an exFAT disk image with hdiutil"]
+fn case_only_renames_work_on_exfat() {
+    struct AttachedImage(PathBuf);
+    impl Drop for AttachedImage {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("hdiutil")
+                .args(["detach", "-force"])
+                .arg(&self.0)
+                .output();
+        }
+    }
+    let hdiutil = |args: &[&std::ffi::OsStr]| {
+        let output = std::process::Command::new("hdiutil")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "hdiutil {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let image = temp.path().join("rename.dmg");
+    let volume = temp.path().join("volume");
+    fs::create_dir(&volume).unwrap();
+    hdiutil(&[
+        "create".as_ref(),
+        "-size".as_ref(),
+        "20m".as_ref(),
+        "-fs".as_ref(),
+        "ExFAT".as_ref(),
+        "-volname".as_ref(),
+        "EXPLORIE".as_ref(),
+        image.as_os_str(),
+    ]);
+    hdiutil(&[
+        "attach".as_ref(),
+        "-nobrowse".as_ref(),
+        "-mountpoint".as_ref(),
+        volume.as_os_str(),
+        image.as_os_str(),
+    ]);
+    let _attached = AttachedImage(volume.clone());
+    let directory = volume.join("files");
+    fs::create_dir_all(directory.join("folder")).unwrap();
+    fs::write(directory.join("notes.txt"), "keep").unwrap();
+    fs::write(directory.join("alpha.txt"), "alpha").unwrap();
+    let native = services(temp.path());
+
+    for (before, after) in [("notes.txt", "Notes.txt"), ("folder", "FOLDER")] {
+        let renamed = native
+            .mutations
+            .rename_path(directory.join(before), after.into())
+            .wait()
+            .unwrap();
+        assert_eq!(PathBuf::from(renamed), directory.join(after));
+    }
+    native
+        .mutations
+        .batch_rename(vec![explorie_native_services::BatchRenameItem {
+            source_path: directory.join("alpha.txt"),
+            new_base_name: "ALPHA.txt".to_string(),
+        }])
+        .wait()
+        .unwrap();
+
+    let mut names: Vec<String> = fs::read_dir(&directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| !name.starts_with("._"))
+        .collect();
+    names.sort();
+    assert_eq!(names, ["ALPHA.txt", "FOLDER", "Notes.txt"]);
+    assert_eq!(
+        fs::read_to_string(directory.join("Notes.txt")).unwrap(),
+        "keep"
+    );
 }

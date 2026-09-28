@@ -7,10 +7,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt;
-use std::fs::{self, File};
+use std::fs;
+#[cfg(any(windows, target_os = "macos"))]
+use std::fs::File;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+#[cfg(any(windows, target_os = "macos"))]
+use std::process::Child;
+use std::process::Command;
+#[cfg(any(windows, target_os = "macos"))]
+use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -216,8 +222,10 @@ pub trait RemoteDriveBackend: Send + Sync {
 
 struct SystemRemoteDriveBackend;
 
+#[cfg(any(windows, target_os = "macos"))]
 struct SystemRemoteDriveProcess(Child);
 
+#[cfg(any(windows, target_os = "macos"))]
 impl RemoteDriveProcess for SystemRemoteDriveProcess {
     fn try_wait(&mut self) -> ServiceResult<Option<RemoteProcessStatus>> {
         self.0
@@ -238,6 +246,7 @@ impl RemoteDriveProcess for SystemRemoteDriveProcess {
     }
 }
 
+#[cfg(any(windows, target_os = "macos"))]
 fn process_status(status: std::process::ExitStatus) -> RemoteProcessStatus {
     RemoteProcessStatus {
         success: status.success(),
@@ -292,6 +301,10 @@ impl RemoteDriveBackend for SystemRemoteDriveBackend {
     fn mount_helper(&self, id: &str, volume_name: &str, port: u16) -> ServiceResult<()> {
         #[cfg(target_os = "macos")]
         {
+            // The privileged helper refuses to mount unless rclone is already
+            // listening, and rclone opens its NFS socket only after reaching
+            // the remote, which can be after its remote-control API is ready.
+            wait_for_loopback_listener(port, READY_TIMEOUT)?;
             macos::mount(id, volume_name, port)
                 .map_err(|error| ServiceError::new(ErrorCode::HelperMissing, error))
         }
@@ -973,6 +986,7 @@ fn validate_volume_name(value: &str) -> ServiceResult<()> {
     Ok(())
 }
 
+#[cfg(any(windows, target_os = "macos", test))]
 fn remote_spec(profile: &RemoteDriveProfile) -> String {
     let path = profile.remote_path.trim_matches('/');
     if path.is_empty() {
@@ -1285,6 +1299,17 @@ fn configure_rclone_with_system(rclone: &Path, _resources: &ResourcePaths) -> Se
     }
 }
 
+#[cfg(not(any(windows, target_os = "macos")))]
+fn start_mount_with_system(
+    _request: &RemoteMountRequest,
+) -> ServiceResult<Box<dyn RemoteDriveProcess>> {
+    Err(ServiceError::new(
+        ErrorCode::Unsupported,
+        "Remote Drives currently support Windows and macOS only.",
+    ))
+}
+
+#[cfg(any(windows, target_os = "macos"))]
 fn start_mount_with_system(
     request: &RemoteMountRequest,
 ) -> ServiceResult<Box<dyn RemoteDriveProcess>> {
@@ -1311,16 +1336,8 @@ fn start_mount_with_system(
                 "Missing macOS remote-drive helper port.",
             )
         })?;
-        command.args(["serve", "nfs", &remote, "--addr"]);
-        command.arg(format!("127.0.0.1:{port}"));
-        command.args(["--vfs-cache-mode", "full"]);
+        command.args(nfs_serve_arguments(&remote, port));
     }
-
-    #[cfg(not(any(windows, target_os = "macos")))]
-    return Err(ServiceError::new(
-        ErrorCode::Unsupported,
-        "Remote Drives currently support Windows and macOS only.",
-    ));
 
     let log = File::create(request.cache_dir.join("rclone.log")).map_err(ServiceError::from)?;
     let log_err = log.try_clone().map_err(ServiceError::from)?;
@@ -1346,6 +1363,43 @@ fn start_mount_with_system(
         })
 }
 
+/// `rclone serve nfs` has no authentication, so it must only ever listen on
+/// IPv4 loopback, on a fresh random port for the lifetime of one mount. The
+/// privileged macOS helper additionally checks that the listener is this
+/// user's signed rclone before mounting it.
+#[cfg(any(target_os = "macos", test))]
+fn nfs_serve_arguments(remote: &str, port: u16) -> Vec<String> {
+    [
+        "serve",
+        "nfs",
+        remote,
+        "--addr",
+        &std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port)).to_string(),
+        "--vfs-cache-mode",
+        "full",
+    ]
+    .map(String::from)
+    .to_vec()
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn wait_for_loopback_listener(port: u16, timeout: Duration) -> ServiceResult<()> {
+    let address = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+        if std::net::TcpStream::connect_timeout(&address, Duration::from_millis(250)).is_ok() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(150));
+    }
+    Err(ServiceError::new(
+        ErrorCode::RemoteUnavailable,
+        "Timed out waiting for rclone's local NFS server to start.",
+    )
+    .retryable(true))
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
 fn rc_bind_address(rc_url: &str) -> ServiceResult<&str> {
     rc_url
         .strip_prefix("http://")
@@ -1826,6 +1880,34 @@ fn macos_helper_status() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nfs_server_listens_only_on_ipv4_loopback() {
+        assert_eq!(
+            nfs_serve_arguments("cloud:folder", 49_152),
+            [
+                "serve",
+                "nfs",
+                "cloud:folder",
+                "--addr",
+                "127.0.0.1:49152",
+                "--vfs-cache-mode",
+                "full"
+            ]
+        );
+    }
+
+    #[test]
+    fn nfs_mounts_wait_for_the_loopback_listener() {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        wait_for_loopback_listener(port, Duration::from_secs(5)).unwrap();
+        drop(listener);
+        let started = Instant::now();
+        let error = wait_for_loopback_listener(port, Duration::from_millis(400)).unwrap_err();
+        assert_eq!(error.code, ErrorCode::RemoteUnavailable);
+        assert!(started.elapsed() >= Duration::from_millis(400));
+    }
 
     #[test]
     fn parses_and_sorts_remote_names() {

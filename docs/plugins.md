@@ -29,6 +29,17 @@ local Syncthing configuration; Explorie retains its path, not the API key. Git r
 repository state and does not fetch. Obsidian actions use its URI handler and do not edit
 vault configuration. Plugins are not bundled copies of these applications.
 
+Browsing a repository must not run code from it, even an extracted archive. The Git plugin
+only runs read-only commands with the pager disabled, `--no-optional-locks` (so `status`
+never writes the index and no hooks fire) and a command-line `core.fsmonitor=false` that
+outranks repository settings. Filter drivers can't be neutralized that way, so before
+`git status` the plugin reads the configuration (reading runs nothing) and refuses to
+inspect a repository whose own `.git/config`, `config.worktree` or included files define
+`filter.*.clean|smudge|process`, `diff.external`, `diff.*.command|textconv`,
+`include.path` or `includeIf.*.path`. Such folders show **Git · Untrusted configuration**
+and list the keys. User and system configuration, such as a global Git LFS filter, stays
+trusted. This check needs Git 2.26 or newer.
+
 Updates preserve enablement and configuration, including a previous Disable. Bundled
 integrations can be disabled; their files are managed with the app. Obsidian vault actions
 address the vault by its folder name using the documented

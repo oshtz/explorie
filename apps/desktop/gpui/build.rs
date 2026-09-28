@@ -31,6 +31,13 @@ fn embed_plugin_catalog() {
                     .join(format!("explorie-plugin-{plugin}-{version}-{target}.zip"));
                 println!("cargo:rerun-if-changed={}", archive.display());
             }
+            // Node runs only when a catalog is supplied, i.e. in release/CI builds
+            // that already used Node to create it; plain cargo builds never need it.
+            // package-plugins.mjs is the single catalog verifier shared with the
+            // macOS/Windows packagers and release smoke tests. Here it rejects a
+            // catalog whose packages do not match before it is embedded, and stages
+            // the zips beside the binary so target/<profile> runs with its bundled
+            // plugins (packagers re-verify and re-stage what actually ships).
             let output = PathBuf::from(env::var_os("OUT_DIR").unwrap());
             let profile = output.ancestors().nth(3).expect("Cargo profile directory");
             let status = Command::new("node")

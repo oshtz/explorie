@@ -13,6 +13,7 @@ gpui::actions!(
     native_text_input,
     [
         Backspace,
+        DeleteToStart,
         Delete,
         Left,
         Right,
@@ -30,6 +31,8 @@ gpui::actions!(
 pub fn key_bindings() -> Vec<KeyBinding> {
     vec![
         KeyBinding::new("backspace", Backspace, Some("NativeTextInput")),
+        // macOS text fields delete to the start of the line on Cmd+Backspace.
+        KeyBinding::new("cmd-backspace", DeleteToStart, Some("NativeTextInput")),
         KeyBinding::new("delete", Delete, Some("NativeTextInput")),
         KeyBinding::new("left", Left, Some("NativeTextInput")),
         KeyBinding::new("right", Right, Some("NativeTextInput")),
@@ -235,6 +238,17 @@ impl NativeTextInput {
                 return;
             }
             self.select_to(previous, cx);
+        }
+        self.replace_text_in_range(None, "", window, cx);
+    }
+
+    fn delete_to_start(&mut self, _: &DeleteToStart, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_range.is_empty() {
+            if self.cursor_offset() == 0 {
+                window.play_system_bell();
+                return;
+            }
+            self.select_to(0, cx);
         }
         self.replace_text_in_range(None, "", window, cx);
     }
@@ -776,6 +790,7 @@ impl Render for NativeTextInput {
             .tab_stop(true)
             .cursor(CursorStyle::IBeam)
             .on_action(cx.listener(Self::backspace))
+            .on_action(cx.listener(Self::delete_to_start))
             .on_action(cx.listener(Self::delete))
             .on_action(cx.listener(Self::left))
             .on_action(cx.listener(Self::right))

@@ -13,7 +13,7 @@ use zip::{CompressionMethod, ZipArchive, ZipWriter};
 // Re-export Password for 7z operations
 pub use sevenz_rust::Password as SevenZPassword;
 
-mod sevenzip;
+pub(crate) mod sevenzip;
 
 #[derive(Clone, Copy, Debug)]
 pub struct ExtractionLimits {
@@ -176,7 +176,7 @@ pub enum ArchiveFormat {
     SevenZ,
 }
 
-fn validate_archive_entry_path(entry_path: &Path) -> io::Result<()> {
+pub(crate) fn validate_archive_entry_path(entry_path: &Path) -> io::Result<()> {
     let mut saw_normal_component = false;
     for component in entry_path.components() {
         match component {
@@ -251,21 +251,10 @@ enum ArchiveSourceKind {
     Directory,
 }
 
+/// Links and junctions only (see `is_link_metadata`): cloud placeholders and
+/// deduplicated files are reparse points too, but ordinary files and folders.
 fn metadata_is_link_or_reparse(metadata: &Metadata) -> bool {
-    if metadata.file_type().is_symlink() {
-        return true;
-    }
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-
-        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-    }
-
-    #[cfg(not(windows))]
-    false
+    super::is_link_metadata(metadata)
 }
 
 fn link_or_reparse_error(path: &Path) -> io::Error {
@@ -548,7 +537,7 @@ fn with_atomic_archive_output<T>(
     result
 }
 
-fn ensure_safe_extraction_path(root: &Path, entry_path: &Path) -> io::Result<PathBuf> {
+pub(crate) fn ensure_safe_extraction_path(root: &Path, entry_path: &Path) -> io::Result<PathBuf> {
     validate_archive_entry_path(entry_path)?;
     let destination = root.join(entry_path);
     if !destination.starts_with(root) {
@@ -577,250 +566,58 @@ fn remove_staging_directory(path: &Path) {
     }
 }
 
-#[derive(Debug)]
-enum ExtractionMergeAction {
-    Added {
-        destination: PathBuf,
-        staging: PathBuf,
-    },
-    Replaced {
-        destination: PathBuf,
-        staging: PathBuf,
-        backup: PathBuf,
-    },
-}
-
-fn validate_extraction_merge(staging: &Path, output: &Path) -> io::Result<()> {
-    for entry in fs::read_dir(staging)? {
-        let entry = entry?;
-        let staged_path = entry.path();
-        let staged_metadata = fs::symlink_metadata(&staged_path)?;
-        if metadata_is_link_or_reparse(&staged_metadata) {
-            return Err(link_or_reparse_error(&staged_path));
-        }
-        let destination = output.join(entry.file_name());
-        ensure_no_link_ancestors(&destination)?;
-        match fs::symlink_metadata(&destination) {
-            Ok(destination_metadata) => {
-                if metadata_is_link_or_reparse(&destination_metadata) {
-                    return Err(link_or_reparse_error(&destination));
-                }
-                if staged_metadata.is_dir() && destination_metadata.is_dir() {
-                    validate_extraction_merge(&staged_path, &destination)?;
-                } else if !staged_metadata.is_file() || !destination_metadata.is_file() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        format!(
-                            "Archive entry type conflicts with existing destination: {}",
-                            destination.display()
-                        ),
-                    ));
-                }
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(())
-}
-
-fn merge_extracted_directory(
-    staging: &Path,
-    output: &Path,
-    output_root: &Path,
-    backup_root: &Path,
-    actions: &mut Vec<ExtractionMergeAction>,
-) -> io::Result<()> {
-    let staged_entries = fs::read_dir(staging)?
-        .map(|entry| entry.map(|entry| entry.path()))
-        .collect::<io::Result<Vec<_>>>()?;
-
-    for staged_path in staged_entries {
-        let name = staged_path.file_name().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Staged archive entry has no filename",
-            )
-        })?;
-        let destination = output.join(name);
-        ensure_no_link_ancestors(&destination)?;
-        match fs::symlink_metadata(&destination) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                fs::rename(&staged_path, &destination)?;
-                actions.push(ExtractionMergeAction::Added {
-                    destination,
-                    staging: staged_path,
-                });
-            }
-            Err(error) => return Err(error),
-            Ok(destination_metadata) => {
-                let staged_metadata = fs::symlink_metadata(&staged_path)?;
-                if staged_metadata.is_dir() && destination_metadata.is_dir() {
-                    merge_extracted_directory(
-                        &staged_path,
-                        &destination,
-                        output_root,
-                        backup_root,
-                        actions,
-                    )?;
-                    fs::remove_dir(&staged_path)?;
-                } else {
-                    let relative = destination
-                        .strip_prefix(output_root)
-                        .map_err(io::Error::other)?;
-                    let backup = backup_root.join(relative);
-                    if let Some(parent) = backup.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
-                    fs::rename(&destination, &backup)?;
-                    if let Err(error) = fs::rename(&staged_path, &destination) {
-                        return match fs::rename(&backup, &destination) {
-                            Ok(()) => Err(error),
-                            Err(restore_error) => Err(io::Error::other(format!(
-                                "Failed to merge extracted entry ({error}); failed to restore {} ({restore_error})",
-                                destination.display()
-                            ))),
-                        };
-                    }
-                    actions.push(ExtractionMergeAction::Replaced {
-                        destination,
-                        staging: staged_path,
-                        backup,
-                    });
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn rollback_extraction_merge(actions: &[ExtractionMergeAction]) -> io::Result<()> {
-    let mut errors = Vec::new();
-    for action in actions.iter().rev() {
-        let (destination, staging, backup) = match action {
-            ExtractionMergeAction::Added {
-                destination,
-                staging,
-            } => (destination, staging, None),
-            ExtractionMergeAction::Replaced {
-                destination,
-                staging,
-                backup,
-            } => (destination, staging, Some(backup)),
-        };
-        if let Some(parent) = staging.parent()
-            && let Err(error) = fs::create_dir_all(parent)
-        {
-            errors.push(format!("create {}: {error}", parent.display()));
-            continue;
-        }
-        if let Err(error) = fs::rename(destination, staging) {
-            errors.push(format!(
-                "move {} back to staging: {error}",
-                destination.display()
-            ));
-            continue;
-        }
-        if let Some(backup) = backup
-            && let Err(error) = fs::rename(backup, destination)
-        {
-            errors.push(format!(
-                "restore {} from {}: {error}",
-                destination.display(),
-                backup.display()
-            ));
-        }
-    }
-
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(io::Error::other(errors.join("; ")))
-    }
-}
-
-fn commit_staged_directory(
-    staging: &Path,
-    output: &Path,
-    parent: &Path,
-    output_existed: bool,
-) -> io::Result<()> {
+/// Publishes a fully staged extraction as a new folder. `rename_noreplace`
+/// also refuses an empty folder that a plain rename would silently replace.
+fn commit_staged_directory(staging: &Path, output: &Path, parent: &Path) -> io::Result<()> {
     ensure_no_link_ancestors(output)?;
-    if !output_existed {
-        if fs::symlink_metadata(output).is_ok() {
-            return Err(io::Error::new(
+    super::rename_noreplace(staging, output).map_err(|error| {
+        if error.kind() == io::ErrorKind::AlreadyExists {
+            io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 format!(
                     "Extraction destination appeared during extraction: {}",
                     output.display()
                 ),
-            ));
+            )
+        } else {
+            error
         }
-        fs::rename(staging, output)?;
-        if let Err(error) = sync_directory(parent) {
-            tracing::warn!(path = %parent.display(), %error, "failed to sync extraction output directory");
-        }
-        return Ok(());
-    }
-
-    validate_extraction_merge(staging, output)?;
-    let backup = temporary_sibling(parent, output, "backup")?;
-    fs::create_dir(&backup)?;
-    let mut actions = Vec::new();
-    if let Err(commit_error) =
-        merge_extracted_directory(staging, output, output, &backup, &mut actions)
-    {
-        return match rollback_extraction_merge(&actions) {
-            Ok(()) => {
-                remove_staging_directory(&backup);
-                Err(commit_error)
-            }
-            Err(rollback_error) => Err(io::Error::other(format!(
-                "Failed to merge extracted archive ({commit_error}); rollback also failed ({rollback_error}); recovery data remains at {}",
-                backup.display()
-            ))),
-        };
-    }
-    remove_staging_directory(staging);
+    })?;
     if let Err(error) = sync_directory(parent) {
         tracing::warn!(path = %parent.display(), %error, "failed to sync extraction output directory");
     }
-    remove_staging_directory(&backup);
     Ok(())
 }
 
+/// Extracts into a staging folder and publishes it as `output_dir`, which
+/// must not exist yet: merging into an existing folder would replace files
+/// that happen to share names with archive entries.
 fn with_staged_extraction<T>(
     output_dir: &Path,
     extract: impl FnOnce(&Path) -> io::Result<T>,
 ) -> io::Result<T> {
     let (output, parent) = resolve_sibling_target(output_dir, true)?;
     ensure_no_link_ancestors(&output)?;
-    let output_existed = match fs::symlink_metadata(&output) {
-        Ok(metadata) => {
-            if metadata_is_link_or_reparse(&metadata) {
-                return Err(link_or_reparse_error(&output));
-            }
-            if !metadata.is_dir() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "Extraction destination is not a directory: {}",
-                        output.display()
-                    ),
-                ));
-            }
-            true
+    match fs::symlink_metadata(&output) {
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "Extraction destination already exists: {}",
+                    output.display()
+                ),
+            ));
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
-    };
+    }
 
     let staging = temporary_sibling(&parent, &output, "extract")?;
     fs::create_dir(&staging)?;
     let result = (|| {
         let value = extract(&staging)?;
         validate_tree_without_links(&staging)?;
-        commit_staged_directory(&staging, &output, &parent, output_existed)?;
+        commit_staged_directory(&staging, &output, &parent)?;
         Ok(value)
     })();
     if result.is_err() {
@@ -2767,8 +2564,6 @@ mod tests {
 
         // Extract archive
         let extract_dir = temp_dir.path().join("extracted");
-        fs::create_dir(&extract_dir).unwrap();
-        fs::write(extract_dir.join("existing.txt"), b"preserved").unwrap();
         extract_zip_archive(&archive_path, &extract_dir).unwrap();
 
         // Verify extraction
@@ -2776,10 +2571,6 @@ mod tests {
         assert!(extracted_file.exists());
         let content = fs::read_to_string(&extracted_file).unwrap();
         assert_eq!(content, "Hello, World!");
-        assert_eq!(
-            fs::read(extract_dir.join("existing.txt")).unwrap(),
-            b"preserved"
-        );
     }
 
     #[test]
@@ -3023,12 +2814,10 @@ mod tests {
     }
 
     #[test]
-    fn failed_zip_extraction_preserves_existing_destination() {
+    fn failed_zip_extraction_publishes_nothing() {
         let temp = TempDir::new().unwrap();
         let archive_path = temp.path().join("traversal.zip");
         let output = temp.path().join("output");
-        fs::create_dir(&output).unwrap();
-        fs::write(output.join("sentinel.txt"), b"preserved").unwrap();
 
         let file = File::create(&archive_path).unwrap();
         let mut archive = ZipWriter::new(file);
@@ -3040,19 +2829,16 @@ mod tests {
         archive.finish().unwrap();
 
         assert!(extract_zip_archive(&archive_path, &output).is_err());
-        assert_eq!(fs::read(output.join("sentinel.txt")).unwrap(), b"preserved");
-        assert!(!output.join("good.txt").exists());
+        assert!(!output.exists());
         assert!(!temp.path().join("escape.txt").exists());
         assert_no_staging_paths(temp.path());
     }
 
     #[test]
-    fn extraction_budget_failure_preserves_existing_destination() {
+    fn extraction_budget_failure_publishes_nothing() {
         let temp = TempDir::new().unwrap();
         let archive_path = temp.path().join("budget.zip");
         let output = temp.path().join("output");
-        fs::create_dir(&output).unwrap();
-        fs::write(output.join("sentinel.txt"), b"preserved").unwrap();
         let file = File::create(&archive_path).unwrap();
         let mut archive = ZipWriter::new(file);
         archive
@@ -3077,8 +2863,7 @@ mod tests {
         );
 
         assert!(result.is_err());
-        assert_eq!(fs::read(output.join("sentinel.txt")).unwrap(), b"preserved");
-        assert!(!output.join("too-large.txt").exists());
+        assert!(!output.exists());
         assert_no_staging_paths(temp.path());
     }
 
@@ -3236,12 +3021,10 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_extraction_preserves_existing_destination() {
+    fn cancelled_extraction_publishes_nothing() {
         let temp = TempDir::new().unwrap();
         let archive_path = temp.path().join("cancelled.zip");
         let output = temp.path().join("output");
-        fs::create_dir(&output).unwrap();
-        fs::write(output.join("sentinel.txt"), b"preserved").unwrap();
         let file = File::create(&archive_path).unwrap();
         let mut archive = ZipWriter::new(file);
         archive
@@ -3261,44 +3044,67 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
-        assert_eq!(fs::read(output.join("sentinel.txt")).unwrap(), b"preserved");
-        assert!(!output.join("new.txt").exists());
+        assert!(!output.exists());
         assert_no_staging_paths(temp.path());
     }
 
+    fn single_file_zip(path: &Path, name: &str, contents: &[u8]) {
+        let mut archive = ZipWriter::new(File::create(path).unwrap());
+        archive
+            .start_file(name, SimpleFileOptions::default())
+            .unwrap();
+        archive.write_all(contents).unwrap();
+        archive.finish().unwrap();
+    }
+
     #[test]
-    fn successful_zip_extraction_merges_after_full_staging() {
+    fn extraction_refuses_an_existing_destination_without_touching_it() {
         let temp = TempDir::new().unwrap();
-        let archive_path = temp.path().join("merge.zip");
+        let archive_path = temp.path().join("bundle.zip");
+        single_file_zip(&archive_path, "same.txt", b"new");
         let output = temp.path().join("output");
         fs::create_dir(&output).unwrap();
         fs::write(output.join("same.txt"), b"old").unwrap();
         fs::write(output.join("unrelated.txt"), b"untouched").unwrap();
+        let empty = temp.path().join("empty");
+        fs::create_dir(&empty).unwrap();
 
-        let file = File::create(&archive_path).unwrap();
-        let mut archive = ZipWriter::new(file);
-        archive
-            .start_file("same.txt", SimpleFileOptions::default())
-            .unwrap();
-        archive.write_all(b"new").unwrap();
-        archive.finish().unwrap();
+        for destination in [&output, &empty] {
+            let error = extract_archive(&archive_path, destination).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        }
 
-        extract_zip_archive(&archive_path, &output).unwrap();
-        assert_eq!(fs::read(output.join("same.txt")).unwrap(), b"new");
+        assert_eq!(fs::read(output.join("same.txt")).unwrap(), b"old");
         assert_eq!(
             fs::read(output.join("unrelated.txt")).unwrap(),
             b"untouched"
         );
+        assert_eq!(fs::read_dir(&empty).unwrap().count(), 0);
         assert_no_staging_paths(temp.path());
     }
 
     #[test]
-    fn seven_z_traversal_preserves_existing_destination() {
+    fn extraction_refuses_a_destination_that_appears_while_extracting() {
+        let temp = TempDir::new().unwrap();
+        let output = temp.path().join("output");
+
+        let error = with_staged_extraction(&output, |staging| {
+            fs::write(staging.join("extracted.txt"), b"new")?;
+            fs::create_dir(&output)?;
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_dir(&output).unwrap().count(), 0);
+        assert_no_staging_paths(temp.path());
+    }
+
+    #[test]
+    fn seven_z_traversal_publishes_nothing() {
         let temp = TempDir::new().unwrap();
         let archive_path = temp.path().join("traversal.7z");
         let output = temp.path().join("output");
-        fs::create_dir(&output).unwrap();
-        fs::write(output.join("sentinel.txt"), b"preserved").unwrap();
 
         let file = File::create(&archive_path).unwrap();
         let mut archive = sevenz_rust::ArchiveWriter::new(file).unwrap();
@@ -3310,7 +3116,7 @@ mod tests {
         archive.finish().unwrap();
 
         assert!(extract_7z_archive(&archive_path, &output, None).is_err());
-        assert_eq!(fs::read(output.join("sentinel.txt")).unwrap(), b"preserved");
+        assert!(!output.exists());
         assert!(!temp.path().join("escape.txt").exists());
         assert_no_staging_paths(temp.path());
     }
@@ -3333,8 +3139,6 @@ mod tests {
         let archive_path = temp.path().join("traversal.tar");
         let output = temp.path().join("output");
         let payload = b"escaped";
-        fs::create_dir(&output).unwrap();
-        fs::write(output.join("sentinel.txt"), b"preserved").unwrap();
 
         let file = File::create(&archive_path).unwrap();
         let mut builder = tar::Builder::new(file);
@@ -3351,7 +3155,7 @@ mod tests {
 
         assert!(extract_tar_archive(&archive_path, &output, false).is_err());
         assert!(!temp.path().join("escape.txt").exists());
-        assert_eq!(fs::read(output.join("sentinel.txt")).unwrap(), b"preserved");
+        assert!(!output.exists());
         assert_no_staging_paths(temp.path());
     }
 
@@ -3390,10 +3194,9 @@ mod tests {
         assert!(extract_tar_archive(&archive_path, &output, false).is_err());
         assert!(!outside.join("escaped.txt").exists());
 
-        // The same guard must reject a symlink that existed before extraction.
-        if output.exists() {
-            fs::remove_dir_all(&output).unwrap();
-        }
+        // An existing output folder, here holding a planted link, is never
+        // written into.
+        assert!(!output.exists());
         fs::create_dir(&output).unwrap();
         symlink(&outside, output.join("link")).unwrap();
         assert!(extract_tar_archive(&archive_path, &output, false).is_err());

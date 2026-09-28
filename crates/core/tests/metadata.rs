@@ -1,4 +1,6 @@
-use explorie_core::{create_explorie_schema, list_dir, update_custom_fields};
+use explorie_core::{
+    create_explorie_schema, list_dir, list_dir_with_warnings, update_custom_fields,
+};
 use serde_json::json;
 use std::collections::HashMap;
 use std::fs;
@@ -76,10 +78,16 @@ fn malformed_metadata_is_reported_and_never_overwritten() {
     fs::write(root.join("notes.txt"), b"notes").unwrap();
     fs::write(&metadata_path, b"{ definitely not valid json").unwrap();
 
-    assert_eq!(
-        list_dir(root).unwrap_err().kind(),
-        std::io::ErrorKind::InvalidData
-    );
+    // Browsing still works: the folder lists without custom fields and the
+    // problem is surfaced as a warning instead of failing the whole listing.
+    let listing = list_dir_with_warnings(root, false).unwrap();
+    assert_eq!(listing.entries.len(), 1);
+    assert!(listing.entries[0].custom.is_empty());
+    assert_eq!(listing.warnings.len(), 1, "{:?}", listing.warnings);
+    assert!(listing.warnings[0].contains(".explorie.json"));
+    assert_eq!(list_dir(root).unwrap().len(), 1);
+
+    // Writers still refuse to replace the malformed document.
     let mut fields = HashMap::new();
     fields.insert("tag".to_string(), json!("docs"));
     assert_eq!(

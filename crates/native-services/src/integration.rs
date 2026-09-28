@@ -7,13 +7,12 @@ use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(any(windows, target_os = "macos"))]
 use std::process::Command;
 use std::sync::Arc;
 #[cfg(target_os = "macos")]
 use std::time::Duration;
 
-#[cfg(target_os = "macos")]
-const METADATA_HELPER_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(target_os = "macos")]
 const MAX_METADATA_OUTPUT: usize = 1024 * 1024;
 #[cfg(target_os = "macos")]
@@ -26,12 +25,15 @@ pub struct SystemIntegrationStatus {
     pub enabled: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct AppInfo {
     pub name: String,
     pub path: PathBuf,
     pub bundle_id: Option<String>,
+    /// The application the system opens this file with by default.
+    #[serde(default)]
+    pub is_default: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -75,6 +77,15 @@ pub trait PlatformActionsBackend: Send + Sync {
     fn reveal(&self, path: &Path) -> io::Result<()>;
     fn open_with(&self, path: &Path, app_name: &str) -> io::Result<()>;
     fn apps_for_file(&self, path: &Path) -> io::Result<Vec<AppInfo>>;
+
+    /// Ask the user to pick an application (Open With ▸ Other…). `None`
+    /// means the chooser was cancelled.
+    fn choose_application(&self) -> io::Result<Option<PathBuf>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Choosing an application is unavailable on this platform.",
+        ))
+    }
 }
 
 struct SystemFinderTagsBackend;
@@ -110,6 +121,11 @@ impl PlatformActionsBackend for SystemPlatformActionsBackend {
 
     fn apps_for_file(&self, path: &Path) -> io::Result<Vec<AppInfo>> {
         apps_for_file(path)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn choose_application(&self) -> io::Result<Option<PathBuf>> {
+        choose_application()
     }
 }
 
@@ -238,6 +254,18 @@ impl IntegrationService {
             backend
                 .open_with(&path, &app_name)
                 .map_err(|error| ServiceError::from(error).operation("open_with"))
+        })
+    }
+
+    /// Let the user pick an application in a system file chooser that
+    /// starts in /Applications and only accepts applications. Resolves to
+    /// `None` when the chooser is cancelled.
+    pub fn choose_application(&self) -> BlockingTask<Option<PathBuf>> {
+        let backend = Arc::clone(&self.platform_actions);
+        self.context.spawn_blocking(move || {
+            backend
+                .choose_application()
+                .map_err(|error| ServiceError::from(error).operation("choose_application"))
         })
     }
 
@@ -561,110 +589,14 @@ fn reveal(_path: &Path) -> io::Result<()> {
     ))
 }
 
-#[cfg(target_os = "macos")]
+/// Finder tags as raw `"Name\n<colorIndex>"` strings; the encoding lives in
+/// `explorie_core`, which listings share.
 fn get_finder_tags(path: &Path) -> io::Result<Vec<String>> {
-    let output = run_metadata_helper(
-        Command::new("mdls")
-            .args(["-name", "kMDItemUserTags", "-raw"])
-            .arg(path),
-        MAX_METADATA_OUTPUT,
-    )?;
-    if !output.status.success() {
-        return Ok(Vec::new());
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(stdout
-        .trim()
-        .trim_start_matches('(')
-        .trim_end_matches(')')
-        .split(',')
-        .map(|value| value.trim().trim_matches('"').to_string())
-        .filter(|value| !value.is_empty() && value != "null")
-        .collect())
+    explorie_core::read_finder_tags(path)
 }
 
-#[cfg(not(target_os = "macos"))]
-fn get_finder_tags(_path: &Path) -> io::Result<Vec<String>> {
-    Ok(Vec::new())
-}
-
-#[cfg(target_os = "macos")]
 fn set_finder_tags(path: &Path, tags: &[String]) -> io::Result<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-    let c_path = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid path"))?;
-    let attr_name = CString::new("com.apple.metadata:_kMDItemUserTags").unwrap();
-    if tags.is_empty() {
-        let result =
-            unsafe { libc::removexattr(c_path.as_ptr(), attr_name.as_ptr(), libc::XATTR_NOFOLLOW) };
-        if result == 0 {
-            return Ok(());
-        }
-        let error = io::Error::last_os_error();
-        return if error.raw_os_error() == Some(libc::ENOATTR) {
-            Ok(())
-        } else {
-            Err(error)
-        };
-    }
-    let escaped = tags
-        .iter()
-        .map(|tag| {
-            format!(
-                "<string>{}</string>",
-                tag.replace('&', "&amp;")
-                    .replace('<', "&lt;")
-                    .replace('>', "&gt;")
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let plist = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><array>{escaped}</array></plist>"
-    );
-    let temp = std::env::temp_dir().join(format!(
-        "explorie-tags-{}-{}.plist",
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ));
-    fs::write(&temp, plist)?;
-    let converted = run_metadata_helper(
-        Command::new("plutil")
-            .args(["-convert", "binary1"])
-            .arg(&temp),
-        0,
-    )?;
-    if !converted.status.success() {
-        let _ = fs::remove_file(&temp);
-        return Err(io::Error::other("Failed to convert Finder tag plist"));
-    }
-    let binary = fs::read(&temp);
-    let _ = fs::remove_file(&temp);
-    let binary = binary?;
-    let result = unsafe {
-        libc::setxattr(
-            c_path.as_ptr(),
-            attr_name.as_ptr(),
-            binary.as_ptr().cast(),
-            binary.len(),
-            0,
-            libc::XATTR_NOFOLLOW,
-        )
-    };
-    if result < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn set_finder_tags(_path: &Path, _tags: &[String]) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "Finder tags are only available on macOS.",
-    ))
+    explorie_core::write_finder_tags(path, tags)
 }
 
 fn finder_tag_colors() -> HashMap<String, u8> {
@@ -709,86 +641,109 @@ fn open_with_app(_path: &Path, _app_name: &str) -> io::Result<()> {
     ))
 }
 
-#[cfg(target_os = "macos")]
-fn apps_for_file(path: &Path) -> io::Result<Vec<AppInfo>> {
+/// One application as reported by LaunchServices.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Deserialize)]
+struct LaunchServicesApp {
+    name: String,
+    path: PathBuf,
+    bundle_id: Option<String>,
+    #[serde(default)]
+    is_default: bool,
+}
+
+/// Finder's Open With order: the default handler first (marked), then the
+/// other applications alphabetically. Each name is offered once (the first,
+/// preferred copy wins) so the menu has no look-alike entries; Open With
+/// launches the listed copy by its path.
+#[cfg(any(target_os = "macos", test))]
+fn open_with_menu(apps: Vec<LaunchServicesApp>) -> Vec<AppInfo> {
     use std::collections::HashSet;
-    let output = run_metadata_helper(
-        Command::new("mdls")
-            .args(["-name", "kMDItemContentType", "-raw"])
-            .arg(path),
-        MAX_METADATA_OUTPUT,
-    )?;
-    if !output.status.success() {
-        return Ok(Vec::new());
-    }
-    let uti = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if uti.is_empty() || uti == "(null)" {
-        return Ok(Vec::new());
-    }
-    let extension = path
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let common: &[(&str, &str)] = match extension.as_str() {
-        "txt" | "md" | "json" | "js" | "ts" | "py" | "rs" | "go" | "html" | "css" => &[
-            ("TextEdit", "/System/Applications/TextEdit.app"),
-            ("Visual Studio Code", "/Applications/Visual Studio Code.app"),
-            ("Sublime Text", "/Applications/Sublime Text.app"),
-            ("BBEdit", "/Applications/BBEdit.app"),
-            ("Xcode", "/Applications/Xcode.app"),
-        ],
-        "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp" | "heic" => &[
-            ("Preview", "/System/Applications/Preview.app"),
-            ("Photos", "/System/Applications/Photos.app"),
-            ("Pixelmator Pro", "/Applications/Pixelmator Pro.app"),
-        ],
-        "pdf" => &[("Preview", "/System/Applications/Preview.app")],
-        "mp4" | "mov" | "avi" | "mkv" | "webm" => &[
-            (
-                "QuickTime Player",
-                "/System/Applications/QuickTime Player.app",
-            ),
-            ("VLC", "/Applications/VLC.app"),
-            ("IINA", "/Applications/IINA.app"),
-        ],
-        _ => &[],
-    };
+
+    let (defaults, mut others): (Vec<_>, Vec<_>) = apps.into_iter().partition(|app| app.is_default);
+    others.sort_by_cached_key(|app| app.name.to_lowercase());
     let mut seen = HashSet::new();
-    Ok(common
-        .iter()
-        .filter_map(|(name, app_path)| {
-            let path = Path::new(app_path);
-            (path.exists() && seen.insert(*name)).then(|| AppInfo {
-                name: (*name).to_string(),
-                path: path.to_path_buf(),
-                bundle_id: None,
-            })
+    defaults
+        .into_iter()
+        .chain(others)
+        .filter(|app| !app.name.is_empty() && seen.insert(app.name.to_lowercase()))
+        .map(|app| AppInfo {
+            name: app.name,
+            path: app.path,
+            bundle_id: app.bundle_id,
+            is_default: app.is_default,
         })
-        .collect())
+        .collect()
 }
 
 #[cfg(target_os = "macos")]
-fn run_metadata_helper(
-    command: &mut Command,
-    max_stdout: usize,
-) -> io::Result<crate::process::ProcessOutput> {
-    let output =
-        run_with_timeout(command, METADATA_HELPER_TIMEOUT, max_stdout, 0).map_err(|error| {
-            match error {
-                ProcessError::Io(error) => error,
-                ProcessError::TimedOut => {
-                    io::Error::new(io::ErrorKind::TimedOut, "macOS metadata helper timed out")
-                }
-            }
-        })?;
-    if output.stdout_truncated {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "macOS metadata helper returned too much output",
-        ));
+fn apps_for_file(path: &Path) -> io::Result<Vec<AppInfo>> {
+    use std::ffi::{CStr, CString};
+    use std::os::raw::c_char;
+    use std::os::unix::ffi::OsStrExt;
+
+    unsafe extern "C" {
+        fn explorie_apps_for_file(path: *const c_char) -> *mut c_char;
+        fn explorie_open_with_free(value: *mut c_char);
     }
-    Ok(output)
+
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid path"))?;
+    // SAFETY: The bridge reads the NUL-terminated path synchronously and
+    // returns null or a heap string released by the paired free function.
+    let json = unsafe { explorie_apps_for_file(c_path.as_ptr()) };
+    if json.is_null() {
+        return Ok(Vec::new());
+    }
+    // SAFETY: A non-null bridge result is a valid NUL-terminated allocation.
+    let bytes = unsafe { CStr::from_ptr(json) }.to_bytes().to_vec();
+    // SAFETY: The pointer came from the bridge and has not been released yet.
+    unsafe { explorie_open_with_free(json) };
+    let apps: Vec<LaunchServicesApp> = serde_json::from_slice(&bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    Ok(open_with_menu(apps))
+}
+
+/// Show the system application chooser and wait for the user's answer.
+/// The panel runs on the main thread (the bridge dispatches it there), so
+/// this must be called from a worker thread while the app's run loop runs.
+#[cfg(target_os = "macos")]
+fn choose_application() -> io::Result<Option<PathBuf>> {
+    use std::ffi::{CStr, OsStr, c_void};
+    use std::os::raw::c_char;
+    use std::os::unix::ffi::OsStrExt;
+    use std::sync::mpsc;
+
+    type Chosen = mpsc::Sender<Option<PathBuf>>;
+
+    unsafe extern "C" {
+        fn explorie_choose_application(
+            callback: extern "C" fn(*mut c_void, *const c_char),
+            context: *mut c_void,
+        );
+    }
+
+    extern "C" fn chosen(context: *mut c_void, path: *const c_char) {
+        // SAFETY: `context` is the boxed sender leaked below; the bridge
+        // calls back exactly once.
+        let sender = unsafe { Box::from_raw(context.cast::<Chosen>()) };
+        let path = (!path.is_null()).then(|| {
+            // SAFETY: A non-null path is a NUL-terminated string that the
+            // bridge keeps alive for the duration of the callback.
+            let bytes = unsafe { CStr::from_ptr(path) }.to_bytes();
+            PathBuf::from(OsStr::from_bytes(bytes))
+        });
+        let _ = sender.send(path);
+    }
+
+    let (sender, receiver) = mpsc::channel();
+    let context = Box::into_raw(Box::new(sender)).cast::<c_void>();
+    // SAFETY: The callback matches the bridge's signature and takes
+    // ownership of `context` when it runs.
+    unsafe { explorie_choose_application(chosen, context) };
+    receiver
+        .recv()
+        .map_err(|_| io::Error::other("The application chooser closed unexpectedly"))
 }
 
 #[cfg(windows)]
@@ -797,6 +752,7 @@ fn apps_for_file(_path: &Path) -> io::Result<Vec<AppInfo>> {
         name: "Choose another app…".to_string(),
         path: PathBuf::new(),
         bundle_id: None,
+        is_default: false,
     }])
 }
 
@@ -1067,6 +1023,7 @@ mod windows_integration {
 mod tests {
     use super::*;
     use crate::{NativeServices, ResourcePaths};
+    #[cfg(any(windows, target_os = "macos"))]
     use std::fs;
     use std::sync::Mutex;
 
@@ -1131,8 +1088,70 @@ mod tests {
                 name: "Fixture App".to_string(),
                 path: PathBuf::from("/fixture/app"),
                 bundle_id: Some("test.fixture.app".to_string()),
+                is_default: true,
             }])
         }
+    }
+
+    #[test]
+    fn application_choices_cross_the_async_service_boundary() {
+        struct Chooser(Option<PathBuf>);
+
+        impl PlatformActionsBackend for Chooser {
+            fn open(&self, _path: &Path) -> io::Result<()> {
+                Ok(())
+            }
+
+            fn reveal(&self, _path: &Path) -> io::Result<()> {
+                Ok(())
+            }
+
+            fn open_with(&self, _path: &Path, _app_name: &str) -> io::Result<()> {
+                Ok(())
+            }
+
+            fn apps_for_file(&self, _path: &Path) -> io::Result<Vec<AppInfo>> {
+                Ok(Vec::new())
+            }
+
+            fn choose_application(&self) -> io::Result<Option<PathBuf>> {
+                Ok(self.0.clone())
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let chosen = PathBuf::from("/Applications/Chosen.app");
+        let native = NativeServices::with_platform_actions_backend(
+            ResourcePaths::test(root.path()),
+            Arc::new(Chooser(Some(chosen.clone()))),
+        );
+        assert_eq!(
+            native.integration.choose_application().wait().unwrap(),
+            Some(chosen)
+        );
+        let cancelled = NativeServices::with_platform_actions_backend(
+            ResourcePaths::test(root.path()),
+            Arc::new(Chooser(None)),
+        );
+        assert_eq!(
+            cancelled.integration.choose_application().wait().unwrap(),
+            None
+        );
+
+        // Backends that cannot choose report it instead of hanging.
+        let native = NativeServices::with_platform_actions_backend(
+            ResourcePaths::test(root.path()),
+            Arc::new(FakePlatformActionsBackend::default()),
+        );
+        assert_eq!(
+            native
+                .integration
+                .choose_application()
+                .wait()
+                .unwrap_err()
+                .code,
+            ErrorCode::Unsupported
+        );
     }
 
     #[test]
@@ -1283,6 +1302,191 @@ mod tests {
             }
         };
         assert_eq!(contents.trim(), "opened-by-shell");
+    }
+
+    #[test]
+    fn open_with_menu_puts_the_default_first_then_sorts_and_dedupes_by_name() {
+        let app = |name: &str, path: &str, is_default: bool| LaunchServicesApp {
+            name: name.to_string(),
+            path: PathBuf::from(path),
+            bundle_id: Some(format!("test.{name}")),
+            is_default,
+        };
+        let menu = open_with_menu(vec![
+            app("Zed", "/Applications/Zed.app", false),
+            app("BBEdit", "/Applications/BBEdit.app", false),
+            app("TextEdit", "/System/Applications/TextEdit.app", true),
+            app("bbedit", "/Volumes/Old/BBEdit.app", false),
+            app("", "/Applications/Nameless.app", false),
+        ]);
+        let names: Vec<_> = menu.iter().map(|app| app.name.as_str()).collect();
+        assert_eq!(names, ["TextEdit", "BBEdit", "Zed"]);
+        assert_eq!(menu[1].path, PathBuf::from("/Applications/BBEdit.app"));
+        assert_eq!(menu[0].bundle_id.as_deref(), Some("test.TextEdit"));
+        let defaults: Vec<_> = menu.iter().map(|app| app.is_default).collect();
+        assert_eq!(defaults, [true, false, false]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_open_with_lists_launch_services_handlers() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("notes.txt");
+        fs::write(&path, "plain text").unwrap();
+
+        let apps = apps_for_file(&path).unwrap();
+        let text_edit = apps
+            .iter()
+            .find(|app| app.bundle_id.as_deref() == Some("com.apple.TextEdit"))
+            .unwrap_or_else(|| panic!("TextEdit should open .txt files: {apps:?}"));
+        assert_eq!(text_edit.name, "TextEdit");
+        assert!(text_edit.path.ends_with("TextEdit.app"));
+        assert!(apps.iter().all(|app| app.path.exists()));
+        let mut names: Vec<_> = apps.iter().map(|app| app.name.to_lowercase()).collect();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), apps.len(), "names are unique: {apps:?}");
+    }
+
+    #[cfg(target_os = "macos")]
+    fn write_raw_tags(path: &Path, values: Vec<plist::Value>) {
+        let mut encoded = Vec::new();
+        plist::Value::Array(values)
+            .to_writer_binary(&mut encoded)
+            .unwrap();
+        write_raw_tag_bytes(path, &encoded);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn write_raw_tag_bytes(path: &Path, bytes: &[u8]) {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: NUL-terminated strings and a pointer/length pair for `bytes`.
+        let result = unsafe {
+            libc::setxattr(
+                c_path.as_ptr(),
+                c"com.apple.metadata:_kMDItemUserTags".as_ptr(),
+                bytes.as_ptr().cast(),
+                bytes.len(),
+                0,
+                libc::XATTR_NOFOLLOW,
+            )
+        };
+        assert_eq!(result, 0, "{}", io::Error::last_os_error());
+    }
+
+    #[cfg(target_os = "macos")]
+    fn read_raw_tags(path: &Path) -> Vec<plist::Value> {
+        let output = Command::new("xattr")
+            .args(["-px", "com.apple.metadata:_kMDItemUserTags"])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let hex: String = String::from_utf8(output.stdout)
+            .unwrap()
+            .split_whitespace()
+            .collect();
+        let bytes: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).unwrap())
+            .collect();
+        plist::Value::from_reader(io::Cursor::new(bytes))
+            .unwrap()
+            .into_array()
+            .unwrap()
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_finder_tags_read_colors_and_names_straight_from_the_xattr() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("tagged.txt");
+        fs::write(&path, "content").unwrap();
+        assert!(get_finder_tags(&path).unwrap().is_empty());
+
+        write_raw_tags(
+            &path,
+            vec![
+                plist::Value::String("Important\n6".into()),
+                plist::Value::String("Client, Inc.".into()),
+                plist::Value::String("say \"hi\"".into()),
+            ],
+        );
+        assert_eq!(
+            get_finder_tags(&path).unwrap(),
+            vec![
+                "Important\n6".to_string(),
+                "Client, Inc.".to_string(),
+                "say \"hi\"".to_string()
+            ]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_finder_tag_writes_keep_colors_and_unknown_entries() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("tagged.txt");
+        fs::write(&path, "content").unwrap();
+        write_raw_tags(
+            &path,
+            vec![
+                plist::Value::String("Important\n6".into()),
+                plist::Value::String("Plain".into()),
+                plist::Value::Integer(42.into()),
+            ],
+        );
+        assert_eq!(
+            get_finder_tags(&path).unwrap(),
+            vec!["Important\n6".to_string(), "Plain".to_string()]
+        );
+
+        set_finder_tags(&path, &["Important".to_string(), "Review\n4".to_string()]).unwrap();
+        assert_eq!(
+            read_raw_tags(&path),
+            vec![
+                plist::Value::String("Important\n6".into()),
+                plist::Value::String("Review\n4".into()),
+                plist::Value::Integer(42.into()),
+            ]
+        );
+
+        // Removing every tag keeps the entry this code does not understand.
+        set_finder_tags(&path, &[]).unwrap();
+        assert_eq!(read_raw_tags(&path), vec![plist::Value::Integer(42.into())]);
+        assert!(get_finder_tags(&path).unwrap().is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_unreadable_finder_tags_are_reported_and_never_overwritten() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("tagged.txt");
+        fs::write(&path, "content").unwrap();
+        write_raw_tag_bytes(&path, b"not a plist");
+
+        assert_eq!(
+            get_finder_tags(&path).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            set_finder_tags(&path, &["Work".to_string()])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        let output = Command::new("xattr")
+            .args(["-p", "com.apple.metadata:_kMDItemUserTags"])
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "not a plist"
+        );
     }
 
     #[cfg(target_os = "macos")]

@@ -23,11 +23,14 @@ Current features:
 
 - **Multiple view modes:** List, Grid, and Finder-style Column views with a terminal preview column.
 - **Tabbed browsing:** Open multiple directories in tabs (Ctrl/Cmd+T).
-- **File previews:** One Explorie-owned Quick Look experience on Windows and macOS, including selected-set navigation and an index sheet, plus images, embedded audio/video, locally rendered PDFs, highlighted text/code, archive listings, and optional helper-generated previews.
+- **File previews:** One Explorie-owned Quick Look experience on Windows and macOS, including selected-set navigation and an index sheet, plus images, embedded audio/video, locally rendered PDFs, highlighted text/code, archive listings, and optional helper-generated previews. On macOS, system Quick Look thumbnails and preview images cover HEIC/HEIF, camera RAW, video, Office and iWork files without extra helpers, and files, folders and apps show their Finder icons.
+- **Finder conventions on macOS:** A native menu bar (including the Services menu), Finder's default shortcuts, application bundles that open like files (with Show Package Contents), folder symlinks you can browse into, Finder tags shown in rows and searchable in smart folders, cloud-only (iCloud/File Provider) items marked and never downloaded just to preview them, and Spotlight-backed searches with a crawler fallback.
+- **System clipboard:** Copy, cut and paste files between explorie windows and Finder or Explorer.
 - **Archives:** Built-in ZIP, 7z, TAR/TAR.GZ and RAR handling, plus bundled upstream 7-Zip 26.03 for inspecting and extracting XZ, BZIP2, GZIP, CAB, ISO, WIM, MSI, DMG and other supported archive/disk-image formats. No separate 7-Zip installation is needed. Additional formats are extract-only in Explorie; single-stream formats decompress one layer (for example, `files.tar.xz` produces `files.tar`).
 - **Custom metadata:** Read/write `.explorie.json` for custom fields per folder.
 - **Theming:** Dark/light/system themes, accent colors, local font stacks, UI scale, density, and more.
 - **Drag & drop:** Move files between folders with visual feedback.
+- **Safe file operations:** Copies are staged and published without overwriting, cross-volume moves are verified before the source is removed, symbolic links are copied as links, operations work on exFAT/FAT volumes, extraction never merges into an existing folder, replaced items go to the Trash, and interrupted operations can be restored after a crash.
 - **Settings panel:** Comprehensive appearance and behavior customization.
 - **OS integration:** Native window controls and platform file opening.
 - **Persistent Remote Drives:** Reconnect existing rclone remotes as native Windows drive letters or macOS volumes while explorie is running.
@@ -56,12 +59,12 @@ Current features:
 
 ### Optional Dependencies
 
-| Dependency      | Purpose                                        | Installation                                                                           |
-| --------------- | ---------------------------------------------- | -------------------------------------------------------------------------------------- |
-| **FFmpeg**      | Video thumbnails for non-browser video formats | Windows: `winget install ffmpeg`<br>macOS: `brew install ffmpeg`                       |
-| **LibreOffice** | Office/OpenDocument preview conversion         | Windows: install from libreoffice.org<br>macOS: `brew install --cask libreoffice`      |
-| **ImageMagick** | HEIC/TIFF/PSD preview conversion               | Windows: `winget install ImageMagick.ImageMagick`<br>macOS: `brew install imagemagick` |
-| **cargo-watch** | Rust hot reload during dev                     | `cargo install cargo-watch`                                                            |
+| Dependency      | Purpose                                          | Installation                                                                           |
+| --------------- | ------------------------------------------------ | -------------------------------------------------------------------------------------- |
+| **FFmpeg**      | Video playback; video thumbnails on Windows      | Windows: `winget install ffmpeg`<br>macOS: `brew install ffmpeg`                       |
+| **LibreOffice** | Office/OpenDocument previews (optional on macOS) | Windows: install from libreoffice.org<br>macOS: `brew install --cask libreoffice`      |
+| **ImageMagick** | HEIC/TIFF/PSD previews (optional on macOS)       | Windows: `winget install ImageMagick.ImageMagick`<br>macOS: `brew install imagemagick` |
+| **cargo-watch** | Rust hot reload during dev                       | `cargo install cargo-watch`                                                            |
 
 ### Platform Notes
 
@@ -127,6 +130,25 @@ cargo run -p explorie-cli -- --help      # CLI help (listing and ffmpeg-preview)
 | `pnpm dev:watch`  | Dev with Rust hot reload (requires cargo-watch) |
 | `pnpm rust:watch` | Watch Rust crates and run tests on change       |
 
+### Development Setup
+
+- **macOS without the Metal toolchain:** GPUI compiles its shaders with Xcode's `metal` tool. With only the Command Line Tools installed, add `--features runtime-shaders` to GPUI commands (`cargo run -p explorie-gpui --features runtime-shaders`), or `--features explorie-gpui/runtime-shaders` to workspace-wide ones such as clippy. CI and releases precompile shaders, so never enable it there.
+- **Fast local builds without the heavy preview backends:** 3D, audio, SQLite, Parquet/Arrow, font, and email previews are cargo features of `explorie-gpui` (forwarded to `explorie-native-services`) that are on by default, so plain `cargo build`/`cargo test` and every release build include all of them. Leaving them out skips their largest dependencies, including assimp's C++ build, so no CMake is needed: `cargo run -p explorie-gpui --no-default-features --features runtime-shaders` (drop `--features runtime-shaders` if you have the Metal toolchain or are not on macOS). Add single backends back with, for example, `--features preview-sqlite`. Files a build cannot preview are still detected: their preview says the backend isn't included in this build, 3D models keep their file icon instead of a thumbnail, and videos play without sound. CI lints this reduced build.
+  - `preview-3d`: 3D model previews and thumbnails (glTF/GLB, OBJ, STL, PLY, 3MF, FBX) through assimp, which builds from C++ source with CMake.
+  - `preview-audio`: audio playback and video soundtracks (rodio and Symphonia; needs ALSA headers on Linux).
+  - `preview-columnar`: Parquet and Arrow IPC/Feather table previews (the Apache Arrow and Parquet crates).
+  - `preview-sqlite`: SQLite database previews (bundled SQLite, compiled from C).
+  - `preview-fonts`: TTF, OTF, WOFF, and WOFF2 font specimens.
+  - `preview-mail`: `.eml` email previews.
+  - `full-previews`: all of the above; the default.
+- **Prepare 7-Zip before running tests:** `node scripts/prepare-7zip.mjs` downloads and verifies the pinned 7-Zip that archive tests and GPUI builds use (`pnpm prepare:native` also fetches rclone and WinFsp). `release` and `ci` GPUI builds fail without it.
+- **Use a short, canonical `TMPDIR` for tests, like CI:** macOS's default `/var/folders/…/T` is long and sits behind the `/var` → `/private/var` symlink, which filesystem-safety tests (canonical paths, link-ancestor checks) are sensitive to. For example: `mkdir -p /private/tmp/explorie-tests && TMPDIR=/private/tmp/explorie-tests cargo test --locked -p explorie-core`.
+- **Cargo profiles:**
+  - `dev` builds workspace crates at `opt-level = 0` for fast incremental rebuilds and dependencies at `opt-level = 2`, so image, archive, and PDF decoding stay usable in debug runs. The first build after changing these settings recompiles every dependency once.
+  - `release` (thin LTO, one codegen unit) is what `pnpm desktop:build` and tagged releases ship. It keeps `panic = "unwind"`: preview decoders and background jobs rely on `catch_unwind`, and the build fails if a profile switches to `abort`.
+  - `ci` is `release` without LTO and with 16 codegen units, for fast optimized PR builds. Like `release`, it needs the prepared 7-Zip and an `EXPLORIE_PLUGIN_CATALOG` from `node scripts/package-plugins.mjs`; `cargo build -p explorie-gpui --profile ci` then writes to `target/ci/`.
+- **Fuzzing (optional):** `fuzz/` holds cargo-fuzz targets for the 7-Zip listing parser, archive path validation, `.explorie.json` custom fields, and plugin protocol frames. Run them with `cargo install cargo-fuzz`, then `cargo +nightly fuzz run <target>`. A weekly workflow also runs each target.
+
 ### Building & Testing
 
 | Command              | Description                                                            |
@@ -191,13 +213,16 @@ explorie does not include telemetry. Diagnostics exports are local-only and are 
 
 Remote Drives use the bundled, pinned rclone executable with the user's existing rclone configuration. Choose **Remote Drives → Configure** to open rclone's own interactive setup in a terminal; when it closes, Explorie refreshes the remote list and opens the Add Drive dialog. Explorie never stores provider credentials or OAuth tokens. Encrypted rclone configurations must be unlockable non-interactively through the user's existing rclone environment or password command. Mount processes run only while explorie is open; stable per-profile VFS caches allow interrupted uploads to resume.
 
+On macOS, a connected remote drive is served by `rclone serve nfs` on a fresh random `127.0.0.1` port for as long as it stays connected. Before the administrator-approved helper mounts it as root (with `nosuid,nodev`), the helper checks that the only listener on that port is the requesting user's team-signed rclone, bound to IPv4 loopback. rclone's NFS server has no authentication, though, and doesn't check which user is asking. While a drive is connected, any process on the Mac that finds the port, including software running under other local accounts, can read and change the files in that cloud drive, and other local accounts can browse the mounted volume. Connect remote drives only on Macs whose other accounts and installed software you trust, and disconnect drives you aren't using. Closing this gap needs an authenticated transport, such as an rclone FUSE mount through macFUSE or FUSE-T, or WebDAV with per-mount credentials. That is future work. Windows drives use `rclone mount` with WinFsp instead.
+
 ---
 
 ## Known Limitations
 
 - Public binary releases still need real-machine packaged-app QA before broad distribution; macOS is explicitly not release-ready until that proof exists.
-- Video previews use an optional local FFmpeg process for probing and bounded native playback; unavailable helpers produce an actionable fallback.
-- Office/OpenDocument previews require LibreOffice. HEIC/HEIF/TIFF/PSD previews require ImageMagick.
+- Video playback uses an optional local FFmpeg process for probing and bounded native playback; unavailable helpers produce an actionable fallback. On macOS, video thumbnails come from Quick Look without FFmpeg.
+- On Windows, Office/OpenDocument previews require LibreOffice and HEIC/HEIF/TIFF/PSD previews require ImageMagick. On macOS these fall back to Quick Look when the helpers are missing.
+- Linux is compile- and lint-checked in CI but is not a product target: `main()` exits early, and Windows/macOS-only features (remote drives, bundled 7-Zip, integrations, the menu bar) are unavailable there.
 - Explorie Quick Look and Column View behavior, plus notarized DMG behavior, should be checked on a real Mac for each release candidate.
 
 ---
@@ -213,7 +238,7 @@ pnpm release:check
 
 The command writes local evidence under `.release-checks/`, which is ignored by git. It requires a clean, version-aligned working tree; runs dependency audits, Rust formatting, the full workspace tests, strict clippy, and a locked GPUI release build; then verifies the executable under the workspace `target/release` directory.
 
-Windows and macOS builds check the latest published GitHub Release automatically. Updates use the exact platform asset and refuse to install unless its size and SHA-256 match GitHub's release asset size and SHA-256 digest; failed checks leave the installed app untouched. Windows updates run the per-user installer, replace the installed files, remove the installer, and reopen Explorie. macOS updates additionally require the downloaded DMG and app to pass Developer ID, Gatekeeper, bundle-ID, version, and signing-team checks before a staged bundle swap; failures roll back to the old app, while success removes the DMG and backup before reopening. Windows Authenticode signing is intentionally not part of the release contract. Releases remain immutable and version-tag based. Bump the matching versions in the root package and GPUI Cargo manifest, merge the candidate commit to `main`, and wait for its `CI Gate` to pass before pushing a new `v<version>` tag. That immutable tag builds the candidate packages once and attaches them to a draft release. After those exact assets pass the real-machine checklist below, manually dispatch the release workflow from that tag with the Windows and macOS attestations and the two tested artifact SHA-256 values. The protected publish job verifies those hashes against the existing draft before publishing it without rebuilding. Existing releases, assets, and tags are never replaced; failures are fixed in a new version.
+Windows and macOS builds check the latest published GitHub Release automatically. Updates use the exact platform asset and refuse to install unless its size and SHA-256 match GitHub's release asset size and SHA-256 digest, and, once an update signing key is configured (see [Update signing](#update-signing)), unless its detached ed25519 signature verifies against the key compiled into the running app; failed checks leave the installed app untouched. Windows updates run the per-user installer, replace the installed files, remove the installer, and reopen Explorie. macOS updates additionally require the downloaded DMG and app to pass Developer ID, Gatekeeper, bundle-ID, version, and signing-team checks before a staged bundle swap; failures roll back to the old app, while success removes the DMG and backup before reopening. Windows Authenticode signing is intentionally not part of the release contract. Releases remain immutable and version-tag based. Bump the matching versions in the root package and GPUI Cargo manifest, merge the candidate commit to `main`, and wait for its `CI Gate` to pass before pushing a new `v<version>` tag. That immutable tag builds the candidate packages once and attaches them to a draft release. After those exact assets pass the real-machine checklist below, manually dispatch the release workflow from that tag with the Windows and macOS attestations and the two tested artifact SHA-256 values. The protected publish job verifies those hashes against the existing draft before publishing it without rebuilding. Existing releases, assets, and tags are never replaced; failures are fixed in a new version.
 
 Protect `v*` tags against update/deletion, require `CI Gate` on `main`, protect the `release-signing` and `release-publish` environments, and enable immutable releases in the GitHub repository settings before public distribution.
 
@@ -224,6 +249,20 @@ macOS releases require these signing secrets:
 The release workflow publishes an explicitly named unsigned per-user Windows x64 installer, a signed/notarized macOS arm64 DMG. Windows packages intentionally remain unsigned, so SmartScreen or antivirus warnings are expected. CI installs, launch-smokes, and uninstalls the Windows package; publication additionally requires explicit proof that both candidates passed disposable filesystem operations on real machines.
 
 Each `v<version>` draft contains exactly two assets: `explorie-<version>-windows-x64-setup-unsigned.exe` and `explorie-<version>-macos-arm64.dmg`.
+
+### Update signing
+
+GitHub's SHA-256 digest comes from the same API response as the download, so on its own it only proves the bytes match what the GitHub account published. Update signing adds an independent check: the release workflow signs both installers with an offline-generated ed25519 key, and the updater refuses any payload whose signature does not verify against the public key embedded at build time. This matters most for the unsigned Windows installer, which the updater runs silently.
+
+Signatures use [minisign](https://jedisct1.github.io/minisign/)'s prehashed format. They are carried as machine-readable lines inside a hidden `<!-- explorie-update-signatures ... -->` block in the release notes (`explorie-signature <asset-name> <signature> <global-signature>`), so each release still has exactly two assets. Each signature's trusted comment is `explorie-update <asset-name>`, which binds it to one version and platform.
+
+To turn signing on:
+
+1. Generate a key pair offline with `minisign -G -p update-signing-key.pub -s update-signing.key` (or `rsign generate`). Keep the password-protected secret key in your password manager, not in the repository.
+2. Store the full contents of `update-signing.key` as the `UPDATE_SIGNING_KEY` secret of the `release-signing` environment, and its password as `UPDATE_SIGNING_KEY_PASSWORD`. The candidate job now runs in that environment, so any reviewers that environment requires also gate the draft.
+3. Replace `crates/native-services/update-signing-key.pub` with the generated public key file and ship it in a release. Builds can instead take the key from the `EXPLORIE_UPDATE_PUBLIC_KEY` environment variable at compile time.
+
+When a public key is compiled in, every update on every platform must carry a valid signature. The candidate job fails if the public key and `UPDATE_SIGNING_KEY` don't match or if the secret is missing, and the candidate and publication checks verify the signatures in the draft notes. Without a key (for example in development builds) updates keep the SHA-256-only behavior and the notes are left unchanged. `node scripts/update-signatures.mjs verify --notes <notes.md> <installer>...` checks a release by hand. To rotate the key, ship the new public key in a release that is still signed with the old key, then sign the following releases with the new key. Anyone who installs a build that predates the embedded key updates once through the SHA-256-only path.
 
 Integration ZIPs and catalogs stay inside the build and installed app. Build checksum files remain internal CI evidence. Candidate and publication checks verify that GitHub exposes exactly the two expected installers and that their sizes and SHA-256 digests match the uploaded bytes; publication also requires the exact hashes attested on real machines.
 
@@ -248,19 +287,36 @@ Only the first `bildhaus/explorie` release at `0.1.0` may record an updater exem
 
 ## Keyboard Shortcuts
 
-| Shortcut     | Action                                               |
-| ------------ | ---------------------------------------------------- |
-| `Space`      | Open or close Quick Look for the selected file       |
-| `Escape`     | Close dialogs, menus, Quick Look, or command palette |
-| `Ctrl/Cmd+T` | New tab                                              |
-| `Ctrl/Cmd+W` | Close tab                                            |
-| `Ctrl/Cmd+P` | Command palette                                      |
-| `Ctrl/Cmd+F` | Focus search                                         |
-| `Ctrl/Cmd+,` | Settings                                             |
-| `Arrow keys` | Navigate file views                                  |
-| `Enter`      | Open selected item                                   |
-| `F2`         | Rename selected item                                 |
-| `Delete`     | Delete or trash selected item                        |
+Each platform gets its native file manager's conventions: Explorer-style keys on Windows and Finder-style keys on macOS. Every editable shortcut can be rebound in **Settings → Shortcuts**; press `?` in the browser for the live list, including fixed keys.
+
+| Action                                | Windows                        | macOS                         |
+| ------------------------------------- | ------------------------------ | ----------------------------- |
+| Open selected item                    | `Enter`                        | `Cmd+O` or `Cmd+Down`         |
+| Quick Look                            | `Space`                        | `Space`                       |
+| Rename                                | `F2`                           | `Return`                      |
+| Move to Trash                         | `Delete`                       | `Cmd+Backspace`               |
+| Delete permanently                    | `Shift+Delete`                 | `Cmd+Option+Backspace`        |
+| Back / Forward                        | `Alt+Left` / `Alt+Right`       | `Cmd+[` / `Cmd+]`             |
+| Enclosing folder                      | `Alt+Up` or `Backspace`        | `Cmd+Up`                      |
+| Go to folder                          | `Ctrl+G`                       | `Cmd+Shift+G`                 |
+| Search filenames                      | `Ctrl+F`                       | `Cmd+F`                       |
+| New folder                            | `Ctrl+Shift+N`                 | `Cmd+Shift+N`                 |
+| Copy / Cut / Paste                    | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | `Cmd+C` / `Cmd+X` / `Cmd+V`   |
+| Undo / Redo                           | `Ctrl+Z` / `Ctrl+Y`            | `Cmd+Z` / `Cmd+Shift+Z`       |
+| Show or hide hidden files             | `Ctrl+H`                       | `Cmd+Shift+.`                 |
+| List / Grid / Column view             | `Ctrl+1` / `Ctrl+2` / `Ctrl+3` | `Cmd+2` / `Cmd+1` / `Cmd+3`   |
+| Refresh                               | `F5`                           | `Cmd+R`                       |
+| New window / New tab                  | `Ctrl+N` / `Ctrl+T`            | `Cmd+N` / `Cmd+T`             |
+| Close tab (or window on its last tab) | `Ctrl+W`                       | `Cmd+W`                       |
+| Next / Previous tab                   | `Ctrl+Tab` / `Ctrl+Shift+Tab`  | `Ctrl+Tab` / `Ctrl+Shift+Tab` |
+| Add or remove favorite                | `Ctrl+D`                       | `Ctrl+Cmd+T`                  |
+| Command palette                       | `Ctrl+Shift+P`                 | `Cmd+Shift+P`                 |
+| Settings                              | `Ctrl+,`                       | `Cmd+,`                       |
+| Connect remote drives                 | `Ctrl+Shift+R`                 | `Cmd+K`                       |
+| Keyboard shortcuts                    | `?`                            | `?`                           |
+| Close dialogs, menus, or Quick Look   | `Escape`                       | `Escape`                      |
+
+On macOS, explorie also has a native menu bar (File, Edit, View, Go, Window, Help, plus Services, Hide, and Quit) whose key equivalents follow your current shortcuts. The Go menu adds Finder's `Cmd+Shift+H` (Home), `Cmd+Shift+D` (Desktop), and `Cmd+Shift+O` (Documents). Plain `Backspace` does nothing in the browser (as in Finder), and `Cmd+H`, `Cmd+Q`, `Cmd+M`, `Cmd+Tab`, and ``Cmd+` `` keep their standard meanings.
 
 ---
 

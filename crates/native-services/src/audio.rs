@@ -1,22 +1,37 @@
 //! Local audio playback owned by the native desktop runtime.
+//!
+//! Decoding and output use rodio, behind the `preview-audio` cargo feature.
+//! Without it the service still validates requests, but every load fails with
+//! an Unsupported error.
 
+#[cfg(feature = "preview-audio")]
 use std::fs::File;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "preview-audio")]
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::Duration;
+#[cfg(feature = "preview-audio")]
+use std::time::UNIX_EPOCH;
 
+#[cfg(feature = "preview-audio")]
 use rodio::{Decoder, DeviceSinkBuilder, Player, Source};
+#[cfg(feature = "preview-audio")]
 use sha2::{Digest, Sha256};
 
+#[cfg(feature = "preview-audio")]
 use crate::process::{ProcessError, run_with_timeout};
 use crate::{BlockingTask, ErrorCode, ServiceContext, ServiceError, ServiceResult};
 
+#[cfg(any(feature = "preview-audio", test))]
 const DEFAULT_VOLUME: f32 = 0.8;
+#[cfg(feature = "preview-audio")]
 const AUDIO_TRANSCODE_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_AUDIO_SOURCE_BYTES: u64 = 512 * 1024 * 1024;
+#[cfg(feature = "preview-audio")]
 const MAX_TRANSCODE_CACHE_ENTRIES: usize = 8;
+#[cfg(feature = "preview-audio")]
 const MAX_TRANSCODE_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Snapshot consumed by the GPUI controls. Durations are milliseconds so the
@@ -52,17 +67,20 @@ pub trait AudioBackend: Send + Sync {
     fn open(&self, path: &Path) -> ServiceResult<Arc<dyn AudioPlayback>>;
 }
 
+#[cfg(feature = "preview-audio")]
 struct RodioBackend {
     cache_dir: PathBuf,
     transcode_lock: Mutex<()>,
 }
 
+#[cfg(feature = "preview-audio")]
 struct RodioPlayback {
     _device: rodio::MixerDeviceSink,
     player: Player,
     duration: Option<Duration>,
 }
 
+#[cfg(feature = "preview-audio")]
 impl AudioBackend for RodioBackend {
     fn open(&self, path: &Path) -> ServiceResult<Arc<dyn AudioPlayback>> {
         match open_rodio_playback(path) {
@@ -80,6 +98,7 @@ impl AudioBackend for RodioBackend {
     }
 }
 
+#[cfg(feature = "preview-audio")]
 fn open_rodio_playback(path: &Path) -> ServiceResult<Arc<dyn AudioPlayback>> {
     let file = File::open(path).map_err(|error| {
         ServiceError::from(error).operation(format!("open audio {}", path.display()))
@@ -111,6 +130,7 @@ fn open_rodio_playback(path: &Path) -> ServiceResult<Arc<dyn AudioPlayback>> {
     }))
 }
 
+#[cfg(feature = "preview-audio")]
 impl AudioPlayback for RodioPlayback {
     fn duration(&self) -> Option<Duration> {
         self.duration
@@ -159,6 +179,20 @@ impl AudioPlayback for RodioPlayback {
     }
 }
 
+/// Stands in for rodio in builds without the `preview-audio` feature.
+#[cfg(not(feature = "preview-audio"))]
+struct UnavailableAudioBackend;
+
+#[cfg(not(feature = "preview-audio"))]
+impl AudioBackend for UnavailableAudioBackend {
+    fn open(&self, _path: &Path) -> ServiceResult<Arc<dyn AudioPlayback>> {
+        Err(ServiceError::new(
+            ErrorCode::Unsupported,
+            "Audio playback isn't included in this build",
+        ))
+    }
+}
+
 struct ActiveAudio {
     path: PathBuf,
     playback: Arc<dyn AudioPlayback>,
@@ -176,14 +210,14 @@ pub struct AudioService {
 
 impl AudioService {
     pub fn new(context: ServiceContext) -> Self {
-        let cache_dir = context.resources().cache_dir.join("audio-preview");
-        Self::with_backend(
-            context,
-            Arc::new(RodioBackend {
-                cache_dir,
-                transcode_lock: Mutex::new(()),
-            }),
-        )
+        #[cfg(feature = "preview-audio")]
+        let backend = Arc::new(RodioBackend {
+            cache_dir: context.resources().cache_dir.join("audio-preview"),
+            transcode_lock: Mutex::new(()),
+        });
+        #[cfg(not(feature = "preview-audio"))]
+        let backend = Arc::new(UnavailableAudioBackend);
+        Self::with_backend(context, backend)
     }
 
     pub fn with_backend(context: ServiceContext, backend: Arc<dyn AudioBackend>) -> Self {
@@ -355,6 +389,7 @@ fn audio_extension(path: &Path) -> String {
         .to_ascii_lowercase()
 }
 
+#[cfg(feature = "preview-audio")]
 fn transcode_opus(path: &Path, cache_dir: &Path) -> ServiceResult<PathBuf> {
     let metadata = path.metadata().map_err(ServiceError::from)?;
     let modified = metadata
@@ -375,7 +410,8 @@ fn transcode_opus(path: &Path, cache_dir: &Path) -> ServiceResult<PathBuf> {
     let temporary = output.with_extension(format!("flac.{}.tmp", uuid::Uuid::new_v4()));
     let result = run_with_timeout(
         ffmpeg_command()
-            .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i"])
+            .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y"])
+            .args(["-protocol_whitelist", "file,pipe", "-i"])
             .arg(path)
             .args(["-map", "0:a:0", "-vn", "-c:a", "flac", "-f", "flac"])
             .arg(&temporary),
@@ -417,6 +453,7 @@ fn transcode_opus(path: &Path, cache_dir: &Path) -> ServiceResult<PathBuf> {
     Ok(output)
 }
 
+#[cfg(feature = "preview-audio")]
 fn ffmpeg_command() -> Command {
     let command = Command::new("ffmpeg");
     #[cfg(windows)]
@@ -429,6 +466,7 @@ fn ffmpeg_command() -> Command {
     command
 }
 
+#[cfg(feature = "preview-audio")]
 fn prune_audio_cache(cache_dir: &Path) {
     let Ok(entries) = std::fs::read_dir(cache_dir) else {
         return;
@@ -623,6 +661,23 @@ mod tests {
         let opus = directory.path().join("song.opus");
         std::fs::write(&opus, b"fixture").unwrap();
         assert_eq!(service.load(opus.clone()).wait().unwrap().path, opus);
+    }
+
+    #[test]
+    fn default_backend_rejects_undecodable_or_excluded_audio() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("noise.wav");
+        std::fs::write(&path, b"not audio").unwrap();
+        let service = AudioService::new(ServiceContext::new(crate::ResourcePaths::test(
+            directory.path(),
+        )));
+        let error = service.load(path).wait().unwrap_err();
+        assert_eq!(error.code, ErrorCode::Unsupported);
+        assert_eq!(
+            error.message == "Audio playback isn't included in this build",
+            !cfg!(feature = "preview-audio"),
+            "{error:?}"
+        );
     }
 
     struct StaleBackend {
