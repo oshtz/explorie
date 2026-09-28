@@ -46,12 +46,24 @@ test('rejects wrong release identity or a release already published', async t =>
   }
 });
 
+test('accepts the untagged download URLs GitHub gives draft assets', async t => {
+  const f = await fixture(t);
+  const assets = f.release.assets.map(asset => ({ ...asset,
+    browser_download_url: `https://github.com/${f.repository}/releases/download/untagged-13c4fc92a6560bd999a6/${asset.name}` }));
+  await verifyReleaseAssets({ ...f.release, assets }, f.directory, f.repository, f.tag);
+});
+
 test('fails closed on malformed digest, wrong URL, size or upload state', async t => {
   const f = await fixture(t);
   for (const patch of [{ digest: null }, { digest: '' }, { digest: `sha512:${'a'.repeat(64)}` },
     { digest: `sha256:${'g'.repeat(64)}` }, { digest: 'sha256:abc' }, { state: 'starter' },
     { size: 0 }, { size: 0.5 }, { size: f.release.assets[0].size + 1 },
-    { browser_download_url: f.release.assets[0].browser_download_url.replace('github.com', 'example.com') }]) {
+    { browser_download_url: f.release.assets[0].browser_download_url.replace('github.com', 'example.com') },
+    { browser_download_url: f.release.assets[0].browser_download_url.replace('bildhaus/explorie', 'bildhaus/other') },
+    { browser_download_url: `https://github.com/${f.repository}/releases/download/untagged-XYZ/${f.release.assets[0].name}` },
+    { browser_download_url: `https://github.com/${f.repository}/releases/download/untagged-abc/nested/${f.release.assets[0].name}` },
+    { browser_download_url: `https://github.com/${f.repository}/releases/download/untagged-abc/other.exe` },
+    { browser_download_url: `https://github.com/${f.repository}/releases/download/v9.9.9/${f.release.assets[0].name}` }]) {
     const release = { ...f.release, assets: [{ ...f.release.assets[0], ...patch }, f.release.assets[1]] };
     await assert.rejects(verifyReleaseAssets(release, f.directory, f.repository, f.tag));
   }
