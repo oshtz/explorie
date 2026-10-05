@@ -168,3 +168,107 @@ fn cancel_all_records_the_waiting_operation_as_cancelled(cx: &mut TestAppContext
     });
     remove_fixture(&fixture.root);
 }
+
+/// Fill the operations history with finished copies so the panel is tall
+/// enough to reach any dialog drawn in the middle of the window.
+fn fill_operation_history(view: &mut DirectoryWindow, destination: &Path) {
+    for index in 0..8 {
+        let id = format!("finished-{index}");
+        view.operations.track(
+            id.clone(),
+            FileOperationRequest {
+                kind: FileOperationKind::Copy,
+                sources: vec![destination.join(format!("item-{index}.txt"))],
+                destination: Some(destination.to_path_buf()),
+                conflict_policy: ConflictPolicy::Error,
+            },
+        );
+        view.operations.apply(FileOperationEvent {
+            job_id: id,
+            state: explorie_native_services::FileOperationState::Completed,
+            progress: None,
+            result: None,
+            retryable_sources: Vec::new(),
+            error: None,
+        });
+    }
+    view.operation_ui.panel_hidden = false;
+}
+
+fn intersection(a: Bounds<Pixels>, b: Bounds<Pixels>) -> Option<Bounds<Pixels>> {
+    let left = a.left().max(b.left());
+    let top = a.top().max(b.top());
+    let right = a.right().min(b.right());
+    let bottom = a.bottom().min(b.bottom());
+    (left < right && top < bottom)
+        .then(|| Bounds::from_corners(point(left, top), point(right, bottom)))
+}
+
+#[gpui::test]
+fn modal_prompts_draw_and_take_clicks_above_the_operations_panel(cx: &mut TestAppContext) {
+    let directory = fixture_dir();
+    let report = directory.join("report.txt");
+    fs::write(&report, "report").unwrap();
+    let services = NativeServices::new(ResourcePaths::test(&directory));
+    let (view, window) =
+        cx.add_window_view(|_, cx| DirectoryWindow::new(directory.clone(), services, cx));
+    window.simulate_resize(gpui::size(px(800.0), px(600.0)));
+    view.update(window, |view, cx| {
+        fill_operation_history(view, &directory);
+        view.prompt_rename_path(report.clone(), cx);
+    });
+    window.run_until_parked();
+
+    let panel = window.debug_bounds("operation-panel").unwrap();
+    let dialog = window.debug_bounds("mutation-prompt-dialog").unwrap();
+    let submit = window.debug_bounds("mutation-prompt-submit").unwrap();
+    let minimize = window.debug_bounds("minimize-operations").unwrap();
+    let overlap = intersection(panel, submit)
+        .expect("the test needs the panel to reach the dialog's Rename button");
+    assert!(intersection(minimize, dialog).is_none());
+
+    // The panel lies under the dialog's backdrop: its buttons can't be used
+    // while the prompt is open.
+    window.simulate_click(minimize.center(), Modifiers::default());
+    view.update(window, |view, _| {
+        assert!(!view.operation_ui.panel_minimized);
+        assert!(view.mutation.prompt.is_some());
+    });
+
+    // The Rename button is fully usable even where the panel would cover it.
+    view.update(window, |view, cx| {
+        let prompt = view.mutation.prompt.as_mut().unwrap();
+        prompt.input = "renamed.txt".to_string();
+        prompt.replace_on_type = false;
+        cx.notify();
+    });
+    window.run_until_parked();
+    window.simulate_click(overlap.center(), Modifiers::default());
+    let renamed = directory.join("renamed.txt");
+    wait_until(&view, window, "the rename", |_| renamed.is_file());
+    assert!(!report.exists());
+    remove_fixture(&directory);
+}
+
+#[gpui::test]
+fn the_conflict_prompt_is_not_covered_by_the_operations_panel(cx: &mut TestAppContext) {
+    let fixture = ConflictFixture::new();
+    let (view, window) = fixture.open_at_conflict(cx);
+    view.update(window, |view, cx| {
+        fill_operation_history(view, &fixture.destination);
+        cx.notify();
+    });
+    window.run_until_parked();
+
+    let panel = window.debug_bounds("operation-panel").unwrap();
+    let cancel = window.debug_bounds("conflict-cancel-all").unwrap();
+    let dialog = window.debug_bounds("file-conflict-dialog").unwrap();
+    assert_eq!(f32::from(dialog.size.width), 560.0);
+    let overlap = intersection(panel, cancel)
+        .expect("the test needs the panel to reach the dialog's Cancel All button");
+    window.simulate_click(overlap.center(), Modifiers::default());
+    view.update(window, |view, _| {
+        assert!(view.operation_ui.conflict_prompts.is_empty());
+    });
+    remove_fixture(&fixture.root);
+}

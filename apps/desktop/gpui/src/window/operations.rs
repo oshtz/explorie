@@ -1002,6 +1002,7 @@ impl DirectoryWindow {
         div()
             .id("file-conflict-backdrop")
             .debug_selector(|| "file-conflict-backdrop".to_string())
+            .occlude()
             .absolute()
             .inset_0()
             .flex()

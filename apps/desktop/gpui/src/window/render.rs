@@ -887,6 +887,9 @@ impl Render for DirectoryWindow {
                     )
                     .child(sidebar_resizer),
             )
+            // The operations panel floats over the file list but under every
+            // dialog, sheet and menu, so it never covers a modal prompt.
+            .child(operation_panel)
             .child(plugin_details)
             .child(settings_panel)
             .child(control_surface)
@@ -899,7 +902,6 @@ impl Render for DirectoryWindow {
             .child(appearance_value_editor)
             .child(settings_confirmation)
             .child(context_menu)
-            .child(operation_panel)
             .when_some(quick_look, |window, quick_look| window.child(quick_look))
             .child(toast)
             .child(pane_probe);
