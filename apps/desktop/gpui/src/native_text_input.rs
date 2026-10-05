@@ -28,8 +28,11 @@ gpui::actions!(
     ]
 );
 
-pub fn key_bindings() -> Vec<KeyBinding> {
-    vec![
+/// Text field bindings. `paste_through_menu` leaves Cmd+V to the Edit
+/// menu's Paste, which routes it back to the focused field (on macOS only a
+/// paste through the menu may read text another app copied without asking).
+pub fn key_bindings(paste_through_menu: bool) -> Vec<KeyBinding> {
+    let mut bindings = vec![
         KeyBinding::new("backspace", Backspace, Some("NativeTextInput")),
         // macOS text fields delete to the start of the line on Cmd+Backspace.
         KeyBinding::new("cmd-backspace", DeleteToStart, Some("NativeTextInput")),
@@ -41,14 +44,17 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-a", SelectAll, Some("NativeTextInput")),
         KeyBinding::new("cmd-a", SelectAll, Some("NativeTextInput")),
         KeyBinding::new("ctrl-v", Paste, Some("NativeTextInput")),
-        KeyBinding::new("cmd-v", Paste, Some("NativeTextInput")),
         KeyBinding::new("ctrl-c", Copy, Some("NativeTextInput")),
         KeyBinding::new("cmd-c", Copy, Some("NativeTextInput")),
         KeyBinding::new("ctrl-x", Cut, Some("NativeTextInput")),
         KeyBinding::new("cmd-x", Cut, Some("NativeTextInput")),
         KeyBinding::new("home", Home, Some("NativeTextInput")),
         KeyBinding::new("end", End, Some("NativeTextInput")),
-    ]
+    ];
+    if !paste_through_menu {
+        bindings.push(KeyBinding::new("cmd-v", Paste, Some("NativeTextInput")));
+    }
+    bindings
 }
 
 #[derive(Clone, Debug)]

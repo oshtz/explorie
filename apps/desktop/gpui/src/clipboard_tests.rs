@@ -139,7 +139,7 @@ fn copy_and_cut_write_the_system_clipboard_and_keep_the_in_app_state(cx: &mut Te
         let in_app = view.clipboard.state.as_ref().unwrap();
         assert_eq!(in_app.kind, ClipboardKind::Cut);
         assert_eq!(in_app.paths, contents.paths);
-        assert_eq!(view.paste_candidate(), Some(in_app));
+        assert_eq!(view.paste_count(), Some(2));
     });
 }
 
@@ -213,7 +213,7 @@ fn an_explorie_cut_pastes_as_a_move_and_then_clears_the_clipboard(cx: &mut TestA
     assert!(!fixture.file("notes.txt").exists());
     assert_eq!(clipboard.contents(), None, "the cut is used up");
     target_view.update(cx, |view, _| {
-        assert_eq!(view.paste_candidate(), None);
+        assert_eq!(view.paste_count(), None);
     });
 
     // The window that cut drops its stale state once it sees the clipboard.
@@ -221,7 +221,7 @@ fn an_explorie_cut_pastes_as_a_move_and_then_clears_the_clipboard(cx: &mut TestA
         assert!(view.clipboard.state.is_some());
         view.refresh_system_clipboard();
         assert!(view.clipboard.state.is_none());
-        assert_eq!(view.paste_candidate(), None);
+        assert_eq!(view.paste_count(), None);
     });
 }
 
@@ -389,7 +389,7 @@ fn window_activation_refreshes_the_paste_affordances(cx: &mut TestAppContext) {
     let ((view, clipboard), cx) = open_window(cx, services, &fixture.destination);
     cx.simulate_resize(gpui::size(px(800.0), px(600.0)));
     cx.run_until_parked();
-    view.update(cx, |view, _| assert_eq!(view.paste_candidate(), None));
+    view.update(cx, |view, _| assert_eq!(view.paste_count(), None));
 
     clipboard.set(Some(ClipboardFiles {
         paths: vec![fixture.file("notes.txt")],
@@ -398,10 +398,75 @@ fn window_activation_refreshes_the_paste_affordances(cx: &mut TestAppContext) {
     cx.deactivate_window();
     cx.update(|window, _| window.activate_window());
     cx.run_until_parked();
-    view.update(cx, |view, _| {
+    view.update(cx, |view, _| assert_eq!(view.paste_count(), Some(1)));
+    assert_eq!(
+        clipboard.reads(),
+        0,
+        "activation only peeks, so macOS never asks to read another app's copy"
+    );
+}
+
+#[gpui::test]
+fn files_macos_withholds_explain_how_to_paste_them(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    let services = NativeServices::new(ResourcePaths::test(&fixture.root));
+    let ((view, clipboard), cx) = open_window(cx, services, &fixture.source);
+    view.update(cx, |view, cx| {
+        view.browser
+            .replace_entries(vec![fixture.entry("notes.txt")]);
+        view.browser.select(fixture.file("notes.txt"));
+        view.copy_selected(cx);
+        view.navigate_to(fixture.destination.clone(), cx);
+    });
+    // Another app copies files, and macOS refuses a read it did not see the
+    // user start from Edit > Paste.
+    clipboard.set(Some(ClipboardFiles {
+        paths: vec![fixture.file("report.txt")],
+        cut: false,
+    }));
+    clipboard.withheld.store(true, Ordering::Release);
+    view.update(cx, |view, cx| {
+        view.open_empty_context_menu(gpui::point(px(10.0), px(10.0)), cx);
         assert_eq!(
-            view.paste_candidate().map(|state| state.paths.clone()),
-            Some(vec![fixture.file("notes.txt")])
+            view.context_menu_actions(),
+            vec![(ContextMenuAction::Paste, false)],
+            "a peek still sees the files"
+        );
+        assert!(
+            view.clipboard.state.is_none(),
+            "this window's copy is no longer on the clipboard"
+        );
+        view.close_context_menu(cx);
+
+        view.paste(cx);
+        assert!(view.operations.latest().is_none(), "nothing was pasted");
+        assert_eq!(
+            view.status_message.as_deref(),
+            Some(crate::file_clipboard::WITHHELD_MESSAGE),
+            "guidance instead of \"Nothing to paste\""
         );
     });
+}
+
+#[gpui::test]
+fn a_move_never_reads_a_clipboard_another_app_replaced(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    let services = NativeServices::new(ResourcePaths::test(&fixture.root));
+    let events = services.subscribe_async();
+    let ((view, clipboard), cx) = open_window(cx, services, &fixture.destination);
+    clipboard.set(Some(ClipboardFiles {
+        paths: vec![fixture.file("notes.txt")],
+        cut: true,
+    }));
+    view.update(cx, |view, cx| view.paste(cx));
+    let reads = clipboard.reads();
+    // Another app copies files before the move finishes.
+    let other = ClipboardFiles {
+        paths: vec![fixture.file("report.txt")],
+        cut: false,
+    };
+    clipboard.set(Some(other.clone()));
+    assert!(finish_operation(&view, cx, &events));
+    assert_eq!(clipboard.contents(), Some(other));
+    assert_eq!(clipboard.reads(), reads, "only a peek after the move");
 }

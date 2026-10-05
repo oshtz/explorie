@@ -10,8 +10,11 @@ pub(crate) struct ClipboardUi {
     pub(crate) state: Option<ClipboardState>,
     /// The system file clipboard (an in-memory stand-in in tests).
     pub(crate) files: Rc<dyn FileClipboard>,
-    /// What the system clipboard held when last read or written.
+    /// What the system clipboard held when last looked at.
     pub(crate) system: SystemClipboard,
+    /// The clipboard change count right after this window wrote `state`, so
+    /// a peek can tell whether the clipboard still holds it.
+    pub(crate) written: Option<i64>,
 }
 
 /// Window-side state of file operations: the operation panel, the conflict
@@ -374,9 +377,16 @@ impl DirectoryWindow {
                 ClipboardKind::Copy => "Copied",
                 ClipboardKind::Cut => "Cut",
             };
+            self.clipboard.written = None;
             self.status_message = Some(match written {
                 Ok(()) => {
-                    self.clipboard.system = SystemClipboard::Files(state);
+                    self.clipboard.system = SystemClipboard::Files(count);
+                    self.clipboard.written = self
+                        .clipboard
+                        .files
+                        .peek()
+                        .ok()
+                        .map(|summary| summary.change_count);
                     format!("{verb} {count} item(s) to the clipboard")
                 }
                 Err(error) => {
@@ -392,33 +402,58 @@ impl DirectoryWindow {
         cx.notify();
     }
 
-    /// Read the system clipboard and update the paste affordances. The
-    /// in-app state is dropped once the system clipboard no longer holds
-    /// what this window put there.
+    /// Look at the system clipboard and update the paste affordances. The
+    /// in-app state is dropped once the clipboard no longer holds what this
+    /// window put there. Only peeks: on macOS, reading files another app
+    /// copied outside a paste the user started would ask for permission.
     pub(crate) fn refresh_system_clipboard(&mut self) {
-        match self.clipboard.files.read() {
-            Ok(files) => {
-                self.clipboard.system = SystemClipboard::from_files(files);
-                let current = match &self.clipboard.system {
-                    SystemClipboard::Files(state) => Some(state),
-                    _ => None,
-                };
-                if self.clipboard.state.is_some() && self.clipboard.state.as_ref() != current {
+        match self.clipboard.files.peek() {
+            Ok(summary) => {
+                self.clipboard.system = SystemClipboard::from_summary(&summary);
+                if self.clipboard.written != Some(summary.change_count) {
                     self.clipboard.state = None;
+                    self.clipboard.written = None;
                 }
             }
             Err(_) => self.clipboard.system = SystemClipboard::Unknown,
         }
     }
 
-    /// What Paste would paste, as of the last clipboard read: the system
-    /// clipboard's files, or the in-app state when the system clipboard
-    /// cannot be read.
-    pub(crate) fn paste_candidate(&self) -> Option<&ClipboardState> {
+    /// How many items Paste would paste, as of the last look at the
+    /// clipboard: the system clipboard's files, or the in-app state when the
+    /// system clipboard is unavailable.
+    pub(crate) fn paste_count(&self) -> Option<usize> {
         match &self.clipboard.system {
-            SystemClipboard::Files(state) => Some(state),
+            SystemClipboard::Files(count) => Some(*count),
             SystemClipboard::Empty => None,
-            SystemClipboard::Unknown => self.clipboard.state.as_ref(),
+            SystemClipboard::Unknown => {
+                self.clipboard.state.as_ref().map(|state| state.paths.len())
+            }
+        }
+    }
+
+    /// Read the files to paste. Files macOS withheld report guidance instead
+    /// of "Nothing to paste"; an unavailable clipboard falls back to the
+    /// in-app state.
+    fn read_paste_source(&mut self) -> Result<Option<ClipboardState>, String> {
+        match self.clipboard.files.read() {
+            Ok(files) => {
+                self.clipboard.system = SystemClipboard::from_files(files.as_ref());
+                let current = files.and_then(file_clipboard::clipboard_state);
+                if self.clipboard.state.is_some() && self.clipboard.state != current {
+                    self.clipboard.state = None;
+                    self.clipboard.written = None;
+                }
+                Ok(current)
+            }
+            Err(error) if error.code == ErrorCode::PermissionDenied => {
+                self.record_error("Clipboard read blocked", error.message.clone());
+                Err(error.message)
+            }
+            Err(_) => {
+                self.clipboard.system = SystemClipboard::Unknown;
+                Ok(self.clipboard.state.clone())
+            }
         }
     }
 
@@ -427,11 +462,18 @@ impl DirectoryWindow {
     /// pastes as a move. Text on the clipboard means there is nothing to
     /// paste.
     pub(crate) fn paste(&mut self, cx: &mut Context<Self>) {
-        self.refresh_system_clipboard();
-        let Some(clipboard) = self.paste_candidate().cloned() else {
-            self.status_message = Some("Nothing to paste".to_string());
-            cx.notify();
-            return;
+        let clipboard = match self.read_paste_source() {
+            Ok(Some(clipboard)) => clipboard,
+            Ok(None) => {
+                self.status_message = Some("Nothing to paste".to_string());
+                cx.notify();
+                return;
+            }
+            Err(guidance) => {
+                self.status_message = Some(guidance);
+                cx.notify();
+                return;
+            }
         };
         let kind = match clipboard.kind {
             ClipboardKind::Copy => FileOperationKind::Copy,
@@ -463,6 +505,12 @@ impl DirectoryWindow {
         else {
             return;
         };
+        // Only explorie writes the cut marker, and reading what this app
+        // wrote never asks; peek first so a clipboard another app replaced
+        // meanwhile is never read.
+        if !self.clipboard.files.peek().is_ok_and(|summary| summary.cut) {
+            return;
+        }
         let Ok(Some(files)) = self.clipboard.files.read() else {
             return;
         };
