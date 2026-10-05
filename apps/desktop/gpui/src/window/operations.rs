@@ -595,8 +595,16 @@ impl DirectoryWindow {
             return;
         };
         let count = request.sources.len();
-        if self.try_start_file_operation(request, cx).is_some() {
+        let awaiting_decision = self.operations.operations().iter().any(|operation| {
+            operation.id() == previous_id && operation.status() == OperationStatus::NeedsDecision
+        });
+        if let Some(id) = self.try_start_file_operation(request, cx) {
             self.operations.mark_retry_started(previous_id);
+            if awaiting_decision {
+                // Retrying answers the pending conflict: the new job carries on
+                // the waiting operation's entry.
+                self.supersede_operation(previous_id, &id, 0);
+            }
             self.operation_ui
                 .conflict_prompts
                 .retain(|prompt| prompt.job_id != previous_id);
@@ -1682,6 +1690,7 @@ impl DirectoryWindow {
                                         "Retry",
                                         rgb(0x31523b),
                                     )
+                                    .debug_selector(move || format!("retry-operation-{index}"))
                                     .on_click(cx.listener(
                                         move |this, _, _, cx| this.retry_operation(&retry_id, cx),
                                     )),

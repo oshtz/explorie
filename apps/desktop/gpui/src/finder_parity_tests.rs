@@ -92,8 +92,6 @@ fn a_pending_conflict_waits_for_a_decision_instead_of_failing(cx: &mut TestAppCo
         assert_eq!(operations.len(), 1);
         assert_eq!(operations[0].status(), OperationStatus::NeedsDecision);
         assert_eq!(operations[0].error(), None);
-        // The prompt is how the conflict is resolved, not Retry.
-        assert_eq!(view.operations.latest_retryable_id(), None);
         assert_eq!(
             view.status_message.as_deref(),
             Some("A destination conflict needs your decision")
@@ -104,6 +102,7 @@ fn a_pending_conflict_waits_for_a_decision_instead_of_failing(cx: &mut TestAppCo
         window.debug_bounds("operation-decision-0").is_some(),
         "the history row explains it is waiting for a decision"
     );
+    assert!(window.debug_bounds("retry-operation-0").is_none());
 
     let keep_both = window.debug_bounds("conflict-keep-both").unwrap().center();
     window.simulate_click(keep_both, Modifiers::default());

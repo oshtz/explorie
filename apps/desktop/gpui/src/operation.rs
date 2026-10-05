@@ -233,7 +233,6 @@ impl OperationQueue {
             .rev()
             .find(|operation| {
                 !operation.retryable_sources.is_empty()
-                    && operation.status != OperationStatus::NeedsDecision
                     && operation.request.kind != explorie_native_services::FileOperationKind::Trash
             })
             .map(OperationRecord::id)
@@ -904,7 +903,9 @@ mod tests {
         let waiting = &queue.operations()[0];
         assert_eq!(waiting.status(), OperationStatus::NeedsDecision);
         assert_eq!(waiting.error(), None);
-        assert_eq!(queue.latest_retryable_id(), None);
+        // The Retry shortcut can still try again, e.g. after the user moved
+        // the existing file away; the panel offers the prompt instead.
+        assert_eq!(queue.latest_retryable_id(), Some("job-1"));
         // Waiting for the user is neither running nor finished.
         assert_eq!(queue.active_count(), 0);
         queue.clear_completed();
