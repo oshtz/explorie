@@ -31,6 +31,7 @@ pub mod plugins;
 pub mod preview;
 mod process;
 pub mod remote_drives;
+mod rich_markdown;
 pub mod rich_preview;
 pub mod search;
 pub mod updater;
@@ -70,7 +71,7 @@ pub use remote_drives::{
     RemoteDriveService, RemoteDriveState, RemoteDriveStatus, RemoteMountRequest,
     RemoteProcessStatus, validate_remote_drive_profile,
 };
-pub use rich_preview::{RichBlock, RichBlockKind, RichPreview};
+pub use rich_preview::{RichBlock, RichBlockKind, RichPreview, RichSpan, RichSpanStyle};
 pub use search::{
     CombineMode, SearchCriteria, SearchIndexHealth, SearchProgressEvent, SearchResult,
     SearchService, SearchSource, SearchType,

@@ -5,6 +5,7 @@
 //! cargo features). A build without one still routes those files here and
 //! answers with an Unsupported error that names what is missing.
 
+use crate::preview::TextHighlight;
 use crate::{ErrorCode, ServiceError, ServiceResult};
 #[cfg(feature = "preview-columnar")]
 use arrow_cast::display::array_value_to_string;
@@ -14,7 +15,6 @@ use fontdue::{Font, FontSettings};
 use mail_parser::MessageParser;
 #[cfg(feature = "preview-columnar")]
 use parquet::file::reader::{FileReader, SerializedFileReader};
-use pulldown_cmark::{Options, Parser, html};
 #[cfg(feature = "preview-sqlite")]
 use rusqlite::config::DbConfig;
 #[cfg(feature = "preview-sqlite")]
@@ -32,8 +32,8 @@ use zip::ZipArchive;
 const MAX_RICH_SOURCE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_TEXT_SOURCE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRY_BYTES: u64 = 32 * 1024 * 1024;
-const MAX_BLOCKS: usize = 240;
-const MAX_BLOCK_TEXT: usize = 8 * 1024;
+pub(crate) const MAX_BLOCKS: usize = 240;
+pub(crate) const MAX_BLOCK_TEXT: usize = 8 * 1024;
 #[cfg(any(feature = "preview-sqlite", feature = "preview-columnar"))]
 const MAX_TABLE_COLUMNS: usize = 16;
 #[cfg(any(feature = "preview-sqlite", feature = "preview-columnar"))]
@@ -45,20 +45,57 @@ const SQLITE_PROGRESS_INTERVAL: i32 = 10_000;
 #[cfg(feature = "preview-sqlite")]
 const MAX_SQLITE_VALUE_BYTES: i32 = 16 * 1024 * 1024;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum RichBlockKind {
     Heading,
+    #[default]
     Paragraph,
     Metadata,
     TableHeader,
     TableRow,
     Code,
+    ListItem,
+    Rule,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RichBlock {
     pub kind: RichBlockKind,
+    /// The block's plain text; for styled blocks, its spans' text joined.
     pub text: String,
+    /// Inline runs and their styles, for sources that have them (Markdown).
+    /// Empty when the block is plain `text`.
+    pub spans: Vec<RichSpan>,
+    /// A heading's level (1–6), or how deeply a list item or code block sits
+    /// inside lists.
+    pub level: u8,
+    /// A list item's bullet, number or task box.
+    pub marker: Option<String>,
+    /// How many block quotes enclose the block.
+    pub quote_depth: u8,
+    /// A Markdown table row's cells. Other tables keep the row in `text`.
+    pub cells: Vec<Vec<RichSpan>>,
+    /// Syntax highlights within `text`, for code blocks.
+    pub highlights: Vec<TextHighlight>,
+}
+
+/// A run of inline text with one style.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RichSpan {
+    pub text: String,
+    pub style: RichSpanStyle,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RichSpanStyle {
+    pub strong: bool,
+    pub emphasis: bool,
+    pub strikethrough: bool,
+    pub code: bool,
+    /// The destination of a link, shown but never fetched by the preview.
+    pub link: Option<String>,
+    /// An image's alt text, which stands in for the image.
+    pub image: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -134,10 +171,14 @@ fn block(kind: RichBlockKind, text: impl Into<String>) -> RichBlock {
         text.truncate(MAX_BLOCK_TEXT);
         text.push('…');
     }
-    RichBlock { kind, text }
+    RichBlock {
+        kind,
+        text,
+        ..RichBlock::default()
+    }
 }
 
-fn text_blocks(text: &str) -> Vec<RichBlock> {
+pub(crate) fn text_blocks(text: &str) -> Vec<RichBlock> {
     text.split("\n\n")
         .map(str::trim)
         .filter(|paragraph| !paragraph.is_empty())
@@ -149,24 +190,21 @@ fn text_blocks(text: &str) -> Vec<RichBlock> {
 fn markdown_preview(path: &Path) -> ServiceResult<RichPreview> {
     let bytes = bounded_read(path, MAX_TEXT_SOURCE_BYTES)?;
     let source = String::from_utf8_lossy(&bytes);
-    let mut rendered_html = String::new();
-    html::push_html(&mut rendered_html, Parser::new_ext(&source, Options::all()));
-    let rendered = html2text::from_read(rendered_html.as_bytes(), 100).map_err(|error| {
-        ServiceError::new(
-            ErrorCode::InvalidInput,
-            format!("Unable to render Markdown preview: {error}"),
-        )
-    })?;
-    let title = source
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("# ").map(str::trim))
-        .filter(|title| !title.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| file_title(path));
+    let mut blocks = crate::rich_markdown::markdown_blocks(&source);
+    // A leading top-level heading becomes the title rather than repeating
+    // beneath it.
+    let title = if blocks
+        .first()
+        .is_some_and(|block| block.kind == RichBlockKind::Heading && block.level == 1)
+    {
+        blocks.remove(0).text
+    } else {
+        file_title(path)
+    };
     Ok(RichPreview {
         title,
         subtitle: "Rendered Markdown · scripts and network access disabled".to_string(),
-        blocks: text_blocks(&rendered),
+        blocks,
         image_path: None,
     })
 }
@@ -854,6 +892,20 @@ mod tests {
                 .iter()
                 .any(|block| block.text.contains("Safe"))
         );
+
+        let readme = temp.path().join("README.md");
+        fs::write(
+            &readme,
+            "# Explorie test\n\nSome **markdown** with a [link](https://example.com).\n",
+        )
+        .unwrap();
+        let rendered = preview(&readme, temp.path()).unwrap();
+        assert_eq!(rendered.title, "Explorie test");
+        assert_eq!(rendered.blocks.len(), 1, "the title is not repeated");
+        assert_eq!(rendered.blocks[0].text, "Some markdown with a link.");
+        assert!(rendered.blocks[0].spans.iter().any(|span| {
+            span.style.link.as_deref() == Some("https://example.com") && span.text == "link"
+        }));
 
         let html = temp.path().join("page.html");
         fs::write(

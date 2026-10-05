@@ -243,3 +243,104 @@ fn toolbar_breadcrumbs_take_the_room_the_search_field_can_spare(cx: &mut TestApp
         assert!(bounds.left() >= breadcrumbs.left() && bounds.right() <= breadcrumbs.right());
     }
 }
+
+#[gpui::test]
+fn markdown_preview_renders_structure_instead_of_raw_markup(cx: &mut TestAppContext) {
+    let directory = std::env::temp_dir().join(format!("explorie-markdown-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let readme = directory.join("README.md");
+    std::fs::write(
+        &readme,
+        "# Explorie test\n\n\
+         [Docs](https://example.com/docs) stay offline.\n\n\
+         Some **markdown** with a [link](https://example.com).\n\n\
+         ## Details\n\n\
+         - first\n- second\n\n\
+         > quoted\n\n\
+         ```rust\nfn main() {}\n```\n\n\
+         ---\n\n\
+         | Name | Size |\n| --- | --- |\n| a.txt | 1 KB |\n",
+    )
+    .unwrap();
+    let services = NativeServices::new(explorie_native_services::ResourcePaths::test(&directory));
+    let (view, window) =
+        cx.add_window_view(|_, cx| DirectoryWindow::new(directory.clone(), services, cx));
+    view.update(window, |view, cx| {
+        view.visuals.icon_loading_enabled = false;
+        view.settings.view.show_preview_panel = true;
+        view.browser
+            .replace_entries(vec![entry_at(readme.clone(), false)]);
+        view.listing.state = ListingState::Ready;
+        view.browser.select(readme.clone());
+        view.preview_selected(cx);
+    });
+    for _ in 0..4_000 {
+        window.run_until_parked();
+        if view.update(window, |view, _| {
+            matches!(
+                view.preview.state,
+                PreviewState::Ready {
+                    content: PreviewContent::Rich(_),
+                    ..
+                }
+            )
+        }) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    view.update(window, |view, _| {
+        let PreviewState::Ready {
+            content: PreviewContent::Rich(preview),
+            ..
+        } = &view.preview.state
+        else {
+            panic!("the Markdown preview did not load");
+        };
+        assert_eq!(preview.title, "Explorie test");
+        for block in &preview.blocks {
+            assert_ne!(block.text, "Explorie test", "the title is repeated");
+            assert!(!block.text.starts_with('#'), "raw heading {:?}", block.text);
+            assert!(!block.text.contains("**"), "raw emphasis {:?}", block.text);
+            assert!(!block.text.contains("]("), "raw link {:?}", block.text);
+        }
+    });
+    window.simulate_resize(gpui::size(px(1_024.0), px(768.0)));
+    window.run_until_parked();
+
+    assert!(window.debug_bounds("rich-preview").is_some());
+    assert!(window.debug_bounds("rich-preview-title").is_some());
+    for selector in [
+        "rich-link-0",
+        "rich-paragraph-1",
+        "rich-link-1",
+        "rich-heading-2-2",
+        "rich-list-item-3",
+        "rich-list-item-4",
+        "rich-quote-5",
+        "rich-code-6",
+        "rich-rule-7",
+        "rich-table-row-8",
+        "rich-table-row-9",
+    ] {
+        assert!(
+            window.debug_bounds(selector).is_some(),
+            "missing rendered Markdown element {selector}"
+        );
+    }
+
+    // A link opens in the system browser only when clicked.
+    assert_eq!(window.opened_url(), None);
+    let docs = window.debug_bounds("rich-link-0").unwrap();
+    window.simulate_click(
+        gpui::point(docs.left() + px(4.0), docs.center().y),
+        gpui::Modifiers::default(),
+    );
+    window.run_until_parked();
+    assert_eq!(
+        window.opened_url().as_deref(),
+        Some("https://example.com/docs")
+    );
+
+    std::fs::remove_dir_all(directory).unwrap();
+}

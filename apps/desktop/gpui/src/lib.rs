@@ -77,6 +77,7 @@ mod palette;
 mod prompt;
 mod recovery;
 mod remote_support;
+mod rich_blocks;
 mod runtime;
 mod session;
 mod settings;
@@ -124,6 +125,7 @@ use preview_panel::{
 use prompt::{MutationPrompt, MutationPromptKind};
 pub use recovery::RecoveryMarker;
 use remote_support::*;
+use rich_blocks::rich_block_element;
 pub use runtime::WindowRuntime;
 use runtime::*;
 use session::{

@@ -712,7 +712,33 @@ fn highlight_text(path: &Path, text: &str) -> (Option<String>, Vec<TextHighlight
     if syntax.name == "Plain Text" {
         return (None, Vec::new());
     }
+    (
+        Some(syntax.name.clone()),
+        highlight_with_syntax(syntaxes, syntax, text),
+    )
+}
 
+/// Syntax highlights for a Markdown code block whose info string names
+/// `language`, either as an extension ("rs") or a name ("rust").
+pub(crate) fn highlight_code(language: &str, text: &str) -> Vec<TextHighlight> {
+    let language = language.trim().to_ascii_lowercase();
+    if language.is_empty() {
+        return Vec::new();
+    }
+    let syntaxes = syntax_set();
+    match find_syntax(syntaxes, &language).or_else(|| syntaxes.find_syntax_by_token(&language)) {
+        Some(syntax) if syntax.name != "Plain Text" => {
+            highlight_with_syntax(syntaxes, syntax, text)
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn highlight_with_syntax(
+    syntaxes: &SyntaxSet,
+    syntax: &SyntaxReference,
+    text: &str,
+) -> Vec<TextHighlight> {
     let mut parser = ParseState::new(syntax);
     let mut scopes = ScopeStack::new();
     let mut highlights = Vec::<TextHighlight>::new();
@@ -724,7 +750,7 @@ fn highlight_text(path: &Path, text: &str) -> (Option<String>, Vec<TextHighlight
         };
         for (region, operation) in ScopeRegionIterator::new(&operations, line) {
             if scopes.apply(operation).is_err() {
-                return (Some(syntax.name.clone()), highlights);
+                return highlights;
             }
             let start = offset;
             offset = offset.saturating_add(region.len());
@@ -743,12 +769,12 @@ fn highlight_text(path: &Path, text: &str) -> (Option<String>, Vec<TextHighlight
                     kind,
                 });
             } else {
-                return (Some(syntax.name.clone()), highlights);
+                return highlights;
             }
         }
     }
 
-    (Some(syntax.name.clone()), highlights)
+    highlights
 }
 
 fn find_syntax<'a>(syntaxes: &'a SyntaxSet, extension: &str) -> Option<&'a SyntaxReference> {
