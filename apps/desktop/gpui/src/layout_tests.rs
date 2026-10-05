@@ -107,3 +107,66 @@ fn column_strip_scrolls_the_leaf_into_view_without_clipping_the_leftmost_column(
         "the preview {preview:?} must reach the strip's end {strip_bounds:?}"
     );
 }
+
+#[gpui::test]
+fn list_names_stay_whole_beside_a_custom_column_with_the_inspector_open(cx: &mut TestAppContext) {
+    let directory = PathBuf::from("list-layout").join("Documents");
+    let names = [
+        "data.json",
+        "notes.txt",
+        "letter.docx",
+        "README.md",
+        "report.pdf",
+        "summary.xlsx",
+    ];
+    let entries = names
+        .iter()
+        .map(|name| {
+            let mut entry = entry_at(directory.join(name), false);
+            entry.modified = std::time::SystemTime::now();
+            entry
+                .custom
+                .insert("status".to_string(), serde_json::json!("Draft"));
+            entry
+        })
+        .collect::<Vec<_>>();
+    let (view, window) = cx.add_window_view(|_, cx| {
+        DirectoryWindow::new(directory.clone(), NativeServices::default(), cx)
+    });
+    view.update(window, |view, cx| {
+        view.visuals.icon_loading_enabled = false;
+        view.settings.view.show_preview_panel = true;
+        view.browser.replace_entries(entries);
+        view.listing.state = ListingState::Ready;
+        cx.notify();
+    });
+    window.simulate_resize(gpui::size(px(1_024.0), px(768.0)));
+    window.run_until_parked();
+
+    assert!(window.debug_bounds("preview-panel").is_some());
+    assert!(window.debug_bounds("sort-custom-status").is_some());
+    let visible = view.update(window, |view, _| {
+        view.browser
+            .visible_entries()
+            .iter()
+            .map(|entry| file_name(entry))
+            .collect::<Vec<_>>()
+    });
+    // The test text system advances every character 0.6 em, so a 14 px
+    // label is 8.4 px per character.
+    for (index, name) in visible.iter().enumerate() {
+        let bounds = window
+            .debug_bounds(Box::leak(format!("entry-{index}-name").into_boxed_str()))
+            .unwrap();
+        let needed = name.chars().count() as f32 * 8.4;
+        assert!(
+            f32::from(bounds.size.width) + 0.5 >= needed,
+            "{name} is truncated to {:?}, needing {needed}px",
+            bounds.size.width
+        );
+    }
+    // The other columns stay readable rather than collapsing to nothing.
+    for selector in ["sort-custom-status", "sort-size", "sort-modified"] {
+        assert!(f32::from(window.debug_bounds(selector).unwrap().size.width) >= 56.0);
+    }
+}

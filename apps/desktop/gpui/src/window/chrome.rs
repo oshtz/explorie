@@ -1792,30 +1792,14 @@ impl DirectoryWindow {
         let name = sort_label(&self.browser, &SortKey::Name);
         let size = sort_label(&self.browser, &SortKey::Size);
         let modified = sort_label(&self.browser, &SortKey::Modified);
-        let columns = self.browser.custom_columns();
-        let custom_default =
-            list_custom_column_width(self.layout.listing_viewport_width, columns.len());
-        let (default_size_width, default_modified_width) =
-            list_builtin_column_widths(columns.len());
-        let size_width = self
-            .browser
-            .column_width("size")
-            .map_or(default_size_width, f32::from);
-        let modified_width = self
-            .browser
-            .column_width("modified")
-            .map_or(default_modified_width, f32::from);
+        let (columns, size_width, modified_width) = self.list_column_layout();
         let mut custom_headers = Vec::with_capacity(columns.len());
-        for column in columns {
+        for (column, width) in columns {
             let key = SortKey::Custom(column.clone());
             let label = sort_label(&self.browser, &key);
             let selector = format!("sort-custom-{}", column.to_lowercase());
             let aria_label = format!("Sort by custom field {column}");
             let width_key = format!("custom:{column}");
-            let width = self
-                .browser
-                .column_width(&width_key)
-                .map_or(custom_default, f32::from);
             let resize_handle = self.render_list_column_resize_handle(
                 width_key,
                 width,
@@ -1900,7 +1884,8 @@ impl DirectoryWindow {
                     .tab_stop(true)
                     .w(px(size_width))
                     .relative()
-                    .px_3()
+                    .flex_none()
+                    .px_2()
                     .focus(move |header| header.bg(palette.hover).text_color(palette.text))
                     .hover(move |header| header.bg(palette.hover).text_color(palette.text))
                     .cursor_pointer()
@@ -1920,7 +1905,8 @@ impl DirectoryWindow {
                     .tab_stop(true)
                     .w(px(modified_width))
                     .relative()
-                    .px_3()
+                    .flex_none()
+                    .px_2()
                     .focus(move |header| header.bg(palette.hover).text_color(palette.text))
                     .hover(move |header| header.bg(palette.hover).text_color(palette.text))
                     .cursor_pointer()

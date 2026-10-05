@@ -333,6 +333,31 @@ impl DirectoryWindow {
             .into_any_element()
     }
 
+    /// The list's custom columns with their widths, then the Size and
+    /// Modified widths; the header and every row share this layout.
+    pub(crate) fn list_column_layout(&self) -> (Vec<(String, f32)>, f32, f32) {
+        let columns = self.browser.custom_columns();
+        let custom_widths = columns
+            .iter()
+            .map(|column| {
+                self.browser
+                    .column_width(&format!("custom:{column}"))
+                    .map(f32::from)
+            })
+            .collect::<Vec<_>>();
+        let widths = list_column_widths(
+            self.layout.listing_viewport_width,
+            self.browser.column_width("size").map(f32::from),
+            self.browser.column_width("modified").map(f32::from),
+            &custom_widths,
+        );
+        (
+            columns.into_iter().zip(widths.custom).collect(),
+            widths.size,
+            widths.modified,
+        )
+    }
+
     pub(crate) fn render_list_view(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let count = self.browser.visible_entries().len();
         let marquee_layout = MarqueeLayout::List {
@@ -347,29 +372,7 @@ impl DirectoryWindow {
             self.pointer.selection_marquee = None;
         }
         let marquee_overlay = self.selection_marquee_overlay_rect(marquee_layout);
-        let columns = self.browser.custom_columns();
-        let custom_default =
-            list_custom_column_width(self.layout.listing_viewport_width, columns.len());
-        let columns = columns
-            .into_iter()
-            .map(|column| {
-                let width = self
-                    .browser
-                    .column_width(&format!("custom:{column}"))
-                    .map_or(custom_default, f32::from);
-                (column, width)
-            })
-            .collect::<Vec<_>>();
-        let (default_size_width, default_modified_width) =
-            list_builtin_column_widths(columns.len());
-        let size_width = self
-            .browser
-            .column_width("size")
-            .map_or(default_size_width, f32::from);
-        let modified_width = self
-            .browser
-            .column_width("modified")
-            .map_or(default_modified_width, f32::from);
+        let (columns, size_width, modified_width) = self.list_column_layout();
         let list = uniform_list(
             "listing-results",
             count,
@@ -451,7 +454,13 @@ impl DirectoryWindow {
                                 .gap_2()
                                 .px_3()
                                 .child(icon)
-                                .child(div().min_w_0().truncate().child(file_name(&entry)))
+                                .child(
+                                    div()
+                                        .debug_selector(move || format!("entry-{index}-name"))
+                                        .min_w_0()
+                                        .truncate()
+                                        .child(file_name(&entry)),
+                                )
                                 .children(entry_tag_dots(
                                     &entry,
                                     format!("entry-tags-{index}"),
@@ -475,8 +484,24 @@ impl DirectoryWindow {
                                 ),
                         )
                         .children(custom_cells)
-                        .child(div().w(px(size_width)).px_3().text_sm().child(size))
-                        .child(div().w(px(modified_width)).px_3().text_sm().child(modified))
+                        .child(
+                            div()
+                                .flex_none()
+                                .w(px(size_width))
+                                .px_2()
+                                .truncate()
+                                .text_sm()
+                                .child(size),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .w(px(modified_width))
+                                .px_2()
+                                .truncate()
+                                .text_sm()
+                                .child(modified),
+                        )
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
