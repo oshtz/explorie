@@ -1001,7 +1001,7 @@ impl DirectoryWindow {
         };
         let toolbar_button_size = 32.0 * palette.scale * density_scale;
         let popover_top = toolbar_button_size + 4.0;
-        let breadcrumbs = self.render_breadcrumbs(cx);
+        let breadcrumbs = self.render_breadcrumbs(compact, cx);
         let query_preview: String = self.browser.search_query().chars().take(20).collect();
         let search_label = if query_preview.is_empty() {
             "Search".to_string()
@@ -1676,6 +1676,16 @@ impl DirectoryWindow {
                     .flex()
                     .items_center()
                     .gap_1()
+                    .when(!compact, |mut controls| {
+                        // Give the search field's spare width to the path
+                        // before the breadcrumbs start collapsing: these
+                        // controls shrink far faster, down to the search
+                        // field's minimum beside the view, sort, filter and
+                        // more buttons (seven buttons, each after a gap).
+                        controls.style().flex_shrink = Some(1_000.0);
+                        controls
+                            .min_w(px(112.0 + 7.0 * (toolbar_button_size + 4.0 * palette.scale)))
+                    })
                     .when(compact, |controls| controls.w_full().justify_end())
                     .when_some(compact_plugin_badges, |controls, badge| {
                         controls.child(badge)

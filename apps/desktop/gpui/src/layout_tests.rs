@@ -170,3 +170,76 @@ fn list_names_stay_whole_beside_a_custom_column_with_the_inspector_open(cx: &mut
         assert!(f32::from(window.debug_bounds(selector).unwrap().size.width) >= 56.0);
     }
 }
+
+fn crumb_bounds(window: &mut gpui::VisualTestContext, index: usize) -> gpui::Bounds<Pixels> {
+    window
+        .debug_bounds(Box::leak(format!("breadcrumb-{index}").into_boxed_str()))
+        .unwrap()
+}
+
+#[gpui::test]
+fn toolbar_breadcrumbs_take_the_room_the_search_field_can_spare(cx: &mut TestAppContext) {
+    let directory = ["Users", "someone", "Desktop", "Fixture", "Documents"]
+        .iter()
+        .fold(PathBuf::from("Volumes"), |path, part| path.join(part));
+    let stack = build_path_stack(&directory);
+    let current = stack.len() - 1;
+    let (view, window) = cx.add_window_view(|_, cx| {
+        DirectoryWindow::new(directory.clone(), NativeServices::default(), cx)
+    });
+    view.update(window, |view, cx| {
+        view.visuals.icon_loading_enabled = false;
+        view.settings.view.show_preview_panel = true;
+        view.listing.state = ListingState::Ready;
+        cx.notify();
+    });
+    window.simulate_resize(gpui::size(px(1_024.0), px(768.0)));
+    window.run_until_parked();
+
+    let toolbar = window.debug_bounds("browser-toolbar").unwrap();
+    let breadcrumbs = window.debug_bounds("breadcrumbs").unwrap();
+    let trailing = window.debug_bounds("toolbar-trailing-controls").unwrap();
+    let search = window.debug_bounds("search").unwrap();
+    assert_eq!(f32::from(toolbar.size.height), 40.0, "single-row toolbar");
+    assert!(
+        trailing.right() <= toolbar.right() + px(0.5),
+        "trailing controls {trailing:?} overflow the toolbar {toolbar:?}"
+    );
+    assert_eq!(
+        f32::from(search.size.width),
+        112.0,
+        "the search field shrinks before the path collapses"
+    );
+    assert!(f32::from(breadcrumbs.size.width) > 96.0);
+    // The test text system advances every character 0.6 em: 8.4 px at 14 px,
+    // plus the crumb's 8 px of padding.
+    let current_bounds = crumb_bounds(window, current);
+    assert!(
+        f32::from(current_bounds.size.width) + 0.5 >= "Documents".len() as f32 * 8.4 + 8.0,
+        "the current folder {current_bounds:?} must stay whole"
+    );
+    assert!(current_bounds.right() <= breadcrumbs.right());
+    let parent = crumb_bounds(window, current - 1);
+    assert!(
+        parent.left() >= breadcrumbs.left() && parent.right() <= current_bounds.left(),
+        "the nearest parent {parent:?} keeps what room is left before {current_bounds:?}"
+    );
+
+    // With room to spare the whole path shows and the search field is whole.
+    window.simulate_resize(gpui::size(px(1_600.0), px(768.0)));
+    window.run_until_parked();
+    assert_eq!(
+        f32::from(window.debug_bounds("search").unwrap().size.width),
+        180.0
+    );
+    let breadcrumbs = window.debug_bounds("breadcrumbs").unwrap();
+    for (index, path) in stack.iter().enumerate() {
+        let label = path.file_name().unwrap().to_string_lossy();
+        let bounds = crumb_bounds(window, index);
+        assert!(
+            f32::from(bounds.size.width) + 0.5 >= label.chars().count() as f32 * 8.4 + 8.0,
+            "{label} is truncated to {bounds:?}"
+        );
+        assert!(bounds.left() >= breadcrumbs.left() && bounds.right() <= breadcrumbs.right());
+    }
+}
