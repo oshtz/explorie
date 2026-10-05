@@ -6013,6 +6013,14 @@ fn native_finder_tags_load_render_add_remove_and_retain_failed_edits(cx: &mut Te
         window.debug_bounds("preview-metadata")
     );
     assert!(window.debug_bounds("finder-tag-0").is_some());
+    // The metadata scrolls within the whole inspector instead of a short
+    // fixed-height box that clips the tag editor.
+    let panel = window.debug_bounds("preview-panel").unwrap();
+    let metadata = window.debug_bounds("preview-metadata").unwrap();
+    assert!(
+        metadata.bottom() >= panel.bottom() - px(2.0),
+        "metadata {metadata:?} should reach the bottom of the inspector {panel:?}"
+    );
 
     assert!(window.debug_bounds("add-finder-tag").is_some());
     view.update(window, |view, cx| view.begin_add_finder_tag(cx));
