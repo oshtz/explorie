@@ -173,6 +173,7 @@ impl DirectoryWindow {
             return;
         };
         self.close_preview(cx);
+        self.end_subfolder_search(false, cx);
         self.listing.generation = self.listing.generation.wrapping_add(1);
         self.listing.task = None;
         self.column_view.generation = self.column_view.generation.wrapping_add(1);

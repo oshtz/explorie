@@ -10,8 +10,11 @@ pub(crate) struct ClipboardUi {
     pub(crate) state: Option<ClipboardState>,
     /// The system file clipboard (an in-memory stand-in in tests).
     pub(crate) files: Rc<dyn FileClipboard>,
-    /// What the system clipboard held when last read or written.
+    /// What the system clipboard held when last looked at.
     pub(crate) system: SystemClipboard,
+    /// The clipboard change count right after this window wrote `state`, so
+    /// a peek can tell whether the clipboard still holds it.
+    pub(crate) written: Option<i64>,
 }
 
 /// Window-side state of file operations: the operation panel, the conflict
@@ -94,7 +97,15 @@ impl DirectoryWindow {
             self.notify_progress(cx);
             return;
         }
-        if let Some(error) = failed_error {
+        // A conflict under the "ask" policy is a question for the user, not a
+        // failure: the operation waits for their decision.
+        let conflict_request = conflict
+            .then(|| self.operations.retry_request(&job_id))
+            .flatten()
+            .filter(|request| request.conflict_policy == ConflictPolicy::Error);
+        if let Some(error) = failed_error
+            && conflict_request.is_none()
+        {
             self.record_error("File operation failed", error);
         }
         let recovery_error = if terminal {
@@ -148,10 +159,9 @@ impl DirectoryWindow {
                 message
             });
         }
-        if conflict
-            && let Some(request) = self.operations.retry_request(&job_id)
-            && request.conflict_policy == ConflictPolicy::Error
-        {
+        if let Some(request) = conflict_request {
+            self.operations.mark_needs_decision(&job_id);
+            self.publish_operation_status(&job_id);
             if !self
                 .operation_ui
                 .conflict_prompts
@@ -170,7 +180,9 @@ impl DirectoryWindow {
         }
         if completed && let Some(request) = self.operation_ui.conflict_continuations.remove(&job_id)
         {
-            self.start_file_operation(request, cx);
+            if let Some(next_id) = self.try_start_file_operation(request, cx) {
+                self.supersede_operation(&job_id, &next_id, 0);
+            }
         } else if terminal {
             self.operation_ui.conflict_continuations.remove(&job_id);
         }
@@ -186,6 +198,42 @@ impl DirectoryWindow {
         self.recovery.notice =
             !self.recovery.interrupted.is_empty() || !self.recovery.jobs.is_empty();
         cx.notify();
+    }
+
+    /// Mirror a local status change (one native events don't report, such as
+    /// waiting for a conflict decision) to the other windows' panels.
+    fn publish_operation_status(&self, id: &str) {
+        let Some(lifetime) = self.window_lifetime.as_ref() else {
+            return;
+        };
+        if let Some(operation) = self
+            .operations
+            .operations()
+            .iter()
+            .find(|operation| operation.id() == id)
+        {
+            lifetime.runtime.finish_background_operation(
+                id,
+                operation.status(),
+                operation.error().map(str::to_string),
+            );
+        }
+    }
+
+    /// Let the job carrying out a conflict decision take over the history
+    /// entry of the job that stopped at the conflict.
+    fn supersede_operation(&mut self, previous_id: &str, next_id: &str, skipped: usize) {
+        if self.operations.supersede(previous_id, next_id, skipped)
+            && let Some(lifetime) = self.window_lifetime.as_ref()
+        {
+            lifetime.runtime.forget_operation(previous_id);
+        }
+    }
+
+    /// Settle a conflict prompt's operation without starting another job.
+    fn settle_conflict_decision(&mut self, id: &str, unresolved: usize, cancelled: bool) {
+        self.operations.settle_decision(id, unresolved, cancelled);
+        self.publish_operation_status(id);
     }
 
     /// Redraws for a progress-only update at most ~10 times per second, with a
@@ -329,9 +377,16 @@ impl DirectoryWindow {
                 ClipboardKind::Copy => "Copied",
                 ClipboardKind::Cut => "Cut",
             };
+            self.clipboard.written = None;
             self.status_message = Some(match written {
                 Ok(()) => {
-                    self.clipboard.system = SystemClipboard::Files(state);
+                    self.clipboard.system = SystemClipboard::Files(count);
+                    self.clipboard.written = self
+                        .clipboard
+                        .files
+                        .peek()
+                        .ok()
+                        .map(|summary| summary.change_count);
                     format!("{verb} {count} item(s) to the clipboard")
                 }
                 Err(error) => {
@@ -347,33 +402,58 @@ impl DirectoryWindow {
         cx.notify();
     }
 
-    /// Read the system clipboard and update the paste affordances. The
-    /// in-app state is dropped once the system clipboard no longer holds
-    /// what this window put there.
+    /// Look at the system clipboard and update the paste affordances. The
+    /// in-app state is dropped once the clipboard no longer holds what this
+    /// window put there. Only peeks: on macOS, reading files another app
+    /// copied outside a paste the user started would ask for permission.
     pub(crate) fn refresh_system_clipboard(&mut self) {
-        match self.clipboard.files.read() {
-            Ok(files) => {
-                self.clipboard.system = SystemClipboard::from_files(files);
-                let current = match &self.clipboard.system {
-                    SystemClipboard::Files(state) => Some(state),
-                    _ => None,
-                };
-                if self.clipboard.state.is_some() && self.clipboard.state.as_ref() != current {
+        match self.clipboard.files.peek() {
+            Ok(summary) => {
+                self.clipboard.system = SystemClipboard::from_summary(&summary);
+                if self.clipboard.written != Some(summary.change_count) {
                     self.clipboard.state = None;
+                    self.clipboard.written = None;
                 }
             }
             Err(_) => self.clipboard.system = SystemClipboard::Unknown,
         }
     }
 
-    /// What Paste would paste, as of the last clipboard read: the system
-    /// clipboard's files, or the in-app state when the system clipboard
-    /// cannot be read.
-    pub(crate) fn paste_candidate(&self) -> Option<&ClipboardState> {
+    /// How many items Paste would paste, as of the last look at the
+    /// clipboard: the system clipboard's files, or the in-app state when the
+    /// system clipboard is unavailable.
+    pub(crate) fn paste_count(&self) -> Option<usize> {
         match &self.clipboard.system {
-            SystemClipboard::Files(state) => Some(state),
+            SystemClipboard::Files(count) => Some(*count),
             SystemClipboard::Empty => None,
-            SystemClipboard::Unknown => self.clipboard.state.as_ref(),
+            SystemClipboard::Unknown => {
+                self.clipboard.state.as_ref().map(|state| state.paths.len())
+            }
+        }
+    }
+
+    /// Read the files to paste. Files macOS withheld report guidance instead
+    /// of "Nothing to paste"; an unavailable clipboard falls back to the
+    /// in-app state.
+    fn read_paste_source(&mut self) -> Result<Option<ClipboardState>, String> {
+        match self.clipboard.files.read() {
+            Ok(files) => {
+                self.clipboard.system = SystemClipboard::from_files(files.as_ref());
+                let current = files.and_then(file_clipboard::clipboard_state);
+                if self.clipboard.state.is_some() && self.clipboard.state != current {
+                    self.clipboard.state = None;
+                    self.clipboard.written = None;
+                }
+                Ok(current)
+            }
+            Err(error) if error.code == ErrorCode::PermissionDenied => {
+                self.record_error("Clipboard read blocked", error.message.clone());
+                Err(error.message)
+            }
+            Err(_) => {
+                self.clipboard.system = SystemClipboard::Unknown;
+                Ok(self.clipboard.state.clone())
+            }
         }
     }
 
@@ -382,11 +462,18 @@ impl DirectoryWindow {
     /// pastes as a move. Text on the clipboard means there is nothing to
     /// paste.
     pub(crate) fn paste(&mut self, cx: &mut Context<Self>) {
-        self.refresh_system_clipboard();
-        let Some(clipboard) = self.paste_candidate().cloned() else {
-            self.status_message = Some("Nothing to paste".to_string());
-            cx.notify();
-            return;
+        let clipboard = match self.read_paste_source() {
+            Ok(Some(clipboard)) => clipboard,
+            Ok(None) => {
+                self.status_message = Some("Nothing to paste".to_string());
+                cx.notify();
+                return;
+            }
+            Err(guidance) => {
+                self.status_message = Some(guidance);
+                cx.notify();
+                return;
+            }
         };
         let kind = match clipboard.kind {
             ClipboardKind::Copy => FileOperationKind::Copy,
@@ -418,6 +505,12 @@ impl DirectoryWindow {
         else {
             return;
         };
+        // Only explorie writes the cut marker, and reading what this app
+        // wrote never asks; peek first so a clipboard another app replaced
+        // meanwhile is never read.
+        if !self.clipboard.files.peek().is_ok_and(|summary| summary.cut) {
+            return;
+        }
         let Ok(Some(files)) = self.clipboard.files.read() else {
             return;
         };
@@ -550,8 +643,16 @@ impl DirectoryWindow {
             return;
         };
         let count = request.sources.len();
-        if self.try_start_file_operation(request, cx).is_some() {
+        let awaiting_decision = self.operations.operations().iter().any(|operation| {
+            operation.id() == previous_id && operation.status() == OperationStatus::NeedsDecision
+        });
+        if let Some(id) = self.try_start_file_operation(request, cx) {
             self.operations.mark_retry_started(previous_id);
+            if awaiting_decision {
+                // Retrying answers the pending conflict: the new job carries on
+                // the waiting operation's entry.
+                self.supersede_operation(previous_id, &id, 0);
+            }
             self.operation_ui
                 .conflict_prompts
                 .retain(|prompt| prompt.job_id != previous_id);
@@ -584,7 +685,7 @@ impl DirectoryWindow {
 
         if choice == FileConflictChoice::Skip {
             if prompt.apply_to_all || count == 1 {
-                self.operations.mark_retry_started(&prompt.job_id);
+                self.settle_conflict_decision(&prompt.job_id, count, false);
                 self.operation_ui.conflict_prompts.pop_front();
                 self.status_message = Some(if count == 1 {
                     format!("Skipped {}", path_label(&current))
@@ -597,8 +698,9 @@ impl DirectoryWindow {
 
             let mut remainder = prompt.request.clone();
             remainder.sources.remove(0);
-            if self.try_start_file_operation(remainder, cx).is_some() {
+            if let Some(id) = self.try_start_file_operation(remainder, cx) {
                 self.operations.mark_retry_started(&prompt.job_id);
+                self.supersede_operation(&prompt.job_id, &id, 1);
                 self.operation_ui.conflict_prompts.pop_front();
                 self.status_message = Some(format!(
                     "Skipped {} • continuing with {} item(s)",
@@ -628,6 +730,7 @@ impl DirectoryWindow {
             return;
         };
         self.operations.mark_retry_started(&prompt.job_id);
+        self.supersede_operation(&prompt.job_id, &id, 0);
         self.operation_ui.conflict_prompts.pop_front();
         if let Some(continuation) = continuation {
             self.operation_ui
@@ -654,7 +757,7 @@ impl DirectoryWindow {
             .map(|prompt| prompt.request.sources.len())
             .sum::<usize>();
         for prompt in prompts {
-            self.operations.mark_retry_started(&prompt.job_id);
+            self.settle_conflict_decision(&prompt.job_id, prompt.request.sources.len(), true);
         }
         self.status_message = Some(format!("Cancelled {count} unresolved item(s)"));
         cx.notify();
@@ -955,6 +1058,7 @@ impl DirectoryWindow {
         div()
             .id("file-conflict-backdrop")
             .debug_selector(|| "file-conflict-backdrop".to_string())
+            .occlude()
             .absolute()
             .inset_0()
             .flex()
@@ -1158,7 +1262,18 @@ impl DirectoryWindow {
                 .iter()
                 .filter(|operation| operation.status == OperationStatus::Failed)
                 .count();
-        let finished_count = self.operations.operations().len() - queue_active_count;
+        let waiting_count = self
+            .operations
+            .operations()
+            .iter()
+            .filter(|operation| operation.status() == OperationStatus::NeedsDecision)
+            .count();
+        let finished_count = self
+            .operations
+            .operations()
+            .iter()
+            .filter(|operation| operation.status().is_settled())
+            .count();
         let has_visible_content = self.clipboard.state.is_some()
             || !self.operations.operations().is_empty()
             || !foreign_operations.is_empty()
@@ -1223,6 +1338,8 @@ impl DirectoryWindow {
 
         let status_label = if active_count > 0 {
             format!("{active_count} active")
+        } else if waiting_count > 0 {
+            "Needs decision".to_string()
         } else if failed_count > 0 {
             format!("{failed_count} failed")
         } else {
@@ -1230,6 +1347,8 @@ impl DirectoryWindow {
         };
         let status_color = if active_count > 0 {
             self.palette.accent
+        } else if waiting_count > 0 {
+            decision_color()
         } else if failed_count > 0 {
             rgb(0xff6b6b)
         } else {
@@ -1370,18 +1489,7 @@ impl DirectoryWindow {
         }
 
         for (index, operation) in foreign_operations.iter().rev().enumerate() {
-            let status = match operation.status {
-                OperationStatus::Running => "In progress",
-                OperationStatus::Completed => "Completed",
-                OperationStatus::Cancelled => "Cancelled",
-                OperationStatus::Failed => "Failed",
-            };
-            let status_color = match operation.status {
-                OperationStatus::Running => self.palette.accent,
-                OperationStatus::Completed => rgb(0x6fcf97),
-                OperationStatus::Cancelled => rgb(0xffb86c),
-                OperationStatus::Failed => rgb(0xff6b6b),
-            };
+            let (status, status_color) = operation_status_label(operation.status, self.palette);
             let destination = operation
                 .destination
                 .as_deref()
@@ -1471,7 +1579,8 @@ impl DirectoryWindow {
             .enumerate()
         {
             let kind = file_operation_label(operation.request().kind);
-            let count = operation.request().sources.len();
+            let count = operation.total_items();
+            let skipped = operation.skipped_items();
             let destination = operation
                 .request()
                 .destination
@@ -1479,16 +1588,16 @@ impl DirectoryWindow {
                 .map(path_label)
                 .map(|destination| format!(" → {destination}"))
                 .unwrap_or_default();
+            let skipped_note = if skipped > 0 {
+                format!(" • {skipped} skipped")
+            } else {
+                String::new()
+            };
             let details = format!(
-                "{count} item{}{destination}",
+                "{count} item{}{destination}{skipped_note}",
                 if count == 1 { "" } else { "s" }
             );
-            let (status, status_color) = match operation.status() {
-                OperationStatus::Running => ("In progress", self.palette.accent),
-                OperationStatus::Completed => ("Completed", rgb(0x6fcf97)),
-                OperationStatus::Cancelled => ("Cancelled", rgb(0xffb86c)),
-                OperationStatus::Failed => ("Failed", rgb(0xff6b6b)),
-            };
+            let (status, status_color) = operation_status_label(operation.status(), self.palette);
             let progress_fraction = operation.progress().map_or_else(
                 || {
                     if operation.status() == OperationStatus::Completed {
@@ -1528,8 +1637,25 @@ impl DirectoryWindow {
                 .and_then(|progress| progress.current_path.as_deref())
                 .map(|path| path.display().to_string());
             let error = operation.error().map(str::to_string);
+            let decision = (operation.status() == OperationStatus::NeedsDecision).then(|| {
+                let conflict = self
+                    .operation_ui
+                    .conflict_prompts
+                    .iter()
+                    .find(|prompt| prompt.job_id == operation.id())
+                    .and_then(FileConflictPrompt::current_source)
+                    .map(path_label);
+                match conflict {
+                    Some(name) => {
+                        format!("“{name}” already exists • choose Skip, Replace or Keep Both")
+                    }
+                    None => "Waiting for a conflict decision".to_string(),
+                }
+            });
             let running = operation.status() == OperationStatus::Running;
+            let settled = operation.status().is_settled();
             let retryable = operation.retryable_count() > 0
+                && operation.status() != OperationStatus::NeedsDecision
                 && operation.request().kind != FileOperationKind::Trash;
             let operation_id = operation.id().to_string();
             let cancel_id = operation_id.clone();
@@ -1612,12 +1738,13 @@ impl DirectoryWindow {
                                         "Retry",
                                         rgb(0x31523b),
                                     )
+                                    .debug_selector(move || format!("retry-operation-{index}"))
                                     .on_click(cx.listener(
                                         move |this, _, _, cx| this.retry_operation(&retry_id, cx),
                                     )),
                                 )
                             })
-                            .when(!running, |header| {
+                            .when(settled, |header| {
                                 header.child(
                                     operation_icon_button(
                                         ("remove-operation", index),
@@ -1679,6 +1806,20 @@ impl DirectoryWindow {
                                 .text_xs()
                                 .text_color(self.palette.tertiary)
                                 .child(current_path),
+                        )
+                    })
+                    .when_some(decision, |row, decision| {
+                        row.child(
+                            div()
+                                .debug_selector(move || format!("operation-decision-{index}"))
+                                .p_2()
+                                .rounded_sm()
+                                .border_1()
+                                .border_color(with_alpha(decision_color(), 0.4))
+                                .bg(with_alpha(decision_color(), 0.1))
+                                .text_xs()
+                                .text_color(decision_color())
+                                .child(decision),
                         )
                     })
                     .when_some(error, |row, error| {
@@ -1829,5 +1970,22 @@ impl DirectoryWindow {
                 )
             })
             .into_any_element()
+    }
+}
+
+/// The amber used for operations waiting on the user's decision.
+fn decision_color() -> Rgba {
+    rgb(0xfbbf24)
+}
+
+/// The status word and color an operation row shows.
+fn operation_status_label(status: OperationStatus, palette: UiPalette) -> (&'static str, Rgba) {
+    match status {
+        OperationStatus::Running => ("In progress", palette.accent),
+        OperationStatus::Completed => ("Completed", rgb(0x6fcf97)),
+        OperationStatus::Cancelled => ("Cancelled", rgb(0xffb86c)),
+        OperationStatus::Failed => ("Failed", rgb(0xff6b6b)),
+        OperationStatus::NeedsDecision => ("Needs decision", decision_color()),
+        OperationStatus::Skipped => ("Skipped", palette.muted),
     }
 }

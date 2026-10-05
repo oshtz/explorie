@@ -38,19 +38,65 @@ pub(crate) fn sort_label(browser: &BrowserState, key: &SortKey) -> String {
     }
 }
 
-pub(crate) fn list_custom_column_width(viewport_width: f32, column_count: usize) -> f32 {
-    if column_count == 0 {
-        return 0.0;
-    }
-    const BUILT_IN_AND_NAME_ALLOWANCE: f32 = 420.0; // 180 px Name + 110 px Size + 130 px Modified
-    ((viewport_width - BUILT_IN_AND_NAME_ALLOWANCE) / column_count as f32).clamp(48.0, 160.0)
+/// List view widths for every column but Name, which takes what they leave.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ListColumnWidths {
+    pub(crate) custom: Vec<f32>,
+    pub(crate) size: f32,
+    pub(crate) modified: f32,
 }
 
-pub(crate) fn list_builtin_column_widths(custom_column_count: usize) -> (f32, f32) {
-    if custom_column_count == 0 {
-        (120.0, 140.0)
+/// Name gets at least this much before the other columns give up any of
+/// their preferred width; ~12 characters of the default font plus the icon.
+const LIST_NAME_TARGET_WIDTH: f32 = 200.0;
+const LIST_SIZE_WIDTH: (f32, f32) = (80.0, 110.0);
+const LIST_MODIFIED_WIDTH: (f32, f32) = (118.0, 130.0);
+const LIST_CUSTOM_WIDTH: (f32, f32) = (56.0, 120.0);
+
+/// Lays out the list's fixed columns for a `viewport_width` list. Widths the
+/// user set (`Some`) are kept. The rest take their preferred widths while Name
+/// still gets [`LIST_NAME_TARGET_WIDTH`], then shrink together toward their
+/// minimums (custom columns the most) so Name keeps the remaining space.
+pub(crate) fn list_column_widths(
+    viewport_width: f32,
+    size: Option<f32>,
+    modified: Option<f32>,
+    custom: &[Option<f32>],
+) -> ListColumnWidths {
+    // Without custom columns the built-ins keep their roomier legacy widths.
+    let (size_range, modified_range) = if custom.is_empty() {
+        ((LIST_SIZE_WIDTH.0, 120.0), (LIST_MODIFIED_WIDTH.0, 140.0))
     } else {
-        (110.0, 130.0)
+        (LIST_SIZE_WIDTH, LIST_MODIFIED_WIDTH)
+    };
+    let columns = custom
+        .iter()
+        .map(|width| (*width, LIST_CUSTOM_WIDTH))
+        .chain([(size, size_range), (modified, modified_range)])
+        .collect::<Vec<_>>();
+    let fixed: f32 = columns.iter().filter_map(|(width, _)| *width).sum();
+    let (minimum, preferred) = columns
+        .iter()
+        .filter(|(width, _)| width.is_none())
+        .fold((0.0, 0.0), |(minimum, preferred), (_, range)| {
+            (minimum + range.0, preferred + range.1)
+        });
+    let available = viewport_width - SELECTION_MARQUEE_GUTTER - fixed - LIST_NAME_TARGET_WIDTH;
+    let share = if preferred > minimum {
+        ((available - minimum) / (preferred - minimum)).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let mut widths = columns.into_iter().map(|(width, (minimum, preferred))| {
+        width.unwrap_or_else(|| (minimum + (preferred - minimum) * share).floor())
+    });
+    let custom = widths.by_ref().take(custom.len()).collect();
+    let size = widths.next().unwrap_or(size_range.1);
+    let modified = widths.next().unwrap_or(modified_range.1);
+    ListColumnWidths {
+        custom,
+        size,
+        modified,
     }
 }
 
@@ -727,5 +773,47 @@ mod tests {
         for label in ["Today, 00:00", "Yesterday", "2026-02-27"] {
             assert!(label.chars().count() <= 12, "{label} fits the column");
         }
+    }
+
+    #[test]
+    fn list_columns_yield_width_to_name_before_truncating_it() {
+        // 1024 px window with the sidebar and inspector open.
+        let tight = list_column_widths(420.0, None, None, &[None]);
+        assert_eq!(
+            tight,
+            ListColumnWidths {
+                custom: vec![56.0],
+                size: 80.0,
+                modified: 118.0,
+            }
+        );
+        // Wide windows keep the preferred widths.
+        let wide = list_column_widths(1_200.0, None, None, &[None]);
+        assert_eq!(
+            wide,
+            ListColumnWidths {
+                custom: vec![120.0],
+                size: 110.0,
+                modified: 130.0,
+            }
+        );
+        assert_eq!(
+            list_column_widths(1_200.0, None, None, &[]),
+            ListColumnWidths {
+                custom: Vec::new(),
+                size: 120.0,
+                modified: 140.0,
+            }
+        );
+        // In between, the columns shrink together and Name keeps its target.
+        let middle = list_column_widths(520.0, None, None, &[None]);
+        assert!(tight.size < middle.size && middle.size < wide.size);
+        let taken = middle.custom[0] + middle.size + middle.modified;
+        assert!(520.0 - SELECTION_MARQUEE_GUTTER - taken >= LIST_NAME_TARGET_WIDTH);
+        // Widths the user set win, even when they crowd Name.
+        let resized = list_column_widths(420.0, Some(200.0), None, &[Some(150.0)]);
+        assert_eq!(resized.size, 200.0);
+        assert_eq!(resized.custom, vec![150.0]);
+        assert_eq!(resized.modified, 118.0);
     }
 }

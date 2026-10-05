@@ -40,6 +40,9 @@ pub(crate) struct ColumnViewUi {
     pub(crate) scroll_handles: Vec<UniformListScrollHandle>,
     pub(crate) strip_scroll: ScrollHandle,
     pub(crate) scroll_to_leaf_attempts: u8,
+    /// Width the trailing preview gains so the strip can scroll to a column
+    /// boundary (see [`leaf_alignment`](crate::column::leaf_alignment)).
+    pub(crate) preview_fill: f32,
     pub(crate) selection: BTreeSet<PathBuf>,
     pub(crate) pending_selection: Option<ColumnSelectionTarget>,
 }
@@ -48,11 +51,7 @@ impl DirectoryWindow {
     pub fn start_listing(&mut self, cx: &mut Context<Self>) {
         self.start_disk_info(cx);
         self.clear_plugin_context(cx);
-        if let Some(criteria) = self
-            .browser
-            .active_smart_folder()
-            .map(|folder| folder.criteria().clone())
-        {
+        if let Some(criteria) = self.listing_search_criteria() {
             self.start_smart_search(criteria, cx);
         } else if self.browser.view_mode() == ViewMode::Column {
             self.start_column_listings(true, cx);
@@ -166,9 +165,7 @@ impl DirectoryWindow {
         self.listing
             .warning
             .as_ref()
-            .filter(|(path, _)| {
-                path == self.browser.path() && self.browser.active_smart_folder().is_none()
-            })
+            .filter(|(path, _)| path == self.browser.path() && !self.listing_shows_search_results())
             .map(|(_, warning)| warning.as_str())
     }
 
@@ -329,7 +326,7 @@ impl DirectoryWindow {
     }
 
     pub(crate) fn listing_in_flight(&self) -> bool {
-        if self.browser.active_smart_folder().is_some() {
+        if self.listing_shows_search_results() {
             self.search.task.is_some()
         } else if self.browser.view_mode() == ViewMode::Column {
             self.column_view
@@ -343,11 +340,7 @@ impl DirectoryWindow {
     }
 
     pub(crate) fn refresh(&mut self, cx: &mut Context<Self>) {
-        if let Some(criteria) = self
-            .browser
-            .active_smart_folder()
-            .map(|folder| folder.criteria().clone())
-        {
+        if let Some(criteria) = self.listing_search_criteria() {
             self.start_smart_search(criteria, cx);
         } else if self.browser.view_mode() == ViewMode::Column {
             self.start_column_listings(false, cx);
@@ -361,7 +354,14 @@ impl DirectoryWindow {
             return;
         }
         self.pointer.selection_marquee = None;
+        if view_mode == ViewMode::Column {
+            // Column view can't show a flat list of subfolder results.
+            self.end_subfolder_search(false, cx);
+        }
         self.browser.set_view_mode(view_mode);
+        if self.search.subfolders.is_some() {
+            self.browser.show_search_results(true);
+        }
         self.settings.view.view_mode = view_mode;
         self.persist_settings();
         self.persist_session();

@@ -193,6 +193,9 @@ pub struct BrowserState {
     sort_key: SortKey,
     sort_direction: SortDirection,
     view_mode: ViewMode,
+    /// The view shown instead of `view_mode` while the listing holds a
+    /// flat list of search results Column view can't show.
+    search_results_view: Option<ViewMode>,
     search_query: String,
     folder_view_states: HashMap<PathBuf, FolderViewState>,
     pending_selection: Vec<PathBuf>,
@@ -225,6 +228,7 @@ impl BrowserState {
             sort_key: SortKey::Name,
             sort_direction: SortDirection::Ascending,
             view_mode: ViewMode::List,
+            search_results_view: None,
             search_query: String::new(),
             folder_view_states: HashMap::new(),
             pending_selection: Vec::new(),
@@ -381,11 +385,20 @@ impl BrowserState {
     }
 
     pub fn view_mode(&self) -> ViewMode {
-        self.view_mode
+        self.search_results_view.unwrap_or(self.view_mode)
     }
 
     pub fn set_view_mode(&mut self, view_mode: ViewMode) {
         self.view_mode = view_mode;
+        self.search_results_view = None;
+    }
+
+    /// Show the listing's search results as a list while it holds them if
+    /// the folder's own view is Column view, without changing the view the
+    /// folder remembers; `false` returns to that view.
+    pub(crate) fn show_search_results(&mut self, showing: bool) {
+        self.search_results_view =
+            (showing && self.view_mode == ViewMode::Column).then_some(ViewMode::List);
     }
 
     /// The filter, sort and search settings other listings (Column view

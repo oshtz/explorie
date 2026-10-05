@@ -2,8 +2,34 @@
 
 use crate::*;
 
-/// Search in this window: whether the search field is active, and the
-/// smart-folder search running with its progress.
+/// How long typing must pause before a subfolder search starts, so each
+/// keystroke doesn't restart the crawl.
+pub(crate) const SUBFOLDER_SEARCH_DELAY: Duration = Duration::from_millis(250);
+
+/// The longest folder name the search scope bar shows in full.
+const SCOPE_FOLDER_LABEL_CHARS: usize = 24;
+
+/// Where the search field looks. "This Folder" filters the folder's own
+/// listing as you type; "Subfolders" is Finder's folder scope: the folder
+/// and everything under it, found by the same Spotlight + crawler search
+/// smart folders use.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum SearchScope {
+    #[default]
+    ThisFolder,
+    Subfolders,
+}
+
+/// A search of a folder's subfolders whose results the listing shows in
+/// place of the folder's own entries.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SubfolderSearch {
+    pub(crate) root: PathBuf,
+    pub(crate) query: String,
+}
+
+/// Search in this window: whether the search field is active, its scope,
+/// and the smart-folder or subfolder search running with its progress.
 #[derive(Default)]
 pub(crate) struct SearchUi {
     pub(crate) active: bool,
@@ -11,9 +37,197 @@ pub(crate) struct SearchUi {
     pub(crate) generation: u64,
     pub(crate) request_id: Option<String>,
     pub(crate) progress: Option<SearchProgressEvent>,
+    pub(crate) scope: SearchScope,
+    /// The subfolder search the listing shows, if any.
+    pub(crate) subfolders: Option<SubfolderSearch>,
+    /// A subfolder search waiting for typing to pause.
+    pub(crate) debounce: Option<Task<()>>,
 }
 
 impl DirectoryWindow {
+    /// The search whose results the listing shows instead of a folder's
+    /// entries: the active smart folder's, or a subfolder search's.
+    pub(crate) fn listing_search_criteria(&self) -> Option<SearchCriteria> {
+        if let Some(folder) = self.browser.active_smart_folder() {
+            return Some(folder.criteria().clone());
+        }
+        let search = self.search.subfolders.as_ref()?;
+        Some(SearchCriteria {
+            name_pattern: Some(search.query.clone()),
+            type_filter: match self.browser.filter() {
+                EntryFilter::All => SearchType::All,
+                EntryFilter::Files => SearchType::Files,
+                EntryFilter::Folders => SearchType::Folders,
+            },
+            search_paths: vec![search.root.clone()],
+            recursive: true,
+            ..SearchCriteria::default()
+        })
+    }
+
+    /// Whether the listing holds search results rather than a folder.
+    pub(crate) fn listing_shows_search_results(&self) -> bool {
+        self.browser.active_smart_folder().is_some() || self.search.subfolders.is_some()
+    }
+
+    /// Whether keyboard focus is in the toolbar search field.
+    pub(crate) fn search_field_focused(&self, window: &Window, cx: &App) -> bool {
+        self.text_input.target == Some(TextInputTarget::Search)
+            && self
+                .text_input
+                .entity
+                .as_ref()
+                .is_some_and(|input| input.focus_handle(cx).is_focused(window))
+    }
+
+    /// React to the search field's query changing: keep the selection to
+    /// the items still shown, and search subfolders when that is the scope.
+    pub(crate) fn search_query_did_change(&mut self, cx: &mut Context<Self>) {
+        self.drop_hidden_selection(cx);
+        self.update_subfolder_search(cx);
+    }
+
+    /// The browser's own selection follows its filtered rows; Column view's
+    /// selection must too, so opening or acting on the selection never
+    /// reaches an item the search hides.
+    pub(crate) fn drop_hidden_selection(&mut self, cx: &mut Context<Self>) {
+        if self.column_view.selection.is_empty() {
+            return;
+        }
+        let shown: BTreeSet<PathBuf> = self
+            .column_view
+            .selection
+            .iter()
+            .filter(|path| {
+                self.column_view
+                    .columns
+                    .columns()
+                    .iter()
+                    .any(|column| column.visible_entry(&self.browser, path).is_some())
+            })
+            .cloned()
+            .collect();
+        if shown.len() != self.column_view.selection.len() {
+            self.column_view.selection = shown;
+            self.sync_pinned_preview(cx);
+        }
+    }
+
+    /// Start, restart (after a pause in typing) or end the subfolder search
+    /// to match the scope and query.
+    pub(crate) fn update_subfolder_search(&mut self, cx: &mut Context<Self>) {
+        let query = self.browser.search_query().trim().to_string();
+        if self.search.scope != SearchScope::Subfolders
+            || query.is_empty()
+            || self.browser.active_smart_folder().is_some()
+        {
+            self.end_subfolder_search(true, cx);
+            return;
+        }
+        if self.search.subfolders.as_ref().is_some_and(|search| {
+            search.query == query && search.root.as_path() == self.browser.path()
+        }) {
+            self.search.debounce = None;
+            return;
+        }
+        let executor = cx.background_executor().clone();
+        self.search.debounce = Some(cx.spawn(async move |this, cx| {
+            executor.timer(SUBFOLDER_SEARCH_DELAY).await;
+            let _ = this.update(cx, |view, cx| view.start_subfolder_search(cx));
+        }));
+    }
+
+    /// Search the current folder's subfolders for the query now, showing the
+    /// results in the listing (as a list, if the folder uses Column view).
+    pub(crate) fn start_subfolder_search(&mut self, cx: &mut Context<Self>) {
+        self.search.debounce = None;
+        let query = self.browser.search_query().trim().to_string();
+        if self.search.scope != SearchScope::Subfolders
+            || query.is_empty()
+            || self.browser.active_smart_folder().is_some()
+        {
+            return;
+        }
+        self.search.subfolders = Some(SubfolderSearch {
+            root: self.browser.path().to_path_buf(),
+            query,
+        });
+        self.browser.show_search_results(true);
+        self.listing.generation = self.listing.generation.wrapping_add(1);
+        self.listing.task = None;
+        self.column_view.generation = self.column_view.generation.wrapping_add(1);
+        self.column_view.tasks.clear();
+        self.column_view.selection.clear();
+        if let Some(criteria) = self.listing_search_criteria() {
+            self.start_smart_search(criteria, cx);
+        }
+        self.start_watching(cx);
+        self.listing
+            .scroll_handle
+            .scroll_to_item_strict(0, ScrollStrategy::Top);
+        cx.notify();
+    }
+
+    /// Stop showing subfolder results; with `relist`, show the folder's own
+    /// entries again (a folder change lists the new folder itself).
+    pub(crate) fn end_subfolder_search(&mut self, relist: bool, cx: &mut Context<Self>) {
+        self.search.debounce = None;
+        if self.search.subfolders.take().is_none() {
+            return;
+        }
+        self.services.search.cancel();
+        self.search.generation = self.search.generation.wrapping_add(1);
+        self.search.task = None;
+        self.search.request_id = None;
+        self.search.progress = None;
+        self.browser.show_search_results(false);
+        if relist {
+            self.start_listing(cx);
+            self.start_watching(cx);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn set_search_scope(&mut self, scope: SearchScope, cx: &mut Context<Self>) {
+        if self.search.scope == scope {
+            return;
+        }
+        self.search.scope = scope;
+        match scope {
+            SearchScope::Subfolders => self.start_subfolder_search(cx),
+            SearchScope::ThisFolder => self.end_subfolder_search(true, cx),
+        }
+        // Keep typing in the field after picking a scope.
+        if self.search.active {
+            self.text_input.focus_pending = true;
+        }
+        cx.notify();
+    }
+
+    /// Clear the search and give the keyboard back to the file list, as
+    /// Escape in the field and its clear button do.
+    pub(crate) fn clear_search_and_focus_list(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.browser.clear_search();
+        self.search.active = false;
+        self.deactivate_native_text_input();
+        self.end_subfolder_search(true, cx);
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    /// Like Finder, leaving a folder ends its search.
+    pub(crate) fn reset_search_for_navigation(&mut self) {
+        self.browser.clear_search();
+        self.search.active = false;
+        if self.text_input.target == Some(TextInputTarget::Search) {
+            self.deactivate_native_text_input();
+        }
+    }
+
     pub(crate) fn start_smart_search(&mut self, criteria: SearchCriteria, cx: &mut Context<Self>) {
         self.cancel_watcher_patch();
         self.services.search.cancel();
@@ -49,12 +263,17 @@ impl DirectoryWindow {
     pub(crate) fn apply_search_event(&mut self, event: SearchEvent, cx: &mut Context<Self>) {
         match event {
             SearchEvent::Completed { generation, result }
-                if generation == self.search.generation
-                    && self.browser.active_smart_folder().is_some() =>
+                if generation == self.search.generation && self.listing_shows_search_results() =>
             {
                 self.search.task = None;
                 self.search.request_id = None;
-                let status = search_result_status(&result);
+                let root = self
+                    .search
+                    .subfolders
+                    .as_ref()
+                    .filter(|_| self.browser.active_smart_folder().is_none())
+                    .map(|search| search.root.as_path());
+                let status = search_result_status(&result, root);
                 self.browser.replace_entries(result.entries);
                 self.listing.state = ListingState::Ready;
                 self.status_message = Some(status);
@@ -62,8 +281,7 @@ impl DirectoryWindow {
                 self.finish_pending_preview_refresh(cx);
             }
             SearchEvent::Failed { generation, error }
-                if generation == self.search.generation
-                    && self.browser.active_smart_folder().is_some() =>
+                if generation == self.search.generation && self.listing_shows_search_results() =>
             {
                 self.search.task = None;
                 self.search.request_id = None;
@@ -77,9 +295,9 @@ impl DirectoryWindow {
                     self.watcher.refresh_pending = false;
                     return;
                 }
-                self.record_error("Smart-folder search failed", error.to_string());
+                self.record_error("Search failed", error.to_string());
                 self.listing.state = ListingState::Failed(error.to_string());
-                self.status_message = Some(format!("Smart-folder search failed: {error}"));
+                self.status_message = Some(format!("Search failed: {error}"));
             }
             SearchEvent::Completed { .. } | SearchEvent::Failed { .. } => {}
         }
@@ -92,7 +310,7 @@ impl DirectoryWindow {
         cx: &mut Context<Self>,
     ) {
         if self.search.request_id.as_deref() != Some(progress.request_id.as_str())
-            || self.browser.active_smart_folder().is_none()
+            || !self.listing_shows_search_results()
         {
             return;
         }
@@ -146,11 +364,68 @@ impl DirectoryWindow {
         cx.notify();
     }
 
+    /// Finder's search scope bar: while the search field is in use, choose
+    /// between this folder's items and the folder with all its subfolders.
+    /// Smart folders carry their own scope, so they don't show it.
+    pub(crate) fn render_search_scope_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        if self.browser.active_smart_folder().is_some()
+            || (!self.search.active && self.browser.search_query().is_empty())
+        {
+            return div().into_any_element();
+        }
+        let palette = self.palette;
+        let mut folder = path_label(
+            self.search
+                .subfolders
+                .as_ref()
+                .map_or(self.browser.path(), |search| search.root.as_path()),
+        );
+        // Keep both choices on screen however long the folder's name is.
+        if folder.chars().count() > SCOPE_FOLDER_LABEL_CHARS {
+            folder = folder
+                .chars()
+                .take(SCOPE_FOLDER_LABEL_CHARS - 1)
+                .chain(['…'])
+                .collect();
+        }
+        let scope = self.search.scope;
+        let button = |id: &'static str, label: String, value: SearchScope| {
+            toolbar_button(id, &label, selected_control_color(scope == value, palette))
+                .debug_selector(move || id.to_string())
+                .role(Role::RadioButton)
+                .aria_selected(scope == value)
+                .on_click(cx.listener(move |this, _, _, cx| this.set_search_scope(value, cx)))
+        };
+        div()
+            .id("search-scope-bar")
+            .debug_selector(|| "search-scope-bar".to_string())
+            .role(Role::RadioGroup)
+            .aria_label("Search scope")
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_1()
+            .border_b_1()
+            .border_color(palette.border)
+            .bg(palette.topbar)
+            .text_xs()
+            .child(div().text_color(palette.muted).child("Search:"))
+            .child(button(
+                "search-scope-this-folder",
+                format!("“{folder}”"),
+                SearchScope::ThisFolder,
+            ))
+            .child(button(
+                "search-scope-subfolders",
+                "Include subfolders".to_string(),
+                SearchScope::Subfolders,
+            ))
+            .into_any_element()
+    }
+
     pub(crate) fn rebuild_search_index(&mut self, cx: &mut Context<Self>) {
-        let active_criteria = self
-            .browser
-            .active_smart_folder()
-            .map(|folder| folder.criteria().clone());
+        let active_criteria = self.listing_search_criteria();
         if self.search.task.is_some() {
             self.cancel_smart_search(cx);
         }
@@ -354,16 +629,13 @@ impl DirectoryWindow {
         match event.keystroke.key.as_str() {
             "backspace" => {
                 self.browser.pop_search_character();
+                self.search_query_did_change(cx);
                 cx.stop_propagation();
                 cx.notify();
             }
             "escape" => {
-                self.browser.clear_search();
-                self.search.active = false;
-                self.deactivate_native_text_input();
-                window.focus(&self.focus_handle, cx);
+                self.clear_search_and_focus_list(window, cx);
                 cx.stop_propagation();
-                cx.notify();
             }
             "enter" => {
                 self.search.active = false;
@@ -380,6 +652,7 @@ impl DirectoryWindow {
                     && !text.chars().any(char::is_control)
                 {
                     self.browser.push_search_text(text);
+                    self.search_query_did_change(cx);
                     cx.stop_propagation();
                     cx.notify();
                 }
@@ -389,9 +662,10 @@ impl DirectoryWindow {
     }
 }
 
-/// The status line for a finished smart-folder search: how many results,
-/// whether they are partial, and what answered the search.
-pub(crate) fn search_result_status(result: &SearchResult) -> String {
+/// The status line for a finished smart-folder search, or a search of the
+/// subfolders of `root`: how many results, whether they are partial, and
+/// what answered the search.
+pub(crate) fn search_result_status(result: &SearchResult, root: Option<&Path>) -> String {
     let count = result.entries.len();
     let crawler_status = || {
         if result.reused_index {
@@ -407,10 +681,11 @@ pub(crate) fn search_result_status(result: &SearchResult) -> String {
         SearchSource::Mixed => format!("Spotlight + {}", crawler_status()),
         SearchSource::Crawler => crawler_status(),
     };
-    let results = format!(
-        "{count} smart-folder result{}",
-        if count == 1 { "" } else { "s" }
-    );
+    let plural = if count == 1 { "" } else { "s" };
+    let results = match root {
+        Some(root) => format!("{count} result{plural} in {}", path_label(root)),
+        None => format!("{count} smart-folder result{plural}"),
+    };
     if result.truncated {
         format!("{results} (partial results) • {source}")
     } else {

@@ -1001,7 +1001,7 @@ impl DirectoryWindow {
         };
         let toolbar_button_size = 32.0 * palette.scale * density_scale;
         let popover_top = toolbar_button_size + 4.0;
-        let breadcrumbs = self.render_breadcrumbs(cx);
+        let breadcrumbs = self.render_breadcrumbs(compact, cx);
         let query_preview: String = self.browser.search_query().chars().take(20).collect();
         let search_label = if query_preview.is_empty() {
             "Search".to_string()
@@ -1676,6 +1676,16 @@ impl DirectoryWindow {
                     .flex()
                     .items_center()
                     .gap_1()
+                    .when(!compact, |mut controls| {
+                        // Give the search field's spare width to the path
+                        // before the breadcrumbs start collapsing: these
+                        // controls shrink far faster, down to the search
+                        // field's minimum beside the view, sort, filter and
+                        // more buttons (seven buttons, each after a gap).
+                        controls.style().flex_shrink = Some(1_000.0);
+                        controls
+                            .min_w(px(112.0 + 7.0 * (toolbar_button_size + 4.0 * palette.scale)))
+                    })
                     .when(compact, |controls| controls.w_full().justify_end())
                     .when_some(compact_plugin_badges, |controls, badge| {
                         controls.child(badge)
@@ -1746,14 +1756,15 @@ impl DirectoryWindow {
                                             false,
                                             true,
                                         )
+                                        .debug_selector(|| "clear-search".to_string())
                                         .w(px(24.0 * palette.scale))
                                         .h(px(24.0 * palette.scale))
                                         .on_click(
-                                            cx.listener(|this, _, _, cx| {
-                                                this.browser.clear_search();
-                                                this.search.active = false;
-                                                this.deactivate_native_text_input();
-                                                cx.notify();
+                                            cx.listener(|this, _, window, cx| {
+                                                // Don't let the field's own click handler
+                                                // reactivate it.
+                                                cx.stop_propagation();
+                                                this.clear_search_and_focus_list(window, cx);
                                             }),
                                         ),
                                     )
@@ -1792,30 +1803,14 @@ impl DirectoryWindow {
         let name = sort_label(&self.browser, &SortKey::Name);
         let size = sort_label(&self.browser, &SortKey::Size);
         let modified = sort_label(&self.browser, &SortKey::Modified);
-        let columns = self.browser.custom_columns();
-        let custom_default =
-            list_custom_column_width(self.layout.listing_viewport_width, columns.len());
-        let (default_size_width, default_modified_width) =
-            list_builtin_column_widths(columns.len());
-        let size_width = self
-            .browser
-            .column_width("size")
-            .map_or(default_size_width, f32::from);
-        let modified_width = self
-            .browser
-            .column_width("modified")
-            .map_or(default_modified_width, f32::from);
+        let (columns, size_width, modified_width) = self.list_column_layout();
         let mut custom_headers = Vec::with_capacity(columns.len());
-        for column in columns {
+        for (column, width) in columns {
             let key = SortKey::Custom(column.clone());
             let label = sort_label(&self.browser, &key);
             let selector = format!("sort-custom-{}", column.to_lowercase());
             let aria_label = format!("Sort by custom field {column}");
             let width_key = format!("custom:{column}");
-            let width = self
-                .browser
-                .column_width(&width_key)
-                .map_or(custom_default, f32::from);
             let resize_handle = self.render_list_column_resize_handle(
                 width_key,
                 width,
@@ -1900,7 +1895,8 @@ impl DirectoryWindow {
                     .tab_stop(true)
                     .w(px(size_width))
                     .relative()
-                    .px_3()
+                    .flex_none()
+                    .px_2()
                     .focus(move |header| header.bg(palette.hover).text_color(palette.text))
                     .hover(move |header| header.bg(palette.hover).text_color(palette.text))
                     .cursor_pointer()
@@ -1920,7 +1916,8 @@ impl DirectoryWindow {
                     .tab_stop(true)
                     .w(px(modified_width))
                     .relative()
-                    .px_3()
+                    .flex_none()
+                    .px_2()
                     .focus(move |header| header.bg(palette.hover).text_color(palette.text))
                     .hover(move |header| header.bg(palette.hover).text_color(palette.text))
                     .cursor_pointer()

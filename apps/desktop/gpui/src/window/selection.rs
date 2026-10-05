@@ -445,3 +445,14 @@ impl DirectoryWindow {
         }
     }
 }
+
+/// Whether a left mouse-down on an item asks for its context menu instead
+/// of selecting: Control-click on macOS, as in Finder.
+pub(crate) fn is_secondary_click(event: &gpui::MouseDownEvent) -> bool {
+    let modifiers = event.modifiers;
+    cfg!(target_os = "macos")
+        && modifiers.control
+        && !modifiers.shift
+        && !modifiers.alt
+        && !modifiers.platform
+}

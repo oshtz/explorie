@@ -40,8 +40,15 @@ impl DirectoryWindow {
         if self.browser.navigate(path) {
             let target = self.browser.path().to_path_buf();
             self.prepare_column_selection(&origin, &target);
-            self.path_did_change(cx);
+            self.folder_did_change(cx);
         }
+    }
+
+    /// The current folder changed by navigating (not by switching tabs):
+    /// like Finder, its search ends.
+    pub(crate) fn folder_did_change(&mut self, cx: &mut Context<Self>) {
+        self.reset_search_for_navigation();
+        self.path_did_change(cx);
     }
 
     pub(crate) fn activate_column(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -59,7 +66,7 @@ impl DirectoryWindow {
         // An interaction inside the column strip must keep that view active,
         // even if this folder has a different saved view mode.
         self.browser.set_view_mode(ViewMode::Column);
-        self.path_did_change(cx);
+        self.folder_did_change(cx);
         self.column_view.pending_selection = None;
         // Use the displayed listing immediately so this click and subsequent
         // keyboard input work while the fresh directory request is pending.
@@ -343,7 +350,7 @@ impl DirectoryWindow {
         if self.browser.go_back() {
             let target = self.browser.path().to_path_buf();
             self.prepare_column_selection(&origin, &target);
-            self.path_did_change(cx);
+            self.folder_did_change(cx);
         }
     }
 
@@ -354,7 +361,7 @@ impl DirectoryWindow {
         if self.browser.go_forward() {
             let target = self.browser.path().to_path_buf();
             self.prepare_column_selection(&origin, &target);
-            self.path_did_change(cx);
+            self.folder_did_change(cx);
         }
     }
 
@@ -365,7 +372,7 @@ impl DirectoryWindow {
         if self.browser.go_to_back_history(index) {
             let target = self.browser.path().to_path_buf();
             self.prepare_column_selection(&origin, &target);
-            self.path_did_change(cx);
+            self.folder_did_change(cx);
         }
     }
 
@@ -376,7 +383,7 @@ impl DirectoryWindow {
         if self.browser.go_to_forward_history(index) {
             let target = self.browser.path().to_path_buf();
             self.prepare_column_selection(&origin, &target);
-            self.path_did_change(cx);
+            self.folder_did_change(cx);
         }
     }
 
@@ -393,7 +400,7 @@ impl DirectoryWindow {
         if self.browser.go_up() {
             let target = self.browser.path().to_path_buf();
             self.prepare_column_selection(&origin, &target);
-            self.path_did_change(cx);
+            self.folder_did_change(cx);
         }
     }
 
@@ -918,7 +925,15 @@ impl DirectoryWindow {
             .into_any_element()
     }
 
-    pub(crate) fn render_breadcrumbs(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    /// The toolbar's path. In the single-row toolbar the strip asks for its
+    /// full width and gives way only after the search field has shrunk; it
+    /// never shrinks below the current folder's whole label (up to its cap),
+    /// and ancestors collapse root-first to make room.
+    pub(crate) fn render_breadcrumbs(
+        &mut self,
+        compact: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let palette = self.palette;
         if let Some(editor) = self.navigation_ui.breadcrumb_editor.as_ref() {
             return div()
@@ -958,6 +973,19 @@ impl DirectoryWindow {
         let current_path = self.browser.path().to_path_buf();
         let stack = build_path_stack(&current_path);
         let current_index = stack.len().saturating_sub(1);
+        let current_label = stack
+            .last()
+            .map(|path| {
+                path.file_name()
+                    .unwrap_or_else(|| path.as_os_str())
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .unwrap_or_default();
+        let current_max_width = BREADCRUMB_CURRENT_MAX_WIDTH * palette.scale;
+        // The current crumb's label plus its horizontal padding.
+        let current_width = (self.breadcrumb_label_width(&current_label, cx) + 8.0 * palette.scale)
+            .min(current_max_width);
         let mut crumbs = Vec::with_capacity(stack.len());
         for (index, path) in stack.into_iter().enumerate() {
             let is_current = index == current_index;
@@ -985,12 +1013,17 @@ impl DirectoryWindow {
                 .when(is_current, |crumb| crumb.cursor_text())
                 .when(!is_current, |crumb| crumb.cursor_pointer())
                 .whitespace_nowrap()
-                .max_w(px(if is_current { 180.0 } else { 120.0 } * palette.scale))
+                .max_w(px(if is_current {
+                    current_max_width
+                } else {
+                    120.0 * palette.scale
+                }))
                 .truncate()
                 .text_sm()
                 .text_color(palette.text)
                 .when(is_current, |crumb| {
                     crumb
+                        .flex_shrink_0()
                         .min_w(px(32.0 * palette.scale))
                         .font_weight(FontWeight::SEMIBOLD)
                 })
@@ -1039,12 +1072,24 @@ impl DirectoryWindow {
             );
         }
 
+        // Room for the whole current crumb and the edit hit area beside it.
+        let min_width = (current_width + BREADCRUMB_HIT_AREA_MIN_WIDTH + 1.0).max(96.0);
         div()
             .id("breadcrumbs")
             .debug_selector(|| "breadcrumbs".to_string())
             .flex()
-            .flex_1()
-            .min_w(px(96.0))
+            .map(|strip| {
+                if compact {
+                    // A content-sized basis would wrap the actions after it
+                    // onto the second toolbar row.
+                    strip.flex_1()
+                } else {
+                    // The trailing controls shrink far faster (see
+                    // `render_toolbar`), so the path gives way last.
+                    strip.flex_auto()
+                }
+            })
+            .min_w(px(min_width))
             .items_center()
             .justify_start()
             .overflow_x_scroll()
@@ -1054,7 +1099,7 @@ impl DirectoryWindow {
                     .id("breadcrumb-edit-hit-area")
                     .debug_selector(|| "breadcrumb-edit-hit-area".to_string())
                     .flex_1()
-                    .min_w(px(8.0))
+                    .min_w(px(BREADCRUMB_HIT_AREA_MIN_WIDTH))
                     .h_full()
                     .cursor_text(),
             )
@@ -1063,6 +1108,27 @@ impl DirectoryWindow {
                 window.focus(&this.focus_handle, cx);
             }))
             .into_any_element()
+    }
+}
+
+const BREADCRUMB_CURRENT_MAX_WIDTH: f32 = 180.0;
+const BREADCRUMB_HIT_AREA_MIN_WIDTH: f32 = 8.0;
+
+impl DirectoryWindow {
+    /// Width of a breadcrumb label in the current crumb's font.
+    fn breadcrumb_label_width(&self, label: &str, cx: &App) -> f32 {
+        let text_system = cx.text_system();
+        let mut font = gpui::font(font_family(&self.settings));
+        font.weight = FontWeight::SEMIBOLD;
+        let font_id = text_system.resolve_font(&font);
+        // `text_sm` is 0.875 rem, and the rem follows the UI scale.
+        let font_size = px(14.0 * self.palette.scale);
+        let width: f32 = label
+            .chars()
+            .map(|character| f32::from(text_system.layout_width(font_id, font_size, character)))
+            .sum();
+        // Shaping can differ slightly from summed advances.
+        width.ceil() + 2.0
     }
 }
 

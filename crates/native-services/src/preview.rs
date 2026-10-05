@@ -40,6 +40,27 @@ const QUICKLOOK_THUMBNAIL_TIMEOUT: Duration = Duration::from_secs(5);
 /// Office documents can take Quick Look several seconds at preview size.
 #[cfg(target_os = "macos")]
 const QUICKLOOK_PREVIEW_TIMEOUT: Duration = Duration::from_secs(15);
+/// Edges Quick Look is asked for at preview size, largest first. It refuses
+/// some large photos (a 6016 px HEIC fails with "Could not generate a
+/// thumbnail" from about 2000 px) that it renders fine a little smaller.
+#[cfg(target_os = "macos")]
+const QUICKLOOK_PREVIEW_DIMENSIONS: [u32; 3] = [IMAGE_PREVIEW_DIMENSION, 1_600, 1_024];
+/// ImageIO decodes in process; a 36-megapixel HEIC takes about 0.3 seconds at
+/// preview size, a camera RAW somewhat longer.
+#[cfg(target_os = "macos")]
+const IMAGEIO_TIMEOUT: Duration = Duration::from_secs(15);
+/// Largest source ImageIO may decode, matching the ImageMagick area limit.
+/// ImageIO downsamples while it decodes, so even this stays far below the
+/// memory a full-resolution decode of a smaller image takes.
+#[cfg(target_os = "macos")]
+const MAX_IMAGEIO_SOURCE_PIXELS: u64 = 128_000_000;
+/// Images with more pixels than this go to ImageIO before the bundled
+/// decoders on macOS. Every thumbnail and preview of them is downsampled, and
+/// ImageIO decodes JPEG and HEIC at the reduced size and streams PNG instead of
+/// holding the full image (an 8000 px PNG peaks near 200 MB through the bundled
+/// decoder). Smaller images keep the bundled decoder's output.
+const IMAGEIO_MIN_SOURCE_PIXELS: u64 = DISPLAY_IMAGE_MAX_PIXELS;
+const IMAGEIO_TOOL: &str = "macOS ImageIO";
 const MAX_THUMBNAIL_ENTRIES: usize = 256;
 const MAX_THUMBNAIL_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_PDF_BYTES: u64 = 256 * 1024 * 1024;
@@ -712,7 +733,33 @@ fn highlight_text(path: &Path, text: &str) -> (Option<String>, Vec<TextHighlight
     if syntax.name == "Plain Text" {
         return (None, Vec::new());
     }
+    (
+        Some(syntax.name.clone()),
+        highlight_with_syntax(syntaxes, syntax, text),
+    )
+}
 
+/// Syntax highlights for a Markdown code block whose info string names
+/// `language`, either as an extension ("rs") or a name ("rust").
+pub(crate) fn highlight_code(language: &str, text: &str) -> Vec<TextHighlight> {
+    let language = language.trim().to_ascii_lowercase();
+    if language.is_empty() {
+        return Vec::new();
+    }
+    let syntaxes = syntax_set();
+    match find_syntax(syntaxes, &language).or_else(|| syntaxes.find_syntax_by_token(&language)) {
+        Some(syntax) if syntax.name != "Plain Text" => {
+            highlight_with_syntax(syntaxes, syntax, text)
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn highlight_with_syntax(
+    syntaxes: &SyntaxSet,
+    syntax: &SyntaxReference,
+    text: &str,
+) -> Vec<TextHighlight> {
     let mut parser = ParseState::new(syntax);
     let mut scopes = ScopeStack::new();
     let mut highlights = Vec::<TextHighlight>::new();
@@ -724,7 +771,7 @@ fn highlight_text(path: &Path, text: &str) -> (Option<String>, Vec<TextHighlight
         };
         for (region, operation) in ScopeRegionIterator::new(&operations, line) {
             if scopes.apply(operation).is_err() {
-                return (Some(syntax.name.clone()), highlights);
+                return highlights;
             }
             let start = offset;
             offset = offset.saturating_add(region.len());
@@ -743,12 +790,12 @@ fn highlight_text(path: &Path, text: &str) -> (Option<String>, Vec<TextHighlight
                     kind,
                 });
             } else {
-                return (Some(syntax.name.clone()), highlights);
+                return highlights;
             }
         }
     }
 
-    (Some(syntax.name.clone()), highlights)
+    highlights
 }
 
 fn find_syntax<'a>(syntaxes: &'a SyntaxSet, extension: &str) -> Option<&'a SyntaxReference> {
@@ -1582,10 +1629,11 @@ fn is_iwork_document(path: &Path) -> bool {
 }
 
 /// A thumbnail PNG for `path`, cached per source identity and size. Formats
-/// the bundled decoders read are decoded natively; on macOS Quick Look covers
-/// what they cannot (HEIC, RAW, video poster frames, PDF, Office, iWork,
-/// fonts, USDZ...); FFmpeg and ImageMagick are the last resort. Cloud
-/// placeholders get no thumbnail because reading them would download them.
+/// the bundled decoders read are decoded natively; on macOS ImageIO decodes
+/// what they cannot (HEIC, AVIF, RAW) and large images, and Quick Look covers
+/// the rest (video poster frames, PDF, Office, iWork, fonts, USDZ...); FFmpeg
+/// and ImageMagick are the last resort. Cloud placeholders get no thumbnail
+/// because reading them would download them.
 fn get_file_thumbnail(path: &Path, max_size: u32, cache: &Path) -> ServiceResult<Option<PathBuf>> {
     let Ok(metadata) = fs::symlink_metadata(path) else {
         return Ok(None);
@@ -1607,13 +1655,23 @@ fn get_file_thumbnail(path: &Path, max_size: u32, cache: &Path) -> ServiceResult
     fs::create_dir_all(cache).map_err(ServiceError::from)?;
     match source {
         ThumbnailSource::Svg => render_svg_preview(path, &output, max_size)?,
-        ThumbnailSource::Psd => render_psd_preview(path, &output, max_size)
-            .or_else(|error| quicklook_thumbnail_after(path, &output, max_size, error))?,
-        ThumbnailSource::NativeImage => generate_native_thumbnail(path, &output, max_size)
-            .or_else(|error| quicklook_thumbnail_after(path, &output, max_size, error))?,
+        ThumbnailSource::Psd => {
+            imageio_image_before(is_large_image(path), path, &output, max_size, || {
+                render_psd_preview(path, &output, max_size)
+            })
+            .or_else(|error| quicklook_thumbnail_after(path, &output, max_size, error))?
+        }
+        ThumbnailSource::NativeImage => {
+            imageio_image_before(is_large_image(path), path, &output, max_size, || {
+                generate_native_thumbnail(path, &output, max_size)
+            })
+            .or_else(|error| quicklook_thumbnail_after(path, &output, max_size, error))?
+        }
         ThumbnailSource::ExternalImage => {
-            quicklook_thumbnail_before(path, &output, max_size, || {
-                generate_external_image_thumbnail(path, &output, max_size, cache)
+            imageio_image_before(true, path, &output, max_size, || {
+                quicklook_thumbnail_before(path, &output, max_size, || {
+                    generate_external_image_thumbnail(path, &output, max_size, cache)
+                })
             })?
         }
         ThumbnailSource::Video => quicklook_thumbnail_before(path, &output, max_size, || {
@@ -1676,6 +1734,114 @@ fn quicklook_thumbnail_before(
     fallback()
 }
 
+/// ImageIO's decode of `path`, fitted within `max_size` and upright, written
+/// to `output` as PNG (macOS only). With `cancellation`, a newer preview stops
+/// the wait.
+fn imageio_image(
+    path: &Path,
+    output: &Path,
+    max_size: u32,
+    cancellation: Option<(&AtomicU64, u64)>,
+) -> ServiceResult<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let limits = macos::SourceLimits {
+            max_dimension: MAX_IMAGE_DECODE_DIMENSION,
+            max_pixels: MAX_IMAGEIO_SOURCE_PIXELS,
+        };
+        macos::imageio_thumbnail(
+            path,
+            max_size,
+            limits,
+            IMAGEIO_TIMEOUT,
+            output,
+            cancellation,
+        )
+        .map_err(imageio_error)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (path, output, max_size, cancellation);
+        Err(ServiceError::new(
+            ErrorCode::Unsupported,
+            "ImageIO is only available on macOS",
+        ))
+    }
+}
+
+/// On macOS, when `imageio_first`, try ImageIO before `decode` and keep
+/// `decode` for what ImageIO cannot read.
+fn imageio_image_before(
+    imageio_first: bool,
+    path: &Path,
+    output: &Path,
+    max_size: u32,
+    decode: impl FnOnce() -> ServiceResult<()>,
+) -> ServiceResult<()> {
+    if cfg!(target_os = "macos")
+        && imageio_first
+        && imageio_image(path, output, max_size, None).is_ok()
+    {
+        return Ok(());
+    }
+    decode()
+}
+
+/// Whether `path` declares more than [`IMAGEIO_MIN_SOURCE_PIXELS`], which
+/// macOS decodes with ImageIO first. Only headers are read.
+fn is_large_image(path: &Path) -> bool {
+    cfg!(target_os = "macos")
+        && source_pixel_count(path).is_some_and(|pixels| pixels > IMAGEIO_MIN_SOURCE_PIXELS)
+}
+
+/// The pixel count an image's header declares, for formats the bundled
+/// decoders read, without decoding pixels.
+fn source_pixel_count(path: &Path) -> Option<u64> {
+    if let Some((width, height)) = image_header_dimensions(path) {
+        return Some(u64::from(width) * u64::from(height));
+    }
+    // A Photoshop header stores the height and width after its signature,
+    // version, reserved bytes and channel count.
+    let mut header = [0_u8; 22];
+    File::open(path).ok()?.read_exact(&mut header).ok()?;
+    if !header.starts_with(b"8BPS") {
+        return None;
+    }
+    let height = u32::from_be_bytes(header[14..18].try_into().ok()?);
+    let width = u32::from_be_bytes(header[18..22].try_into().ok()?);
+    Some(u64::from(width) * u64::from(height))
+}
+
+#[cfg(target_os = "macos")]
+fn imageio_error(error: macos::NativeImageError) -> ServiceError {
+    match error {
+        macos::NativeImageError::Unavailable => {
+            ServiceError::new(ErrorCode::Unsupported, "macOS cannot decode this image")
+        }
+        macos::NativeImageError::TooLarge => ServiceError::new(
+            ErrorCode::Unsupported,
+            "Image dimensions are too large to preview safely",
+        ),
+        macos::NativeImageError::TimedOut => ServiceError::new(
+            ErrorCode::Internal,
+            format!(
+                "Decoding the image timed out after {} seconds",
+                IMAGEIO_TIMEOUT.as_secs()
+            ),
+        ),
+        macos::NativeImageError::Cancelled => ServiceError::new(
+            ErrorCode::Cancelled,
+            "Preview helper superseded by a newer preview",
+        ),
+        macos::NativeImageError::WriteFailed => {
+            ServiceError::new(ErrorCode::Internal, "Unable to save the decoded image")
+        }
+        macos::NativeImageError::InvalidInput => {
+            ServiceError::new(ErrorCode::InvalidInput, "macOS cannot open this path")
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn quicklook_error(error: macos::NativeImageError, timeout: Duration) -> ServiceError {
     match error {
@@ -1696,6 +1862,10 @@ fn quicklook_error(error: macos::NativeImageError, timeout: Duration) -> Service
         macos::NativeImageError::InvalidInput => {
             ServiceError::new(ErrorCode::InvalidInput, "Quick Look cannot open this path")
         }
+        macos::NativeImageError::TooLarge => ServiceError::new(
+            ErrorCode::Unsupported,
+            "Image dimensions are too large to preview safely",
+        ),
     }
 }
 
@@ -2196,6 +2366,11 @@ fn convert_svg_preview(path: &Path, cache: &Path) -> ServiceResult<PreviewArtifa
 
 fn convert_native_image_preview(path: &Path, cache: &Path) -> ServiceResult<PreviewArtifact> {
     validate_preview_image(path, MAX_IMAGE_PREVIEW_BYTES)?;
+    if is_large_image(path)
+        && let Ok(artifact) = convert_imageio_preview(path, cache, None)
+    {
+        return Ok(artifact);
+    }
     fs::create_dir_all(cache).map_err(ServiceError::from)?;
     let output = cache_output(cache, path, "native-image", "png");
     if !output.metadata().is_ok_and(|metadata| metadata.len() > 0)
@@ -2219,6 +2394,11 @@ fn convert_native_image_preview(path: &Path, cache: &Path) -> ServiceResult<Prev
     })
 }
 
+/// A preview of a format the bundled raster decoder cannot read: HEIC, AVIF,
+/// JPEG XL, Photoshop and camera RAW. macOS decodes them with ImageIO (small
+/// Photoshop documents keep the bundled decoder); otherwise, and when ImageIO
+/// fails, the PSD decoder or ImageMagick converts them, and Quick Look stands
+/// in for a missing or failing helper.
 fn convert_image_preview(
     path: &Path,
     detected_mime: Option<&str>,
@@ -2226,7 +2406,15 @@ fn convert_image_preview(
     helper_generation: &AtomicU64,
     ticket: u64,
 ) -> ServiceResult<PreviewArtifact> {
-    let converted = if extension(path) == "psd" {
+    let is_psd = extension(path) == "psd";
+    if cfg!(target_os = "macos") && (!is_psd || is_large_image(path)) {
+        match convert_imageio_preview(path, cache, Some((helper_generation, ticket))) {
+            Ok(artifact) => return Ok(artifact),
+            Err(error) if error.code == ErrorCode::Cancelled => return Err(error),
+            Err(_) => {}
+        }
+    }
+    let converted = if is_psd {
         convert_psd_preview(path, cache)
     } else {
         convert_imagemagick_preview(path, detected_mime, cache, helper_generation, ticket)
@@ -2286,9 +2474,36 @@ fn convert_imagemagick_preview(
     })
 }
 
+/// ImageIO's decode of `path`, fitted within the preview dimension, as the
+/// preview image (macOS only). With `cancellation`, a newer preview stops the
+/// wait.
+fn convert_imageio_preview(
+    path: &Path,
+    cache: &Path,
+    cancellation: Option<(&AtomicU64, u64)>,
+) -> ServiceResult<PreviewArtifact> {
+    validate_preview_image(path, MAX_IMAGE_PREVIEW_BYTES)?;
+    if let Some((generation, ticket)) = cancellation {
+        ensure_helper_current(generation, ticket)?;
+    }
+    fs::create_dir_all(cache).map_err(ServiceError::from)?;
+    let output = cache_output(cache, path, "imageio", "png");
+    if !output.metadata().is_ok_and(|metadata| metadata.len() > 0) {
+        imageio_image(path, &output, IMAGE_PREVIEW_DIMENSION, cancellation)?;
+    }
+    prune_generated_artifact_cache(cache, &output);
+    Ok(PreviewArtifact {
+        kind: "image".into(),
+        path: output,
+        mime_type: "image/png".into(),
+        tool: IMAGEIO_TOOL.into(),
+    })
+}
+
 /// Quick Look's rendering of `path`, fitted within the preview dimension, as
-/// the preview image (macOS only). With `cancellation`, a newer preview stops
-/// the wait.
+/// the preview image (macOS only). Sizes Quick Look refuses are retried
+/// smaller (see [`QUICKLOOK_PREVIEW_DIMENSIONS`]) within one timeout. With
+/// `cancellation`, a newer preview stops the wait.
 fn convert_quicklook_preview(
     path: &Path,
     cache: &Path,
@@ -2303,13 +2518,9 @@ fn convert_quicklook_preview(
         fs::create_dir_all(cache).map_err(ServiceError::from)?;
         let output = cache_output(cache, path, "quicklook", "png");
         if !output.metadata().is_ok_and(|metadata| metadata.len() > 0) {
-            macos::quicklook_thumbnail(
-                path,
-                IMAGE_PREVIEW_DIMENSION,
-                QUICKLOOK_PREVIEW_TIMEOUT,
-                &output,
-                cancellation,
-            )
+            quicklook_with_smaller_retries(QUICKLOOK_PREVIEW_TIMEOUT, |dimension, timeout| {
+                macos::quicklook_thumbnail(path, dimension, timeout, &output, cancellation)
+            })
             .map_err(|error| quicklook_error(error, QUICKLOOK_PREVIEW_TIMEOUT))?;
         }
         prune_generated_artifact_cache(cache, &output);
@@ -2328,6 +2539,28 @@ fn convert_quicklook_preview(
             "Quick Look previews are only available on macOS",
         ))
     }
+}
+
+/// Run `attempt` with each of [`QUICKLOOK_PREVIEW_DIMENSIONS`] and the time
+/// left of `timeout`, moving to the next, smaller size only while Quick Look
+/// reports it has no image. Timeouts, cancellation and success end the loop.
+#[cfg(target_os = "macos")]
+fn quicklook_with_smaller_retries(
+    timeout: Duration,
+    mut attempt: impl FnMut(u32, Duration) -> Result<(), macos::NativeImageError>,
+) -> Result<(), macos::NativeImageError> {
+    let deadline = Instant::now() + timeout;
+    let mut result = Err(macos::NativeImageError::Unavailable);
+    for dimension in QUICKLOOK_PREVIEW_DIMENSIONS {
+        result = attempt(
+            dimension,
+            deadline.saturating_duration_since(Instant::now()),
+        );
+        if result != Err(macos::NativeImageError::Unavailable) {
+            break;
+        }
+    }
+    result
 }
 
 /// On macOS, answer a failed or unavailable helper conversion with Quick
@@ -2607,6 +2840,7 @@ fn prune_generated_artifact_cache(cache: &Path, protected: &Path) {
                 "-svg.",
                 "-native-image.",
                 "-image.",
+                "-imageio.",
                 "-quicklook.",
             ]
             .iter()
@@ -2869,6 +3103,41 @@ mod display_image_tests {
         assert_eq!(width, IMAGE_PREVIEW_DIMENSION);
         assert!(height < IMAGE_PREVIEW_DIMENSION);
         assert_eq!(service.display_image(large).wait().unwrap(), shown);
+    }
+
+    #[test]
+    fn huge_images_downscale_to_bounded_previews_and_thumbnails() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = PreviewService::new(ServiceContext::new(ResourcePaths::test(temp.path())));
+        // 48 megapixels: above the size macOS hands to ImageIO.
+        let huge = temp.path().join("huge.png");
+        image::GrayImage::from_fn(8_000, 6_000, |x, y| image::Luma([((x ^ y) % 256) as u8]))
+            .save(&huge)
+            .unwrap();
+        assert_eq!(is_large_image(&huge), cfg!(target_os = "macos"));
+
+        let thumbnail = service
+            .thumbnail(huge.clone(), 256)
+            .wait()
+            .unwrap()
+            .unwrap();
+        assert_eq!(image::image_dimensions(&thumbnail).unwrap(), (256, 192));
+
+        let shown = service.display_image(huge.clone()).wait().unwrap();
+        assert!(shown.starts_with(service.cache_dir()));
+        assert_eq!(
+            image::image_dimensions(&shown).unwrap(),
+            (IMAGE_PREVIEW_DIMENSION, 1_536)
+        );
+
+        let artifact = service.artifact(huge).wait().unwrap();
+        assert_eq!(artifact.path, shown, "the preview reuses the cached decode");
+        let expected_tool = if cfg!(target_os = "macos") {
+            IMAGEIO_TOOL
+        } else {
+            "Explorie image decoder"
+        };
+        assert_eq!(artifact.tool, expected_tool);
     }
 }
 
@@ -3820,8 +4089,22 @@ mod tests {
     /// Converts a PNG to HEIC with the system `sips` tool.
     #[cfg(target_os = "macos")]
     fn write_test_heic(directory: &Path, name: &str) -> PathBuf {
+        write_test_heic_sized(directory, name, 320, 180)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn write_test_heic_sized(directory: &Path, name: &str, width: u32, height: u32) -> PathBuf {
         let png = directory.join(format!("{name}.png"));
-        write_test_image(&png, 320, 180, [40, 120, 220, 255]);
+        // A gradient, so the encoder produces real image data at any size.
+        image::RgbImage::from_fn(width, height, |x, y| {
+            image::Rgb([
+                (x % 256) as u8,
+                (y % 256) as u8,
+                ((x / 64 + y / 64) % 256) as u8,
+            ])
+        })
+        .save(&png)
+        .unwrap();
         let heic = directory.join(format!("{name}.heic"));
         let converted = Command::new("sips")
             .args(["-s", "format", "heic"])
@@ -3883,7 +4166,7 @@ mod tests {
         assert_eq!(
             service.thumbnail(heic, 128).wait().unwrap().unwrap(),
             thumbnail,
-            "Quick Look thumbnails are cached like native ones"
+            "system thumbnails are cached like native ones"
         );
 
         let pdf = temp.path().join("manual.pdf");
@@ -3955,21 +4238,132 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn large_heic_photos_preview_through_imageio_without_helpers() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = PreviewService::new(ServiceContext::new(ResourcePaths::test(temp.path())));
+        // Larger than the sizes Quick Look refuses for real photos, and
+        // landscape so the fitted size shows the aspect ratio is kept.
+        let heic = write_test_heic_sized(temp.path(), "wallpaper", 6_016, 4_000);
+
+        let artifact = service.artifact(heic.clone()).wait().unwrap();
+        assert_eq!(artifact.kind, "image");
+        assert_eq!(artifact.mime_type, "image/png");
+        assert_eq!(artifact.tool, IMAGEIO_TOOL);
+        assert_eq!(
+            assert_png_within(&artifact.path, IMAGE_PREVIEW_DIMENSION),
+            (IMAGE_PREVIEW_DIMENSION, 1_362)
+        );
+        assert!(artifact.path.starts_with(service.cache_dir()));
+        assert_eq!(
+            service.artifact(heic.clone()).wait().unwrap().path,
+            artifact.path,
+            "the decode is cached by source identity"
+        );
+
+        let thumbnail = service
+            .thumbnail(heic.clone(), 256)
+            .wait()
+            .unwrap()
+            .unwrap();
+        assert_eq!(assert_png_within(&thumbnail, 256), (256, 170));
+
+        // Quick Look, the fallback, answers at a size it accepts.
+        let artifact = convert_quicklook_preview(&heic, &service.cache_dir(), None).unwrap();
+        assert_eq!(artifact.tool, "Quick Look");
+        let (width, height) = assert_png_within(&artifact.path, IMAGE_PREVIEW_DIMENSION);
+        assert!(width > height, "landscape photo stays landscape");
+
+        // Sources beyond the decode limits are refused from the header alone.
+        let output = temp.path().join("refused.png");
+        let limits = macos::SourceLimits {
+            max_dimension: MAX_IMAGE_DECODE_DIMENSION,
+            max_pixels: 1_000_000,
+        };
+        assert_eq!(
+            macos::imageio_thumbnail(&heic, 256, limits, IMAGEIO_TIMEOUT, &output, None),
+            Err(macos::NativeImageError::TooLarge)
+        );
+        assert!(!output.exists());
+        let generation = AtomicU64::new(2);
+        assert_eq!(
+            macos::imageio_thumbnail(
+                &heic,
+                256,
+                macos::SourceLimits {
+                    max_dimension: MAX_IMAGE_DECODE_DIMENSION,
+                    max_pixels: MAX_IMAGEIO_SOURCE_PIXELS,
+                },
+                IMAGEIO_TIMEOUT,
+                &output,
+                Some((&generation, 1))
+            ),
+            Err(macos::NativeImageError::Cancelled)
+        );
+        let text = temp.path().join("notes.heic");
+        fs::write(&text, "not an image").unwrap();
+        assert_eq!(
+            imageio_image(&text, &output, 256, None).unwrap_err().code,
+            ErrorCode::Unsupported
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn quick_look_previews_retry_smaller_sizes_it_accepts() {
+        use macos::NativeImageError::{Cancelled, TimedOut, Unavailable};
+
+        let run = |outcomes: &[Result<(), macos::NativeImageError>]| {
+            let mut tried = Vec::new();
+            let result =
+                quicklook_with_smaller_retries(Duration::from_secs(15), |size, timeout| {
+                    assert!(timeout <= Duration::from_secs(15));
+                    tried.push(size);
+                    outcomes[tried.len() - 1]
+                });
+            (result, tried)
+        };
+        assert_eq!(
+            run(&[Err(Unavailable), Ok(())]),
+            (Ok(()), vec![IMAGE_PREVIEW_DIMENSION, 1_600])
+        );
+        assert_eq!(
+            run(&[Err(Unavailable); 3]),
+            (Err(Unavailable), QUICKLOOK_PREVIEW_DIMENSIONS.to_vec()),
+            "files Quick Look cannot draw at any size keep failing"
+        );
+        assert_eq!(
+            run(&[Err(TimedOut)]),
+            (Err(TimedOut), vec![IMAGE_PREVIEW_DIMENSION])
+        );
+        assert_eq!(
+            run(&[Err(Unavailable), Err(Cancelled)]),
+            (Err(Cancelled), vec![IMAGE_PREVIEW_DIMENSION, 1_600])
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn quick_look_previews_stand_in_for_missing_helpers() {
         let temp = tempfile::tempdir().unwrap();
         let service = PreviewService::new(ServiceContext::new(ResourcePaths::test(temp.path())));
 
+        // ImageIO decodes HEIC before any helper is needed, and Quick Look
+        // still renders it when ImageIO cannot.
         let heic = write_test_heic(temp.path(), "preview");
-        let artifact = service.artifact(heic).wait().unwrap();
+        let artifact = service.artifact(heic.clone()).wait().unwrap();
         assert_eq!(artifact.kind, "image");
         assert_eq!(artifact.mime_type, "image/png");
-        if first_available_tool(&["magick"], "--version").is_none() {
-            assert_eq!(artifact.tool, "Quick Look");
-            assert_eq!(
-                assert_png_within(&artifact.path, IMAGE_PREVIEW_DIMENSION),
-                (320, 180)
-            );
-        }
+        assert_eq!(artifact.tool, IMAGEIO_TOOL);
+        assert_eq!(
+            assert_png_within(&artifact.path, IMAGE_PREVIEW_DIMENSION),
+            (320, 180)
+        );
+        let artifact = convert_quicklook_preview(&heic, &service.cache_dir(), None).unwrap();
+        assert_eq!(artifact.tool, "Quick Look");
+        assert_eq!(
+            assert_png_within(&artifact.path, IMAGE_PREVIEW_DIMENSION),
+            (320, 180)
+        );
 
         let text = temp.path().join("letter.txt");
         fs::write(&text, "Dear reader,\nQuick Look renders this letter.\n").unwrap();

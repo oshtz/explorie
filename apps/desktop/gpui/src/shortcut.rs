@@ -409,6 +409,39 @@ pub(crate) fn is_plain_key_binding(binding: &str) -> bool {
     !parsed.has_command_modifier() && !parsed.is_function_key()
 }
 
+/// Whether the paste shortcut is left to AppKit's Edit ▸ Paste key
+/// equivalent instead of a GPUI key binding. macOS lets an app read files
+/// another app copied without asking only when the paste arrives through the
+/// Edit menu's `paste:` item (clicked or by its key equivalent); a GPUI
+/// binding would consume the key before AppKit sees it. AppKit can only use
+/// single chords with a modifier (or function keys) as key equivalents.
+pub(crate) fn paste_shortcut_belongs_to_menu(binding: &str, platform: KeymapPlatform) -> bool {
+    if platform != KeymapPlatform::MacOs || binding.trim().contains(' ') {
+        return false;
+    }
+    let parsed = ParsedBinding::parse(binding, platform);
+    parsed.has_command_modifier() || parsed.is_function_key()
+}
+
+/// Whether Cmd+V in a text field must also go through the Edit menu, because
+/// the menu's Paste uses that key and routes it to the focused text field.
+pub(crate) fn text_paste_belongs_to_menu(overrides: &BTreeMap<String, String>) -> bool {
+    text_paste_belongs_to_menu_for(overrides, KeymapPlatform::CURRENT)
+}
+
+pub(crate) fn text_paste_belongs_to_menu_for(
+    overrides: &BTreeMap<String, String>,
+    platform: KeymapPlatform,
+) -> bool {
+    let paste = effective_binding_for(
+        overrides,
+        shortcut_definition("file-paste").expect("editable shortcut is defined"),
+        platform,
+    );
+    paste_shortcut_belongs_to_menu(&paste, platform)
+        && canonical_binding(&paste, platform) == canonical_binding("secondary-v", platform)
+}
+
 /// The key context a browser shortcut should use so it never competes with
 /// typing or caret movement in a focused text field.
 fn browser_binding_context(binding: &str, platform: KeymapPlatform) -> &'static str {
@@ -773,7 +806,6 @@ pub(crate) fn application_key_bindings_for(
         editable("nav-toggle-favorite", Box::new(ToggleFavorite)),
         editable("file-copy", Box::new(CopySelected)),
         editable("file-cut", Box::new(CutSelected)),
-        editable("file-paste", Box::new(Paste)),
         editable("file-trash", Box::new(TrashSelected)),
         editable("file-delete-permanently", Box::new(PermanentDeleteSelected)),
         KeyBinding::new("secondary-alt-a", CreateArchive, Some("browser")),
@@ -806,6 +838,14 @@ pub(crate) fn application_key_bindings_for(
         editable("help-shortcuts", Box::new(ToggleShortcutsOverlay)),
         editable("help-diagnostics", Box::new(ToggleDiagnostics)),
     ];
+    let paste = effective_binding_for(
+        overrides,
+        shortcut_definition("file-paste").expect("editable shortcut is defined"),
+        platform,
+    );
+    if !paste_shortcut_belongs_to_menu(&paste, platform) {
+        bindings.push(editable("file-paste", Box::new(Paste)));
+    }
     match platform {
         KeymapPlatform::Windows => {
             bindings.push(KeyBinding::new(
@@ -844,7 +884,10 @@ pub(crate) fn application_key_bindings_for(
         }
     }
     // Display-only: the Edit menu shows the file shortcuts for its text-aware
-    // actions; keyboard input keeps using the actions bound above.
+    // actions; keyboard input keeps using the actions bound above, except
+    // for a macOS paste shortcut left to the menu (see
+    // `paste_shortcut_belongs_to_menu`), which reaches it as the key
+    // equivalent of Edit ▸ Paste.
     let display_only = |binding: &str, action: Box<dyn gpui::Action>| {
         load_binding(binding, action, MENU_DISPLAY_CONTEXT)
     };
@@ -1200,6 +1243,57 @@ mod tests {
                 fixed_browser_bindings_for(platform).contains(&("space", "preview selected item"))
             );
         }
+    }
+
+    #[test]
+    fn macos_leaves_the_paste_shortcut_to_the_edit_menu() {
+        let binds_paste = |overrides: &BTreeMap<String, String>, platform| {
+            application_key_bindings_for(overrides, platform)
+                .iter()
+                .any(|binding| binding.action().partial_eq(&Paste))
+        };
+        let menu_shows_paste = |overrides: &BTreeMap<String, String>, platform| {
+            application_key_bindings_for(overrides, platform)
+                .iter()
+                .any(|binding| binding.action().partial_eq(&MenuPaste))
+        };
+        let defaults = BTreeMap::new();
+        // macOS only treats a paste through Edit > Paste as user initiated,
+        // so Cmd+V must reach AppKit as the menu's key equivalent.
+        assert!(!binds_paste(&defaults, KeymapPlatform::MacOs));
+        assert!(menu_shows_paste(&defaults, KeymapPlatform::MacOs));
+        assert!(text_paste_belongs_to_menu_for(
+            &defaults,
+            KeymapPlatform::MacOs
+        ));
+        // Windows keeps binding Ctrl+V itself.
+        assert!(binds_paste(&defaults, KeymapPlatform::Windows));
+        assert!(!text_paste_belongs_to_menu_for(
+            &defaults,
+            KeymapPlatform::Windows
+        ));
+
+        // A rebound chord is still a key equivalent; text fields keep Cmd+V.
+        let chord = BTreeMap::from([("file-paste".to_string(), "secondary-shift-v".to_string())]);
+        assert!(!binds_paste(&chord, KeymapPlatform::MacOs));
+        assert!(!text_paste_belongs_to_menu_for(
+            &chord,
+            KeymapPlatform::MacOs
+        ));
+        // AppKit cannot use a bare key or a key sequence as a key equivalent.
+        for binding in ["p", "secondary-k v"] {
+            let overrides = BTreeMap::from([("file-paste".to_string(), binding.to_string())]);
+            assert!(binds_paste(&overrides, KeymapPlatform::MacOs), "{binding}");
+            assert!(
+                !text_paste_belongs_to_menu_for(&overrides, KeymapPlatform::MacOs),
+                "{binding}"
+            );
+        }
+        assert!(paste_shortcut_belongs_to_menu("f5", KeymapPlatform::MacOs));
+        assert!(!paste_shortcut_belongs_to_menu(
+            "secondary-v",
+            KeymapPlatform::Windows
+        ));
     }
 
     #[test]

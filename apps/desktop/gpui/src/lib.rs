@@ -54,6 +54,8 @@ mod diagnostics;
 mod entry_kind_tests;
 mod error_reports;
 mod file_clipboard;
+#[cfg(test)]
+mod finder_parity_tests;
 mod native_text_input;
 mod operation;
 mod operation_recovery;
@@ -68,6 +70,8 @@ mod entry_marks;
 mod entry_visuals;
 mod image_memory;
 mod interaction;
+#[cfg(test)]
+mod layout_tests;
 mod media_player;
 #[cfg(test)]
 mod media_player_tests;
@@ -75,6 +79,7 @@ mod palette;
 mod prompt;
 mod recovery;
 mod remote_support;
+mod rich_blocks;
 mod runtime;
 mod session;
 mod settings;
@@ -95,7 +100,7 @@ pub use app_menu::install_app_menus;
 use batch_rename::{BatchRenameEditor, BatchRenameMode};
 use browser::{BrowserState, file_name, is_directory_entry, is_folder_like};
 pub use browser::{EntryFilter, SortDirection, SortKey, ViewMode};
-use column::{ColumnState, build_path_stack};
+use column::{ColumnState, build_path_stack, leaf_alignment};
 use command::{
     CommandContext, CommandId, CommandSpec, all_commands_with_shortcuts, filtered_commands,
 };
@@ -122,6 +127,7 @@ use preview_panel::{
 use prompt::{MutationPrompt, MutationPromptKind};
 pub use recovery::RecoveryMarker;
 use remote_support::*;
+use rich_blocks::rich_block_element;
 pub use runtime::WindowRuntime;
 use runtime::*;
 use session::{
@@ -148,8 +154,8 @@ use widgets::*;
 use window::{
     ClipboardUi, ColumnViewUi, ContextMenuUi, DiskInfoState, EntryVisuals, ListingUi, MutationUi,
     NativeTextInputState, NavigationUi, OperationUi, OverlayUi, PreviewUi, QuickLookUi, RecoveryUi,
-    RemoteDrivesUi, SearchUi, SettingsUi, SystemUi, ToastQueue, WatcherUi, WindowLayout,
-    WorkspaceUi,
+    RemoteDrivesUi, SearchScope, SearchUi, SettingsUi, SystemUi, ToastQueue, WatcherUi,
+    WindowLayout, WorkspaceUi,
 };
 use window_pane::{PaneInputs, PaneKind, WindowPanes};
 use workspace::{

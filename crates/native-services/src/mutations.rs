@@ -576,22 +576,14 @@ fn ensure_not_mount_root(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// `base_name` for the first attempt, then numbered the platform's way
+/// ("untitled folder 2" on macOS, "untitled folder (2)" elsewhere), the same
+/// numbering Keep Both uses for copies.
 fn suffixed_name(base_name: &str, number: u32, preserve_extension: bool) -> OsString {
     if number == 1 {
         return OsString::from(base_name);
     }
-    if !preserve_extension {
-        return OsString::from(format!("{base_name} ({number})"));
-    }
-    let path = Path::new(base_name);
-    let stem = path.file_stem().unwrap_or(path.as_os_str());
-    let mut name = OsString::from(stem);
-    name.push(format!(" ({number})"));
-    if let Some(extension) = path.extension() {
-        name.push(".");
-        name.push(extension);
-    }
-    name
+    explorie_core::numbered_name(std::ffi::OsStr::new(base_name), number, preserve_extension)
 }
 
 fn create_unique_path(
@@ -662,7 +654,7 @@ fn rename_path_impl(source: &Path, new_base_name: &str) -> io::Result<String> {
     }
     // On case- or normalization-insensitive volumes (APFS, NTFS, exFAT) a name
     // that differs only in case or Unicode form still denotes the source:
-    // rename it in place rather than choosing "name (2)".
+    // rename it in place rather than choosing "name 2".
     let requested = parent.join(&name);
     if is_same_entry(source, &metadata, &requested)? {
         rename_same_entry(source, &requested)?;
@@ -1502,7 +1494,14 @@ mod tests {
             .rename_path(root.join("draft.txt"), "report.txt".into())
             .wait()
             .unwrap();
-        assert_eq!(Path::new(&renamed).file_name().unwrap(), "report (2).txt");
+        assert_eq!(
+            Path::new(&renamed).file_name().unwrap(),
+            if cfg!(target_os = "macos") {
+                "report 2.txt"
+            } else {
+                "report (2).txt"
+            }
+        );
         assert_eq!(
             fs::read_to_string(root.join("report.txt")).unwrap(),
             "existing"

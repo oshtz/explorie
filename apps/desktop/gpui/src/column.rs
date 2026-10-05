@@ -214,6 +214,65 @@ pub fn build_path_stack(path: &Path) -> Vec<PathBuf> {
     stack
 }
 
+/// Where the column strip scrolls to reveal its leaf, and how much wider its
+/// trailing pane (the preview, or blank space) must grow to make that offset
+/// reachable.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct LeafAlignment {
+    /// Scroll distance from the strip's start. It always lands on a column's
+    /// left edge, so the leftmost visible column is never clipped.
+    pub(crate) offset: f32,
+    pub(crate) trailing_fill: f32,
+}
+
+/// Aligns the strip so the leaf and the trailing pane end at the viewport's
+/// right edge while the leftmost visible column is shown whole: as many whole
+/// columns as fit precede the leaf. When the leaf and the trailing pane do not
+/// fit together, the strip scrolls to its end so the preview stays whole; when
+/// even the leaf alone is wider than the viewport, the leaf is aligned to the
+/// left edge instead. Returns `None` before the strip has been laid out.
+pub(crate) fn leaf_alignment(
+    column_widths: &[f32],
+    trailing_width: f32,
+    viewport: f32,
+) -> Option<LeafAlignment> {
+    let leaf = column_widths.len().checked_sub(1)?;
+    if viewport <= 0.0 {
+        return None;
+    }
+    let overflow = column_widths.iter().sum::<f32>() + trailing_width - viewport;
+    if overflow <= 0.0 {
+        return Some(LeafAlignment {
+            offset: 0.0,
+            trailing_fill: 0.0,
+        });
+    }
+    let leaf_start = column_widths[..leaf].iter().sum::<f32>();
+    let mut start = 0.0;
+    for width in &column_widths[..leaf] {
+        // Half a pixel of slack absorbs rounding in laid-out widths.
+        if start >= overflow - 0.5 {
+            break;
+        }
+        start += width;
+    }
+    if start >= overflow - 0.5 {
+        return Some(LeafAlignment {
+            offset: start,
+            trailing_fill: (start - overflow).max(0.0),
+        });
+    }
+    let offset = if column_widths[leaf] > viewport {
+        leaf_start
+    } else {
+        overflow
+    };
+    Some(LeafAlignment {
+        offset,
+        trailing_fill: 0.0,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -356,5 +415,53 @@ mod tests {
         let mut state = ColumnState::new(&path);
         assert!(!state.apply_listed(Path::new("other"), Vec::<FileEntry>::new()));
         assert!(!state.apply_failed(Path::new("other"), "late".to_string()));
+    }
+
+    #[test]
+    fn leaf_alignment_lands_on_a_column_boundary() {
+        // Five 200 px columns and a 300 px preview in a 700 px viewport
+        // overflow by 600: the strip starts at the fourth column and the
+        // preview grows to fill what the third column no longer covers.
+        let widths = [200.0; 5];
+        assert_eq!(
+            leaf_alignment(&widths, 300.0, 700.0),
+            Some(LeafAlignment {
+                offset: 600.0,
+                trailing_fill: 0.0,
+            })
+        );
+        assert_eq!(
+            leaf_alignment(&widths, 300.0, 750.0),
+            Some(LeafAlignment {
+                offset: 600.0,
+                trailing_fill: 50.0,
+            })
+        );
+        // Everything fits: no scrolling and no fill.
+        assert_eq!(
+            leaf_alignment(&widths, 0.0, 1200.0),
+            Some(LeafAlignment {
+                offset: 0.0,
+                trailing_fill: 0.0,
+            })
+        );
+        // The leaf and preview do not fit together: keep the preview whole.
+        assert_eq!(
+            leaf_alignment(&widths, 600.0, 700.0),
+            Some(LeafAlignment {
+                offset: 900.0,
+                trailing_fill: 0.0,
+            })
+        );
+        // Even the leaf alone is too wide: align to the leaf.
+        assert_eq!(
+            leaf_alignment(&[200.0, 200.0, 800.0], 300.0, 700.0),
+            Some(LeafAlignment {
+                offset: 400.0,
+                trailing_fill: 0.0,
+            })
+        );
+        assert_eq!(leaf_alignment(&widths, 300.0, 0.0), None);
+        assert_eq!(leaf_alignment(&[], 300.0, 700.0), None);
     }
 }

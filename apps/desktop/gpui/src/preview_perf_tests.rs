@@ -9,6 +9,7 @@ use explorie_native_services::{
 use gpui::{Resource, TestAppContext, VisualTestContext};
 use uuid::Uuid;
 
+use super::tests::remove_fixture;
 use super::*;
 use crate::image_memory::{BoundedImageCache, RetiredImages};
 
@@ -283,7 +284,7 @@ fn replaced_and_closed_video_frames_leave_the_sprite_atlas(cx: &mut TestAppConte
         assert!(retired.released.contains(&second));
         assert_eq!(retired.pending(), 0);
     });
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 struct Gallery {
@@ -361,7 +362,7 @@ fn bounded_image_cache_stays_within_its_item_and_byte_budgets(cx: &mut TestAppCo
             cache.decoded_bytes()
         );
     });
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -391,7 +392,7 @@ fn visible_images_are_never_evicted_even_past_the_item_budget(cx: &mut TestAppCo
         assert_eq!(cache.len(), 12, "on-screen images must not thrash");
         assert_eq!(cache.evicted(), 0);
     });
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -462,7 +463,7 @@ fn listing_icons_and_preview_images_decode_through_bounded_caches(cx: &mut TestA
     });
     assert_eq!(cached, 1);
     assert!(!globally_cached(cx, &photo));
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -510,7 +511,7 @@ fn large_photos_preview_a_downscaled_copy_and_small_ones_stay_direct(cx: &mut Te
     let (width, height) = image::image_dimensions(&shown).unwrap();
     assert!(width <= 2_048 && height <= 2_048, "{width}x{height}");
     assert_eq!(width, 2_048);
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 /// The per-line highlighting the preview used before documents were cached:
@@ -728,7 +729,7 @@ fn text_preview_frames_do_not_scale_with_file_size(cx: &mut TestAppContext) {
         large_frame <= small_frame * 2 + Duration::from_millis(10),
         "small {small_frame:?}, large {large_frame:?}"
     );
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[derive(Default)]
@@ -840,7 +841,7 @@ fn held_arrow_keys_only_preview_where_the_selection_settles(cx: &mut TestAppCont
         )
     });
     assert!(!requested(&tags).contains(&files[7]));
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -887,5 +888,5 @@ fn quick_look_key_repeats_are_debounced_but_clicks_are_not(cx: &mut TestAppConte
             PreviewState::Ready { path, .. } if path == &files[3]
         )
     });
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }

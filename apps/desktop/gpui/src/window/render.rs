@@ -18,6 +18,13 @@ impl Render for DirectoryWindow {
                 }
             })
             .detach();
+            // A clicked button takes the focus; when it goes away with its
+            // panel or prompt, nothing is focused and every shortcut stops
+            // working until the list is clicked. Hand the focus back.
+            cx.on_focus_lost(window, |view, window, cx| {
+                window.focus(&view.focus_handle, cx);
+            })
+            .detach();
         }
         window.set_rem_size(px(16.0 * self.settings.appearance.ui_scale));
         if let Some(saved) = self.layout.pending_workspace_bounds.take() {
@@ -44,11 +51,16 @@ impl Render for DirectoryWindow {
         self.palette = UiPalette::for_settings(&self.settings, window.appearance());
         self.capture_overlay_focus(window, cx);
         self.ensure_native_text_input(cx);
+        let removed_focus = self.text_input.removed_focus.take();
         if self.text_input.focus_pending
             && let Some(input) = self.text_input.entity.as_ref()
         {
             window.focus(&input.focus_handle(cx), cx);
             self.text_input.focus_pending = false;
+        } else if removed_focus.is_some_and(|focus| focus.is_focused(window)) {
+            // The removed text field had the focus; typing and type-to-select
+            // must keep working without clicking the list first.
+            window.focus(&self.focus_handle, cx);
         }
         self.sync_overlay_focus(window, cx);
         let selection_count = self.effective_selection_count();
@@ -215,6 +227,7 @@ impl Render for DirectoryWindow {
         let settings_confirmation = self.render_settings_confirmation(window, cx);
         let go_to_folder = self.render_go_to_folder(f32::from(bounds.size.height), cx);
         let recovery_notice = self.render_recovery_notice(cx);
+        let search_scope_bar = self.render_search_scope_bar(cx);
         let operation_panel = self.render_operation_panel(status.is_some(), cx);
         let archive_inspection = self.render_archive_inspection(cx);
         let preview_open = !matches!(self.preview.state, PreviewState::Closed);
@@ -285,8 +298,7 @@ impl Render for DirectoryWindow {
         let appearance_value_editor = self.render_appearance_value_editor(cx);
         let context_menu = self.render_file_context_menu(bounds.size, cx);
         let toast = self.render_toast(cx);
-        let search_running =
-            self.search.task.is_some() && self.browser.active_smart_folder().is_some();
+        let search_running = self.search.task.is_some() && self.listing_shows_search_results();
         let status_panel = self.settings.view.show_status_bar.then(|| {
             let status_line = div()
                 .id("watcher-status")
@@ -504,12 +516,18 @@ impl Render for DirectoryWindow {
             .on_action(cx.listener(|this, _: &ClearSelection, window, cx| {
                 if this.settings_ui.confirmation.is_some() {
                     this.cancel_settings_confirmation(window, cx);
+                } else if !this.operation_ui.conflict_prompts.is_empty() {
+                    this.cancel_all_file_conflicts(cx);
+                } else if this.mutation.prompt.is_some() {
+                    this.cancel_mutation_prompt(cx);
                 } else if this.quick_look.open {
                     this.close_quick_look(cx);
                 } else if this.navigation_ui.go_to_folder.is_some() {
                     this.close_go_to_folder(cx);
-                } else if this.search.task.is_some() && this.browser.active_smart_folder().is_some()
-                {
+                } else if this.search_field_focused(window, cx) {
+                    // Escape in the search field clears it and returns to the list.
+                    this.clear_search_and_focus_list(window, cx);
+                } else if this.search.task.is_some() && this.listing_shows_search_results() {
                     this.cancel_smart_search(cx);
                 } else if this.context_menu.menu.is_some() {
                     this.close_context_menu(cx);
@@ -854,6 +872,7 @@ impl Render for DirectoryWindow {
                             .child(tabs)
                             .child(plugin_invitation)
                             .child(recovery_notice)
+                            .child(search_scope_bar)
                             .child(
                                 div()
                                     .id("main-content")
@@ -887,6 +906,9 @@ impl Render for DirectoryWindow {
                     )
                     .child(sidebar_resizer),
             )
+            // The operations panel floats over the file list but under every
+            // dialog, sheet and menu, so it never covers a modal prompt.
+            .child(operation_panel)
             .child(plugin_details)
             .child(settings_panel)
             .child(control_surface)
@@ -899,7 +921,6 @@ impl Render for DirectoryWindow {
             .child(appearance_value_editor)
             .child(settings_confirmation)
             .child(context_menu)
-            .child(operation_panel)
             .when_some(quick_look, |window, quick_look| window.child(quick_look))
             .child(toast)
             .child(pane_probe);

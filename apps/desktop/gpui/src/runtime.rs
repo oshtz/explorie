@@ -330,7 +330,7 @@ impl WindowRuntime {
         while operations.len() > 50 {
             let Some(index) = operations
                 .iter()
-                .position(|operation| operation.status != OperationStatus::Running)
+                .position(|operation| operation.status.is_settled())
             else {
                 break;
             };
@@ -419,9 +419,22 @@ impl WindowRuntime {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let before = operations.len();
         operations.retain(|operation| {
-            operation.owner_window_id != owner_window_id
-                || operation.status == OperationStatus::Running
+            operation.owner_window_id != owner_window_id || !operation.status.is_settled()
         });
+        if operations.len() != before {
+            self.operations_revision.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Drop a summary whatever its status, for an operation another job has
+    /// taken over.
+    pub(crate) fn forget_operation(&self, id: &str) {
+        let mut operations = self
+            .operations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before = operations.len();
+        operations.retain(|operation| operation.id != id);
         if operations.len() != before {
             self.operations_revision.fetch_add(1, Ordering::AcqRel);
         }
@@ -436,7 +449,7 @@ impl WindowRuntime {
         operations.retain(|operation| {
             operation.id != id
                 || operation.owner_window_id != owner_window_id
-                || operation.status == OperationStatus::Running
+                || !operation.status.is_settled()
         });
         if operations.len() != before {
             self.operations_revision.fetch_add(1, Ordering::AcqRel);
