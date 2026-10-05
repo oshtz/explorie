@@ -189,6 +189,22 @@ impl NativeTextInput {
         cx.notify();
     }
 
+    /// Select part of the content (byte offsets, snapped to characters), as
+    /// a rename field selects a file's name without its extension.
+    pub fn select_content_range(&mut self, range: Range<usize>, cx: &mut Context<Self>) {
+        let snap = |offset: usize| {
+            let mut offset = offset.min(self.content.len());
+            while !self.content.is_char_boundary(offset) {
+                offset -= 1;
+            }
+            offset
+        };
+        self.selected_range = snap(range.start)..snap(range.end.max(range.start));
+        self.selection_reversed = false;
+        self.marked_range = None;
+        cx.notify();
+    }
+
     fn emit_changed(&self, cx: &mut Context<Self>) {
         cx.emit(NativeTextInputEvent::Changed(self.content.to_string()));
     }

@@ -748,3 +748,38 @@ fn control_clicking_a_package_opens_its_menu_like_finder(cx: &mut TestAppContext
     window.simulate_mouse_up(row.center(), MouseButton::Left, control);
     assert_package_menu(&view, window, &package);
 }
+
+#[gpui::test]
+fn rename_preselects_a_files_name_without_its_extension(cx: &mut TestAppContext) {
+    let directory = fixture_dir();
+    let resources = fixture_dir();
+    fs::write(directory.join("report.final.pdf"), "pdf").unwrap();
+    fs::create_dir(directory.join("Projects.v2")).unwrap();
+    let services = NativeServices::new(ResourcePaths::test(&resources));
+    let root = directory.clone();
+    let (view, window) = cx.add_window_view(|_, cx| DirectoryWindow::new(root, services, cx));
+    window.simulate_resize(gpui::size(px(900.0), px(650.0)));
+    view.update(window, |view, cx| view.start_listing(cx));
+    wait_until(&view, window, "the listing", |view| {
+        view.browser.visible_entries().len() == 2
+    });
+
+    for (name, expected) in [
+        ("report.final.pdf", "summary.pdf"),
+        ("Projects.v2", "summary"),
+    ] {
+        view.update(window, |view, cx| {
+            view.prompt_rename_path(directory.join(name), cx);
+        });
+        window.run_until_parked();
+        // Typing replaces the selection.
+        type_text(window, "summary");
+        view.update(window, |view, cx| {
+            assert_eq!(view.mutation.prompt.as_ref().unwrap().input, expected);
+            view.cancel_mutation_prompt(cx);
+        });
+        window.run_until_parked();
+    }
+    remove_fixture(&directory);
+    remove_fixture(&resources);
+}

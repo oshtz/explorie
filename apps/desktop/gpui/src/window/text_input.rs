@@ -170,6 +170,9 @@ impl DirectoryWindow {
             }),
             ControlSurface::Closed | ControlSurface::Diagnostics => false,
         };
+        // Like Finder, renaming a file starts with its name selected but not
+        // its extension; a folder's whole name is selected.
+        let mut initial_selection = None;
         let desired = if let Some(editor) = self.settings_ui.appearance_value_editor.as_ref() {
             Some((
                 TextInputTarget::AppearanceValue,
@@ -217,6 +220,12 @@ impl DirectoryWindow {
                 MutationPromptKind::ArchivePassword { .. }
                     | MutationPromptKind::ExtractPassword { .. }
             );
+            if let MutationPromptKind::Rename { source } = &prompt.kind
+                && prompt.replace_on_type
+                && !self.renames_whole_name(source)
+            {
+                initial_selection = Some(0..name_stem_len(&prompt.input));
+            }
             Some((
                 TextInputTarget::MutationPrompt,
                 prompt.input.clone(),
@@ -305,7 +314,9 @@ impl DirectoryWindow {
                         NativeTextInputAppearance { colors, scale },
                         cx,
                     );
-                    if target_changed && replace_on_type {
+                    if target_changed && let Some(range) = initial_selection {
+                        input.select_content_range(range, cx);
+                    } else if target_changed && replace_on_type {
                         input.select_all_content(cx);
                     }
                 });
@@ -313,5 +324,44 @@ impl DirectoryWindow {
         } else if self.text_input.target != Some(TextInputTarget::PreviewFind) {
             self.deactivate_native_text_input();
         }
+    }
+}
+
+impl DirectoryWindow {
+    /// Whether renaming `source` starts with its whole name selected: folders
+    /// (not packages, whose extension Finder leaves out too).
+    fn renames_whole_name(&self, source: &Path) -> bool {
+        self.browser
+            .visible_entries()
+            .iter()
+            .find(|entry| entry.path == source)
+            .map_or_else(
+                || source.is_dir(),
+                |entry| is_directory_entry(entry) && !entry.is_package,
+            )
+    }
+}
+
+/// The length of `name` without its extension: up to the last dot, unless
+/// the only dot starts the name (".profile") or ends it.
+fn name_stem_len(name: &str) -> usize {
+    match name.rfind('.') {
+        Some(dot) if dot > 0 && dot + 1 < name.len() => dot,
+        _ => name.len(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::name_stem_len;
+
+    #[test]
+    fn rename_selection_leaves_out_only_the_last_extension() {
+        assert_eq!(name_stem_len("report.pdf"), 6);
+        assert_eq!(name_stem_len("archive.tar.gz"), 11);
+        assert_eq!(name_stem_len(".profile"), 8);
+        assert_eq!(name_stem_len("README"), 6);
+        assert_eq!(name_stem_len("trailing."), 9);
+        assert_eq!(name_stem_len("café.txt"), "café".len());
     }
 }
