@@ -130,7 +130,7 @@ fn copy_move_and_rename_work_on_exfat() {
             ConflictPolicy::Rename
         )
         .unwrap(),
-        vec![volume.join("source (1)")]
+        vec![volume.join("source 2")]
     );
     fs::write(volume.join("item.txt"), b"old").unwrap();
     operate(
