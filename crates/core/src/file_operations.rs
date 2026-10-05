@@ -685,6 +685,36 @@ fn validate_sources(plans: &[SourcePlan], destination: &Path) -> io::Result<()> 
     Ok(())
 }
 
+/// The number the first alternative name gets when an item is kept beside
+/// an existing one: Finder's "report 2.pdf" on macOS, Explorer's
+/// "report (1).pdf" elsewhere.
+pub const FIRST_CONFLICT_NUMBER: u32 = if cfg!(target_os = "macos") { 2 } else { 1 };
+
+/// `name` numbered the platform's way, for keeping an item beside an existing
+/// one: "report 2.pdf" on macOS (Finder), "report (2).pdf" elsewhere
+/// (Explorer). With `preserve_extension` the number goes before the
+/// extension; folders and extensionless names are numbered at the end.
+pub fn numbered_name(name: &std::ffi::OsStr, number: u32, preserve_extension: bool) -> OsString {
+    let suffix = if cfg!(target_os = "macos") {
+        format!(" {number}")
+    } else {
+        format!(" ({number})")
+    };
+    let path = Path::new(name);
+    let (stem, extension) = if preserve_extension {
+        (path.file_stem().unwrap_or(name), path.extension())
+    } else {
+        (name, None)
+    };
+    let mut numbered = OsString::from(stem);
+    numbered.push(suffix);
+    if let Some(extension) = extension {
+        numbered.push(".");
+        numbered.push(extension);
+    }
+    numbered
+}
+
 fn resolve_target(target: &Path, policy: ConflictPolicy) -> io::Result<PathBuf> {
     if !path_exists_no_follow(target)? {
         return Ok(target.to_path_buf());
@@ -696,21 +726,11 @@ fn resolve_target(target: &Path, policy: ConflictPolicy) -> io::Result<PathBuf> 
         )),
         ConflictPolicy::Replace => Ok(target.to_path_buf()),
         ConflictPolicy::Rename => {
-            let stem = target
-                .file_stem()
-                .or_else(|| target.file_name())
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "invalid target name")
-                })?;
-            let extension = target.extension();
-            for number in 1.. {
-                let mut name = OsString::from(stem);
-                name.push(format!(" ({number})"));
-                if let Some(extension) = extension {
-                    name.push(".");
-                    name.push(extension);
-                }
-                let candidate = target.with_file_name(name);
+            let name = target.file_name().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "invalid target name")
+            })?;
+            for number in FIRST_CONFLICT_NUMBER.. {
+                let candidate = target.with_file_name(numbered_name(name, number, true));
                 if !path_exists_no_follow(&candidate)? {
                     return Ok(candidate);
                 }
@@ -1829,6 +1849,73 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use tempfile::tempdir;
 
+    /// The name Keep Both gives the first copy of `name`.
+    fn kept(name: &str) -> OsString {
+        numbered_name(std::ffi::OsStr::new(name), FIRST_CONFLICT_NUMBER, true)
+    }
+
+    #[test]
+    fn kept_copies_are_numbered_the_platform_file_managers_way() {
+        let names: Vec<_> = ["report.pdf", "source", ".profile", "archive.tar.gz"]
+            .into_iter()
+            .map(kept)
+            .collect();
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                names,
+                ["report 2.pdf", "source 2", ".profile 2", "archive.tar 2.gz"]
+            );
+        } else {
+            assert_eq!(
+                names,
+                [
+                    "report (1).pdf",
+                    "source (1)",
+                    ".profile (1)",
+                    "archive.tar (1).gz"
+                ]
+            );
+        }
+        assert_eq!(
+            numbered_name(std::ffi::OsStr::new("my.folder"), 3, false),
+            if cfg!(target_os = "macos") {
+                "my.folder 3"
+            } else {
+                "my.folder (3)"
+            }
+        );
+    }
+
+    #[test]
+    fn keep_both_takes_the_next_free_number() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("report.pdf");
+        let destination = temp.path().join("destination");
+        fs::create_dir(&destination).unwrap();
+        fs::write(&source, b"new").unwrap();
+        fs::write(destination.join("report.pdf"), b"old").unwrap();
+        fs::write(destination.join(kept("report.pdf")), b"older copy").unwrap();
+
+        let result = perform_file_operation(
+            request(
+                FileOperationKind::Copy,
+                &source,
+                &destination,
+                ConflictPolicy::Rename,
+            ),
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
+        let expected = destination.join(numbered_name(
+            std::ffi::OsStr::new("report.pdf"),
+            FIRST_CONFLICT_NUMBER + 1,
+            true,
+        ));
+        assert_eq!(result.targets, vec![expected.clone()]);
+        assert_eq!(fs::read(expected).unwrap(), b"new");
+    }
+
     /// How `rename_noreplace` behaves on the current test thread.
     #[cfg(unix)]
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2175,8 +2262,11 @@ mod tests {
 
         assert!(!source.exists());
         assert_eq!(fs::read(destination.join("item.txt")).unwrap(), b"old");
-        assert_eq!(fs::read(destination.join("item (1).txt")).unwrap(), b"new");
-        assert_eq!(result.targets, vec![destination.join("item (1).txt")]);
+        assert_eq!(
+            fs::read(destination.join(kept("item.txt"))).unwrap(),
+            b"new"
+        );
+        assert_eq!(result.targets, vec![destination.join(kept("item.txt"))]);
     }
 
     #[test]
@@ -2537,7 +2627,7 @@ mod tests {
         let conflict = run(FileOperationKind::Copy, &source, ConflictPolicy::Error).unwrap_err();
         assert_eq!(conflict.kind(), io::ErrorKind::AlreadyExists);
         let renamed = run(FileOperationKind::Move, &source, ConflictPolicy::Rename).unwrap();
-        assert_eq!(renamed.targets, vec![destination.join("source (1)")]);
+        assert_eq!(renamed.targets, vec![destination.join(kept("source"))]);
         assert!(!source.exists());
 
         run(
@@ -2553,7 +2643,10 @@ mod tests {
             ConflictPolicy::Rename,
         )
         .unwrap();
-        assert_eq!(fs::read(destination.join("item (1).txt")).unwrap(), b"new");
+        assert_eq!(
+            fs::read(destination.join(kept("item.txt"))).unwrap(),
+            b"new"
+        );
         assert!(explorie_leftovers(&destination).is_empty());
     }
 
@@ -2878,7 +2971,7 @@ mod tests {
             |_| {},
         )
         .unwrap();
-        assert_eq!(renamed.targets, vec![destination.join("caf\u{e9} (1).txt")]);
+        assert_eq!(renamed.targets, vec![destination.join("caf\u{e9} 2.txt")]);
         assert_eq!(fs::read(destination.join(decomposed)).unwrap(), b"existing");
     }
 

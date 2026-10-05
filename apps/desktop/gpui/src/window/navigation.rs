@@ -40,8 +40,15 @@ impl DirectoryWindow {
         if self.browser.navigate(path) {
             let target = self.browser.path().to_path_buf();
             self.prepare_column_selection(&origin, &target);
-            self.path_did_change(cx);
+            self.folder_did_change(cx);
         }
+    }
+
+    /// The current folder changed by navigating (not by switching tabs):
+    /// like Finder, its search ends.
+    pub(crate) fn folder_did_change(&mut self, cx: &mut Context<Self>) {
+        self.reset_search_for_navigation();
+        self.path_did_change(cx);
     }
 
     pub(crate) fn activate_column(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -59,7 +66,7 @@ impl DirectoryWindow {
         // An interaction inside the column strip must keep that view active,
         // even if this folder has a different saved view mode.
         self.browser.set_view_mode(ViewMode::Column);
-        self.path_did_change(cx);
+        self.folder_did_change(cx);
         self.column_view.pending_selection = None;
         // Use the displayed listing immediately so this click and subsequent
         // keyboard input work while the fresh directory request is pending.
@@ -343,7 +350,7 @@ impl DirectoryWindow {
         if self.browser.go_back() {
             let target = self.browser.path().to_path_buf();
             self.prepare_column_selection(&origin, &target);
-            self.path_did_change(cx);
+            self.folder_did_change(cx);
         }
     }
 
@@ -354,7 +361,7 @@ impl DirectoryWindow {
         if self.browser.go_forward() {
             let target = self.browser.path().to_path_buf();
             self.prepare_column_selection(&origin, &target);
-            self.path_did_change(cx);
+            self.folder_did_change(cx);
         }
     }
 
@@ -365,7 +372,7 @@ impl DirectoryWindow {
         if self.browser.go_to_back_history(index) {
             let target = self.browser.path().to_path_buf();
             self.prepare_column_selection(&origin, &target);
-            self.path_did_change(cx);
+            self.folder_did_change(cx);
         }
     }
 
@@ -376,7 +383,7 @@ impl DirectoryWindow {
         if self.browser.go_to_forward_history(index) {
             let target = self.browser.path().to_path_buf();
             self.prepare_column_selection(&origin, &target);
-            self.path_did_change(cx);
+            self.folder_did_change(cx);
         }
     }
 
@@ -393,7 +400,7 @@ impl DirectoryWindow {
         if self.browser.go_up() {
             let target = self.browser.path().to_path_buf();
             self.prepare_column_selection(&origin, &target);
-            self.path_did_change(cx);
+            self.folder_did_change(cx);
         }
     }
 

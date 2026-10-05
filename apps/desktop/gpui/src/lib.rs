@@ -54,6 +54,8 @@ mod diagnostics;
 mod entry_kind_tests;
 mod error_reports;
 mod file_clipboard;
+#[cfg(test)]
+mod finder_parity_tests;
 mod native_text_input;
 mod operation;
 mod operation_recovery;
@@ -152,8 +154,8 @@ use widgets::*;
 use window::{
     ClipboardUi, ColumnViewUi, ContextMenuUi, DiskInfoState, EntryVisuals, ListingUi, MutationUi,
     NativeTextInputState, NavigationUi, OperationUi, OverlayUi, PreviewUi, QuickLookUi, RecoveryUi,
-    RemoteDrivesUi, SearchUi, SettingsUi, SystemUi, ToastQueue, WatcherUi, WindowLayout,
-    WorkspaceUi,
+    RemoteDrivesUi, SearchScope, SearchUi, SettingsUi, SystemUi, ToastQueue, WatcherUi,
+    WindowLayout, WorkspaceUi,
 };
 use window_pane::{PaneInputs, PaneKind, WindowPanes};
 use workspace::{

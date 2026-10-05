@@ -149,7 +149,7 @@ fn macos_system_font_uses_gpui_platform_alias() {
     assert_eq!(font_family(&settings), MACOS_SYSTEM_FONT_FAMILY);
 }
 
-fn fixture_dir() -> PathBuf {
+pub(crate) fn fixture_dir() -> PathBuf {
     let path = std::env::temp_dir().join(format!(
         "explorie-gpui-fixture-{}-{}",
         std::process::id(),
@@ -164,7 +164,7 @@ fn fixture_dir() -> PathBuf {
 /// Removes a fixture directory. On Windows a file sent to the Recycle Bin or a
 /// directory watch can hold a handle for a moment after an operation has
 /// finished, so deletion is retried briefly there.
-fn remove_fixture(path: &Path) {
+pub(crate) fn remove_fixture(path: &Path) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         match fs::remove_dir_all(path) {
@@ -185,7 +185,16 @@ fn remove_fixture(path: &Path) {
     }
 }
 
-fn secondary_keystroke(keys: &str) -> Keystroke {
+/// The name Keep Both gives the first copy of `name` on this platform.
+pub(crate) fn kept_name(name: &str) -> PathBuf {
+    PathBuf::from(explorie_core::numbered_name(
+        std::ffi::OsStr::new(name),
+        explorie_core::FIRST_CONFLICT_NUMBER,
+        true,
+    ))
+}
+
+pub(crate) fn secondary_keystroke(keys: &str) -> Keystroke {
     let modifier = if cfg!(target_os = "macos") {
         "cmd"
     } else {
@@ -3441,7 +3450,7 @@ fn retry_control_copies_only_the_unresolved_batch_suffix(cx: &mut TestAppContext
         fs::read_to_string(destination.join("second.txt")).unwrap(),
         "second"
     );
-    assert!(!destination.join("first (1).txt").exists());
+    assert!(!destination.join(kept_name("first.txt")).exists());
     view.update(cx, |view, _| {
         assert!(view.operations.latest_retryable_id().is_none());
         assert_eq!(
@@ -3556,7 +3565,7 @@ fn cancelled_copy_removes_stage_and_retry_completes_once(cx: &mut TestAppContext
         fs::metadata(destination.join("large.bin")).unwrap().len(),
         FILE_SIZE
     );
-    assert!(!destination.join("large (1).bin").exists());
+    assert!(!destination.join(kept_name("large.bin")).exists());
     view.update(cx, |view, _| {
         assert!(view.operations.latest_retryable_id().is_none());
         assert_eq!(
@@ -3660,7 +3669,7 @@ fn conflict_prompt_skips_one_then_keeps_both_for_the_next_unresolved_item(cx: &m
     window.simulate_click(keep_both, gpui::Modifiers::default());
     for _ in 0..300 {
         window.run_until_parked();
-        if destination.join("third (1).txt").is_file()
+        if destination.join(kept_name("third.txt")).is_file()
             && view.update(window, |view, _| {
                 view.operation_ui.conflict_prompts.is_empty()
             })
@@ -3678,13 +3687,13 @@ fn conflict_prompt_skips_one_then_keeps_both_for_the_next_unresolved_item(cx: &m
         fs::read_to_string(destination.join("second.txt")).unwrap(),
         "second-existing"
     );
-    assert!(!destination.join("second (1).txt").exists());
+    assert!(!destination.join(kept_name("second.txt")).exists());
     assert_eq!(
         fs::read_to_string(destination.join("third.txt")).unwrap(),
         "third-existing"
     );
     assert_eq!(
-        fs::read_to_string(destination.join("third (1).txt")).unwrap(),
+        fs::read_to_string(destination.join(kept_name("third.txt"))).unwrap(),
         "third-new"
     );
     view.update(window, |view, _| {
@@ -7948,7 +7957,7 @@ fn go_to_folder_restores_shortcut_autocomplete_validation_recent_and_modal_geome
         window.simulate_keystrokes(key);
     }
     window.executor().advance_clock(Duration::from_millis(150));
-    for _ in 0..100 {
+    for _ in 0..2_000 {
         window.run_until_parked();
         let ready = view.update(window, |view, _| {
             view.navigation_ui
@@ -7976,7 +7985,7 @@ fn go_to_folder_restores_shortcut_autocomplete_validation_recent_and_modal_geome
         assert!(state.suggestions.is_empty());
     });
     window.simulate_keystrokes("enter");
-    for _ in 0..100 {
+    for _ in 0..2_000 {
         window.run_until_parked();
         if view.update(window, |view, _| view.navigation_ui.go_to_folder.is_none()) {
             break;
@@ -8000,7 +8009,7 @@ fn go_to_folder_restores_shortcut_autocomplete_validation_recent_and_modal_geome
         state.replace_on_type = false;
         view.submit_go_to_folder(cx);
     });
-    for _ in 0..100 {
+    for _ in 0..2_000 {
         window.run_until_parked();
         let ready = view.update(window, |view, _| {
             view.navigation_ui
@@ -8091,7 +8100,7 @@ fn folder_load_failure_restores_retry_picker_and_recovery_geometry(cx: &mut Test
 
     let retry = window.debug_bounds("retry-listing").unwrap().center();
     window.simulate_click(retry, gpui::Modifiers::default());
-    for _ in 0..100 {
+    for _ in 0..2_000 {
         window.run_until_parked();
         if view.update(window, |view, _| {
             matches!(view.listing.state, ListingState::Ready)
@@ -8113,7 +8122,7 @@ fn folder_load_failure_restores_retry_picker_and_recovery_geometry(cx: &mut Test
     view.update(window, |view, cx| {
         view.complete_folder_picker(Ok(Some(alternate.clone())), cx);
     });
-    for _ in 0..100 {
+    for _ in 0..2_000 {
         window.run_until_parked();
         if view.update(window, |view, _| {
             matches!(view.listing.state, ListingState::Ready)
@@ -9206,7 +9215,7 @@ fn keep_both_move_undo_restores_the_original_name_and_redo_repeats_it() {
     fs::create_dir(&destination).unwrap();
     let source = source_dir.join("report.txt");
     let existing = destination.join("report.txt");
-    let kept = destination.join("report (1).txt");
+    let kept = destination.join(kept_name("report.txt"));
     fs::write(&source, "moved").unwrap();
     fs::write(&existing, "already there").unwrap();
     let services = NativeServices::new(explorie_native_services::ResourcePaths::test(&directory));
@@ -9226,7 +9235,7 @@ fn keep_both_move_undo_restores_the_original_name_and_redo_repeats_it() {
         undo_action(record.action, services.clone()).await.unwrap()
     });
     assert_eq!(fs::read_to_string(&source).unwrap(), "moved");
-    assert!(!source_dir.join("report (1).txt").exists());
+    assert!(!source_dir.join(kept_name("report.txt")).exists());
     assert!(!kept.exists());
     assert_eq!(fs::read_to_string(&existing).unwrap(), "already there");
     let UndoAction::Move { request, pairs } = &undone else {
@@ -9249,8 +9258,8 @@ fn keep_both_move_undo_keeps_the_suffix_when_the_original_name_was_retaken() {
     fs::create_dir(&source_dir).unwrap();
     fs::create_dir(&destination).unwrap();
     let source = source_dir.join("report.txt");
-    let kept = destination.join("report (1).txt");
-    let restored = source_dir.join("report (1).txt");
+    let kept = destination.join(kept_name("report.txt"));
+    let restored = source_dir.join(kept_name("report.txt"));
     fs::write(&source, "moved").unwrap();
     fs::write(destination.join("report.txt"), "already there").unwrap();
     let services = NativeServices::new(explorie_native_services::ResourcePaths::test(&directory));
@@ -10508,23 +10517,38 @@ fn smart_folder_status_names_spotlight_and_partial_results() {
         source,
     };
     assert_eq!(
-        crate::window::search::search_result_status(&result(SearchSource::Spotlight, true, false)),
+        crate::window::search::search_result_status(
+            &result(SearchSource::Spotlight, true, false),
+            None
+        ),
         "2 smart-folder results • Spotlight"
     );
     assert_eq!(
-        crate::window::search::search_result_status(&result(SearchSource::Spotlight, true, true)),
+        crate::window::search::search_result_status(
+            &result(SearchSource::Spotlight, true, true),
+            None
+        ),
         "2 smart-folder results (partial results) • Spotlight"
     );
     assert_eq!(
-        crate::window::search::search_result_status(&result(SearchSource::Crawler, true, false)),
+        crate::window::search::search_result_status(
+            &result(SearchSource::Crawler, true, false),
+            None
+        ),
         "2 smart-folder results • cached index"
     );
     assert_eq!(
-        crate::window::search::search_result_status(&result(SearchSource::Crawler, false, true)),
+        crate::window::search::search_result_status(
+            &result(SearchSource::Crawler, false, true),
+            None
+        ),
         "2 smart-folder results (partial results) • 40 paths indexed"
     );
     assert_eq!(
-        crate::window::search::search_result_status(&result(SearchSource::Mixed, false, false)),
+        crate::window::search::search_result_status(
+            &result(SearchSource::Mixed, false, false),
+            None
+        ),
         "2 smart-folder results • Spotlight + 40 paths indexed"
     );
 }
@@ -11581,7 +11605,15 @@ fn submitting_an_unchanged_name_closes_the_rename_prompt(cx: &mut TestAppContext
         assert!(!view.undo_ledger.can_undo(SystemTime::now()));
     });
     assert_eq!(fs::read_to_string(&source).unwrap(), "keep");
-    assert!(!directory.join("notes (2).txt").exists());
+    assert!(
+        !directory
+            .join(explorie_core::numbered_name(
+                std::ffi::OsStr::new("notes.txt"),
+                2,
+                true
+            ))
+            .exists()
+    );
     fs::remove_dir_all(directory).unwrap();
 }
 

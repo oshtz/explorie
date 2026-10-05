@@ -41,7 +41,7 @@ mod remote_drives;
 pub(crate) use remote_drives::RemoteDrivesUi;
 mod render;
 pub(crate) mod search;
-pub(crate) use search::SearchUi;
+pub(crate) use search::{SearchScope, SearchUi};
 mod selection;
 mod settings_panel;
 pub(crate) use settings_panel::SettingsUi;

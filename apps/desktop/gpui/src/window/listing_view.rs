@@ -1,5 +1,6 @@
 //! `DirectoryWindow` behavior for listing view.
 
+use super::selection::is_secondary_click;
 use crate::*;
 
 impl DirectoryWindow {
@@ -42,11 +43,9 @@ impl DirectoryWindow {
         if !column && !query.is_empty() {
             actions.push(
                 toolbar_button("empty-clear-search", "Clear search", self.palette.control)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.browser.clear_search();
-                        this.search.active = false;
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.clear_search_and_focus_list(window, cx);
                         this.persist_session();
-                        cx.notify();
                     }))
                     .into_any_element(),
             );
@@ -506,6 +505,16 @@ impl DirectoryWindow {
                             MouseButton::Left,
                             cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
                                 window.focus(&this.focus_handle, cx);
+                                if is_secondary_click(event) {
+                                    this.open_file_context_menu(
+                                        pointer_path.clone(),
+                                        is_dir,
+                                        event.position,
+                                        cx,
+                                    );
+                                    cx.stop_propagation();
+                                    return;
+                                }
                                 this.select_from_pointer(pointer_path.clone(), event, cx);
                                 if event.click_count >= 2 {
                                     this.open_entry(pointer_path.clone(), is_dir, cx);
@@ -883,6 +892,16 @@ impl DirectoryWindow {
                                     cx.listener(
                                         move |this, event: &gpui::MouseDownEvent, window, cx| {
                                             window.focus(&this.focus_handle, cx);
+                                            if is_secondary_click(event) {
+                                                this.open_file_context_menu(
+                                                    pointer_path.clone(),
+                                                    is_dir,
+                                                    event.position,
+                                                    cx,
+                                                );
+                                                cx.stop_propagation();
+                                                return;
+                                            }
                                             this.select_from_pointer(
                                                 pointer_path.clone(),
                                                 event,
@@ -1252,6 +1271,18 @@ impl DirectoryWindow {
                                     cx.listener(
                                         move |this, event: &gpui::MouseDownEvent, window, cx| {
                                             window.focus(&this.focus_handle, cx);
+                                            if is_secondary_click(event) {
+                                                this.activate_column(column_index, cx);
+                                                this.column_view.pending_selection = None;
+                                                this.open_file_context_menu(
+                                                    pointer_path.clone(),
+                                                    is_dir,
+                                                    event.position,
+                                                    cx,
+                                                );
+                                                cx.stop_propagation();
+                                                return;
+                                            }
                                             let extend = event.modifiers.shift
                                                 || event.modifiers.control
                                                 || event.modifiers.platform;

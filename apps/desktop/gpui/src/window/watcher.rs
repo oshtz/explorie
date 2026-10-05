@@ -40,9 +40,8 @@ impl DirectoryWindow {
         let watched_paths = self.watched_paths();
         let watcher = self.services.watcher.clone();
         let recursive = self
-            .browser
-            .active_smart_folder()
-            .is_some_and(|folder| folder.criteria().recursive);
+            .listing_search_criteria()
+            .is_some_and(|criteria| criteria.recursive);
         self.watcher.status = WatchStatus::Starting;
 
         self.watcher.task = Some(cx.spawn(async move |this, cx| {
@@ -111,7 +110,7 @@ impl DirectoryWindow {
                 self.watcher.status = WatchStatus::Watching;
                 self.invalidate_changed_preview(&event.paths);
                 self.services.search.invalidate(&event.paths);
-                let smart_folder = self.browser.active_smart_folder().is_some();
+                let smart_folder = self.listing_shows_search_results();
                 // Let the current listing finish before refreshing. Restarting it for
                 // every filesystem event can starve slow folders indefinitely.
                 // Search invalidation cancels the active search, so restart it now.
@@ -203,7 +202,7 @@ impl DirectoryWindow {
         cx: &mut Context<Self>,
     ) {
         self.watcher.patch_task = None;
-        if guard != self.watcher_patch_guard() || self.browser.active_smart_folder().is_some() {
+        if guard != self.watcher_patch_guard() || self.listing_shows_search_results() {
             // A newer listing, tab, folder or view owns the entries now.
             self.watcher.patch_pending.clear();
             return;
@@ -283,8 +282,8 @@ impl DirectoryWindow {
     }
 
     pub(crate) fn watched_paths(&self) -> Vec<PathBuf> {
-        if let Some(folder) = self.browser.active_smart_folder() {
-            folder.criteria().search_paths.clone()
+        if let Some(criteria) = self.listing_search_criteria() {
+            criteria.search_paths
         } else if self.browser.view_mode() == ViewMode::Column {
             self.column_view.columns.paths()
         } else {
@@ -300,6 +299,9 @@ impl DirectoryWindow {
         self.close_context_menu(cx);
         self.close_preview(cx);
         self.navigation_ui.breadcrumb_editor = None;
+        // Subfolder results belong to the folder (and tab) being left.
+        self.end_subfolder_search(false, cx);
+        self.browser.show_search_results(false);
         let leaving_smart_folder = self.browser.active_smart_folder().is_some();
         self.browser.clear_active_smart_folder();
         if leaving_smart_folder {
