@@ -7,10 +7,10 @@
 #include <stdint.h>
 #include <string.h>
 
-// Quick Look thumbnails and NSWorkspace icons rendered to PNG files. Every
-// entry point is synchronous, safe to call from any background thread, and
-// bounded by a timeout: the system work runs on its own queue and a late
-// result is simply dropped.
+// ImageIO downsampled decodes, Quick Look thumbnails and NSWorkspace icons
+// rendered to PNG files. Every entry point is synchronous, safe to call from
+// any background thread, and bounded by a timeout: the system work runs on its
+// own queue and a late result is simply dropped.
 //
 // Result codes; keep in sync with crates/native-services/src/preview/macos.rs.
 enum {
@@ -20,6 +20,7 @@ enum {
     ExploriePreviewImageCancelled = 3,
     ExploriePreviewImageWriteFailed = 4,
     ExploriePreviewImageInvalidInput = 5,
+    ExploriePreviewImageTooLarge = 6,
 };
 
 // Icon containers for explorie_workspace_type_icon.
@@ -36,6 +37,9 @@ static const uint32_t ExplorieMaxImagePixels = 4096;
 // with the block instead of touching freed memory.
 @interface ExploriePreviewImageResult : NSObject
 @property(atomic, strong) NSData *png;
+// Set once the caller stops waiting, so queued work that has not started yet
+// can skip itself.
+@property(atomic) BOOL abandoned;
 @end
 
 @implementation ExploriePreviewImageResult
@@ -129,6 +133,60 @@ static int32_t ExplorieWait(dispatch_semaphore_t done, double timeoutSeconds,
     }
 }
 
+// Decodes the primary image of `source` for explorie_imageio_thumbnail and
+// stores the PNG in `result`. A request the caller abandoned while it was
+// queued skips the expensive decode.
+static int32_t ExplorieImageIODecode(CGImageSourceRef source, NSDictionary *sourceOptions,
+                                     uint32_t max_pixels, uint32_t max_source_dimension,
+                                     uint64_t max_source_pixels,
+                                     ExploriePreviewImageResult *result) {
+    if (CGImageSourceGetCount(source) == 0) return ExploriePreviewImageUnavailable;
+    size_t index = CGImageSourceGetPrimaryImageIndex(source);
+    NSDictionary *properties = CFBridgingRelease(
+        CGImageSourceCopyPropertiesAtIndex(source, index, (__bridge CFDictionaryRef)sourceOptions));
+    uint64_t width =
+        [properties[(__bridge NSString *)kCGImagePropertyPixelWidth] unsignedLongLongValue];
+    uint64_t height =
+        [properties[(__bridge NSString *)kCGImagePropertyPixelHeight] unsignedLongLongValue];
+    if (width == 0 || height == 0) return ExploriePreviewImageUnavailable;
+    if (width > max_source_dimension || height > max_source_dimension ||
+        width * height > max_source_pixels) {
+        return ExploriePreviewImageTooLarge;
+    }
+    if (result.abandoned) return ExploriePreviewImageCancelled;
+    NSDictionary *thumbnailOptions = @{
+        (__bridge NSString *)kCGImageSourceCreateThumbnailFromImageAlways : @YES,
+        (__bridge NSString *)kCGImageSourceCreateThumbnailWithTransform : @YES,
+        (__bridge NSString *)kCGImageSourceShouldCacheImmediately : @YES,
+        (__bridge NSString *)kCGImageSourceThumbnailMaxPixelSize :
+            @(MIN((uint64_t)max_pixels, MAX(width, height))),
+    };
+    CGImageRef image = CGImageSourceCreateThumbnailAtIndex(
+        source, index, (__bridge CFDictionaryRef)thumbnailOptions);
+    if (image == NULL) return ExploriePreviewImageUnavailable;
+    size_t fitWidth = 0;
+    size_t fitHeight = 0;
+    ExplorieFitSize(CGImageGetWidth(image), CGImageGetHeight(image), max_pixels, &fitWidth,
+                    &fitHeight);
+    result.png = ExploriePNGData(image, fitWidth, fitHeight);
+    CGImageRelease(image);
+    return result.png != nil ? ExploriePreviewImageOK : ExploriePreviewImageUnavailable;
+}
+
+static int32_t ExplorieImageIOThumbnail(NSURL *url, uint32_t max_pixels,
+                                        uint32_t max_source_dimension,
+                                        uint64_t max_source_pixels,
+                                        ExploriePreviewImageResult *result) {
+    NSDictionary *sourceOptions = @{(__bridge NSString *)kCGImageSourceShouldCache : @NO};
+    CGImageSourceRef source =
+        CGImageSourceCreateWithURL((__bridge CFURLRef)url, (__bridge CFDictionaryRef)sourceOptions);
+    if (source == NULL) return ExploriePreviewImageUnavailable;
+    int32_t status = ExplorieImageIODecode(source, sourceOptions, max_pixels, max_source_dimension,
+                                           max_source_pixels, result);
+    CFRelease(source);
+    return status;
+}
+
 static int32_t ExplorieWritePNG(NSData *png, NSString *outputPath) {
     if (png == nil) return ExploriePreviewImageUnavailable;
     return [png writeToFile:outputPath options:NSDataWritingAtomic error:nil]
@@ -198,6 +256,50 @@ int32_t explorie_quicklook_thumbnail(const char *path, uint32_t max_pixels, doub
             [generator cancelRequest:request];
             return waited;
         }
+        return ExplorieWritePNG(result.png, outputPath);
+    }
+}
+
+// Writes ImageIO's decode of the primary image in `path`, fitted within
+// `max_pixels` square, upright per its EXIF orientation and never enlarged, to
+// `output` as an sRGB PNG. ImageIO decodes JPEG and HEIC directly at a reduced
+// size, so a large photo is never held at full resolution; other formats are
+// decoded once and scaled down. A source whose header declares more than
+// `max_source_dimension` pixels on an edge or `max_source_pixels` in total
+// reports TooLarge without decoding pixels; one ImageIO cannot read reports
+// Unavailable. The decode runs on its own queue and is abandoned, like Quick
+// Look requests, after `timeout_seconds` or once `generation` (when not NULL,
+// read atomically and only by this thread) no longer equals `ticket`.
+int32_t explorie_imageio_thumbnail(const char *path, uint32_t max_pixels,
+                                   uint32_t max_source_dimension, uint64_t max_source_pixels,
+                                   double timeout_seconds, const char *output,
+                                   const uint64_t *generation, uint64_t ticket) {
+    @autoreleasepool {
+        NSString *filePath = ExplorieFilePath(path);
+        NSString *outputPath = ExplorieFilePath(output);
+        if (filePath == nil || outputPath == nil || max_pixels == 0 ||
+            max_pixels > ExplorieMaxImagePixels) {
+            return ExploriePreviewImageInvalidInput;
+        }
+        NSURL *url = [NSURL fileURLWithPath:filePath];
+        ExploriePreviewImageResult *result = [ExploriePreviewImageResult new];
+        // Written before the semaphore is signalled and read only after a
+        // successful wait, so the block's store is visible to this thread.
+        __block int32_t status = ExploriePreviewImageUnavailable;
+        dispatch_semaphore_t done = dispatch_semaphore_create(0);
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+          @autoreleasepool {
+              status = ExplorieImageIOThumbnail(url, max_pixels, max_source_dimension,
+                                                max_source_pixels, result);
+          }
+          dispatch_semaphore_signal(done);
+        });
+        int32_t waited = ExplorieWait(done, timeout_seconds, generation, ticket);
+        if (waited != ExploriePreviewImageOK) {
+            result.abandoned = YES;
+            return waited;
+        }
+        if (status != ExploriePreviewImageOK) return status;
         return ExplorieWritePNG(result.png, outputPath);
     }
 }
