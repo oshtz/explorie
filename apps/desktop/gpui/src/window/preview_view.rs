@@ -360,7 +360,12 @@ impl DirectoryWindow {
             .when(side_panel, |panel| {
                 panel
                     .flex_shrink_0()
-                    .w(px(self.layout.preview_panel_width * self.palette.scale))
+                    .w(px(self.layout.preview_panel_width * self.palette.scale
+                        + if column_preview {
+                            self.column_view.preview_fill
+                        } else {
+                            0.0
+                        }))
                     .min_w(px(MIN_PREVIEW_PANEL_WIDTH * self.palette.scale))
                     .h_full()
                     .border_l_1()
@@ -937,42 +942,15 @@ impl DirectoryWindow {
                         .into_any_element()
                 }
                 PreviewContent::Rich(preview) => {
-                    let blocks = preview.blocks.into_iter().map(|block| {
-                        let row = div()
-                            .w_full()
-                            .text_color(self.palette.text)
-                            .child(block.text);
-                        match block.kind {
-                            RichBlockKind::Heading => {
-                                row.mt_2().text_base().font_weight(FontWeight::SEMIBOLD)
-                            }
-                            RichBlockKind::Metadata => row.text_xs().text_color(self.palette.muted),
-                            RichBlockKind::TableHeader => row
-                                .px_2()
-                                .py_1()
-                                .bg(self.palette.control)
-                                .font_family(monospace_font_family())
-                                .text_xs()
-                                .font_weight(FontWeight::SEMIBOLD),
-                            RichBlockKind::TableRow => row
-                                .px_2()
-                                .py_1()
-                                .border_b_1()
-                                .border_color(self.palette.border)
-                                .font_family(monospace_font_family())
-                                .text_xs(),
-                            RichBlockKind::Code => row
-                                .p_2()
-                                .rounded_md()
-                                .bg(self.palette.control)
-                                .font_family(monospace_font_family())
-                                .text_xs(),
-                            RichBlockKind::Paragraph => row.text_sm().line_height(px(21.0)),
-                        }
-                        .into_any_element()
-                    });
+                    let palette = self.palette;
+                    let blocks = preview
+                        .blocks
+                        .into_iter()
+                        .enumerate()
+                        .map(move |(index, block)| rich_block_element(index, block, palette));
                     div()
                         .id("rich-preview")
+                        .debug_selector(|| "rich-preview".to_string())
                         .flex()
                         .flex_col()
                         .w_full()
@@ -982,6 +960,7 @@ impl DirectoryWindow {
                             div()
                                 .px_4()
                                 .pt_4()
+                                .debug_selector(|| "rich-preview-title".to_string())
                                 .text_lg()
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(self.palette.text)
@@ -1737,7 +1716,12 @@ impl DirectoryWindow {
             .when(side_panel, |panel| {
                 panel
                     .flex_shrink_0()
-                    .w(px(self.layout.preview_panel_width * self.palette.scale))
+                    .w(px(self.layout.preview_panel_width * self.palette.scale
+                        + if column_preview {
+                            self.column_view.preview_fill
+                        } else {
+                            0.0
+                        }))
                     .min_w(px(MIN_PREVIEW_PANEL_WIDTH * self.palette.scale))
                     .h_full()
                     .border_l_1()

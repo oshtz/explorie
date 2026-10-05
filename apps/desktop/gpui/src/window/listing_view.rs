@@ -333,6 +333,31 @@ impl DirectoryWindow {
             .into_any_element()
     }
 
+    /// The list's custom columns with their widths, then the Size and
+    /// Modified widths; the header and every row share this layout.
+    pub(crate) fn list_column_layout(&self) -> (Vec<(String, f32)>, f32, f32) {
+        let columns = self.browser.custom_columns();
+        let custom_widths = columns
+            .iter()
+            .map(|column| {
+                self.browser
+                    .column_width(&format!("custom:{column}"))
+                    .map(f32::from)
+            })
+            .collect::<Vec<_>>();
+        let widths = list_column_widths(
+            self.layout.listing_viewport_width,
+            self.browser.column_width("size").map(f32::from),
+            self.browser.column_width("modified").map(f32::from),
+            &custom_widths,
+        );
+        (
+            columns.into_iter().zip(widths.custom).collect(),
+            widths.size,
+            widths.modified,
+        )
+    }
+
     pub(crate) fn render_list_view(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let count = self.browser.visible_entries().len();
         let marquee_layout = MarqueeLayout::List {
@@ -347,29 +372,7 @@ impl DirectoryWindow {
             self.pointer.selection_marquee = None;
         }
         let marquee_overlay = self.selection_marquee_overlay_rect(marquee_layout);
-        let columns = self.browser.custom_columns();
-        let custom_default =
-            list_custom_column_width(self.layout.listing_viewport_width, columns.len());
-        let columns = columns
-            .into_iter()
-            .map(|column| {
-                let width = self
-                    .browser
-                    .column_width(&format!("custom:{column}"))
-                    .map_or(custom_default, f32::from);
-                (column, width)
-            })
-            .collect::<Vec<_>>();
-        let (default_size_width, default_modified_width) =
-            list_builtin_column_widths(columns.len());
-        let size_width = self
-            .browser
-            .column_width("size")
-            .map_or(default_size_width, f32::from);
-        let modified_width = self
-            .browser
-            .column_width("modified")
-            .map_or(default_modified_width, f32::from);
+        let (columns, size_width, modified_width) = self.list_column_layout();
         let list = uniform_list(
             "listing-results",
             count,
@@ -451,7 +454,13 @@ impl DirectoryWindow {
                                 .gap_2()
                                 .px_3()
                                 .child(icon)
-                                .child(div().min_w_0().truncate().child(file_name(&entry)))
+                                .child(
+                                    div()
+                                        .debug_selector(move || format!("entry-{index}-name"))
+                                        .min_w_0()
+                                        .truncate()
+                                        .child(file_name(&entry)),
+                                )
                                 .children(entry_tag_dots(
                                     &entry,
                                     format!("entry-tags-{index}"),
@@ -475,8 +484,24 @@ impl DirectoryWindow {
                                 ),
                         )
                         .children(custom_cells)
-                        .child(div().w(px(size_width)).px_3().text_sm().child(size))
-                        .child(div().w(px(modified_width)).px_3().text_sm().child(modified))
+                        .child(
+                            div()
+                                .flex_none()
+                                .w(px(size_width))
+                                .px_2()
+                                .truncate()
+                                .text_sm()
+                                .child(size),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .w(px(modified_width))
+                                .px_2()
+                                .truncate()
+                                .text_sm()
+                                .child(modified),
+                        )
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
@@ -1063,7 +1088,8 @@ impl DirectoryWindow {
         {
             self.pointer.selection_marquee = None;
         }
-        let mut rendered_columns = Vec::with_capacity(column_count);
+        let mut rendered_columns = Vec::with_capacity(column_count + 2);
+        let mut column_widths = Vec::with_capacity(column_count);
 
         for (column_index, column_path, loading, error, entry_count) in snapshots {
             let column_width = self
@@ -1071,6 +1097,7 @@ impl DirectoryWindow {
                 .column_view_width(&column_path)
                 .map(f32::from)
                 .unwrap_or(DEFAULT_COLUMN_VIEW_WIDTH);
+            column_widths.push(column_width);
             let marquee_layout = MarqueeLayout::Column {
                 index: column_index,
                 row_height: f32::from(self.settings.appearance.list_row_height),
@@ -1560,18 +1587,45 @@ impl DirectoryWindow {
             );
         }
 
-        if self.settings.view.show_preview_panel && !self.quick_look.open {
+        let show_preview = self.settings.view.show_preview_panel && !self.quick_look.open;
+        let alignment = leaf_alignment(
+            &column_widths,
+            if show_preview {
+                self.layout.preview_panel_width * self.palette.scale
+            } else {
+                0.0
+            },
+            f32::from(self.column_view.strip_scroll.bounds().size.width),
+        );
+        let trailing_fill = alignment.map_or(0.0, |alignment| alignment.trailing_fill);
+        self.column_view.preview_fill = if show_preview { trailing_fill } else { 0.0 };
+        if show_preview {
             rendered_columns.push(if matches!(self.preview.state, PreviewState::Closed) {
                 self.render_preview_summary_panel(true, true, cx)
             } else {
                 self.render_preview_panel(true, false, true, cx)
             });
+        } else if trailing_fill > 0.0 {
+            rendered_columns.push(
+                div()
+                    .flex_shrink_0()
+                    .w(px(trailing_fill))
+                    .h_full()
+                    .into_any_element(),
+            );
         }
         let rendered_column_count = rendered_columns.len();
 
         if self.column_view.scroll_to_leaf_attempts > 0 && rendered_column_count > 0 {
             let max_offset = self.column_view.strip_scroll.max_offset().x;
-            if max_offset > px(0.0) {
+            if let Some(alignment) = alignment {
+                // Land on a column boundary rather than the far end, so the
+                // leftmost visible column is never cut off.
+                let offset = self.column_view.strip_scroll.offset();
+                self.column_view
+                    .strip_scroll
+                    .set_offset(gpui::point(px(-alignment.offset), offset.y));
+            } else if max_offset > px(0.0) {
                 let offset = self.column_view.strip_scroll.offset();
                 self.column_view
                     .strip_scroll
