@@ -586,6 +586,9 @@ mod tests {
         let equivalent =
             |menu, label| key_equivalent(&keymap, action_for(&menus, menu, label).as_ref());
         assert_eq!(equivalent("Edit", "Copy"), keystroke("secondary-c"));
+        // On macOS this key equivalent is how Cmd+V pastes at all: the
+        // keymap leaves it to AppKit so the paste counts as user initiated.
+        assert_eq!(equivalent("Edit", "Paste"), keystroke("secondary-v"));
         assert_eq!(equivalent("Edit", "Select All"), keystroke("secondary-a"));
         assert_eq!(
             equivalent("File", "New Folder"),

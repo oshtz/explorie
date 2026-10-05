@@ -82,7 +82,7 @@ impl DirectoryWindow {
                     .on_click(cx.listener(|this, _, _, cx| this.prompt_new_folder(cx)))
                     .into_any_element(),
             );
-            if self.paste_candidate().is_some() {
+            if self.paste_count().is_some() {
                 actions.push(
                     toolbar_button("empty-paste", "Paste", self.palette.control)
                         .debug_selector(|| "empty-paste".to_string())

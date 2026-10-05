@@ -19,7 +19,7 @@ impl DirectoryWindow {
         let count = menu.paths.len();
         if count == 0 {
             return self
-                .paste_candidate()
+                .paste_count()
                 .map(|_| vec![(ContextMenuAction::Paste, false)])
                 .unwrap_or_default();
         }
@@ -172,7 +172,7 @@ impl DirectoryWindow {
         // Files may have been copied in Finder or another window since the
         // clipboard was last read.
         self.refresh_system_clipboard();
-        if self.paste_candidate().is_none() {
+        if self.paste_count().is_none() {
             self.close_context_menu(cx);
             return;
         }
@@ -434,9 +434,7 @@ impl DirectoryWindow {
         }
         let selection_count = menu.paths.len();
         let label_count = if selection_count == 0 {
-            self.paste_candidate()
-                .map(|clipboard| clipboard.paths.len())
-                .unwrap_or(0)
+            self.paste_count().unwrap_or(0)
         } else {
             selection_count
         };

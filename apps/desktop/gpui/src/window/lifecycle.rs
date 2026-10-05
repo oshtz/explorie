@@ -6,7 +6,9 @@ impl DirectoryWindow {
     pub fn install_shortcut_bindings(&self, cx: &mut Context<Self>) {
         cx.clear_key_bindings();
         let mut bindings = application_key_bindings(&self.settings.shortcut_bindings);
-        bindings.extend(native_text_input::key_bindings());
+        bindings.extend(native_text_input::key_bindings(
+            shortcut::text_paste_belongs_to_menu(&self.settings.shortcut_bindings),
+        ));
         cx.bind_keys(bindings);
     }
 
@@ -309,6 +311,7 @@ impl DirectoryWindow {
                 state: None,
                 files: file_clipboard::default_file_clipboard(),
                 system: SystemClipboard::Unknown,
+                written: None,
             },
             navigation_ui: NavigationUi::default(),
             preview: PreviewUi::default(),
