@@ -783,3 +783,29 @@ fn rename_preselects_a_files_name_without_its_extension(cx: &mut TestAppContext)
     remove_fixture(&directory);
     remove_fixture(&resources);
 }
+
+#[gpui::test]
+fn media_shortcut_hints_show_only_where_the_keys_work(cx: &mut TestAppContext) {
+    use super::render_perf_tests::{Fixture, open_window, preview, wait_for};
+
+    let fixture = Fixture::new();
+    let (view, window) = open_window(&fixture, cx);
+    preview(window, &view, &fixture.audio_path);
+    wait_for(window, &view, "the inspector's audio player", |view, cx| {
+        view.media.read(cx).audio_status.is_some()
+    });
+    window.run_until_parked();
+    assert!(window.debug_bounds("audio-seek").is_some());
+    // In the inspector J, K, L and M select files by name.
+    assert!(window.debug_bounds("media-shortcut-hint").is_none());
+
+    let audio_path = fixture.audio_path.clone();
+    view.update(window, |view, cx| {
+        view.open_quick_look(audio_path.clone(), vec![audio_path.clone()], cx);
+    });
+    wait_for(window, &view, "Quick Look's audio player", |view, cx| {
+        view.quick_look.open && view.media.read(cx).audio_status.is_some()
+    });
+    window.run_until_parked();
+    assert!(window.debug_bounds("media-shortcut-hint").is_some());
+}

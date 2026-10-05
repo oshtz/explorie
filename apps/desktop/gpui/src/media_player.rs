@@ -1035,13 +1035,9 @@ impl MediaPlayer {
                                     .child(format!("{}%", (volume * 100.0).round())),
                             ),
                     )
-                    .child(
-                        div()
-                            .text_center()
-                            .text_xs()
-                            .text_color(self.palette.tertiary)
-                            .child("J/L seek  •  K play/pause  •  M mute"),
-                    ),
+                    .when(self.quick_look, |controls| {
+                        controls.child(media_shortcut_hint(self.palette))
+                    }),
             )
             .child(
                 div()
@@ -1344,13 +1340,9 @@ impl MediaPlayer {
                             .text_color(self.palette.muted)
                             .child(file_label),
                     )
-                    .child(
-                        div()
-                            .text_center()
-                            .text_xs()
-                            .text_color(self.palette.tertiary)
-                            .child("J/L seek  •  K play/pause  •  M mute"),
-                    ),
+                    .when(self.quick_look, |controls| {
+                        controls.child(media_shortcut_hint(self.palette))
+                    }),
             )
             .into_any_element()
     }
@@ -1494,4 +1486,15 @@ impl MediaPlayer {
             )
             .into_any_element()
     }
+}
+
+/// The playback shortcuts, shown only in Quick Look: in the inspector those
+/// letters select files by name instead.
+fn media_shortcut_hint(palette: UiPalette) -> impl IntoElement {
+    div()
+        .debug_selector(|| "media-shortcut-hint".to_string())
+        .text_center()
+        .text_xs()
+        .text_color(palette.tertiary)
+        .child("J/L seek  •  K play/pause  •  M mute")
 }
