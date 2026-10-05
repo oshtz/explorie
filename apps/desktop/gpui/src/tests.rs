@@ -194,7 +194,7 @@ pub(crate) fn kept_name(name: &str) -> PathBuf {
     ))
 }
 
-fn secondary_keystroke(keys: &str) -> Keystroke {
+pub(crate) fn secondary_keystroke(keys: &str) -> Keystroke {
     let modifier = if cfg!(target_os = "macos") {
         "cmd"
     } else {
@@ -10517,23 +10517,38 @@ fn smart_folder_status_names_spotlight_and_partial_results() {
         source,
     };
     assert_eq!(
-        crate::window::search::search_result_status(&result(SearchSource::Spotlight, true, false)),
+        crate::window::search::search_result_status(
+            &result(SearchSource::Spotlight, true, false),
+            None
+        ),
         "2 smart-folder results • Spotlight"
     );
     assert_eq!(
-        crate::window::search::search_result_status(&result(SearchSource::Spotlight, true, true)),
+        crate::window::search::search_result_status(
+            &result(SearchSource::Spotlight, true, true),
+            None
+        ),
         "2 smart-folder results (partial results) • Spotlight"
     );
     assert_eq!(
-        crate::window::search::search_result_status(&result(SearchSource::Crawler, true, false)),
+        crate::window::search::search_result_status(
+            &result(SearchSource::Crawler, true, false),
+            None
+        ),
         "2 smart-folder results • cached index"
     );
     assert_eq!(
-        crate::window::search::search_result_status(&result(SearchSource::Crawler, false, true)),
+        crate::window::search::search_result_status(
+            &result(SearchSource::Crawler, false, true),
+            None
+        ),
         "2 smart-folder results (partial results) • 40 paths indexed"
     );
     assert_eq!(
-        crate::window::search::search_result_status(&result(SearchSource::Mixed, false, false)),
+        crate::window::search::search_result_status(
+            &result(SearchSource::Mixed, false, false),
+            None
+        ),
         "2 smart-folder results • Spotlight + 40 paths indexed"
     );
 }

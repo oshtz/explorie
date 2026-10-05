@@ -150,8 +150,8 @@ use widgets::*;
 use window::{
     ClipboardUi, ColumnViewUi, ContextMenuUi, DiskInfoState, EntryVisuals, ListingUi, MutationUi,
     NativeTextInputState, NavigationUi, OperationUi, OverlayUi, PreviewUi, QuickLookUi, RecoveryUi,
-    RemoteDrivesUi, SearchUi, SettingsUi, SystemUi, ToastQueue, WatcherUi, WindowLayout,
-    WorkspaceUi,
+    RemoteDrivesUi, SearchScope, SearchUi, SettingsUi, SystemUi, ToastQueue, WatcherUi,
+    WindowLayout, WorkspaceUi,
 };
 use window_pane::{PaneInputs, PaneKind, WindowPanes};
 use workspace::{

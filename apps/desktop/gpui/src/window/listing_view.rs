@@ -42,11 +42,9 @@ impl DirectoryWindow {
         if !column && !query.is_empty() {
             actions.push(
                 toolbar_button("empty-clear-search", "Clear search", self.palette.control)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.browser.clear_search();
-                        this.search.active = false;
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.clear_search_and_focus_list(window, cx);
                         this.persist_session();
-                        cx.notify();
                     }))
                     .into_any_element(),
             );

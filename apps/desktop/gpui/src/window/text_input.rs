@@ -10,6 +10,12 @@ pub(crate) struct NativeTextInputState {
     pub(crate) entity: Option<Entity<NativeTextInput>>,
     pub(crate) target: Option<TextInputTarget>,
     pub(crate) focus_pending: bool,
+    /// The current input's focus handle.
+    pub(crate) focus: Option<FocusHandle>,
+    /// The focus handle of a removed input: if it still held the keyboard
+    /// focus, the next render hands the focus back to the file list instead
+    /// of leaving it nowhere.
+    pub(crate) removed_focus: Option<FocusHandle>,
 }
 
 impl DirectoryWindow {
@@ -37,6 +43,7 @@ impl DirectoryWindow {
             }
         })
         .detach();
+        self.text_input.focus = Some(input.focus_handle(cx));
         self.text_input.entity = Some(input);
         self.text_input.target = Some(target);
         self.text_input.focus_pending = true;
@@ -44,7 +51,9 @@ impl DirectoryWindow {
     }
 
     pub(crate) fn deactivate_native_text_input(&mut self) {
-        self.text_input.entity = None;
+        if self.text_input.entity.take().is_some() {
+            self.text_input.removed_focus = self.text_input.focus.take();
+        }
         self.text_input.target = None;
         self.text_input.focus_pending = false;
     }
@@ -73,6 +82,7 @@ impl DirectoryWindow {
             Some(TextInputTarget::Search) => {
                 self.browser.set_search_query(value);
                 self.search.active = true;
+                self.search_query_did_change(cx);
             }
             Some(TextInputTarget::ControlQuery) => match self.overlay.surface {
                 ControlSurface::SmartFolders => self.update_smart_folder_query(value, cx),
@@ -244,11 +254,18 @@ impl DirectoryWindow {
                 false,
             ))
         } else if self.search.active {
+            let (placeholder, label) = match self.search.scope {
+                SearchScope::ThisFolder => ("Search current folder…", "Search current folder"),
+                SearchScope::Subfolders => (
+                    "Search folder and subfolders…",
+                    "Search current folder and subfolders",
+                ),
+            };
             Some((
                 TextInputTarget::Search,
                 self.browser.search_query().to_string(),
-                "Search current folder…",
-                "Search current folder",
+                placeholder,
+                label,
                 false,
                 false,
             ))

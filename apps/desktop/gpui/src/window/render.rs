@@ -44,11 +44,16 @@ impl Render for DirectoryWindow {
         self.palette = UiPalette::for_settings(&self.settings, window.appearance());
         self.capture_overlay_focus(window, cx);
         self.ensure_native_text_input(cx);
+        let removed_focus = self.text_input.removed_focus.take();
         if self.text_input.focus_pending
             && let Some(input) = self.text_input.entity.as_ref()
         {
             window.focus(&input.focus_handle(cx), cx);
             self.text_input.focus_pending = false;
+        } else if removed_focus.is_some_and(|focus| focus.is_focused(window)) {
+            // The removed text field had the focus; typing and type-to-select
+            // must keep working without clicking the list first.
+            window.focus(&self.focus_handle, cx);
         }
         self.sync_overlay_focus(window, cx);
         let selection_count = self.effective_selection_count();
@@ -215,6 +220,7 @@ impl Render for DirectoryWindow {
         let settings_confirmation = self.render_settings_confirmation(window, cx);
         let go_to_folder = self.render_go_to_folder(f32::from(bounds.size.height), cx);
         let recovery_notice = self.render_recovery_notice(cx);
+        let search_scope_bar = self.render_search_scope_bar(cx);
         let operation_panel = self.render_operation_panel(status.is_some(), cx);
         let archive_inspection = self.render_archive_inspection(cx);
         let preview_open = !matches!(self.preview.state, PreviewState::Closed);
@@ -285,8 +291,7 @@ impl Render for DirectoryWindow {
         let appearance_value_editor = self.render_appearance_value_editor(cx);
         let context_menu = self.render_file_context_menu(bounds.size, cx);
         let toast = self.render_toast(cx);
-        let search_running =
-            self.search.task.is_some() && self.browser.active_smart_folder().is_some();
+        let search_running = self.search.task.is_some() && self.listing_shows_search_results();
         let status_panel = self.settings.view.show_status_bar.then(|| {
             let status_line = div()
                 .id("watcher-status")
@@ -508,8 +513,10 @@ impl Render for DirectoryWindow {
                     this.close_quick_look(cx);
                 } else if this.navigation_ui.go_to_folder.is_some() {
                     this.close_go_to_folder(cx);
-                } else if this.search.task.is_some() && this.browser.active_smart_folder().is_some()
-                {
+                } else if this.search_field_focused(window, cx) {
+                    // Escape in the search field clears it and returns to the list.
+                    this.clear_search_and_focus_list(window, cx);
+                } else if this.search.task.is_some() && this.listing_shows_search_results() {
                     this.cancel_smart_search(cx);
                 } else if this.context_menu.menu.is_some() {
                     this.close_context_menu(cx);
@@ -854,6 +861,7 @@ impl Render for DirectoryWindow {
                             .child(tabs)
                             .child(plugin_invitation)
                             .child(recovery_notice)
+                            .child(search_scope_bar)
                             .child(
                                 div()
                                     .id("main-content")

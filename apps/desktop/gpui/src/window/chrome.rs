@@ -1746,14 +1746,15 @@ impl DirectoryWindow {
                                             false,
                                             true,
                                         )
+                                        .debug_selector(|| "clear-search".to_string())
                                         .w(px(24.0 * palette.scale))
                                         .h(px(24.0 * palette.scale))
                                         .on_click(
-                                            cx.listener(|this, _, _, cx| {
-                                                this.browser.clear_search();
-                                                this.search.active = false;
-                                                this.deactivate_native_text_input();
-                                                cx.notify();
+                                            cx.listener(|this, _, window, cx| {
+                                                // Don't let the field's own click handler
+                                                // reactivate it.
+                                                cx.stop_propagation();
+                                                this.clear_search_and_focus_list(window, cx);
                                             }),
                                         ),
                                     )

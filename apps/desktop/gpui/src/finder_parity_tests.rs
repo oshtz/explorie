@@ -2,10 +2,11 @@
 //! operations history around conflict prompts, modal prompts drawn above the
 //! operations panel, search, and the smaller Finder conventions.
 
-use super::tests::{fixture_dir, kept_name, remove_fixture};
+use super::tests::{fixture_dir, kept_name, remove_fixture, secondary_keystroke};
+use super::window::search::SUBFOLDER_SEARCH_DELAY;
 use super::*;
 use explorie_native_services::ResourcePaths;
-use gpui::{Modifiers, TestAppContext, VisualTestContext};
+use gpui::{Keystroke, Modifiers, TestAppContext, VisualTestContext};
 use std::fs;
 
 /// Run the executor until `done` holds, letting native jobs finish on their
@@ -22,7 +23,22 @@ fn wait_until(
         if view.update(cx, |view, _| done(view)) {
             return;
         }
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        if Instant::now() >= deadline {
+            view.update(cx, |view, _| {
+                eprintln!(
+                    "state: path={:?} mode={:?} names={:?} task={} subfolders={:?} status={:?} columns={:?} listing={:?}",
+                    view.browser.path(),
+                    view.browser.view_mode(),
+                    visible_names(view),
+                    view.search.task.is_some(),
+                    view.search.subfolders,
+                    view.status_message,
+                    view.column_view.columns.columns().iter().map(|c| (c.path().to_path_buf(), c.loading(), c.entries().len())).collect::<Vec<_>>(),
+                    view.listing.state,
+                );
+            });
+            panic!("timed out waiting for {what}");
+        }
         std::thread::sleep(Duration::from_millis(10));
     }
 }
@@ -270,4 +286,347 @@ fn the_conflict_prompt_is_not_covered_by_the_operations_panel(cx: &mut TestAppCo
         assert!(view.operation_ui.conflict_prompts.is_empty());
     });
     remove_fixture(&fixture.root);
+}
+
+/// A folder to search: `archive/` and `projects/` folders, files with and
+/// without "notes" in their names, and one more notes file deeper down.
+struct SearchFixture {
+    root: PathBuf,
+    resources: PathBuf,
+}
+
+impl SearchFixture {
+    fn new() -> Self {
+        let root = fixture_dir();
+        fs::create_dir(root.join("archive")).unwrap();
+        fs::create_dir_all(root.join("projects/2026")).unwrap();
+        for name in ["notes-link.txt", "notes.md", "todo.txt"] {
+            fs::write(root.join(name), name).unwrap();
+        }
+        fs::write(root.join("projects/2026/deep-notes.txt"), "deep").unwrap();
+        Self {
+            root,
+            resources: fixture_dir(),
+        }
+    }
+
+    fn remove(self) {
+        remove_fixture(&self.root);
+        remove_fixture(&self.resources);
+    }
+
+    /// A focused window on the folder, with the app's real key bindings and
+    /// its listing loaded.
+    fn open<'a>(
+        &self,
+        cx: &'a mut TestAppContext,
+    ) -> (Entity<DirectoryWindow>, &'a mut VisualTestContext) {
+        let services = NativeServices::new(ResourcePaths::test(&self.resources));
+        let root = self.root.clone();
+        let (view, window) = cx.add_window_view(|_, cx| {
+            let view = DirectoryWindow::new(root, services, cx);
+            view.install_shortcut_bindings(cx);
+            view
+        });
+        window.simulate_resize(gpui::size(px(900.0), px(650.0)));
+        view.update(window, |view, cx| view.start_listing(cx));
+        wait_until(&view, window, "the folder listing", |view| {
+            view.browser.visible_entries().len() == 5
+        });
+        focus_list(&view, window);
+        (view, window)
+    }
+}
+
+fn focus_list(view: &Entity<DirectoryWindow>, window: &mut VisualTestContext) {
+    let focus = view.update(window, |view, _| view.focus_handle.clone());
+    window.update(|window, cx| window.focus(&focus, cx));
+    window.run_until_parked();
+}
+
+fn list_has_focus(view: &Entity<DirectoryWindow>, window: &mut VisualTestContext) -> bool {
+    let focus = view.update(window, |view, _| view.focus_handle.clone());
+    window.update(|window, _| focus.is_focused(window))
+}
+
+fn press(window: &mut VisualTestContext, keystroke: Keystroke) {
+    window.update(|window, cx| {
+        window.dispatch_keystroke(keystroke, cx);
+    });
+}
+
+/// Type into whatever text field has the focus, as the IME delivers text.
+fn type_text(window: &mut VisualTestContext, text: &str) {
+    for character in text.chars() {
+        press(
+            window,
+            Keystroke::parse(&character.to_string())
+                .unwrap()
+                .with_simulated_ime(),
+        );
+    }
+    window.run_until_parked();
+}
+
+fn visible_names(view: &DirectoryWindow) -> Vec<String> {
+    view.browser
+        .visible_entries()
+        .iter()
+        .map(|entry| {
+            entry
+                .path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect()
+}
+
+fn start_search(window: &mut VisualTestContext, query: &str) {
+    press(window, secondary_keystroke("f"));
+    window.run_until_parked();
+    type_text(window, query);
+}
+
+#[gpui::test]
+fn escape_in_the_search_field_clears_it_and_returns_to_the_list(cx: &mut TestAppContext) {
+    let fixture = SearchFixture::new();
+    let (view, window) = fixture.open(cx);
+
+    start_search(window, "notes");
+    view.update(window, |view, _| {
+        assert!(view.search.active);
+        assert_eq!(view.browser.search_query(), "notes");
+        assert_eq!(visible_names(view), ["notes-link.txt", "notes.md"]);
+    });
+    assert!(!list_has_focus(&view, window));
+
+    window.simulate_keystrokes("escape");
+    view.update(window, |view, _| {
+        assert!(!view.search.active);
+        assert_eq!(view.browser.search_query(), "");
+        assert_eq!(visible_names(view).len(), 5);
+    });
+    assert!(list_has_focus(&view, window));
+
+    // The keyboard is back in the list: type-to-select works right away.
+    window.simulate_keystrokes("t");
+    view.update(window, |view, _| {
+        assert_eq!(
+            view.browser.selected_path(),
+            Some(fixture.root.join("todo.txt").as_path())
+        );
+    });
+    fixture.remove();
+}
+
+#[gpui::test]
+fn the_clear_button_returns_the_keyboard_to_the_list(cx: &mut TestAppContext) {
+    let fixture = SearchFixture::new();
+    let (view, window) = fixture.open(cx);
+
+    start_search(window, "notes");
+    let clear = window.debug_bounds("clear-search").unwrap().center();
+    window.simulate_click(clear, Modifiers::default());
+    view.update(window, |view, _| {
+        assert!(!view.search.active);
+        assert_eq!(view.browser.search_query(), "");
+        assert_eq!(view.text_input.target, None);
+    });
+    assert!(list_has_focus(&view, window));
+
+    window.simulate_keystrokes("t");
+    view.update(window, |view, _| {
+        assert_eq!(
+            view.browser.selected_path(),
+            Some(fixture.root.join("todo.txt").as_path())
+        );
+    });
+    fixture.remove();
+}
+
+#[gpui::test]
+fn going_to_another_folder_ends_the_search(cx: &mut TestAppContext) {
+    let fixture = SearchFixture::new();
+    let (view, window) = fixture.open(cx);
+
+    start_search(window, "proj");
+    view.update(window, |view, cx| {
+        assert_eq!(visible_names(view), ["projects"]);
+        // As a double-click on the folder does.
+        view.open_entry(fixture.root.join("projects"), true, cx);
+    });
+    wait_until(&view, window, "the subfolder listing", |view| {
+        view.browser.visible_entries().len() == 1
+    });
+    view.update(window, |view, _| {
+        assert_eq!(view.browser.path(), fixture.root.join("projects"));
+        assert_eq!(view.browser.search_query(), "");
+        assert!(!view.search.active);
+        assert_eq!(visible_names(view), ["2026"]);
+    });
+    assert!(list_has_focus(&view, window));
+
+    // Going back doesn't bring the old filter back either.
+    view.update(window, |view, cx| {
+        view.browser.set_search_query("2026".to_string());
+        view.go_back(cx);
+    });
+    wait_until(&view, window, "the parent listing", |view| {
+        view.browser.visible_entries().len() == 5
+    });
+    view.update(window, |view, _| {
+        assert_eq!(view.browser.search_query(), "")
+    });
+    fixture.remove();
+}
+
+#[gpui::test]
+fn items_hidden_by_the_search_cannot_be_opened(cx: &mut TestAppContext) {
+    let fixture = SearchFixture::new();
+    let (view, window) = fixture.open(cx);
+    let archive = fixture.root.join("archive");
+    view.update(window, |view, _| view.browser.select(archive.clone()));
+
+    start_search(window, "notes");
+    window.simulate_keystrokes("enter");
+    assert!(list_has_focus(&view, window));
+    view.update(window, |view, _| {
+        assert_eq!(view.browser.selection_count(), 0);
+        assert!(view.effective_selected_entry().is_none());
+    });
+    press(window, secondary_keystroke("down"));
+    window.run_until_parked();
+    view.update(window, |view, _| {
+        assert_eq!(view.browser.path(), fixture.root.as_path());
+    });
+    fixture.remove();
+}
+
+#[gpui::test]
+fn column_view_selection_drops_items_the_search_hides(cx: &mut TestAppContext) {
+    let fixture = SearchFixture::new();
+    let (view, window) = fixture.open(cx);
+    let archive = fixture.root.join("archive");
+    let notes = fixture.root.join("notes.md");
+    view.update(window, |view, cx| view.set_view_mode(ViewMode::Column, cx));
+    wait_until(&view, window, "the column listing", |view| {
+        view.column_view
+            .columns
+            .columns()
+            .last()
+            .is_some_and(|column| !column.loading())
+    });
+    view.update(window, |view, _| {
+        view.column_view.selection = BTreeSet::from([archive.clone(), notes.clone()]);
+    });
+
+    start_search(window, "notes");
+    view.update(window, |view, _| {
+        assert_eq!(view.column_view.selection, BTreeSet::from([notes.clone()]));
+        assert_eq!(
+            view.effective_selected_paths(),
+            std::slice::from_ref(&notes)
+        );
+    });
+    fixture.remove();
+}
+
+#[gpui::test]
+fn the_search_field_can_search_subfolders_like_finder(cx: &mut TestAppContext) {
+    let fixture = SearchFixture::new();
+    let (view, window) = fixture.open(cx);
+
+    start_search(window, "notes");
+    let bar = window.debug_bounds("search-scope-bar").unwrap();
+    let subfolders = window.debug_bounds("search-scope-subfolders").unwrap();
+    // Both choices stay on screen even for this long fixture folder name.
+    assert!(subfolders.right() <= bar.right());
+    window.simulate_click(subfolders.center(), Modifiers::default());
+    wait_until(&view, window, "the subfolder results", |view| {
+        view.search.task.is_none() && view.browser.visible_entries().len() == 3
+    });
+    view.update(window, |view, _| {
+        assert_eq!(view.search.scope, SearchScope::Subfolders);
+        let mut names = visible_names(view);
+        names.sort();
+        assert_eq!(names, ["deep-notes.txt", "notes-link.txt", "notes.md"]);
+        assert!(
+            view.status_message
+                .as_deref()
+                .is_some_and(|status| status.starts_with("3 results in ")),
+            "{:?}",
+            view.status_message
+        );
+        // The field keeps the keyboard so typing can refine the search.
+        assert!(view.search.active);
+    });
+
+    // Refining waits for typing to pause, then searches again.
+    type_text(window, "-l");
+    window.executor().advance_clock(SUBFOLDER_SEARCH_DELAY);
+    wait_until(&view, window, "the refined results", |view| {
+        view.search.task.is_none()
+            && view
+                .search
+                .subfolders
+                .as_ref()
+                .is_some_and(|search| search.query == "notes-l")
+    });
+    view.update(window, |view, _| {
+        assert_eq!(visible_names(view), ["notes-link.txt"]);
+    });
+
+    // Back to this folder: its own listing, filtered by the query.
+    let this_folder = window
+        .debug_bounds("search-scope-this-folder")
+        .unwrap()
+        .center();
+    window.simulate_click(this_folder, Modifiers::default());
+    wait_until(&view, window, "the folder listing", |view| {
+        view.browser.entries().len() == 5
+    });
+    view.update(window, |view, _| {
+        assert!(view.search.subfolders.is_none());
+        assert_eq!(visible_names(view), ["notes-link.txt"]);
+    });
+    fixture.remove();
+}
+
+#[gpui::test]
+fn subfolder_results_show_as_a_list_and_column_view_returns_after(cx: &mut TestAppContext) {
+    let fixture = SearchFixture::new();
+    let (view, window) = fixture.open(cx);
+    view.update(window, |view, cx| {
+        view.set_view_mode(ViewMode::Column, cx);
+        view.search.scope = SearchScope::Subfolders;
+    });
+    window.run_until_parked();
+
+    start_search(window, "deep");
+    window.executor().advance_clock(SUBFOLDER_SEARCH_DELAY);
+    wait_until(&view, window, "the subfolder results", |view| {
+        view.search.task.is_none() && view.browser.visible_entries().len() == 1
+    });
+    view.update(window, |view, _| {
+        assert_eq!(visible_names(view), ["deep-notes.txt"]);
+        assert_eq!(view.browser.view_mode(), ViewMode::List);
+        assert_eq!(view.settings.view.view_mode, ViewMode::Column);
+    });
+
+    window.simulate_keystrokes("escape");
+    wait_until(&view, window, "the column listing", |view| {
+        view.column_view
+            .columns
+            .columns()
+            .last()
+            .is_some_and(|column| !column.loading() && column.entries().len() == 5)
+    });
+    view.update(window, |view, _| {
+        assert!(view.search.subfolders.is_none());
+        assert_eq!(view.browser.view_mode(), ViewMode::Column);
+        assert_eq!(view.browser.search_query(), "");
+    });
+    fixture.remove();
 }
