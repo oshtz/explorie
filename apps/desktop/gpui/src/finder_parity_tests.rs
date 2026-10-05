@@ -785,6 +785,78 @@ fn rename_preselects_a_files_name_without_its_extension(cx: &mut TestAppContext)
 }
 
 #[gpui::test]
+fn escape_cancels_the_rename_prompt_and_keeps_the_selection(cx: &mut TestAppContext) {
+    let fixture = SearchFixture::new();
+    let (view, window) = fixture.open(cx);
+    let todo = fixture.root.join("todo.txt");
+    view.update(window, |view, cx| {
+        view.browser.select(todo.clone());
+        view.prompt_rename_path(todo.clone(), cx);
+    });
+    window.run_until_parked();
+    type_text(window, "renamed");
+
+    window.simulate_keystrokes("escape");
+    view.update(window, |view, _| {
+        assert!(view.mutation.prompt.is_none());
+        assert_eq!(view.browser.selected_path(), Some(todo.as_path()));
+    });
+    assert!(todo.is_file());
+    fixture.remove();
+}
+
+#[gpui::test]
+fn escape_cancels_a_pending_conflict(cx: &mut TestAppContext) {
+    let fixture = ConflictFixture::new();
+    let (view, window) = fixture.open_at_conflict(cx);
+    view.update(window, |view, cx| view.install_shortcut_bindings(cx));
+    focus_list(&view, window);
+
+    window.simulate_keystrokes("escape");
+    wait_until(&view, window, "the cancelled copy", |view| {
+        view.operation_ui.conflict_prompts.is_empty() && view.operations.active_count() == 0
+    });
+    assert_eq!(
+        fs::read_to_string(fixture.destination.join("report.txt")).unwrap(),
+        "existing"
+    );
+    remove_fixture(&fixture.root);
+}
+
+#[gpui::test]
+fn the_keyboard_keeps_working_after_clicking_a_button_that_goes_away(cx: &mut TestAppContext) {
+    let fixture = ConflictFixture::new();
+    let (view, window) = fixture.open_at_conflict(cx);
+    view.update(window, |view, cx| {
+        view.install_shortcut_bindings(cx);
+        view.resolve_file_conflict(FileConflictChoice::KeepBoth, cx);
+    });
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let close = loop {
+        window.run_until_parked();
+        if let Some(close) = window.debug_bounds("close-operations") {
+            break close.center();
+        }
+        assert!(Instant::now() < deadline, "the finished copy never settled");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    wait_until(&view, window, "both copies listed", |view| {
+        view.browser.visible_entries().len() == 2
+    });
+    focus_list(&view, window);
+
+    // The close button takes the focus, then disappears with the panel.
+    window.simulate_click(close, Modifiers::default());
+    window.run_until_parked();
+    assert!(list_has_focus(&view, window));
+    window.simulate_keystrokes("down");
+    view.update(window, |view, _| {
+        assert_eq!(view.browser.selection_count(), 1)
+    });
+    remove_fixture(&fixture.root);
+}
+
+#[gpui::test]
 fn media_shortcut_hints_show_only_where_the_keys_work(cx: &mut TestAppContext) {
     use super::render_perf_tests::{Fixture, open_window, preview, wait_for};
 

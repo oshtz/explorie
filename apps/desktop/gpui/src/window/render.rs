@@ -18,6 +18,13 @@ impl Render for DirectoryWindow {
                 }
             })
             .detach();
+            // A clicked button takes the focus; when it goes away with its
+            // panel or prompt, nothing is focused and every shortcut stops
+            // working until the list is clicked. Hand the focus back.
+            cx.on_focus_lost(window, |view, window, cx| {
+                window.focus(&view.focus_handle, cx);
+            })
+            .detach();
         }
         window.set_rem_size(px(16.0 * self.settings.appearance.ui_scale));
         if let Some(saved) = self.layout.pending_workspace_bounds.take() {
@@ -509,6 +516,10 @@ impl Render for DirectoryWindow {
             .on_action(cx.listener(|this, _: &ClearSelection, window, cx| {
                 if this.settings_ui.confirmation.is_some() {
                     this.cancel_settings_confirmation(window, cx);
+                } else if !this.operation_ui.conflict_prompts.is_empty() {
+                    this.cancel_all_file_conflicts(cx);
+                } else if this.mutation.prompt.is_some() {
+                    this.cancel_mutation_prompt(cx);
                 } else if this.quick_look.open {
                     this.close_quick_look(cx);
                 } else if this.navigation_ui.go_to_folder.is_some() {

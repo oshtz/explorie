@@ -82,7 +82,7 @@ impl MutationPrompt {
             }
             MutationPromptKind::Trash { .. } => "Enter to move to Trash • Esc to cancel",
             MutationPromptKind::ArchiveName { .. } => {
-                "Choose format/compression below • Enter to continue • Esc to cancel"
+                "Choose format and compression above • Enter to continue • Esc to cancel"
             }
             MutationPromptKind::ExtractPassword {
                 allow_extended_limits: true,
