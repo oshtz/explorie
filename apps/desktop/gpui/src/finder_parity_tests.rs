@@ -630,3 +630,121 @@ fn subfolder_results_show_as_a_list_and_column_view_returns_after(cx: &mut TestA
     });
     fixture.remove();
 }
+
+fn listed_entry(directory: &Path, name: &str, is_dir: bool, is_package: bool) -> FileEntry {
+    FileEntry {
+        id: uuid::Uuid::new_v4(),
+        path: directory.join(name),
+        size: 0,
+        modified: SystemTime::UNIX_EPOCH,
+        hidden: false,
+        is_dir,
+        custom: std::collections::HashMap::new(),
+        is_symlink: false,
+        is_junction: false,
+        link_target: None,
+        has_xattrs: false,
+        is_package,
+        link_target_is_dir: false,
+        is_cloud_placeholder: false,
+        tags: Vec::new(),
+    }
+}
+
+/// A window listing a `Tool.app` package and a `readme.txt` file, with the
+/// file selected.
+fn window_with_package(
+    cx: &mut TestAppContext,
+    view_mode: ViewMode,
+) -> (Entity<DirectoryWindow>, &mut VisualTestContext, PathBuf) {
+    let directory = PathBuf::from("sample");
+    let (view, window) = cx.add_window_view(|_, cx| {
+        DirectoryWindow::new(directory.clone(), NativeServices::default(), cx)
+    });
+    window.simulate_resize(gpui::size(px(900.0), px(650.0)));
+    let package = directory.join("Tool.app");
+    view.update(window, |view, cx| {
+        view.browser.set_view_mode(view_mode);
+        view.browser.replace_entries(vec![
+            listed_entry(&directory, "readme.txt", false, false),
+            listed_entry(&directory, "Tool.app", true, true),
+        ]);
+        view.listing.state = ListingState::Ready;
+        view.browser.select(directory.join("readme.txt"));
+        cx.notify();
+    });
+    window.run_until_parked();
+    (view, window, package)
+}
+
+fn entry_index(
+    view: &Entity<DirectoryWindow>,
+    window: &mut VisualTestContext,
+    path: &Path,
+) -> usize {
+    view.update(window, |view, _| {
+        view.browser
+            .visible_entries()
+            .iter()
+            .position(|entry| entry.path == path)
+            .unwrap()
+    })
+}
+
+fn assert_package_menu(
+    view: &Entity<DirectoryWindow>,
+    window: &mut VisualTestContext,
+    package: &Path,
+) {
+    view.update(window, |view, _| {
+        assert_eq!(view.browser.selected_paths(), [package.to_path_buf()]);
+        let menu = view.context_menu.menu.as_ref().expect("a context menu");
+        assert_eq!(menu.paths, [package.to_path_buf()]);
+        assert!(
+            view.context_menu_actions()
+                .iter()
+                .any(|(action, _)| *action == ContextMenuAction::ShowPackageContents)
+        );
+    });
+    assert!(
+        window
+            .debug_bounds("context-menu-show-package-contents")
+            .is_some()
+    );
+    assert!(window.debug_bounds("context-menu-preview").is_none());
+}
+
+#[gpui::test]
+fn right_clicking_an_unselected_package_selects_it_for_the_menu(cx: &mut TestAppContext) {
+    for view_mode in [ViewMode::List, ViewMode::Grid] {
+        let (view, window, package) = window_with_package(cx, view_mode);
+        let index = entry_index(&view, window, &package);
+        let selector = match view_mode {
+            ViewMode::Grid => format!("grid-entry-{index}"),
+            _ => format!("entry-{index}"),
+        };
+        let row = window
+            .debug_bounds(Box::leak(selector.into_boxed_str()))
+            .unwrap();
+        window.simulate_mouse_down(row.center(), MouseButton::Right, Modifiers::default());
+        window.simulate_mouse_up(row.center(), MouseButton::Right, Modifiers::default());
+        assert_package_menu(&view, window, &package);
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[gpui::test]
+fn control_clicking_a_package_opens_its_menu_like_finder(cx: &mut TestAppContext) {
+    let (view, window, package) = window_with_package(cx, ViewMode::List);
+    let index = entry_index(&view, window, &package);
+    let row = window
+        .debug_bounds(Box::leak(format!("entry-{index}").into_boxed_str()))
+        .unwrap();
+    let control = Modifiers {
+        control: true,
+        ..Modifiers::default()
+    };
+    window.simulate_mouse_down(row.center(), MouseButton::Left, control);
+    window.simulate_mouse_up(row.center(), MouseButton::Left, control);
+    assert_package_menu(&view, window, &package);
+}
