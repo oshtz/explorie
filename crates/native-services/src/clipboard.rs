@@ -4,6 +4,11 @@
 //! work between explorie windows and with Finder or Explorer: file URLs on
 //! the macOS general pasteboard (plus a private marker for explorie's cut),
 //! and `CF_HDROP` with a "Preferred DropEffect" on Windows.
+//!
+//! macOS 15.4 and later ask the user before an app reads what another app
+//! copied, unless the read is part of a paste the user started from Edit ▸
+//! Paste or its key equivalent. [`peek`] never asks, so it is what keeps
+//! Paste affordances current; [`read_files`] is for the paste itself.
 
 use crate::{ErrorCode, ServiceError, ServiceResult};
 use serde::{Deserialize, Serialize};
@@ -18,6 +23,72 @@ pub struct ClipboardFiles {
     pub cut: bool,
 }
 
+/// What the clipboard holds, learned without reading the files themselves.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ClipboardSummary {
+    /// Changes whenever any app replaces the clipboard contents.
+    pub change_count: i64,
+    /// How many files the clipboard holds.
+    pub file_count: usize,
+    /// True when the files are explorie's (or Explorer's) cut.
+    pub cut: bool,
+}
+
+/// How macOS treats this app's reads of what other apps copied
+/// (`NSPasteboard.accessBehavior`, macOS 15.4 and later).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PasteAccess {
+    /// Never asked yet: the first read outside a user paste asks.
+    Default,
+    /// Reads outside a user paste ask each time.
+    Ask,
+    AlwaysAllow,
+    /// Reads outside a user paste are refused without asking.
+    AlwaysDeny,
+}
+
+impl PasteAccess {
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    fn from_raw(value: i32) -> Option<Self> {
+        match value {
+            0 => Some(Self::Default),
+            1 => Some(Self::Ask),
+            2 => Some(Self::AlwaysAllow),
+            3 => Some(Self::AlwaysDeny),
+            _ => None,
+        }
+    }
+}
+
+/// The error for a clipboard that lists files explorie could not read.
+/// macOS withholds them when the user declined (or denied in System
+/// Settings) a read that was not part of a paste they started from Edit ▸
+/// Paste or its shortcut; that paste is always allowed, so the message points
+/// there first.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn unreadable_files_error(access: Option<PasteAccess>) -> ServiceError {
+    const SETTINGS: &str = "System Settings ▸ Privacy & Security ▸ Paste from Other Apps";
+    match access {
+        Some(PasteAccess::AlwaysDeny) => ServiceError::new(
+            ErrorCode::PermissionDenied,
+            format!(
+                "macOS blocked explorie from reading the files copied in another app. Paste with Edit ▸ Paste or its shortcut, or allow explorie in {SETTINGS}."
+            ),
+        ),
+        Some(PasteAccess::Default | PasteAccess::Ask) => ServiceError::new(
+            ErrorCode::PermissionDenied,
+            format!(
+                "macOS didn't let explorie read the files copied in another app. Paste with Edit ▸ Paste or its shortcut, choose Allow Paste when macOS asks, or allow explorie in {SETTINGS}."
+            ),
+        ),
+        Some(PasteAccess::AlwaysAllow) | None => ServiceError::new(
+            ErrorCode::Io,
+            "The clipboard lists files, but their locations could not be read",
+        ),
+    }
+    .operation("clipboard_read")
+}
+
 /// Replace the clipboard contents with `paths`, marked as cut when `cut`.
 pub fn write_files(paths: &[PathBuf], cut: bool) -> ServiceResult<()> {
     if paths.is_empty() {
@@ -29,9 +100,17 @@ pub fn write_files(paths: &[PathBuf], cut: bool) -> ServiceResult<()> {
     platform::write_files(None, paths, cut)
 }
 
-/// The files on the clipboard, or `None` when it holds no files.
+/// The files on the clipboard, or `None` when it holds no files. Fails with
+/// [`ErrorCode::PermissionDenied`] and guidance for the user when macOS
+/// withholds files another app copied.
 pub fn read_files() -> ServiceResult<Option<ClipboardFiles>> {
     platform::read_files(None)
+}
+
+/// Describe the clipboard without reading the files, which on macOS never
+/// asks the user for permission.
+pub fn peek() -> ServiceResult<ClipboardSummary> {
+    platform::peek(None)
 }
 
 /// Empty the clipboard, as after the files of a cut have been moved.
@@ -41,7 +120,7 @@ pub fn clear() -> ServiceResult<()> {
 
 #[cfg(target_os = "macos")]
 mod platform {
-    use super::ClipboardFiles;
+    use super::{ClipboardFiles, ClipboardSummary, PasteAccess, unreadable_files_error};
     use crate::{ErrorCode, ServiceError, ServiceResult};
     use std::ffi::{CStr, CString, OsStr};
     use std::os::raw::c_char;
@@ -59,6 +138,13 @@ mod platform {
             pasteboard_name: *const c_char,
             out_paths: *mut *mut c_char,
             out_len: *mut usize,
+            out_cut: *mut i32,
+            out_access: *mut i32,
+        ) -> i32;
+        fn explorie_clipboard_peek(
+            pasteboard_name: *const c_char,
+            out_change_count: *mut i64,
+            out_file_count: *mut usize,
             out_cut: *mut i32,
         ) -> i32;
         fn explorie_clipboard_clear(pasteboard_name: *const c_char) -> *mut c_char;
@@ -142,6 +228,7 @@ mod platform {
         let mut buffer: *mut c_char = std::ptr::null_mut();
         let mut length = 0_usize;
         let mut cut = 0_i32;
+        let mut access = -1_i32;
         // SAFETY: The out-pointers reference live locals; the bridge fills
         // them before returning.
         let found = unsafe {
@@ -152,8 +239,12 @@ mod platform {
                 &mut buffer,
                 &mut length,
                 &mut cut,
+                &mut access,
             )
         };
+        if found == 2 {
+            return Err(unreadable_files_error(PasteAccess::from_raw(access)));
+        }
         if found == 0 || buffer.is_null() {
             return Ok(None);
         }
@@ -172,6 +263,58 @@ mod platform {
         }))
     }
 
+    pub(super) fn peek(pasteboard: Option<&str>) -> ServiceResult<ClipboardSummary> {
+        let pasteboard = pasteboard_name(pasteboard)?;
+        let mut summary = ClipboardSummary::default();
+        let mut cut = 0_i32;
+        // SAFETY: The out-pointers reference live locals; the bridge fills
+        // them before returning.
+        let valid = unsafe {
+            explorie_clipboard_peek(
+                pasteboard
+                    .as_ref()
+                    .map_or(std::ptr::null(), |name| name.as_ptr()),
+                &mut summary.change_count,
+                &mut summary.file_count,
+                &mut cut,
+            )
+        };
+        if valid == 0 {
+            return Err(ServiceError::new(
+                ErrorCode::InvalidInput,
+                "Invalid pasteboard",
+            ));
+        }
+        summary.cut = cut != 0;
+        Ok(summary)
+    }
+
+    /// Put one item with raw `data` for `type_name` on a test pasteboard.
+    #[cfg(test)]
+    pub(super) fn write_type(pasteboard: &str, type_name: &str, data: &[u8]) {
+        unsafe extern "C" {
+            fn explorie_clipboard_write_type_for_tests(
+                pasteboard_name: *const c_char,
+                type_name: *const c_char,
+                data: *const u8,
+                length: usize,
+            ) -> i32;
+        }
+        let name = CString::new(pasteboard).unwrap();
+        let type_name = CString::new(type_name).unwrap();
+        // SAFETY: The strings are NUL-terminated and `data` is valid for
+        // `data.len()` bytes during the synchronous call.
+        let written = unsafe {
+            explorie_clipboard_write_type_for_tests(
+                name.as_ptr(),
+                type_name.as_ptr(),
+                data.as_ptr(),
+                data.len(),
+            )
+        };
+        assert_eq!(written, 1);
+    }
+
     #[cfg(test)]
     pub(super) fn release(pasteboard: &str) {
         unsafe extern "C" {
@@ -185,7 +328,7 @@ mod platform {
 
 #[cfg(windows)]
 mod platform {
-    use super::ClipboardFiles;
+    use super::{ClipboardFiles, ClipboardSummary};
     use crate::{ErrorCode, ServiceError, ServiceResult};
     use std::ffi::OsString;
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
@@ -193,8 +336,8 @@ mod platform {
     use std::time::Duration;
     use windows_sys::Win32::Foundation::{GlobalFree, HGLOBAL, POINT};
     use windows_sys::Win32::System::DataExchange::{
-        CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable,
-        OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
+        CloseClipboard, EmptyClipboard, GetClipboardData, GetClipboardSequenceNumber,
+        IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
     };
     use windows_sys::Win32::System::Memory::{
         GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock,
@@ -381,11 +524,23 @@ mod platform {
         };
         Ok(Some(ClipboardFiles { paths, cut }))
     }
+
+    /// Windows has no clipboard consent, so this reads the files as before.
+    pub(super) fn peek(pasteboard: Option<&str>) -> ServiceResult<ClipboardSummary> {
+        // SAFETY: Takes no arguments and only reports the sequence number.
+        let change_count = i64::from(unsafe { GetClipboardSequenceNumber() });
+        let files = read_files(pasteboard)?;
+        Ok(ClipboardSummary {
+            change_count,
+            file_count: files.as_ref().map_or(0, |files| files.paths.len()),
+            cut: files.is_some_and(|files| files.cut),
+        })
+    }
 }
 
 #[cfg(not(any(target_os = "macos", windows)))]
 mod platform {
-    use super::ClipboardFiles;
+    use super::{ClipboardFiles, ClipboardSummary};
     use crate::{ErrorCode, ServiceError, ServiceResult};
     use std::path::PathBuf;
 
@@ -411,6 +566,10 @@ mod platform {
     pub(super) fn clear(_pasteboard: Option<&str>) -> ServiceResult<()> {
         Err(unsupported())
     }
+
+    pub(super) fn peek(_pasteboard: Option<&str>) -> ServiceResult<ClipboardSummary> {
+        Err(unsupported())
+    }
 }
 
 #[cfg(test)]
@@ -423,6 +582,50 @@ mod tests {
             write_files(&[], false).unwrap_err().code,
             ErrorCode::InvalidInput
         );
+    }
+
+    #[test]
+    fn unreadable_files_explain_how_to_paste_them() {
+        for access in [
+            PasteAccess::Default,
+            PasteAccess::Ask,
+            PasteAccess::AlwaysDeny,
+        ] {
+            let error = unreadable_files_error(Some(access));
+            assert_eq!(error.code, ErrorCode::PermissionDenied);
+            assert!(error.message.contains("Edit ▸ Paste"), "{access:?}");
+            assert!(
+                error
+                    .message
+                    .contains("System Settings ▸ Privacy & Security ▸ Paste from Other Apps"),
+                "{access:?}"
+            );
+        }
+        assert!(
+            unreadable_files_error(Some(PasteAccess::Ask))
+                .message
+                .contains("Allow Paste")
+        );
+        assert!(
+            unreadable_files_error(Some(PasteAccess::AlwaysDeny))
+                .message
+                .starts_with("macOS blocked explorie")
+        );
+        // Without pasteboard privacy to blame, it is an ordinary read failure.
+        for access in [Some(PasteAccess::AlwaysAllow), None] {
+            let error = unreadable_files_error(access);
+            assert_eq!(error.code, ErrorCode::Io);
+            assert!(!error.message.contains("System Settings"));
+        }
+    }
+
+    #[test]
+    fn paste_access_matches_nspasteboard_access_behavior() {
+        assert_eq!(PasteAccess::from_raw(0), Some(PasteAccess::Default));
+        assert_eq!(PasteAccess::from_raw(1), Some(PasteAccess::Ask));
+        assert_eq!(PasteAccess::from_raw(2), Some(PasteAccess::AlwaysAllow));
+        assert_eq!(PasteAccess::from_raw(3), Some(PasteAccess::AlwaysDeny));
+        assert_eq!(PasteAccess::from_raw(-1), None);
     }
 
     /// A private pasteboard that is discarded afterwards, so tests never
@@ -482,5 +685,53 @@ mod tests {
         // Clearing leaves nothing to paste.
         platform::clear(Some(&pasteboard.0)).unwrap();
         assert_eq!(platform::read_files(Some(&pasteboard.0)).unwrap(), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_peek_describes_the_pasteboard_without_reading_it() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("a.txt");
+        let second = root.path().join("b.txt");
+        std::fs::write(&first, "a").unwrap();
+        std::fs::write(&second, "b").unwrap();
+        let pasteboard = PrivatePasteboard::new();
+        let empty = platform::peek(Some(&pasteboard.0)).unwrap();
+        assert_eq!((empty.file_count, empty.cut), (0, false));
+
+        platform::write_files(Some(&pasteboard.0), &[first.clone(), second], true).unwrap();
+        let cut = platform::peek(Some(&pasteboard.0)).unwrap();
+        assert_eq!((cut.file_count, cut.cut), (2, true));
+        assert_ne!(cut.change_count, empty.change_count);
+        assert_eq!(
+            platform::peek(Some(&pasteboard.0)).unwrap(),
+            cut,
+            "looking changes nothing"
+        );
+
+        platform::write_files(Some(&pasteboard.0), &[first], false).unwrap();
+        let copy = platform::peek(Some(&pasteboard.0)).unwrap();
+        assert_eq!((copy.file_count, copy.cut), (1, false));
+        assert_ne!(copy.change_count, cut.change_count);
+
+        // Text is not something to paste into a folder.
+        platform::write_type(&pasteboard.0, "public.utf8-plain-text", b"hi");
+        let text = platform::peek(Some(&pasteboard.0)).unwrap();
+        assert_eq!((text.file_count, text.cut), (0, false));
+        assert_eq!(platform::read_files(Some(&pasteboard.0)).unwrap(), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_listed_files_that_cannot_be_read_are_an_error_not_an_empty_clipboard() {
+        let pasteboard = PrivatePasteboard::new();
+        // What a withheld read looks like: the file URL type is listed but
+        // no URL comes back. Private pasteboards always allow reads, so this
+        // is reported as a read failure rather than a privacy block.
+        platform::write_type(&pasteboard.0, "public.file-url", b"");
+        assert_eq!(platform::peek(Some(&pasteboard.0)).unwrap().file_count, 1);
+        let error = platform::read_files(Some(&pasteboard.0)).unwrap_err();
+        assert_eq!(error.code, ErrorCode::Io);
+        assert_eq!(error.operation.as_deref(), Some("clipboard_read"));
     }
 }
