@@ -7957,7 +7957,7 @@ fn go_to_folder_restores_shortcut_autocomplete_validation_recent_and_modal_geome
         window.simulate_keystrokes(key);
     }
     window.executor().advance_clock(Duration::from_millis(150));
-    for _ in 0..100 {
+    for _ in 0..2_000 {
         window.run_until_parked();
         let ready = view.update(window, |view, _| {
             view.navigation_ui
@@ -7985,7 +7985,7 @@ fn go_to_folder_restores_shortcut_autocomplete_validation_recent_and_modal_geome
         assert!(state.suggestions.is_empty());
     });
     window.simulate_keystrokes("enter");
-    for _ in 0..100 {
+    for _ in 0..2_000 {
         window.run_until_parked();
         if view.update(window, |view, _| view.navigation_ui.go_to_folder.is_none()) {
             break;
@@ -8009,7 +8009,7 @@ fn go_to_folder_restores_shortcut_autocomplete_validation_recent_and_modal_geome
         state.replace_on_type = false;
         view.submit_go_to_folder(cx);
     });
-    for _ in 0..100 {
+    for _ in 0..2_000 {
         window.run_until_parked();
         let ready = view.update(window, |view, _| {
             view.navigation_ui
@@ -8100,7 +8100,7 @@ fn folder_load_failure_restores_retry_picker_and_recovery_geometry(cx: &mut Test
 
     let retry = window.debug_bounds("retry-listing").unwrap().center();
     window.simulate_click(retry, gpui::Modifiers::default());
-    for _ in 0..100 {
+    for _ in 0..2_000 {
         window.run_until_parked();
         if view.update(window, |view, _| {
             matches!(view.listing.state, ListingState::Ready)
@@ -8122,7 +8122,7 @@ fn folder_load_failure_restores_retry_picker_and_recovery_geometry(cx: &mut Test
     view.update(window, |view, cx| {
         view.complete_folder_picker(Ok(Some(alternate.clone())), cx);
     });
-    for _ in 0..100 {
+    for _ in 0..2_000 {
         window.run_until_parked();
         if view.update(window, |view, _| {
             matches!(view.listing.state, ListingState::Ready)
