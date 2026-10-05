@@ -20,6 +20,20 @@ pub enum OperationStatus {
     Completed,
     Cancelled,
     Failed,
+    /// Stopped at a destination conflict the user is being asked about; the
+    /// record settles once they choose Skip, Replace or Keep Both.
+    NeedsDecision,
+    /// Every remaining item was skipped at a conflict prompt and nothing was
+    /// transferred.
+    Skipped,
+}
+
+impl OperationStatus {
+    /// Whether the operation has ended for good (not running or waiting for
+    /// the user), so it can be cleared from the history.
+    pub fn is_settled(self) -> bool {
+        !matches!(self, Self::Running | Self::NeedsDecision)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -32,6 +46,13 @@ pub struct OperationRecord {
     retryable_sources: Vec<PathBuf>,
     error: Option<String>,
     undo_recorded: bool,
+    /// Items in the user's operation, which outlives the native job when a
+    /// conflict resolution continues it under a new job.
+    total_items: usize,
+    /// Items earlier jobs of this operation already transferred.
+    completed_items: usize,
+    /// Items the user skipped at conflict prompts.
+    skipped_items: usize,
 }
 
 impl OperationRecord {
@@ -57,6 +78,23 @@ impl OperationRecord {
 
     pub fn retryable_count(&self) -> usize {
         self.retryable_sources.len()
+    }
+
+    pub fn total_items(&self) -> usize {
+        self.total_items
+    }
+
+    pub fn skipped_items(&self) -> usize {
+        self.skipped_items
+    }
+
+    /// Items transferred so far by this operation, across its jobs.
+    fn transferred_items(&self) -> usize {
+        self.completed_items
+            + self
+                .result
+                .as_ref()
+                .map_or(0, |result| result.targets.len())
     }
 }
 
@@ -116,6 +154,7 @@ impl OperationQueue {
 
     pub fn track(&mut self, id: String, request: FileOperationRequest) {
         self.operations.retain(|operation| operation.id != id);
+        let total_items = request.sources.len();
         self.operations.push(OperationRecord {
             id,
             request,
@@ -125,12 +164,15 @@ impl OperationQueue {
             retryable_sources: Vec::new(),
             error: None,
             undo_recorded: false,
+            total_items,
+            completed_items: 0,
+            skipped_items: 0,
         });
         while self.operations.len() > OPERATION_HISTORY_LIMIT {
             let Some(index) = self
                 .operations
                 .iter()
-                .position(|operation| operation.status != OperationStatus::Running)
+                .position(|operation| operation.status.is_settled())
             else {
                 break;
             };
@@ -191,6 +233,7 @@ impl OperationQueue {
             .rev()
             .find(|operation| {
                 !operation.retryable_sources.is_empty()
+                    && operation.status != OperationStatus::NeedsDecision
                     && operation.request.kind != explorie_native_services::FileOperationKind::Trash
             })
             .map(OperationRecord::id)
@@ -228,9 +271,84 @@ impl OperationQueue {
         }
     }
 
+    /// Show a job stopped at a destination conflict as waiting for the
+    /// user's decision instead of as a failure.
+    pub fn mark_needs_decision(&mut self, id: &str) -> bool {
+        let Some(operation) = self
+            .operations
+            .iter_mut()
+            .find(|operation| operation.id == id)
+        else {
+            return false;
+        };
+        operation.status = OperationStatus::NeedsDecision;
+        operation.error = None;
+        true
+    }
+
+    /// Settle an operation waiting at a conflict without transferring its
+    /// `unresolved` remaining items: skipped, or cancelled with Cancel All.
+    /// An operation that transferred nothing at all reads as Skipped.
+    pub fn settle_decision(&mut self, id: &str, unresolved: usize, cancelled: bool) -> bool {
+        let Some(operation) = self
+            .operations
+            .iter_mut()
+            .find(|operation| operation.id == id)
+        else {
+            return false;
+        };
+        operation.retryable_sources.clear();
+        operation.error = None;
+        operation.skipped_items += unresolved;
+        operation.status = if cancelled {
+            OperationStatus::Cancelled
+        } else if operation.transferred_items() == 0 {
+            OperationStatus::Skipped
+        } else {
+            OperationStatus::Completed
+        };
+        true
+    }
+
+    /// Continue the operation `previous_id` under the job `next_id` started to
+    /// carry out a conflict decision: the new job takes the previous record's
+    /// place and its counts, so the history shows one operation with the
+    /// outcome of the decision rather than a failure plus a second entry.
+    pub fn supersede(&mut self, previous_id: &str, next_id: &str, skipped: usize) -> bool {
+        let Some(previous_index) = self
+            .operations
+            .iter()
+            .position(|operation| operation.id == previous_id)
+        else {
+            return false;
+        };
+        let Some(next_index) = self
+            .operations
+            .iter()
+            .position(|operation| operation.id == next_id)
+        else {
+            return false;
+        };
+        if previous_index == next_index {
+            return false;
+        }
+        let mut next = self.operations.remove(next_index);
+        let previous_index = if next_index < previous_index {
+            previous_index - 1
+        } else {
+            previous_index
+        };
+        let previous = &self.operations[previous_index];
+        next.total_items = previous.total_items;
+        next.completed_items = previous.transferred_items();
+        next.skipped_items = previous.skipped_items + skipped;
+        self.operations[previous_index] = next;
+        true
+    }
+
     pub fn clear_completed(&mut self) {
         self.operations
-            .retain(|operation| operation.status == OperationStatus::Running);
+            .retain(|operation| !operation.status.is_settled());
     }
 
     pub fn remove_finished(&mut self, id: &str) -> bool {
@@ -241,7 +359,7 @@ impl OperationQueue {
         else {
             return false;
         };
-        if self.operations[index].status == OperationStatus::Running {
+        if !self.operations[index].status.is_settled() {
             return false;
         }
         self.operations.remove(index);
@@ -750,6 +868,82 @@ mod tests {
             retryable_sources: Vec::new(),
             error: None,
         }));
+    }
+
+    fn conflict_event(
+        job_id: &str,
+        transferred: &[&str],
+        unresolved: &[&str],
+    ) -> FileOperationEvent {
+        FileOperationEvent {
+            job_id: job_id.into(),
+            state: FileOperationState::Failed,
+            progress: None,
+            result: Some(FileOperationResult {
+                processed_entries: transferred.len() as u64,
+                processed_bytes: 0,
+                targets: transferred.iter().map(PathBuf::from).collect(),
+                target_snapshots: Vec::new(),
+            }),
+            retryable_sources: unresolved.iter().map(PathBuf::from).collect(),
+            error: Some(ServiceError::new(
+                ErrorCode::Conflict,
+                "destination already exists",
+            )),
+        }
+    }
+
+    #[test]
+    fn conflict_decisions_settle_one_history_entry_with_their_outcome() {
+        let mut queue = OperationQueue::default();
+        let mut three = request();
+        three.sources = vec!["a".into(), "b".into(), "c".into()];
+        queue.track("job-1".into(), three);
+        assert!(queue.apply(conflict_event("job-1", &["destination/a"], &["b", "c"])));
+        assert!(queue.mark_needs_decision("job-1"));
+        let waiting = &queue.operations()[0];
+        assert_eq!(waiting.status(), OperationStatus::NeedsDecision);
+        assert_eq!(waiting.error(), None);
+        assert_eq!(queue.latest_retryable_id(), None);
+        // Waiting for the user is neither running nor finished.
+        assert_eq!(queue.active_count(), 0);
+        queue.clear_completed();
+        assert!(!queue.remove_finished("job-1"));
+        assert_eq!(queue.operations().len(), 1);
+
+        // Skipping "b" continues with "c" under a new job in the same entry.
+        let mut rest = request();
+        rest.sources = vec!["c".into()];
+        queue.track("job-2".into(), rest);
+        assert!(queue.supersede("job-1", "job-2", 1));
+        assert_eq!(queue.operations().len(), 1);
+        let continued = &queue.operations()[0];
+        assert_eq!(continued.id(), "job-2");
+        assert_eq!(continued.status(), OperationStatus::Running);
+        assert_eq!(continued.total_items(), 3);
+        assert_eq!(continued.skipped_items(), 1);
+
+        // Skipping the last conflict still completes: "a" was transferred.
+        assert!(queue.apply(conflict_event("job-2", &[], &["c"])));
+        assert!(queue.mark_needs_decision("job-2"));
+        assert!(queue.settle_decision("job-2", 1, false));
+        let settled = &queue.operations()[0];
+        assert_eq!(settled.status(), OperationStatus::Completed);
+        assert_eq!(settled.skipped_items(), 2);
+        assert_eq!(settled.retryable_count(), 0);
+
+        // An operation whose only item is skipped reads as Skipped, and
+        // Cancel All reads as Cancelled.
+        queue.track("job-3".into(), request());
+        assert!(queue.apply(conflict_event("job-3", &[], &["source"])));
+        assert!(queue.settle_decision("job-3", 1, false));
+        assert_eq!(queue.operations()[1].status(), OperationStatus::Skipped);
+        queue.track("job-4".into(), request());
+        assert!(queue.apply(conflict_event("job-4", &[], &["source"])));
+        assert!(queue.settle_decision("job-4", 1, true));
+        assert_eq!(queue.operations()[2].status(), OperationStatus::Cancelled);
+        queue.clear_completed();
+        assert!(queue.operations().is_empty());
     }
 
     #[test]

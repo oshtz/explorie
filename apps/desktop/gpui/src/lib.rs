@@ -54,6 +54,8 @@ mod diagnostics;
 mod entry_kind_tests;
 mod error_reports;
 mod file_clipboard;
+#[cfg(test)]
+mod finder_parity_tests;
 mod native_text_input;
 mod operation;
 mod operation_recovery;
