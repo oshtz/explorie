@@ -253,6 +253,7 @@ impl DirectoryWindow {
                 scroll_handles: Vec::new(),
                 strip_scroll: ScrollHandle::new(),
                 scroll_to_leaf_attempts: 0,
+                preview_fill: 0.0,
                 selection: BTreeSet::new(),
                 pending_selection: None,
             },

@@ -360,7 +360,12 @@ impl DirectoryWindow {
             .when(side_panel, |panel| {
                 panel
                     .flex_shrink_0()
-                    .w(px(self.layout.preview_panel_width * self.palette.scale))
+                    .w(px(self.layout.preview_panel_width * self.palette.scale
+                        + if column_preview {
+                            self.column_view.preview_fill
+                        } else {
+                            0.0
+                        }))
                     .min_w(px(MIN_PREVIEW_PANEL_WIDTH * self.palette.scale))
                     .h_full()
                     .border_l_1()
@@ -1737,7 +1742,12 @@ impl DirectoryWindow {
             .when(side_panel, |panel| {
                 panel
                     .flex_shrink_0()
-                    .w(px(self.layout.preview_panel_width * self.palette.scale))
+                    .w(px(self.layout.preview_panel_width * self.palette.scale
+                        + if column_preview {
+                            self.column_view.preview_fill
+                        } else {
+                            0.0
+                        }))
                     .min_w(px(MIN_PREVIEW_PANEL_WIDTH * self.palette.scale))
                     .h_full()
                     .border_l_1()

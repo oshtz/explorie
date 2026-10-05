@@ -40,6 +40,9 @@ pub(crate) struct ColumnViewUi {
     pub(crate) scroll_handles: Vec<UniformListScrollHandle>,
     pub(crate) strip_scroll: ScrollHandle,
     pub(crate) scroll_to_leaf_attempts: u8,
+    /// Width the trailing preview gains so the strip can scroll to a column
+    /// boundary (see [`leaf_alignment`](crate::column::leaf_alignment)).
+    pub(crate) preview_fill: f32,
     pub(crate) selection: BTreeSet<PathBuf>,
     pub(crate) pending_selection: Option<ColumnSelectionTarget>,
 }

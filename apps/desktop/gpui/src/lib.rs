@@ -68,6 +68,8 @@ mod entry_marks;
 mod entry_visuals;
 mod image_memory;
 mod interaction;
+#[cfg(test)]
+mod layout_tests;
 mod media_player;
 #[cfg(test)]
 mod media_player_tests;
@@ -95,7 +97,7 @@ pub use app_menu::install_app_menus;
 use batch_rename::{BatchRenameEditor, BatchRenameMode};
 use browser::{BrowserState, file_name, is_directory_entry, is_folder_like};
 pub use browser::{EntryFilter, SortDirection, SortKey, ViewMode};
-use column::{ColumnState, build_path_stack};
+use column::{ColumnState, build_path_stack, leaf_alignment};
 use command::{
     CommandContext, CommandId, CommandSpec, all_commands_with_shortcuts, filtered_commands,
 };
