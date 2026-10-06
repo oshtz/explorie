@@ -15,12 +15,16 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: 1
 
 # Tests run under cargo-nextest (.config/nextest.toml, profile "ci"): one
 # process per test, in parallel, with a per-test timeout so a hung test fails
 # by name in minutes instead of holding a runner until the job timeout. Every
-# heavy step also has its own timeout, sized for a cold dependency cache.
+# heavy step also has its own timeout. Job timeouts only need to fit a cold
+# dependency cache (a new Cargo.lock or toolchain rebuilds every crate).
+#
+# Keep RUST_* and CARGO_* variables out of workflow and job env: rust-cache
+# hashes them into its cache key, so adding one there invalidates every cache.
+# Set them on individual steps instead.
 
 jobs:
   changes:
@@ -116,6 +120,8 @@ jobs:
       - name: Test Unix safety regressions
         # Real RAR extraction limits, and the Unix journal and helper lifecycle.
         timeout-minutes: 15
+        env:
+          RUST_BACKTRACE: 1
         run: >-
           cargo nextest run --locked --profile ci -p explorie-core -p explorie-native-services
           -E 'test(=archive::tests::real_rar_fixture_extracts_and_enforces_budget_and_cancellation)
@@ -132,7 +138,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.native == 'true'
     runs-on: macos-latest
-    timeout-minutes: 45
+    timeout-minutes: 75
 
     steps:
       - name: Checkout repository
@@ -162,7 +168,7 @@ jobs:
         # explorie-gpui/runtime-shaders feature, and every other feature (the
         # optional preview backends) is on by default, so macOS lints default
         # features (every other cfg(target_os = "macos") path).
-        timeout-minutes: 15
+        timeout-minutes: 25
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Prepare and smoke-test 7-Zip
@@ -171,8 +177,9 @@ jobs:
           node scripts/smoke-7zip.mjs apps/desktop/native-assets/binaries/7zip-aarch64-apple-darwin/7zz
 
       - name: Test the workspace on macOS
-        timeout-minutes: 20
+        timeout-minutes: 30
         env:
+          RUST_BACKTRACE: 1
           TMPDIR: ${{ runner.temp }}
         run: cargo nextest run --locked --profile ci --workspace
 
@@ -220,7 +227,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.native == 'true'
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
       - name: Checkout repository
@@ -268,11 +275,13 @@ jobs:
         run: pnpm release:check:test
 
       - name: GPUI-native Rust clippy
-        timeout-minutes: 15
+        timeout-minutes: 25
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
       - name: Test the workspace on Windows
-        timeout-minutes: 20
+        timeout-minutes: 30
+        env:
+          RUST_BACKTRACE: 1
         run: cargo nextest run --locked --profile ci --workspace
 
       - name: Build GPUI Windows release
