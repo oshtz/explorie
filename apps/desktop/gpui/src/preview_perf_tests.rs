@@ -9,6 +9,7 @@ use explorie_native_services::{
 use gpui::{Resource, TestAppContext, VisualTestContext};
 use uuid::Uuid;
 
+use super::tests::POLL_TIMEOUT;
 use super::tests::remove_fixture;
 use super::*;
 use crate::image_memory::{BoundedImageCache, RetiredImages};
@@ -813,7 +814,8 @@ fn held_arrow_keys_only_preview_where_the_selection_settles(cx: &mut TestAppCont
             PreviewState::Ready { path, .. } if path == &files[9]
         )
     });
-    for _ in 0..200 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         if requested(&tags).contains(&files[9]) {
             break;
         }

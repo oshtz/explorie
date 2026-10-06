@@ -153,8 +153,8 @@ test('release order preserves signing, notarization, catalogs and publication ga
   assert.ok(macPackage.indexOf('--stage-directory') < macPackage.indexOf('sign com.omershatz.explorie "$app"'));
   assert.match(workflow, /--verify-directory \(Join-Path \$installDir "plugins"\)/);
   assert.match(workflow, /--verify-directory "\$installed_app\/Contents\/Resources\/plugins"/);
+  assert.equal((workflow.match(/cargo test --locked -p explorie-native-services plugins::tests::official_bundled_packages_install_and_execute_through_native_manager -- --ignored --exact --nocapture/g) ?? []).length, 2);
+  // CI runs the same offline package test on macOS and Windows, under nextest.
   const ci = await readFile('.github/workflows/ci.yml', 'utf8');
-  for (const pipeline of [workflow, ci]) {
-    assert.equal((pipeline.match(/cargo test --locked -p explorie-native-services plugins::tests::official_bundled_packages_install_and_execute_through_native_manager -- --ignored --exact --nocapture/g) ?? []).length, 2);
-  }
+  assert.equal((ci.match(/--run-ignored only[\s\S]{0,40}-E 'test\(=plugins::tests::official_bundled_packages_install_and_execute_through_native_manager\)/g) ?? []).length, 2);
 });

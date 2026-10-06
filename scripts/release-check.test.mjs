@@ -459,24 +459,25 @@ test('workflows block audits and publish the exact attested draft assets', async
   assert.match(ci, /save-if: \$\{\{ github\.ref == 'refs\/heads\/main' \}\}/);
   assert.match(
     ci,
-    /name: Windows Tests, Lint & Release Contracts[\s\S]*?runs-on: windows-latest[\s\S]*?timeout-minutes: 120/
+    /name: Windows Tests, Lint & Release Contracts[\s\S]*?runs-on: windows-latest[\s\S]*?timeout-minutes: \d+/
+  );
+  // Tests run under nextest in steps with their own timeout.
+  assert.match(
+    ci,
+    /Test the workspace on Windows[\s\S]*?timeout-minutes: \d+[\s\S]*?cargo nextest run --locked --profile ci --workspace/
   );
   assert.match(
     ci,
-    /Test native Rust crates on Windows[\s\S]*?timeout-minutes: 40[\s\S]*?cargo test --locked -p explorie-core -p explorie-native-services -p explorie-ffmpeg-wrapper -p explorie-cli --no-fail-fast -- --test-threads=1/
-  );
-  assert.match(
-    ci,
-    /Test GPUI application on Windows[\s\S]*?timeout-minutes: 40[\s\S]*?cargo test --locked -p explorie-gpui -- --test-threads=1/
+    /Test the workspace on macOS[\s\S]*?timeout-minutes: \d+[\s\S]*?cargo nextest run --locked --profile ci --workspace/
   );
   assert.match(ci, /name: Rust Coverage[\s\S]*?runs-on: windows-latest/);
   assert.match(
     ci,
-    /Generate native Rust coverage[\s\S]*?cargo llvm-cov[\s\S]*?-p explorie-cli -- --test-threads=1/
+    /Generate native Rust coverage[\s\S]*?cargo llvm-cov nextest[\s\S]*?-p explorie-cli/
   );
   assert.doesNotMatch(
-    ci,
-    /Generate native Rust coverage\s+run:[^\n]*explorie-gpui/
+    ci.match(/Generate native Rust coverage[\s\S]*?(?=\n      - name:)/)?.[0] ?? '',
+    /explorie-gpui/
   );
   // PR/main CI builds the optimized `ci` profile; only tagged releases pay for LTO.
   assert.match(
@@ -493,18 +494,12 @@ test('workflows block audits and publish the exact attested draft assets', async
     /Test crash guards in an optimized build[\s\S]*?cargo test --locked --profile ci -p explorie-native-services -p explorie-gpui --test panic_guards/
   );
   assert.match(ci, /name: macOS GPUI Tests & Build[\s\S]*?runs-on: macos-latest/);
-  assert.match(ci, /name: Unix Safety Regression Tests[\s\S]*?runs-on: ubuntu-latest/);
+  const linuxJob = ci.match(/name: Linux Format, Clippy & Unix Safety Tests[\s\S]*?(?=\n  [a-z-]+:\n)/)?.[0] ?? '';
+  assert.match(linuxJob, /runs-on: ubuntu-latest/);
+  assert.match(linuxJob, /pkg-config libasound2-dev/);
   assert.match(
-    ci,
-    /Install Linux native dependencies[\s\S]*?libasound2-dev[\s\S]*?pkg-config/
-  );
-  assert.match(
-    ci,
-    /Test real RAR extraction safety[\s\S]*?real_rar_fixture_extracts_and_enforces_budget_and_cancellation/
-  );
-  assert.match(
-    ci,
-    /Test Unix journal and helper lifecycle safety[\s\S]*?cargo test --locked -p explorie-native-services unix_/
+    linuxJob,
+    /Test Unix safety regressions[\s\S]*?cargo nextest run[\s\S]*?real_rar_fixture_extracts_and_enforces_budget_and_cancellation[\s\S]*?package\(explorie-native-services\) & test\(unix_\)/
   );
   assert.match(
     ci,
@@ -753,6 +748,26 @@ test('tagged release builds restore, but never save, the main CI rust cache', as
   assert.doesNotMatch(release, /save-if: \$\{\{/);
 });
 
+test('CI tests cannot hang a runner: nextest kills stuck tests and steps are bounded', async () => {
+  const [ci, nextest] = await Promise.all(
+    ['.github/workflows/ci.yml', '.config/nextest.toml']
+      .map(file => readFile(path.join(process.cwd(), file), 'utf8'))
+  );
+  const profile = nextest.match(/^\[profile\.ci\]\r?\n([\s\S]*?)(?=^\[|(?![\s\S]))/m)?.[1] ?? '';
+  assert.match(profile, /^slow-timeout = \{ period = "\d+s", terminate-after = \d+ \}\r?$/m);
+  assert.match(profile, /^fail-fast = false\r?$/m);
+  for (const step of ci.matchAll(/- name: ([^\n]+)\n((?:        [^\n]*\n)+)/g)) {
+    if (/cargo nextest run/.test(step[2])) {
+      assert.match(step[2], /timeout-minutes: \d+/, `${step[1]} needs a step timeout`);
+      assert.match(step[2], /--profile ci/, `${step[1]} must use the ci nextest profile`);
+    }
+  }
+  // rust-cache hashes RUST_* and CARGO_* variables into its cache key, so a
+  // workflow-wide one silently invalidates every dependency cache.
+  const workflowEnv = ci.match(/^env:\n((?:  [^\n]*\n)+)/m)?.[1] ?? '';
+  assert.doesNotMatch(workflowEnv.replace(/^  CARGO_TERM_COLOR: always\n/m, ''), /^  (RUST|CARGO)_/m);
+});
+
 test('CI lints macOS-only code without enabling runtime shaders', async () => {
   const ci = await readFile(path.join(process.cwd(), '.github/workflows/ci.yml'), 'utf8');
   const macos = ci.match(/name: macOS GPUI Tests & Build[\s\S]*?(?=\n  [a-z-]+:\n)/)?.[0] ?? '';
@@ -768,9 +783,9 @@ test('CI keeps the GPUI application compiling on Linux', async () => {
 
   assert.match(
     ci,
-    /name: Linux Workspace Clippy[\s\S]*?runs-on: ubuntu-latest[\s\S]*?libxkbcommon-x11-dev[\s\S]*?cargo clippy --locked --workspace --all-targets -- -D warnings/
+    /name: Linux Format, Clippy & Unix Safety Tests[\s\S]*?runs-on: ubuntu-latest[\s\S]*?libxkbcommon-x11-dev[\s\S]*?cargo clippy --locked --workspace --all-targets -- -D warnings/
   );
-  assert.match(ci, /name: CI Gate[\s\S]*?needs: \[[^\]]*check-rust-linux[^\]]*\][\s\S]*?"\$LINUX"/);
+  assert.match(ci, /name: CI Gate[\s\S]*?needs: \[[^\]]*\blinux\b[^\]]*\][\s\S]*?"linux=\$LINUX"/);
 });
 
 test('CI lints the build without optional preview backends, and releases ship them all', async () => {
@@ -778,7 +793,7 @@ test('CI lints the build without optional preview backends, and releases ship th
     ['.github/workflows/ci.yml', '.github/workflows/build-release.yml', 'apps/desktop/gpui/Cargo.toml']
       .map(file => readFile(path.join(process.cwd(), file), 'utf8'))
   );
-  const linux = ci.match(/name: Linux Workspace Clippy[\s\S]*?(?=\n  [a-z-]+:\n)/)?.[0] ?? '';
+  const linux = ci.match(/name: Linux Format, Clippy & Unix Safety Tests[\s\S]*?(?=\n  [a-z-]+:\n)/)?.[0] ?? '';
 
   assert.match(
     linux,

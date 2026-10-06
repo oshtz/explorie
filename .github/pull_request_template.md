@@ -4,7 +4,7 @@
 
 ## Testing
 
-- [ ] `cargo test --workspace --no-fail-fast`
+- [ ] `cargo nextest run --workspace` (or `cargo test --workspace --no-fail-fast`)
 - [ ] `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 - [ ] `cargo fmt --all --check`
 - [ ] `node --test scripts/release-check.test.mjs`

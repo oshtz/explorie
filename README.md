@@ -142,6 +142,7 @@ cargo run -p explorie-cli -- --help      # CLI help (listing and ffmpeg-preview)
   - `preview-mail`: `.eml` email previews.
   - `full-previews`: all of the above; the default.
 - **Prepare 7-Zip before running tests:** `node scripts/prepare-7zip.mjs` downloads and verifies the pinned 7-Zip that archive tests and GPUI builds use (`pnpm prepare:native` also fetches rclone and WinFsp). `release` and `ci` GPUI builds fail without it.
+- **Run tests like CI with [cargo-nextest](https://nexte.st):** `cargo nextest run --workspace` runs every test in its own process and in parallel, and kills any test that runs longer than three minutes (`.config/nextest.toml`). Plain `cargo test` still works, but it runs a crate's tests as threads of one process. Doctests need `cargo test --doc`.
 - **Use a short, canonical `TMPDIR` for tests, like CI:** macOS's default `/var/folders/…/T` is long and sits behind the `/var` → `/private/var` symlink, which filesystem-safety tests (canonical paths, link-ancestor checks) are sensitive to. For example: `mkdir -p /private/tmp/explorie-tests && TMPDIR=/private/tmp/explorie-tests cargo test --locked -p explorie-core`.
 - **Cargo profiles:**
   - `dev` builds workspace crates at `opt-level = 0` for fast incremental rebuilds and dependencies at `opt-level = 2`, so image, archive, and PDF decoding stay usable in debug runs. The first build after changing these settings recompiles every dependency once.
