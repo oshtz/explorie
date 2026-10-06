@@ -48,20 +48,6 @@ allow = [
 confidence-threshold = 0.93
 unused-allowed-license = "allow"
 
-# LEGAL REVIEW NEEDED: at the pinned zed revision (1d029c5), gpui depends on
-# sum_tree -> ztracing -> zlog (+ ztracing_macro), which that revision labels
-# GPL-3.0-or-later. zed has since relicensed all three as Apache-2.0, so bumping
-# the gpui rev resolves this; delete these exceptions when it is bumped.
-exceptions = [
-    { crate = "ztracing", allow = ["GPL-3.0-or-later"] },
-    { crate = "ztracing_macro", allow = ["GPL-3.0-or-later"] },
-    { crate = "zlog", allow = ["GPL-3.0-or-later"] },
-]
-
-# gpui_util and gpui_shared_string have no `license` field at the pinned rev;
-# cargo-deny warns (no-license-field) and detects Apache-2.0 from the
-# LICENSE-APACHE files they ship, matching what newer zed revisions declare.
-
 [licenses.private]
 ignore = false
 

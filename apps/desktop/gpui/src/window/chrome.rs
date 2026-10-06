@@ -1699,7 +1699,7 @@ impl DirectoryWindow {
                             .focusable()
                             .tab_stop(true)
                             .flex()
-                            .flex_shrink()
+                            .flex_shrink(1.)
                             .items_center()
                             .gap_1()
                             .min_w(px(112.0))

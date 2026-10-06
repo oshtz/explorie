@@ -92,8 +92,7 @@ fn wait_for_media(
 
 fn globally_cached(cx: &mut VisualTestContext, path: &Path) -> bool {
     let resource = Resource::from(path.to_path_buf());
-    let (_, first) = cx.update(|_, cx| cx.fetch_asset::<gpui::ImgResourceLoader>(&resource));
-    !first
+    cx.update(|_, cx| cx.has_asset::<gpui::ImgResourceLoader>(&resource))
 }
 
 fn test_frame() -> Arc<RenderImage> {
