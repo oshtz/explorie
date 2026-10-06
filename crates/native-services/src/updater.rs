@@ -16,8 +16,8 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-const RELEASE_API_URL: &str = "https://api.github.com/repos/oshtz/explorie/releases/latest";
-const RELEASE_DOWNLOAD_PREFIX: &str = "https://github.com/oshtz/explorie/releases/download";
+const RELEASE_API_URL: &str = "https://api.github.com/repos/bildhaus/explorie/releases/latest";
+const RELEASE_DOWNLOAD_PREFIX: &str = "https://github.com/bildhaus/explorie/releases/download";
 const MAX_RELEASE_METADATA_BYTES: u64 = 1024 * 1024;
 const MAX_UPDATE_BYTES: u64 = 512 * 1024 * 1024;
 const MIN_UPDATE_BYTES: u64 = 1024 * 1024;

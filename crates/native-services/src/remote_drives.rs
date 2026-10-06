@@ -103,9 +103,6 @@ pub struct RemoteDriveExitBlocker {
     pub error: Option<ServiceError>,
 }
 
-/// Compatibility name for hosts that used the old Tauri-managed state.
-pub type RemoteDriveManager = RemoteDriveService;
-
 struct RunningMount {
     child: Box<dyn RemoteDriveProcess>,
     rclone: PathBuf,

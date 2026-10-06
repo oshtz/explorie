@@ -19,7 +19,7 @@ failed bundle verification, then repairs the bundle and verifies activation succ
 The packaged integration navigation fixture is now required by both Windows and macOS CI,
 alongside the native manager's offline activation smoke. Release-proof validation requires
 bundled integration activation and remote-drive lifecycle checks on both platforms. Its only
-updater exemption is explicit, documented `bildhaus/explorie` first-release proof at `0.1.0`.
+updater exemption is explicit, documented `bildhaus/explorie` first-release proof at `0.0.1`.
 
 These corrections address demonstrated failure paths. They do not establish the cause of the
 earlier isolated `STATUS_STACK_OVERFLOW` or replace real-machine candidate attestations. Final

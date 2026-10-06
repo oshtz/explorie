@@ -101,11 +101,11 @@ async function verify() {
   if (firstRelease) {
     const repositoryUrl = typeof repository === 'string' ? repository : repository?.url;
     if (
-      version !== '0.1.0' ||
+      version !== '0.0.1' ||
       typeof repositoryUrl !== 'string' ||
       !/^https:\/\/github\.com\/bildhaus\/explorie(?:\.git)?\/?$/i.test(repositoryUrl)
     ) {
-      errors.push('firstRelease: updater exemption is only valid for bildhaus/explorie v0.1.0');
+      errors.push('firstRelease: updater exemption is only valid for bildhaus/explorie v0.0.1');
     }
     if (typeof proof.firstRelease?.reason !== 'string' || !proof.firstRelease.reason.trim()) {
       errors.push('firstRelease: a reason for the updater exemption is required');

@@ -10,11 +10,11 @@ import { verifyReleaseAssets } from './verify-release-assets.mjs';
 async function fixture(t) {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'explorie-release-assets-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
-  const repository = 'bildhaus/explorie', tag = 'v0.1.0';
+  const repository = 'bildhaus/explorie', tag = 'v0.0.1';
   const release = { tag_name: tag, draft: true, prerelease: false, assets: [] };
   const attestations = {};
   for (const [platform, suffix] of Object.entries({ windows: 'windows-x64-setup-unsigned.exe', macos: 'macos-arm64.dmg' })) {
-    const name = `explorie-0.1.0-${suffix}`;
+    const name = `explorie-0.0.1-${suffix}`;
     const bytes = Buffer.from(`${platform} verified installer`);
     const hash = createHash('sha256').update(bytes).digest('hex');
     attestations[platform] = hash;

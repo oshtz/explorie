@@ -5,6 +5,6 @@ edition = "2024"
 authors = ["explorie contributors"]
 description = "FFmpeg dynamic-link helper for explorie"
 license = "MIT"
-repository = "https://github.com/oshtz/explorie"
+repository = "https://github.com/bildhaus/explorie"
 
 [dependencies]

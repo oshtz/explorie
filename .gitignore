@@ -69,11 +69,7 @@ out/
 target/
 **/target/
 
-# Tauri (generated artifacts)
-**/src-tauri/target/
-**/src-tauri/gen/
 **/target/**/bundle/
-apps/desktop/frontend/src-tauri/binaries/rclone-*
 apps/desktop/native-assets/binaries/7zip-*/
 apps/desktop/native-assets/binaries/rclone-*
 

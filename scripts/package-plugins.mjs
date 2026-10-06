@@ -100,7 +100,7 @@ export async function packagePlugins({ root = repository, target = nativeTarget(
     ]);
     const filename = `explorie-plugin-${id}-${version}-${target}.zip`;
     return { filename, archive, entry: { manifest, target,
-      assetUrl: `https://github.com/oshtz/explorie/releases/download/v${version}/${filename}`,
+      assetUrl: `https://github.com/bildhaus/explorie/releases/download/v${version}/${filename}`,
       sha256: sha256(archive) } };
   }));
   await mkdir(outputDirectory, { recursive: true });
@@ -121,7 +121,7 @@ export async function verifyCatalog(catalogPath, target, version, packageDirecto
     if (!entry || entry.target !== target) throw new Error(`Missing official ${id}/${target}`);
     validateManifest(entry.manifest, id, version, target);
     const filename = `explorie-plugin-${id}-${version}-${target}.zip`;
-    if (entry.assetUrl !== `https://github.com/oshtz/explorie/releases/download/v${version}/${filename}`
+    if (entry.assetUrl !== `https://github.com/bildhaus/explorie/releases/download/v${version}/${filename}`
         || !/^[a-f0-9]{64}$/.test(entry.sha256)) throw new Error(`Invalid official catalog asset for ${id}`);
     if (sha256(await readFile(path.join(packageDirectory, filename))) !== entry.sha256) {
       throw new Error(`Plugin package integrity failed: ${id}`);

@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 const script = fileURLToPath(new URL('./platform-proof.mjs', import.meta.url));
 const updateCheck = 'automaticUpdateReplacedCleanedAndReopened';
 
-async function fixture(t, version = '0.1.0', repository = 'https://github.com/bildhaus/explorie') {
+async function fixture(t, version = '0.0.1', repository = 'https://github.com/bildhaus/explorie') {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'explorie-platform-proof-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
   await writeFile(path.join(directory, 'package.json'), JSON.stringify({ version, repository }));
@@ -49,7 +49,7 @@ function exempt(proof) {
 }
 
 test('normal releases accept completed proof without a first-release field', async (t) => {
-  const { proof, verify } = await fixture(t, '0.3.2', 'https://github.com/oshtz/explorie');
+  const { proof, verify } = await fixture(t, '0.3.2', 'https://github.com/bildhaus/explorie');
   assert.equal(Object.hasOwn(proof, 'firstRelease'), false);
   const result = await verify();
   assert.equal(result.status, 0, result.stderr);
@@ -62,7 +62,7 @@ test('initialization never overwrites existing attestations', async (t) => {
   assert.equal(run('verify').status, 0);
 });
 
-test('Bildhaus v0.1.0 allows explicit updater N/A with a reason', async (t) => {
+test('Bildhaus v0.0.1 allows explicit updater N/A with a reason', async (t) => {
   const { proof, verify } = await fixture(t);
   exempt(proof);
   const result = await verify();
@@ -71,7 +71,7 @@ test('Bildhaus v0.1.0 allows explicit updater N/A with a reason', async (t) => {
 });
 
 test('first-release exemption accepts the equivalent GitHub repository metadata object', async (t) => {
-  const { proof, verify } = await fixture(t, '0.1.0', { type: 'git', url: 'https://github.com/Bildhaus/explorie.git' });
+  const { proof, verify } = await fixture(t, '0.0.1', { type: 'git', url: 'https://github.com/Bildhaus/explorie.git' });
   exempt(proof);
   const result = await verify();
   assert.equal(result.status, 0, result.stderr);
@@ -99,20 +99,21 @@ test('first-release mode requires a nonempty reason', async (t) => {
 
 test('later versions and unrelated repositories cannot bypass updater proof', async (t) => {
   for (const [version, repository] of [
-    ['0.1.1', 'https://github.com/bildhaus/explorie'],
+    ['0.0.2', 'https://github.com/bildhaus/explorie'],
+    ['0.1.0', 'https://github.com/bildhaus/explorie'],
     ['0.3.2', 'https://github.com/bildhaus/explorie'],
-    ['0.1.0-beta.1', 'https://github.com/bildhaus/explorie'],
-    ['0.1.0', 'https://github.com/oshtz/explorie'],
-    ['0.1.0', 'https://github.com/bildhaus/other'],
-    ['0.1.0', 'https://github.com/bildhaus/explorie/extra'],
-    ['0.1.0', 'https://github.com.evil.example/bildhaus/explorie'],
-    ['0.1.0', null],
+    ['0.0.1-beta.1', 'https://github.com/bildhaus/explorie'],
+    ['0.0.1', 'https://github.com/oshtz/explorie'],
+    ['0.0.1', 'https://github.com/bildhaus/other'],
+    ['0.0.1', 'https://github.com/bildhaus/explorie/extra'],
+    ['0.0.1', 'https://github.com.evil.example/bildhaus/explorie'],
+    ['0.0.1', null],
   ]) {
     const { proof, verify } = await fixture(t, version, repository);
     exempt(proof);
     const result = await verify();
     assert.notEqual(result.status, 0, `${version} ${repository}`);
-    assert.match(result.stderr, /only valid for bildhaus\/explorie v0.1.0/);
+    assert.match(result.stderr, /only valid for bildhaus\/explorie v0.0.1/);
   }
 });
 
@@ -142,8 +143,8 @@ test('first-release mode still rejects stale version, tag, artifact, and digest'
   proof.macos.sha256 = 'invalid';
   const result = await verify();
   assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /version: expected 0.1.0/);
-  assert.match(result.stderr, /candidateTag: expected v0.1.0/);
-  assert.match(result.stderr, /windows: artifact must be explorie-0.1.0/);
+  assert.match(result.stderr, /version: expected 0.0.1/);
+  assert.match(result.stderr, /candidateTag: expected v0.0.1/);
+  assert.match(result.stderr, /windows: artifact must be explorie-0.0.1/);
   assert.match(result.stderr, /macos: sha256 must be/);
 });

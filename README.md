@@ -11,7 +11,7 @@ _MIT-licensed, built to be understandable, extensible, and easy to customize._
 
 ## Overview
 
-explorie is a native GPUI file manager currently validated on **Windows**, with macOS support under active release validation. It uses plain JSON metadata and a themeable native UI. The Rust core owns directory listing, file operations, size calculation, archives, and `.explorie.json` custom fields; a Tauri-free service layer owns previews, jobs, recovery, remote drives, and OS integration.
+explorie is a native GPUI file manager currently validated on **Windows**, with macOS support under active release validation. It uses plain JSON metadata and a themeable native UI. The Rust core owns directory listing, file operations, size calculation, archives, and `.explorie.json` custom fields; a native service layer owns previews, jobs, recovery, remote drives, and OS integration.
 
 Key traits:
 
@@ -83,7 +83,7 @@ apps/
   cli/                     # CLI binary (Rust)
 crates/
   core/                    # Rust business logic for listing, sizes, metadata
-  native-services/         # Tauri-free jobs, previews, recovery, remote drives, OS integration
+  native-services/         # jobs, previews, recovery, remote drives, OS integration
   ffmpeg-wrapper/          # FFmpeg command builder
 sample/                    # Demo data + .explorie.json examples
 ```
@@ -92,7 +92,7 @@ sample/                    # Demo data + .explorie.json examples
 
 ## Install
 
-Download the latest build from [GitHub Releases](https://github.com/oshtz/explorie/releases/latest):
+Download the latest build from [GitHub Releases](https://github.com/bildhaus/explorie/releases/latest):
 
 - **Windows 10/11 x64:** Download `explorie-<version>-windows-x64-setup-unsigned.exe` and run the per-user installer. Windows may show an unsigned-app warning. The completion page offers a default-enabled option to remove the downloaded installer after Setup exits; silent in-app updates clean up their verified installer automatically. After installation, Settings → System Integration can reversibly make Explorie the app Windows uses to open folders.
 - **macOS 13+ on Apple silicon:** Download `explorie-<version>-macos-arm64.dmg`, open it, and move Explorie to Applications. On first launch from Applications while that release image is still mounted, Explorie offers to eject it and move the downloaded DMG to Trash.
@@ -108,7 +108,7 @@ The installers include the integrations and the exact bundled 7-Zip source (`7z2
 ## Quickstart
 
 ```bash
-git clone https://github.com/oshtz/explorie.git
+git clone https://github.com/bildhaus/explorie.git
 cd explorie
 
 pnpm install                             # install release-script tooling
@@ -275,14 +275,13 @@ Before creating a new tag, manually verify:
 - Exercise copy, move, rename, delete/trash, undo/redo, archive, and extract flows on disposable files.
 - Reopen the app and confirm persisted settings.
 - Confirm Windows and macOS packaged-app behavior on real machines.
-- Remove or uninstall v0.1.0 before first running v0.2.6; the permanent `com.omershatz.explorie` identity intentionally starts a clean application lineage.
 - Install the previous public version on each platform, accept the in-app update, and verify it replaces the app, preserves settings, removes the update payload and backup, and reopens at the new version. Install the Windows package, verify the completion-page cleanup removes the downloaded installer, run `cargo test -p explorie-native-services integration::tests::windows_system_open_produces_a_real_shell_side_effect -- --exact --ignored` from an interactive Windows session, verify the System Integration toggle routes folder opens to Explorie and restores the prior handler when disabled or uninstalled, and confirm the unsigned warning is expected. Install the macOS package, verify Explorie offers to eject the mounted release image and moves its DMG to Trash, and verify signing/notarization plus both installer SHA-256 digests.
 
 Create a per-candidate real-machine evidence file with `pnpm platform:proof:init`, fill in the exact artifact names and SHA-256 hashes, then mark each observed check. `pnpm platform:proof:verify` rejects wrong artifact names, missing Windows multi-window/DnD/mixed-DPI/crash/folder-handler proof, and missing macOS multi-window/DnD/multi-monitor/crash/signing/notarization/Gatekeeper proof. It prints the two tested hashes to paste into the protected publication dispatch. The evidence stays under ignored `.release-checks/`; archive it alongside the candidate checksums before enabling the workflow attestations.
 
 Both platforms also require remote-drive lifecycle and bundled-integration activation proof. Enable each included integration from a fresh profile with no package downloads, verify disabled defaults and persistence after restart, and exercise Git folder navigation during filesystem changes. Use disposable files for remote writes and confirm disconnect/reconnect behavior.
 
-Only the first `bildhaus/explorie` release at `0.1.0` may record an updater exemption: add `"firstRelease": { "reason": "First public Bildhaus release; no previous GPUI release to upgrade from" }` to the evidence file and set each platform's `automaticUpdateReplacedCleanedAndReopened` check to `"not-applicable"`. Every other check remains mandatory. Omit `firstRelease` for subsequent releases; `0.1.1` and later must pass the real upgrade check.
+Only the first `bildhaus/explorie` release at `0.0.1` may record an updater exemption: add `"firstRelease": { "reason": "First public Bildhaus release; no previous GPUI release to upgrade from" }` to the evidence file and set each platform's `automaticUpdateReplacedCleanedAndReopened` check to `"not-applicable"`. Every other check remains mandatory. Omit `firstRelease` for subsequent releases; `0.0.2` and later must pass the real upgrade check.
 
 ---
 
