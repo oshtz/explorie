@@ -675,7 +675,7 @@ test('workflows block audits and publish the exact attested draft assets', async
   assert.doesNotMatch(release, /softprops\/action-gh-release|gh api -X DELETE/);
   assert.match(release, /gh release verify "\$GITHUB_REF_NAME"/);
   assert.doesNotMatch(`${ci}\n${release}\n${macosUi}`, /uses:[^\n]+@(v\d+|stable|cargo-)/);
-  assert.match(updater, /api\.github\.com\/repos\/oshtz\/explorie\/releases\/latest/);
+  assert.match(updater, /api\.github\.com\/repos\/bildhaus\/explorie\/releases\/latest/);
   assert.match(updater, /windows-x64-setup-unsigned\.exe/);
   assert.match(updater, /digest/);
   assert.match(updater, /macos-arm64\.dmg/);

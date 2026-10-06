@@ -3,9 +3,9 @@ name = "explorie-native-services"
 version = "0.1.0"
 edition = "2024"
 authors = ["explorie contributors"]
-description = "Tauri-free native services for the explorie desktop application."
+description = "Native services for the explorie desktop application."
 license = "MIT"
-repository = "https://github.com/oshtz/explorie"
+repository = "https://github.com/bildhaus/explorie"
 
 [features]
 # Optional preview backends. Every one is on by default, so release builds and

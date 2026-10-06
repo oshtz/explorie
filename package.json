@@ -1,10 +1,10 @@
 {
   "name": "explorie",
-  "version": "0.3.3",
+  "version": "0.0.1",
   "private": true,
   "packageManager": "pnpm@9.15.9",
   "description": "Ridiculously fast, fully-hackable file manager.",
-  "repository": "https://github.com/oshtz/explorie",
+  "repository": "https://github.com/bildhaus/explorie",
   "license": "MIT",
   "engines": {
     "node": ">=20",

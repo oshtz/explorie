@@ -1,9 +1,7 @@
 //! Native application services shared by the GPUI desktop target.
 //!
-//! This crate deliberately has no Tauri dependency.  The old Tauri binary is
-//! only an adapter: it constructs [`ServiceContext`], delegates commands to
-//! [`NativeServices`], and forwards [`ServiceEvent`] values to legacy event
-//! names until the GPUI shell is fully cut over.
+//! The host constructs a [`ServiceContext`], calls into [`NativeServices`],
+//! and receives progress and results as [`ServiceEvent`] values.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -67,9 +65,9 @@ pub use preview::{
 };
 pub use remote_drives::{
     DisconnectResult, RemoteControlRequest, RemoteDriveBackend, RemoteDriveEnvironment,
-    RemoteDriveExitBlocker, RemoteDriveManager, RemoteDriveProcess, RemoteDriveProfile,
-    RemoteDriveService, RemoteDriveState, RemoteDriveStatus, RemoteMountRequest,
-    RemoteProcessStatus, validate_remote_drive_profile,
+    RemoteDriveExitBlocker, RemoteDriveProcess, RemoteDriveProfile, RemoteDriveService,
+    RemoteDriveState, RemoteDriveStatus, RemoteMountRequest, RemoteProcessStatus,
+    validate_remote_drive_profile,
 };
 pub use rich_preview::{RichBlock, RichBlockKind, RichPreview, RichSpan, RichSpanStyle};
 pub use search::{
@@ -157,7 +155,7 @@ pub type ServiceResult<T> = Result<T, ServiceError>;
 
 /// Resource locations supplied by the host application.
 ///
-/// Nothing in the service layer asks Tauri for paths.  Packaged hosts inject
+/// The service layer never discovers these locations itself.  Packaged hosts inject
 /// the resource and cache directories, while tests can point both at a
 /// disposable fixture.
 #[derive(Clone, Debug)]
