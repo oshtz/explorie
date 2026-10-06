@@ -42,6 +42,22 @@ impl DirectoryWindow {
         cx.notify();
     }
 
+    /// Return confirms an open prompt: it applies a file prompt, and skips
+    /// the item in a conflict prompt (as its key hint says). In the list,
+    /// Return is Rename on macOS and Open on Windows; neither may act on the
+    /// selection behind a prompt. Returns whether a prompt took the key.
+    pub(crate) fn confirm_open_prompt(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.operation_ui.conflict_prompts.is_empty() {
+            self.resolve_file_conflict(FileConflictChoice::Skip, cx);
+            true
+        } else if self.mutation.prompt.is_some() {
+            self.submit_mutation_prompt(cx);
+            true
+        } else {
+            false
+        }
+    }
+
     pub(crate) fn prompt_rename_selected(&mut self, cx: &mut Context<Self>) {
         let paths = self.effective_selected_paths();
         if paths.len() > 1 {

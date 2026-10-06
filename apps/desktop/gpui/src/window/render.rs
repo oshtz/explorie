@@ -509,7 +509,7 @@ impl Render for DirectoryWindow {
                     this.submit_named_theme_editor(cx);
                 } else if this.settings_ui.appearance_value_editor.is_some() {
                     this.submit_appearance_value_editor(cx);
-                } else {
+                } else if !this.confirm_open_prompt(cx) {
                     this.open_selected(cx);
                 }
             }))
@@ -689,7 +689,9 @@ impl Render for DirectoryWindow {
                 this.prompt_new_note(cx);
             }))
             .on_action(cx.listener(|this, _: &RenameSelected, _, cx| {
-                this.prompt_rename_selected(cx);
+                if !this.confirm_open_prompt(cx) {
+                    this.prompt_rename_selected(cx);
+                }
             }))
             .on_action(cx.listener(|this, _: &NewWebsiteLink, _, cx| {
                 this.prompt_new_website_link(cx);

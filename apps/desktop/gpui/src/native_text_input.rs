@@ -88,7 +88,28 @@ pub struct NativeTextInput {
     accent: Rgba,
     masked: bool,
     scale: f32,
+    undo_stack: Vec<TextSnapshot>,
+    redo_stack: Vec<TextSnapshot>,
+    last_edit: Option<EditKind>,
 }
+
+/// The field's text and selection before an edit, for Undo and Redo.
+#[derive(Clone)]
+struct TextSnapshot {
+    content: SharedString,
+    selected_range: Range<usize>,
+}
+
+/// Consecutive edits of one kind undo as one step, as in macOS text fields:
+/// a typed word, or a run of deletions.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EditKind {
+    Typing,
+    Deleting,
+    Other,
+}
+
+const MAX_UNDO_STEPS: usize = 100;
 
 impl EventEmitter<NativeTextInputEvent> for NativeTextInput {}
 
@@ -123,6 +144,9 @@ impl NativeTextInput {
             accent: colors[4],
             masked: false,
             scale: appearance.scale,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            last_edit: None,
         }
     }
 
@@ -138,6 +162,7 @@ impl NativeTextInput {
         self.selection_reversed = false;
         self.marked_range = None;
         self.scroll_x = px(0.0);
+        self.clear_history();
         cx.notify();
     }
 
@@ -175,6 +200,7 @@ impl NativeTextInput {
             self.selection_reversed = false;
             self.marked_range = None;
             self.scroll_x = px(0.0);
+            self.clear_history();
         }
         self.placeholder = placeholder;
         self.label = label;
@@ -215,6 +241,63 @@ impl NativeTextInput {
         cx.emit(NativeTextInputEvent::Changed(self.content.to_string()));
     }
 
+    fn snapshot(&self) -> TextSnapshot {
+        TextSnapshot {
+            content: self.content.clone(),
+            selected_range: self.selected_range.clone(),
+        }
+    }
+
+    fn clear_history(&mut self) {
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.last_edit = None;
+    }
+
+    /// Remember the text before an edit, unless it continues the previous one.
+    fn record_edit(&mut self, kind: EditKind) {
+        if kind == EditKind::Other || self.last_edit != Some(kind) {
+            if self.undo_stack.len() == MAX_UNDO_STEPS {
+                self.undo_stack.remove(0);
+            }
+            self.undo_stack.push(self.snapshot());
+        }
+        self.redo_stack.clear();
+        self.last_edit = Some(kind);
+    }
+
+    fn restore(&mut self, snapshot: TextSnapshot, cx: &mut Context<Self>) {
+        self.content = snapshot.content;
+        self.selected_range = snapshot.selected_range;
+        self.selection_reversed = false;
+        self.marked_range = None;
+        self.last_edit = None;
+        self.emit_changed(cx);
+        cx.notify();
+    }
+
+    // Undo and Redo stay inside a focused field, as in macOS: they never
+    // reach the window, where they would undo the last file operation.
+    fn undo(&mut self, _: &crate::Undo, window: &mut Window, cx: &mut Context<Self>) {
+        match self.undo_stack.pop() {
+            Some(snapshot) => {
+                self.redo_stack.push(self.snapshot());
+                self.restore(snapshot, cx);
+            }
+            None => window.play_system_bell(),
+        }
+    }
+
+    fn redo(&mut self, _: &crate::Redo, window: &mut Window, cx: &mut Context<Self>) {
+        match self.redo_stack.pop() {
+            Some(snapshot) => {
+                self.undo_stack.push(self.snapshot());
+                self.restore(snapshot, cx);
+            }
+            None => window.play_system_bell(),
+        }
+    }
+
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
         if self.selected_range.is_empty() {
             self.move_to(self.previous_boundary(self.cursor_offset()), cx);
@@ -232,10 +315,12 @@ impl NativeTextInput {
     }
 
     fn select_left(&mut self, _: &SelectLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.last_edit = None;
         self.select_to(self.previous_boundary(self.cursor_offset()), cx);
     }
 
     fn select_right(&mut self, _: &SelectRight, _: &mut Window, cx: &mut Context<Self>) {
+        self.last_edit = None;
         self.select_to(self.next_boundary(self.cursor_offset()), cx);
     }
 
@@ -340,6 +425,7 @@ impl NativeTextInput {
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
         self.selected_range = offset..offset;
         self.selection_reversed = false;
+        self.last_edit = None;
         cx.notify();
     }
 
@@ -490,6 +576,20 @@ impl EntityInputHandler for NativeTextInput {
             .map(|range| self.range_from_utf16(range))
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
+        if range.is_empty() && new_text.is_empty() {
+            return;
+        }
+        // Typed characters (including typing over a selection, and committing
+        // composed IME text) coalesce into one step, as do runs of deletions.
+        // Pasted or otherwise inserted text is a step of its own.
+        let kind = if new_text.is_empty() {
+            EditKind::Deleting
+        } else if self.marked_range.is_some() || new_text.chars().count() == 1 {
+            EditKind::Typing
+        } else {
+            EditKind::Other
+        };
+        self.record_edit(kind);
         self.content = format!(
             "{}{}{}",
             &self.content[..range.start],
@@ -519,6 +619,7 @@ impl EntityInputHandler for NativeTextInput {
             .map(|range| self.range_from_utf16(range))
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
+        self.record_edit(EditKind::Typing);
         self.content = format!(
             "{}{}{}",
             &self.content[..range.start],
@@ -824,6 +925,8 @@ impl Render for NativeTextInput {
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::copy))
+            .on_action(cx.listener(Self::undo))
+            .on_action(cx.listener(Self::redo))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))

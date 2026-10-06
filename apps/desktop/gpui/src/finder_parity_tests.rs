@@ -857,6 +857,91 @@ fn the_keyboard_keeps_working_after_clicking_a_button_that_goes_away(cx: &mut Te
 }
 
 #[gpui::test]
+fn undo_in_a_text_field_edits_the_text_not_the_last_file_operation(cx: &mut TestAppContext) {
+    let fixture = SearchFixture::new();
+    let (view, window) = fixture.open(cx);
+    let todo = fixture.root.join("todo.txt");
+    let done = fixture.root.join("done.txt");
+
+    // A rename the window could undo.
+    view.update(window, |view, cx| view.prompt_rename_path(todo.clone(), cx));
+    window.run_until_parked();
+    type_text(window, "done");
+    view.update(window, |view, cx| view.submit_mutation_prompt(cx));
+    wait_until(&view, window, "the rename", |view| {
+        done.is_file() && view.undo_ledger.can_undo(SystemTime::now())
+    });
+
+    // Cmd+Z in a text field undoes the typing, as one step, and leaves the
+    // rename alone; with nothing left to undo it does nothing.
+    view.update(window, |view, cx| view.prompt_rename_path(done.clone(), cx));
+    window.run_until_parked();
+    type_text(window, "final");
+    let input = |view: &DirectoryWindow| view.mutation.prompt.as_ref().unwrap().input.clone();
+    view.update(window, |view, _| assert_eq!(input(view), "final.txt"));
+    press(window, secondary_keystroke("z"));
+    window.run_until_parked();
+    view.update(window, |view, _| assert_eq!(input(view), "done.txt"));
+    press(window, secondary_keystroke("z"));
+    window.run_until_parked();
+    view.update(window, |view, _| {
+        assert_eq!(input(view), "done.txt");
+        assert!(view.undo_ledger.can_undo(SystemTime::now()));
+    });
+    assert!(done.is_file() && !todo.exists());
+
+    // Redo brings the typing back.
+    let redo = if cfg!(target_os = "macos") {
+        "shift-z"
+    } else {
+        "y"
+    };
+    press(window, secondary_keystroke(redo));
+    window.run_until_parked();
+    view.update(window, |view, _| assert_eq!(input(view), "final.txt"));
+    fixture.remove();
+}
+
+#[gpui::test]
+fn return_confirms_a_prompt_without_a_text_field(cx: &mut TestAppContext) {
+    let fixture = SearchFixture::new();
+    let (view, window) = fixture.open(cx);
+    let todo = fixture.root.join("todo.txt");
+    // A path that does not exist fails validation before reaching the Trash.
+    let missing = fixture.root.join("missing.txt");
+    view.update(window, |view, cx| {
+        view.start_service_events(cx);
+        view.browser.select(todo.clone());
+        view.mutation.prompt = Some(MutationPrompt::new(
+            MutationPromptKind::Trash {
+                paths: vec![missing.clone()],
+            },
+            String::new(),
+        ));
+        cx.notify();
+    });
+    window.run_until_parked();
+    focus_list(&view, window);
+
+    // Return is Rename (macOS) or Open (Windows) in the list; with the
+    // confirmation up it confirms instead.
+    window.simulate_keystrokes("enter");
+    view.update(window, |view, _| {
+        assert!(
+            view.mutation.prompt.is_none(),
+            "{:?}",
+            view.mutation.prompt.as_ref().map(|prompt| &prompt.kind)
+        );
+        let operations = view.operations.operations();
+        assert_eq!(operations.len(), 1);
+        assert_eq!(operations[0].request().kind, FileOperationKind::Trash);
+        assert_eq!(operations[0].request().sources, vec![missing.clone()]);
+    });
+    assert!(todo.is_file());
+    fixture.remove();
+}
+
+#[gpui::test]
 fn media_shortcut_hints_show_only_where_the_keys_work(cx: &mut TestAppContext) {
     use super::render_perf_tests::{Fixture, open_window, preview, wait_for};
 

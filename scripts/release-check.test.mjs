@@ -454,7 +454,12 @@ test('workflows block audits and publish the exact attested draft assets', async
   assert.match(ci, /name: Security Audit[\s\S]*?node-version: '24\.19\.0'/);
   assert.match(ci, /cancel-in-progress: \$\{\{ github\.event_name == 'pull_request' \}\}/);
   assert.match(ci, /name: CI Gate/);
-  assert.match(ci, /name: Rust Coverage[\s\S]*?github\.event_name == 'push'/);
+  // Coverage runs in its own push-only workflow, so it gates neither merges
+  // nor the main CI run that releases require.
+  const coverage = await readFile(path.join(process.cwd(), '.github/workflows/coverage.yml'), 'utf8');
+  assert.doesNotMatch(ci, /Rust Coverage|llvm-cov/);
+  assert.match(coverage, /^on:\n  push:\n    branches: \[main, dev\]/m);
+  assert.doesNotMatch(coverage, /pull_request/);
   assert.match(ci, /cache-targets: false/);
   assert.match(ci, /save-if: \$\{\{ github\.ref == 'refs\/heads\/main' \}\}/);
   assert.match(
@@ -470,13 +475,13 @@ test('workflows block audits and publish the exact attested draft assets', async
     ci,
     /Test the workspace on macOS[\s\S]*?timeout-minutes: \d+[\s\S]*?cargo nextest run --locked --profile ci --workspace/
   );
-  assert.match(ci, /name: Rust Coverage[\s\S]*?runs-on: windows-latest/);
+  assert.match(coverage, /name: Rust Coverage[\s\S]*?runs-on: windows-latest/);
   assert.match(
-    ci,
+    coverage,
     /Generate native Rust coverage[\s\S]*?cargo llvm-cov nextest[\s\S]*?-p explorie-cli/
   );
   assert.doesNotMatch(
-    ci.match(/Generate native Rust coverage[\s\S]*?(?=\n      - name:)/)?.[0] ?? '',
+    coverage.match(/Generate native Rust coverage[\s\S]*?(?=\n      - name:)/)?.[0] ?? '',
     /explorie-gpui/
   );
   // PR/main CI builds the optimized `ci` profile; only tagged releases pay for LTO.
@@ -506,7 +511,8 @@ test('workflows block audits and publish the exact attested draft assets', async
     /Build GPUI macOS application[\s\S]*?cargo build -p explorie-gpui --profile ci --locked[\s\S]*?\/target\/ci\/plugins"/
   );
   assert.doesNotMatch(ci, /tauri build/);
-  assert.equal((ci.match(/name: Prepare native dependencies/g) ?? []).length, 2);
+  assert.equal((ci.match(/name: Prepare native dependencies/g) ?? []).length, 1);
+  assert.equal((coverage.match(/name: Prepare native dependencies/g) ?? []).length, 1);
   assert.doesNotMatch(ci, /rclone-x86_64-unknown-linux-gnu/);
   assert.match(release, /gh release create/);
   assert.match(release, /node scripts\/release-check\.mjs --preflight/);
