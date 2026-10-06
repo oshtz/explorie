@@ -4,6 +4,7 @@ use explorie_native_services::ResourcePaths;
 use gpui::{KeyBinding, TestAppContext};
 use uuid::Uuid;
 
+use super::tests::POLL_TIMEOUT;
 use super::*;
 
 struct ColumnFixture {
@@ -288,7 +289,8 @@ fn ancestor_background_context_menu_targets_clicked_column(cx: &mut TestAppConte
         view.execute_context_menu_action(ContextMenuAction::Paste, cx);
     });
     let pasted = fixture.parent.join("leaf.txt");
-    for _ in 0..300 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         window.run_until_parked();
         if pasted.exists() {
             break;

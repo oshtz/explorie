@@ -130,7 +130,7 @@ fn ui_scale_shortcuts_dispatch_through_the_app_keymap(cx: &mut TestAppContext) {
         })
         .unwrap();
 
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[test]
@@ -164,19 +164,24 @@ pub(crate) fn fixture_dir() -> PathBuf {
 /// Removes a fixture directory. On Windows a file sent to the Recycle Bin or a
 /// directory watch can hold a handle for a moment after an operation has
 /// finished, so deletion is retried briefly there.
+/// How long a test polls for background work (file operations, previews,
+/// archive jobs) before giving up. Generous, because parallel test processes
+/// on a loaded CI runner can make that work far slower than on a laptop.
+pub(crate) const POLL_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub(crate) fn remove_fixture(path: &Path) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         match fs::remove_dir_all(path) {
             Ok(()) => return,
+            // A background writer (a session flush, a thumbnail) can add a
+            // file while the tree is being removed, and Windows keeps files
+            // locked briefly after their handles close.
             Err(error)
-                if cfg!(windows)
-                    && Instant::now() < deadline
-                    && matches!(
-                        error.kind(),
-                        std::io::ErrorKind::PermissionDenied
-                            | std::io::ErrorKind::DirectoryNotEmpty
-                    ) =>
+                if Instant::now() < deadline
+                    && (error.kind() == std::io::ErrorKind::DirectoryNotEmpty
+                        || (cfg!(windows)
+                            && error.kind() == std::io::ErrorKind::PermissionDenied)) =>
             {
                 std::thread::sleep(Duration::from_millis(50));
             }
@@ -746,7 +751,7 @@ fn startup_path_uses_the_first_existing_directory_argument() {
     ];
 
     assert_eq!(parse_startup_path(args), Some(directory.clone()));
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[test]
@@ -761,7 +766,7 @@ fn startup_path_rejects_files_and_missing_arguments() {
     ];
 
     assert_eq!(parse_startup_path(args), None);
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[test]
@@ -828,7 +833,7 @@ fn service_task_handoff_returns_a_real_core_listing() {
         DirectoryEvent::Failed { error, .. } => panic!("listing failed: {error}"),
     }
 
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[test]
@@ -859,7 +864,7 @@ fn folder_size_listing_is_opt_in_and_runs_through_native_services() {
         DirectoryEvent::Failed { error, .. } => panic!("listing failed: {error}"),
     }
 
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[test]
@@ -1115,7 +1120,7 @@ fn breadcrumb_background_restores_inline_path_edit_submit_and_cancel(cx: &mut Te
         assert!(view.navigation_ui.breadcrumb_editor.is_some());
         assert_eq!(view.browser.path(), target.as_path());
     });
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -1184,7 +1189,7 @@ fn default_shell_uses_single_row_view_controls_and_navigation_first_sidebar(
         assert!(view.browser.is_favorite(&directory));
     });
 
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -1403,7 +1408,7 @@ fn compact_toolbar_popovers_preserve_actions_at_the_minimum_window_size(cx: &mut
         assert_eq!(view.overlay.toolbar_menu, ToolbarMenu::Closed)
     });
 
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -1493,7 +1498,7 @@ fn grid_view_popover_restores_thumbnail_presets_slider_and_geometry(cx: &mut Tes
         assert_eq!(view.overlay.toolbar_menu, ToolbarMenu::View);
     });
 
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -1578,7 +1583,7 @@ fn toolbar_history_popovers_jump_clear_and_persist_native_navigation(cx: &mut Te
             Some("Navigation history cleared")
         );
     });
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -1701,7 +1706,7 @@ fn list_custom_columns_render_sort_and_reflow_at_supported_window_sizes(cx: &mut
         "wide custom-column layouts must preserve the legacy-priority Name column: {wide_name_width}"
     );
 
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[test]
@@ -1957,7 +1962,8 @@ fn grid_thumbnails_render_real_image_and_video_with_recoverable_failure(cx: &mut
         gpui::size(px(800.0), px(600.0)),
         |_, _| view.clone().into_element(),
     );
-    for _ in 0..500 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.update(cx, |view, _| {
             view.visuals.thumbnail_active == 0
@@ -2024,7 +2030,7 @@ fn grid_thumbnails_render_real_image_and_video_with_recoverable_failure(cx: &mut
         }));
     });
 
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -2072,7 +2078,7 @@ fn grid_thumbnail_cache_holds_every_visible_cell_without_reloading(cx: &mut Test
         // Loads that finish after this are discarded without redrawing.
         view.clear_entry_visuals();
     });
-    fs::remove_dir_all(resources).unwrap();
+    remove_fixture(&resources);
 }
 
 #[gpui::test]
@@ -2151,7 +2157,7 @@ fn grid_resize_reflows_columns_and_keyboard_navigation_uses_live_rows(cx: &mut T
     );
     view.update(cx, |view, _| assert_eq!(view.layout.grid_columns, 3));
 
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -2258,7 +2264,7 @@ fn grid_pointer_marquee_selects_adds_clears_and_cancels_on_resize(cx: &mut TestA
         assert!(view.pointer.selection_marquee.is_none());
     });
 
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -2324,7 +2330,7 @@ fn favorite_keyboard_and_pointer_reordering_share_persistent_order(cx: &mut Test
         assert_eq!(view.browser.favorites()[2].path(), first.as_path());
     });
 
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -2418,7 +2424,7 @@ fn listing_views_share_bounded_native_icon_loading_and_keep_fallbacks(cx: &mut T
     );
     view.update(cx, |view, _| assert_eq!(view.visuals.icons.len(), 3));
 
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[test]
@@ -2515,7 +2521,8 @@ fn restored_column_mode_starts_column_listings_instead_of_list_loading(cx: &mut 
         view.start_listing(cx);
     });
 
-    for _ in 0..20_000 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.update(cx, |view, _| {
             view.column_view
@@ -2566,7 +2573,7 @@ fn restored_column_mode_starts_column_listings_instead_of_list_loading(cx: &mut 
                 view.column_view.scroll_to_leaf_attempts
             );
         });
-    fs::remove_dir_all(relative_root).unwrap();
+    remove_fixture(&relative_root);
 }
 
 #[gpui::test]
@@ -3046,7 +3053,8 @@ fn file_drag_pointer_moves_copies_and_pins_through_native_targets(cx: &mut TestA
         );
     });
 
-    for _ in 0..100 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         if destination.join("move.txt").exists() && destination.join("copy.txt").exists() {
             break;
         }
@@ -3056,7 +3064,7 @@ fn file_drag_pointer_moves_copies_and_pins_through_native_targets(cx: &mut TestA
     assert!(destination.join("copy.txt").is_file());
     assert!(!move_source.exists());
     assert!(copy_source.is_file());
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -3162,7 +3170,8 @@ fn deferred_file_drag_preserves_mouse_down_selection_across_redraws(cx: &mut Tes
                     assert_eq!(request.destination.as_deref(), Some(destination.as_path()));
                     assert!(view.pointer.file_drag_selection.is_none());
                 });
-                for _ in 0..1_000 {
+                let poll_deadline = Instant::now() + POLL_TIMEOUT;
+                while Instant::now() < poll_deadline {
                     window.run_until_parked();
                     if expected
                         .iter()
@@ -3179,7 +3188,7 @@ fn deferred_file_drag_preserves_mouse_down_selection_across_redraws(cx: &mut Tes
                     );
                     assert_eq!(path.exists(), copy);
                 }
-                fs::remove_dir_all(directory).unwrap();
+                remove_fixture(&directory);
             }
         }
     }
@@ -3233,7 +3242,7 @@ fn file_drag_hover_spring_loads_folder_only_after_legacy_delay(cx: &mut TestAppC
     });
     window.simulate_mouse_up(target, MouseButton::Left, gpui::Modifiers::default());
 
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -3289,7 +3298,7 @@ fn file_drag_pointer_refuses_a_managed_remote_root_before_queueing(cx: &mut Test
     });
     assert!(source.is_file());
     remotes.disconnect_blocking(&remote_id, true).unwrap();
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -3359,7 +3368,7 @@ fn native_clipboard_copy_reaches_the_filesystem_and_operation_queue(cx: &mut Tes
             OperationStatus::Completed
         );
     });
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -3458,7 +3467,7 @@ fn retry_control_copies_only_the_unresolved_batch_suffix(cx: &mut TestAppContext
             OperationStatus::Completed
         );
     });
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -3573,7 +3582,7 @@ fn cancelled_copy_removes_stage_and_retry_completes_once(cx: &mut TestAppContext
             OperationStatus::Completed
         );
     });
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -3606,7 +3615,8 @@ fn conflict_prompt_skips_one_then_keeps_both_for_the_next_unresolved_item(cx: &m
             cx,
         );
     });
-    for _ in 0..300 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         window.run_until_parked();
         if view.update(window, |view, _| {
             !view.operation_ui.conflict_prompts.is_empty()
@@ -3641,7 +3651,8 @@ fn conflict_prompt_skips_one_then_keeps_both_for_the_next_unresolved_item(cx: &m
     let skip = window.debug_bounds("conflict-skip").unwrap().center();
     window.simulate_click(skip, gpui::Modifiers::default());
 
-    for _ in 0..300 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         window.run_until_parked();
         let third_is_current = view.update(window, |view, _| {
             view.operation_ui
@@ -3667,7 +3678,8 @@ fn conflict_prompt_skips_one_then_keeps_both_for_the_next_unresolved_item(cx: &m
     window.run_until_parked();
     let keep_both = window.debug_bounds("conflict-keep-both").unwrap().center();
     window.simulate_click(keep_both, gpui::Modifiers::default());
-    for _ in 0..300 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         window.run_until_parked();
         if destination.join(kept_name("third.txt")).is_file()
             && view.update(window, |view, _| {
@@ -3701,7 +3713,7 @@ fn conflict_prompt_skips_one_then_keeps_both_for_the_next_unresolved_item(cx: &m
         assert!(view.operation_ui.conflict_continuations.is_empty());
         assert!(view.operations.latest_retryable_id().is_none());
     });
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -3732,7 +3744,8 @@ fn conflict_prompt_apply_to_all_replaces_every_unresolved_item(cx: &mut TestAppC
             cx,
         );
     });
-    for _ in 0..300 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         window.run_until_parked();
         if view.update(window, |view, _| {
             !view.operation_ui.conflict_prompts.is_empty()
@@ -3776,7 +3789,8 @@ fn conflict_prompt_apply_to_all_replaces_every_unresolved_item(cx: &mut TestAppC
     });
     let replace = window.debug_bounds("conflict-replace").unwrap().center();
     window.simulate_click(replace, gpui::Modifiers::default());
-    for _ in 0..300 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         window.run_until_parked();
         if fs::read_to_string(destination.join("first.txt"))
             .is_ok_and(|contents| contents == "first-new")
@@ -3816,7 +3830,8 @@ fn native_new_folder_prompt_applies_a_safe_filesystem_mutation(cx: &mut TestAppC
         view.mutation.prompt.as_mut().unwrap().input = "GPUI proof".to_string();
         view.submit_mutation_prompt(cx);
     });
-    for _ in 0..300 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.update(cx, |view, _| !view.mutation.in_progress) {
             break;
@@ -3833,7 +3848,7 @@ fn native_new_folder_prompt_applies_a_safe_filesystem_mutation(cx: &mut TestAppC
                 .is_some_and(|message| message.contains("Created or renamed"))
         );
     });
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -3868,7 +3883,8 @@ fn permanent_delete_requires_exact_confirmation_and_never_records_undo_or_retry(
     };
 
     view.update(cx, |view, cx| view.start_preview_helpers(cx));
-    for _ in 0..300 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.update(cx, |view, _| !view.preview.helpers_loading) {
             break;
@@ -3918,7 +3934,8 @@ fn permanent_delete_requires_exact_confirmation_and_never_records_undo_or_retry(
         view.mutation.prompt.as_mut().unwrap().input = "DELETE".to_string();
         view.submit_mutation_prompt(cx);
     });
-    for _ in 0..1_000 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         let finished = view.update(cx, |view, _| {
             !view.mutation.in_progress
@@ -3952,7 +3969,7 @@ fn permanent_delete_requires_exact_confirmation_and_never_records_undo_or_retry(
                 .is_some_and(|message| message.contains("cannot be undone"))
         );
     });
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -4022,7 +4039,8 @@ fn native_archive_prompts_create_and_extract_a_real_zip(cx: &mut TestAppContext)
         ));
         view.submit_mutation_prompt(cx);
     });
-    for _ in 0..300 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.update(cx, |view, _| !view.mutation.in_progress) {
             break;
@@ -4037,7 +4055,8 @@ fn native_archive_prompts_create_and_extract_a_real_zip(cx: &mut TestAppContext)
         view.browser.select(archive.clone());
         view.inspect_selected_archive(cx);
     });
-    for _ in 0..300 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.update(cx, |view, _| !view.preview.archive_inspection_loading) {
             break;
@@ -4063,7 +4082,8 @@ fn native_archive_prompts_create_and_extract_a_real_zip(cx: &mut TestAppContext)
         ));
         view.submit_mutation_prompt(cx);
     });
-    for _ in 0..300 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.update(cx, |view, _| !view.mutation.in_progress) {
             break;
@@ -4097,7 +4117,7 @@ fn native_archive_prompts_create_and_extract_a_real_zip(cx: &mut TestAppContext)
                 .is_some_and(|message| message.contains("Extracted"))
         );
     });
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -4116,7 +4136,8 @@ fn native_sevenzip_fallback_inspection_and_extraction(cx: &mut TestAppContext) {
     let (view, cx) =
         cx.add_window_view(|_, cx| DirectoryWindow::new(directory.clone(), services, cx));
     view.update(cx, |view, cx| view.inspect_archive(archive.clone(), cx));
-    for _ in 0..500 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.update(cx, |view, _| !view.preview.archive_inspection_loading) {
             break;
@@ -4138,7 +4159,8 @@ fn native_sevenzip_fallback_inspection_and_extraction(cx: &mut TestAppContext) {
         ));
         view.submit_mutation_prompt(cx);
     });
-    for _ in 0..500 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.update(cx, |view, _| !view.mutation.in_progress) {
             break;
@@ -4157,7 +4179,7 @@ fn native_sevenzip_fallback_inspection_and_extraction(cx: &mut TestAppContext) {
                 .is_some_and(|message| message.contains("Extracted"))
         );
     });
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -4210,7 +4232,8 @@ fn native_text_preview_is_bounded_generation_safe_and_recovers_from_failure(
         view.browser.select(second.clone());
         view.preview_selected(cx);
     });
-    for _ in 0..300 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.update(cx, |view, _| {
             matches!(view.preview.state, PreviewState::Ready { .. })
@@ -4235,7 +4258,8 @@ fn native_text_preview_is_bounded_generation_safe_and_recovers_from_failure(
         view.select_previous(cx);
         assert_eq!(view.browser.selected_path(), Some(first.as_path()));
     });
-    for _ in 0..300 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.update(cx, |view, _| {
             matches!(view.preview.state, PreviewState::Ready { .. })
@@ -4270,7 +4294,8 @@ fn native_text_preview_is_bounded_generation_safe_and_recovers_from_failure(
         view.browser.select(image_path.clone());
         view.preview_selected(cx);
     });
-    for _ in 0..300 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.update(cx, |view, _| {
             matches!(
@@ -4294,7 +4319,8 @@ fn native_text_preview_is_bounded_generation_safe_and_recovers_from_failure(
             } if path == &image_path && render_path == &image_path
         ));
     });
-    for _ in 0..100 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.update(cx, |view, _| {
             matches!(
@@ -4326,7 +4352,8 @@ fn native_text_preview_is_bounded_generation_safe_and_recovers_from_failure(
         view.browser.select(missing.clone());
         view.preview_selected(cx);
     });
-    for _ in 0..300 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.update(cx, |view, _| {
             matches!(view.preview.state, PreviewState::Failed { .. })
@@ -4346,7 +4373,7 @@ fn native_text_preview_is_bounded_generation_safe_and_recovers_from_failure(
     });
 
     assert_eq!(fs::metadata(&first).unwrap().len(), 600 * 1024);
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -4379,7 +4406,8 @@ fn native_code_preview_highlights_wraps_and_honors_script_safety(cx: &mut TestAp
         view.browser.select(rust_path.clone());
         view.preview_selected(cx);
     });
-    for _ in 0..4_000 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.update(cx, |view, _| {
             matches!(
@@ -4448,21 +4476,15 @@ fn native_code_preview_highlights_wraps_and_honors_script_safety(cx: &mut TestAp
         |_, _| view.clone().into_element(),
     );
     view.update(cx, |view, cx| view.toggle_script_preview(cx));
-    for _ in 0..4_000 {
-        cx.run_until_parked();
-        if view.update(cx, |view, _| {
-            matches!(
-                view.preview.state,
-                PreviewState::Ready {
-                    content: PreviewContent::Fallback { .. },
-                    ..
-                }
-            )
-        }) {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    wait_for_view(&view, cx, "the allowed script's text preview", |view| {
+        matches!(
+            view.preview.state,
+            PreviewState::Ready {
+                content: PreviewContent::Text(_),
+                ..
+            }
+        )
+    });
     view.update(cx, |view, cx| {
         assert!(view.settings.behavior.preview_executable_scripts);
         assert!(matches!(
@@ -4483,7 +4505,8 @@ fn native_code_preview_highlights_wraps_and_honors_script_safety(cx: &mut TestAp
         view.browser.select(markdown_path.clone());
         view.preview_selected(cx);
     });
-    for _ in 0..4_000 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.update(cx, |view, _| {
             matches!(
@@ -4520,7 +4543,7 @@ fn native_code_preview_highlights_wraps_and_honors_script_safety(cx: &mut TestAp
     );
 
     view.update(cx, |view, cx| view.close_preview(cx));
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -4542,7 +4565,8 @@ fn native_pdf_preview_renders_pages_navigates_and_recovers(cx: &mut TestAppConte
         view.browser.select(pdf_path.clone());
         view.preview_selected(cx);
     });
-    for _ in 0..4_000 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.update(cx, |view, _| {
             matches!(
@@ -4589,7 +4613,8 @@ fn native_pdf_preview_renders_pages_navigates_and_recovers(cx: &mut TestAppConte
     );
 
     view.update(cx, |view, cx| view.move_pdf_page(1, cx));
-    for _ in 0..4_000 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.update(cx, |view, _| {
             matches!(
@@ -4615,21 +4640,15 @@ fn native_pdf_preview_renders_pages_navigates_and_recovers(cx: &mut TestAppConte
         view.browser.select(malformed_path.clone());
         view.preview_selected(cx);
     });
-    for _ in 0..4_000 {
-        cx.run_until_parked();
-        if view.update(cx, |view, _| {
-            matches!(
-                view.preview.state,
-                PreviewState::Ready {
-                    content: PreviewContent::Text(_),
-                    ..
-                }
-            )
-        }) {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    wait_for_view(&view, cx, "the malformed PDF's fallback", |view| {
+        matches!(
+            &view.preview.state,
+            PreviewState::Ready {
+                path,
+                content: PreviewContent::Fallback { .. },
+            } if path == &malformed_path
+        )
+    });
     view.update(cx, |view, cx| {
         assert!(
             matches!(
@@ -4648,7 +4667,8 @@ fn native_pdf_preview_renders_pages_navigates_and_recovers(cx: &mut TestAppConte
         fs::write(&malformed_path, minimal_pdf(1)).unwrap();
         view.retry_preview(cx);
     });
-    for _ in 0..4_000 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.update(cx, |view, _| {
             matches!(
@@ -4673,7 +4693,7 @@ fn native_pdf_preview_renders_pages_navigates_and_recovers(cx: &mut TestAppConte
         ));
         view.close_preview(cx);
     });
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -4692,7 +4712,8 @@ fn clearing_preview_cache_refreshes_the_open_cached_preview(cx: &mut TestAppCont
         view.browser.select(pdf_path.clone());
         view.preview_selected(cx);
     });
-    for _ in 0..4_000 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.update(cx, |view, _| {
             matches!(
@@ -4724,7 +4745,8 @@ fn clearing_preview_cache_refreshes_the_open_cached_preview(cx: &mut TestAppCont
         generation
     });
 
-    for _ in 0..4_000 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.update(cx, |view, _| {
             view.preview.generation > generation
@@ -4763,7 +4785,7 @@ fn clearing_preview_cache_refreshes_the_open_cached_preview(cx: &mut TestAppCont
         |_, _| view.clone().into_element(),
     );
 
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -4791,7 +4813,8 @@ fn native_audio_preview_renders_controls_and_owns_playback_lifecycle(cx: &mut Te
         view.browser.select(audio_path.clone());
         view.preview_selected(cx);
     });
-    for _ in 0..200 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.update(cx, |view, _| {
             matches!(
@@ -4861,7 +4884,8 @@ fn native_audio_preview_renders_controls_and_owns_playback_lifecycle(cx: &mut Te
         view.media
             .update(cx, |media, cx| media.toggle_audio_playback(cx));
     });
-    for _ in 0..200 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.update(cx, |view, cx| {
             view.media
@@ -4889,7 +4913,8 @@ fn native_audio_preview_renders_controls_and_owns_playback_lifecycle(cx: &mut Te
         assert!(playback.state.lock().unwrap().stopped);
         assert!(view.media.read(cx).audio_status.is_none());
     });
-    for _ in 0..200 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.update(cx, |view, _| {
             matches!(
@@ -4914,7 +4939,7 @@ fn native_audio_preview_renders_controls_and_owns_playback_lifecycle(cx: &mut Te
         ));
     });
 
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -4942,7 +4967,8 @@ fn native_video_preview_renders_controls_and_owns_decoder_lifecycle(cx: &mut Tes
         view.browser.select(video_path.clone());
         view.preview_selected(cx);
     });
-    for _ in 0..200 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.update(cx, |view, _| {
             matches!(
@@ -4992,7 +5018,8 @@ fn native_video_preview_renders_controls_and_owns_decoder_lifecycle(cx: &mut Tes
         view.media
             .update(cx, |media, cx| media.toggle_video_playback(cx));
     });
-    for _ in 0..200 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.update(cx, |view, cx| {
             view.media
@@ -5010,7 +5037,8 @@ fn native_video_preview_renders_controls_and_owns_decoder_lifecycle(cx: &mut Tes
         view.media
             .update(cx, |media, cx| media.seek_video_fraction(0.5, cx));
     });
-    for _ in 0..200 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.update(cx, |view, cx| {
             view.media
@@ -5041,7 +5069,8 @@ fn native_video_preview_renders_controls_and_owns_decoder_lifecycle(cx: &mut Tes
         );
         view.set_preview_tab(PreviewTab::Metadata, cx);
     });
-    for _ in 0..200 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.update(cx, |view, cx| {
             view.media
@@ -5063,7 +5092,8 @@ fn native_video_preview_renders_controls_and_owns_decoder_lifecycle(cx: &mut Tes
         assert!(view.media.read(cx).video_status.is_none());
         assert!(view.media.read(cx).video_frame.is_none());
     });
-    for _ in 0..200 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.update(cx, |view, _| {
             matches!(
@@ -5079,7 +5109,7 @@ fn native_video_preview_renders_controls_and_owns_decoder_lifecycle(cx: &mut Tes
         std::thread::sleep(Duration::from_millis(5));
     }
     services.video.stop();
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -5113,7 +5143,8 @@ fn real_ffmpeg_video_preview_recovers_renders_and_plays(cx: &mut TestAppContext)
         view.browser.select(video_path.clone());
         view.preview_selected(cx);
     });
-    for _ in 0..300 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.update(cx, |view, _| {
             matches!(
@@ -5166,7 +5197,8 @@ fn real_ffmpeg_video_preview_recovers_renders_and_plays(cx: &mut TestAppContext)
         .unwrap();
     assert!(generated.success());
     view.update(cx, |view, cx| view.retry_preview(cx));
-    for _ in 0..400 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.update(cx, |view, cx| {
             matches!(
@@ -5206,7 +5238,8 @@ fn real_ffmpeg_video_preview_recovers_renders_and_plays(cx: &mut TestAppContext)
         gpui::size(px(1200.0), px(720.0)),
         |_, _| view.clone().into_element(),
     );
-    for _ in 0..300 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.update(cx, |view, cx| {
             view.media
@@ -5244,7 +5277,7 @@ fn real_ffmpeg_video_preview_recovers_renders_and_plays(cx: &mut TestAppContext)
         assert!(view.media.read(cx).video_status.is_none());
     });
     services.video.stop();
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -5318,7 +5351,8 @@ fn native_preview_inspector_renders_tabs_and_persists_custom_fields(cx: &mut Tes
             cx,
         );
     });
-    for _ in 0..300 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.update(cx, |view, _| {
             view.preview
@@ -5341,7 +5375,8 @@ fn native_preview_inspector_renders_tabs_and_persists_custom_fields(cx: &mut Tes
         assert!(editor.draft.is_none());
         view.remove_custom_field("status", cx);
     });
-    for _ in 0..300 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.update(cx, |view, _| {
             view.preview
@@ -5363,7 +5398,7 @@ fn native_preview_inspector_renders_tabs_and_persists_custom_fields(cx: &mut Tes
     assert!(schema["report.txt"].get("status").is_none());
     assert_eq!(schema["report.txt"]["priority"], "high");
     assert!(file.is_file());
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -5396,7 +5431,8 @@ fn preview_navigation_skips_folders_and_dispatches_pointer_and_arrow_paths(
         view.sync_pinned_preview(cx);
     });
     window.simulate_resize(gpui::size(px(800.0), px(600.0)));
-    for _ in 0..200 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         window.run_until_parked();
         if window.debug_bounds("preview-file-counter").is_some() {
             break;
@@ -5436,7 +5472,8 @@ fn preview_navigation_skips_folders_and_dispatches_pointer_and_arrow_paths(
 
     let next = window.debug_bounds("preview-next").unwrap().center();
     window.simulate_click(next, gpui::Modifiers::default());
-    for _ in 0..200 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         window.run_until_parked();
         if view.update(window, |view, _| {
             view.preview.state.path() == Some(second.as_path())
@@ -5460,7 +5497,7 @@ fn preview_navigation_skips_folders_and_dispatches_pointer_and_arrow_paths(
         assert_eq!(view.preview.state.path(), Some(second.as_path()));
         view.close_preview(cx);
     });
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -5525,7 +5562,7 @@ fn quick_look_terminal_states_are_centered_in_the_preview_canvas(cx: &mut TestAp
         window.debug_bounds("quick-look-content").unwrap().center()
     );
 
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -5571,7 +5608,8 @@ fn quick_look_restores_legacy_modal_geometry_navigation_and_pinned_preview_retur
         );
         assert!(!result.propagate);
     });
-    for _ in 0..200 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         window.run_until_parked();
         if window.debug_bounds("quick-look-modal").is_some()
             && view.update(window, |view, _| {
@@ -5635,7 +5673,8 @@ fn quick_look_restores_legacy_modal_geometry_navigation_and_pinned_preview_retur
     });
 
     window.simulate_keystrokes("right");
-    for _ in 0..200 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         window.run_until_parked();
         if view.update(window, |view, _| {
             view.preview.state.path() == Some(second.as_path())
@@ -5707,7 +5746,7 @@ fn quick_look_restores_legacy_modal_geometry_navigation_and_pinned_preview_retur
     window.run_until_parked();
     view.update(window, |view, _| assert!(!view.quick_look.open));
 
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -5737,7 +5776,8 @@ fn quick_look_preserves_multi_selection_and_uses_it_as_the_navigation_set(cx: &m
         view.toggle_quick_look_selected(cx);
     });
     window.simulate_resize(gpui::size(px(900.0), px(640.0)));
-    for _ in 0..200 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         window.run_until_parked();
         if window.debug_bounds("quick-look-index").is_some() {
             break;
@@ -5763,7 +5803,8 @@ fn quick_look_preserves_multi_selection_and_uses_it_as_the_navigation_set(cx: &m
     assert!(window.debug_bounds("quick-look-index-sheet").is_none());
 
     window.simulate_keystrokes("right");
-    for _ in 0..200 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         window.run_until_parked();
         if view.update(window, |view, _| {
             view.preview.state.path() == Some(last.as_path())
@@ -5778,7 +5819,7 @@ fn quick_look_preserves_multi_selection_and_uses_it_as_the_navigation_set(cx: &m
         assert!(view.browser.is_selected(&last));
     });
 
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -5812,7 +5853,8 @@ fn column_view_owns_a_terminal_preview_without_stealing_hierarchy_navigation(
         view.auto_fit_column_view_width(directory.clone(), cx);
     });
     window.simulate_resize(gpui::size(px(1100.0), px(720.0)));
-    for _ in 0..200 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         window.run_until_parked();
         if window.debug_bounds("column-preview").is_some() {
             break;
@@ -5866,7 +5908,7 @@ fn column_view_owns_a_terminal_preview_without_stealing_hierarchy_navigation(
         assert_eq!(view.browser.path(), directory.as_path());
     });
 
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -5947,7 +5989,8 @@ fn native_photo_metadata_renders_with_private_gps_disclosure(cx: &mut TestAppCon
         view.start_preview(second, cx);
         assert!(!view.preview.photo_gps_revealed);
     });
-    for _ in 0..100 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.update(cx, |view, _| {
             !matches!(
@@ -5959,7 +6002,7 @@ fn native_photo_metadata_renders_with_private_gps_disclosure(cx: &mut TestAppCon
         }
         std::thread::sleep(Duration::from_millis(5));
     }
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -5986,7 +6029,8 @@ fn native_finder_tags_load_render_add_remove_and_retain_failed_edits(cx: &mut Te
         view.settings.view.show_preview_panel = true;
         view.preview_selected(cx);
     });
-    for _ in 0..200 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         window.run_until_parked();
         if view.update(window, |view, _| {
             !view.preview.finder_tags.loading && view.preview.finder_tags.tags.len() == 2
@@ -6037,7 +6081,8 @@ fn native_finder_tags_load_render_add_remove_and_retain_failed_edits(cx: &mut Te
         }
     });
     window.simulate_keystrokes("enter");
-    for _ in 0..200 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         window.run_until_parked();
         if view.update(window, |view, _| {
             !view.preview.finder_tags.saving && view.preview.finder_tags.tags.len() == 3
@@ -6069,7 +6114,8 @@ fn native_finder_tags_load_render_add_remove_and_retain_failed_edits(cx: &mut Te
     view.update(window, |view, cx| {
         view.remove_finder_tag("Important\n6", cx)
     });
-    for _ in 0..200 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         window.run_until_parked();
         if view.update(window, |view, _| {
             !view.preview.finder_tags.saving && view.preview.finder_tags.tags.len() == 2
@@ -6097,7 +6143,8 @@ fn native_finder_tags_load_render_add_remove_and_retain_failed_edits(cx: &mut Te
         |_, _| view.clone().into_element(),
     );
     window.simulate_keystrokes("d e n i e d enter");
-    for _ in 0..200 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         window.run_until_parked();
         if view.update(window, |view, _| {
             !view.preview.finder_tags.saving && view.preview.finder_tags.error.is_some()
@@ -6128,7 +6175,7 @@ fn native_finder_tags_load_render_add_remove_and_retain_failed_edits(cx: &mut Te
     );
     assert!(window.debug_bounds("finder-tag-editor").is_some());
 
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -6156,7 +6203,8 @@ fn rendered_metadata_actions_dispatch_native_calls_and_retain_denied_status(
         view.settings.view.show_preview_panel = true;
         view.preview_selected(cx);
     });
-    for _ in 0..200 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         window.run_until_parked();
         if view.update(window, |view, _| {
             view.preview.state.path() == Some(file.as_path())
@@ -6169,7 +6217,8 @@ fn rendered_metadata_actions_dispatch_native_calls_and_retain_denied_status(
         view.set_preview_tab(PreviewTab::Metadata, cx)
     });
     window.simulate_resize(gpui::size(px(1200.0), px(720.0)));
-    for _ in 0..200 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         window.run_until_parked();
         if window.debug_bounds("preview-metadata").is_some() {
             break;
@@ -6184,7 +6233,8 @@ fn rendered_metadata_actions_dispatch_native_calls_and_retain_denied_status(
             .unwrap_or_else(|| panic!("{selector} should render"))
             .center();
         window.simulate_click(point, gpui::Modifiers::default());
-        for _ in 0..200 {
+        let poll_deadline = Instant::now() + POLL_TIMEOUT;
+        while Instant::now() < poll_deadline {
             window.run_until_parked();
             if backend.state.lock().unwrap().actions.len() >= expected_count {
                 break;
@@ -6202,7 +6252,8 @@ fn rendered_metadata_actions_dispatch_native_calls_and_retain_denied_status(
         window.simulate_click(point, gpui::Modifiers::default());
     }
     let expected_successes = if cfg!(windows) { 3 } else { 2 };
-    for _ in 0..200 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         window.run_until_parked();
         if backend.state.lock().unwrap().actions.len() >= expected_successes {
             break;
@@ -6251,7 +6302,8 @@ fn rendered_metadata_actions_dispatch_native_calls_and_retain_denied_status(
         .expect("Reveal should remain rendered")
         .center();
     window.simulate_click(reveal, gpui::Modifiers::default());
-    for _ in 0..200 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         window.run_until_parked();
         if view.update(window, |view, _| {
             view.status_message
@@ -6301,7 +6353,7 @@ fn rendered_metadata_actions_dispatch_native_calls_and_retain_denied_status(
     view.update(window, |view, _| assert_eq!(view.error_reports.len(), 0));
     assert!(window.debug_bounds("error-reports-empty").is_some());
 
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -6375,7 +6427,8 @@ fn native_context_menu_matches_core_legacy_actions_across_all_views(cx: &mut Tes
     assert!(window.debug_bounds("context-menu-open-with").is_some());
     #[cfg(target_os = "macos")]
     {
-        for _ in 0..200 {
+        let poll_deadline = Instant::now() + POLL_TIMEOUT;
+        while Instant::now() < poll_deadline {
             window.run_until_parked();
             if view.update(window, |view, _| {
                 view.context_menu
@@ -6412,7 +6465,8 @@ fn native_context_menu_matches_core_legacy_actions_across_all_views(cx: &mut Tes
 
     let reveal = window.debug_bounds("context-menu-reveal").unwrap().center();
     window.simulate_click(reveal, gpui::Modifiers::default());
-    for _ in 0..200 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         window.run_until_parked();
         if !backend.state.lock().unwrap().actions.is_empty() {
             break;
@@ -6643,7 +6697,7 @@ fn native_context_menu_matches_core_legacy_actions_across_all_views(cx: &mut Tes
         );
     });
 
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -6664,7 +6718,8 @@ fn native_website_link_prompt_collects_name_and_validated_url(cx: &mut TestAppCo
         view.mutation.prompt.as_mut().unwrap().input = "https://openai.com".to_string();
         view.submit_mutation_prompt(cx);
     });
-    for _ in 0..300 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.update(cx, |view, _| !view.mutation.in_progress) {
             break;
@@ -6680,7 +6735,7 @@ fn native_website_link_prompt_collects_name_and_validated_url(cx: &mut TestAppCo
         assert!(view.mutation.prompt.is_none());
         assert!(view.undo_ledger.can_undo(SystemTime::now()));
     });
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -6732,7 +6787,8 @@ fn native_settings_import_applies_and_persists_browser_preferences(cx: &mut Test
 
     let settings_path = resources.config_dir.join("settings-v1.json");
     let mut persisted = None;
-    for _ in 0..100 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         persisted = fs::read(&settings_path)
             .ok()
@@ -6748,7 +6804,7 @@ fn native_settings_import_applies_and_persists_browser_preferences(cx: &mut Test
     assert_eq!(persisted.view.filter_mode, EntryFilter::All);
     assert_eq!(persisted.view.view_mode, ViewMode::List);
     assert_eq!(persisted.legacy_values, legacy);
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -6817,7 +6873,7 @@ fn native_settings_controls_persist_across_restart_and_render_light_high_contras
         assert!(view.settings.behavior.enable_error_reporting);
         assert!(view.settings.behavior.remote_drives_enabled);
     });
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -6889,7 +6945,7 @@ fn sidebar_pointer_and_keyboard_resize_persist_globally_across_restart(cx: &mut 
         ),
         280.0
     );
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -7000,7 +7056,7 @@ fn custom_accent_and_font_validate_render_persist_and_cancel(cx: &mut TestAppCon
         assert!(view.settings_ui.appearance_value_editor.is_none());
         assert_eq!(view.settings.appearance.accent_custom, "#34A853");
     });
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -7133,7 +7189,7 @@ fn named_themes_validate_import_export_apply_delete_and_restart(cx: &mut TestApp
         assert!(view.settings_ui.named_theme_editor.is_none());
         assert_eq!(view.settings.named_themes, persisted.named_themes);
     });
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -7410,7 +7466,8 @@ fn quick_look_decodes_photoshop_documents_to_images(cx: &mut TestAppContext) {
         window.focus(&view.focus_handle, cx);
         view
     });
-    for _ in 0..200 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         window.run_until_parked();
         if view.update(window, |view, _| {
             matches!(view.preview.state, PreviewState::Ready { .. })
@@ -7434,7 +7491,7 @@ fn quick_look_decodes_photoshop_documents_to_images(cx: &mut TestAppContext) {
         }
         state => panic!("PSD Quick Look did not produce an image: {state:?}"),
     });
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[cfg(feature = "preview-3d")]
@@ -7462,7 +7519,8 @@ fn quick_look_renders_and_orbits_models_with_a_cached_grid_thumbnail(cx: &mut Te
         window.focus(&view.focus_handle, cx);
         view
     });
-    for _ in 0..300 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         window.run_until_parked();
         if view.update(window, |view, _| {
             matches!(
@@ -7496,7 +7554,8 @@ fn quick_look_renders_and_orbits_models_with_a_cached_grid_thumbnail(cx: &mut Te
         });
         frame
     });
-    for _ in 0..300 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         window.run_until_parked();
         if view.update(window, |view, cx| {
             view.media.read(cx).model_task.is_none()
@@ -7522,7 +7581,7 @@ fn quick_look_renders_and_orbits_models_with_a_cached_grid_thumbnail(cx: &mut Te
             .expect("rotated model preview was not retained");
         assert_ne!(first_frame, model.frame.rgba);
     });
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -7657,7 +7716,7 @@ fn shortcut_rebinding_rejects_conflicts_dispatches_live_and_survives_restart(
             );
         })
         .unwrap();
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -7810,7 +7869,7 @@ fn status_bar_restores_listing_context_operations_and_responsive_detail(cx: &mut
     });
     window.run_until_parked();
     assert!(window.debug_bounds("status-watcher-summary").is_some());
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -7924,7 +7983,7 @@ fn operation_history_is_a_bounded_floating_panel_with_minimize_and_close(cx: &mu
         f32::from(window.debug_bounds("operation-panel").unwrap().size.height),
         0.0
     );
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -7965,7 +8024,8 @@ fn go_to_folder_restores_shortcut_autocomplete_validation_recent_and_modal_geome
         window.simulate_keystrokes(key);
     }
     window.executor().advance_clock(Duration::from_millis(150));
-    for _ in 0..2_000 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         window.run_until_parked();
         let ready = view.update(window, |view, _| {
             view.navigation_ui
@@ -7993,7 +8053,8 @@ fn go_to_folder_restores_shortcut_autocomplete_validation_recent_and_modal_geome
         assert!(state.suggestions.is_empty());
     });
     window.simulate_keystrokes("enter");
-    for _ in 0..2_000 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         window.run_until_parked();
         if view.update(window, |view, _| view.navigation_ui.go_to_folder.is_none()) {
             break;
@@ -8017,7 +8078,8 @@ fn go_to_folder_restores_shortcut_autocomplete_validation_recent_and_modal_geome
         state.replace_on_type = false;
         view.submit_go_to_folder(cx);
     });
-    for _ in 0..2_000 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         window.run_until_parked();
         let ready = view.update(window, |view, _| {
             view.navigation_ui
@@ -8067,7 +8129,7 @@ fn go_to_folder_restores_shortcut_autocomplete_validation_recent_and_modal_geome
     window.simulate_click(gpui::point(px(2.0), px(2.0)), gpui::Modifiers::default());
     window.run_until_parked();
     assert!(window.debug_bounds("go-to-folder-backdrop").is_none());
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -8108,7 +8170,8 @@ fn folder_load_failure_restores_retry_picker_and_recovery_geometry(cx: &mut Test
 
     let retry = window.debug_bounds("retry-listing").unwrap().center();
     window.simulate_click(retry, gpui::Modifiers::default());
-    for _ in 0..2_000 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         window.run_until_parked();
         if view.update(window, |view, _| {
             matches!(view.listing.state, ListingState::Ready)
@@ -8130,7 +8193,8 @@ fn folder_load_failure_restores_retry_picker_and_recovery_geometry(cx: &mut Test
     view.update(window, |view, cx| {
         view.complete_folder_picker(Ok(Some(alternate.clone())), cx);
     });
-    for _ in 0..2_000 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         window.run_until_parked();
         if view.update(window, |view, _| {
             matches!(view.listing.state, ListingState::Ready)
@@ -8153,7 +8217,7 @@ fn folder_load_failure_restores_retry_picker_and_recovery_geometry(cx: &mut Test
         assert!(!view.navigation_ui.folder_picker_active);
         assert!(view.navigation_ui.folder_picker_error.is_none());
     });
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -8243,7 +8307,7 @@ fn mutation_prompts_match_legacy_modal_geometry_and_keep_validation_local(cx: &m
     assert!(f32::from(toast.size.width) <= 400.0);
     assert_eq!(toast.right(), px(784.0));
     assert_eq!(toast.top(), px(48.0));
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -8370,7 +8434,7 @@ fn command_palette_filters_executes_and_persists_recent_commands(cx: &mut TestAp
             assert_eq!(view.overlay.surface, ControlSurface::Closed)
         })
         .unwrap();
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -8440,7 +8504,7 @@ fn shortcuts_diagnostics_recovery_and_toast_render_as_native_surfaces(cx: &mut T
         assert!(view.toasts.current.is_none());
         assert_eq!(view.overlay.surface, ControlSurface::Closed);
     });
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 fn open_runtime_window(
@@ -8556,7 +8620,8 @@ fn windows_share_one_recovery_journal_and_never_recover_live_operations(cx: &mut
         })
         .unwrap();
 
-    for _ in 0..200 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if first
             .update(cx, |view, _, _| view.recovery.jobs.is_empty())
@@ -8593,7 +8658,7 @@ fn windows_share_one_recovery_journal_and_never_recover_live_operations(cx: &mut
             })
             .unwrap();
     }
-    fs::remove_dir_all(root).unwrap();
+    remove_fixture(&root);
 }
 
 #[gpui::test]
@@ -8664,7 +8729,7 @@ fn interrupted_move_offers_to_restore_its_hidden_source(cx: &mut TestAppContext)
     for view in [first_view, view] {
         view.update(cx, |view, _| view.session_store.as_ref().unwrap().flush());
     }
-    fs::remove_dir_all(root).unwrap();
+    remove_fixture(&root);
 }
 
 #[gpui::test]
@@ -8709,7 +8774,8 @@ fn interrupted_copy_is_restored_retried_and_cleared_from_the_journal(cx: &mut Te
         assert!(view.recovery.interrupted.is_empty());
         assert_eq!(view.recovery.jobs.len(), 1);
     });
-    for _ in 0..100 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.read_with(cx, |view, _| view.recovery.jobs.is_empty()) {
             break;
@@ -8734,7 +8800,7 @@ fn interrupted_copy_is_restored_retried_and_cleared_from_the_journal(cx: &mut Te
             .join("operation-recovery-v1.json")
             .exists()
     );
-    fs::remove_dir_all(root).unwrap();
+    remove_fixture(&root);
 }
 
 #[gpui::test]
@@ -8820,7 +8886,7 @@ fn pinned_inspector_stays_visible_summarizes_multi_selection_and_persists_width(
         assert_eq!(view.settings.view.preview_panel_width, 430.0);
     });
 
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -8860,7 +8926,8 @@ fn restored_single_selection_starts_the_pinned_preview_after_listing(cx: &mut Te
             cx,
         );
     });
-    for _ in 0..300 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.update(cx, |view, _| {
             matches!(view.preview.state, PreviewState::Ready { .. })
@@ -8882,7 +8949,7 @@ fn restored_single_selection_starts_the_pinned_preview_after_listing(cx: &mut Te
         "pinned text preview content should receive visible height"
     );
 
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -8904,7 +8971,8 @@ fn pinned_preview_follows_single_selection_and_closes_for_multi_selection(cx: &m
         view.browser.select(first.clone());
         view.toggle_preview_panel(cx);
     });
-    for _ in 0..300 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.update(cx, |view, _| {
             matches!(view.preview.state, PreviewState::Ready { .. })
@@ -8922,7 +8990,7 @@ fn pinned_preview_follows_single_selection_and_closes_for_multi_selection(cx: &m
         view.sync_pinned_preview(cx);
         assert!(matches!(view.preview.state, PreviewState::Closed));
     });
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -8944,7 +9012,8 @@ fn hidden_preview_panel_stays_hidden_when_preview_content_is_loaded(cx: &mut Tes
         view.start_preview(file.clone(), cx);
     });
     window.simulate_resize(gpui::size(px(1_000.0), px(700.0)));
-    for _ in 0..200 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         window.run_until_parked();
         if view.update(window, |view, _| {
             matches!(view.preview.state, PreviewState::Ready { .. })
@@ -8959,7 +9028,7 @@ fn hidden_preview_panel_stays_hidden_when_preview_content_is_loaded(cx: &mut Tes
     window.run_until_parked();
     assert!(window.debug_bounds("preview-panel").is_none());
 
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -8976,7 +9045,8 @@ fn invalid_website_url_returns_to_the_native_prompt(cx: &mut TestAppContext) {
         view.mutation.prompt.as_mut().unwrap().input = "javascript:alert(1)".to_string();
         view.submit_mutation_prompt(cx);
     });
-    for _ in 0..100 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.read_with(cx, |view, _| !view.mutation.in_progress) {
             break;
@@ -8996,7 +9066,7 @@ fn invalid_website_url_returns_to_the_native_prompt(cx: &mut TestAppContext) {
                 .is_some_and(|message| message.contains("http or https"))
         );
     });
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -9083,7 +9153,7 @@ fn file_operation_progress_redraws_are_throttled_but_completion_is_immediate(
             Some("File operation completed")
         );
     });
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -9174,7 +9244,7 @@ fn shared_state_changes_are_not_reapplied_by_the_window_that_made_them(cx: &mut 
         view.settings_store.as_ref().unwrap().flush();
         view.workspace_store.as_ref().unwrap().flush();
     });
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[test]
@@ -9211,7 +9281,7 @@ fn native_move_round_trips_through_undo_and_redo() {
         "round trip"
     );
     assert!(matches!(final_action, UndoAction::Move { .. }));
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[test]
@@ -9255,7 +9325,7 @@ fn keep_both_move_undo_restores_the_original_name_and_redo_repeats_it() {
     pollster::block_on(redo_action(undone, services, None)).unwrap();
     assert!(!source.exists());
     assert_eq!(fs::read_to_string(&kept).unwrap(), "moved");
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[test]
@@ -9295,7 +9365,7 @@ fn keep_both_move_undo_keeps_the_suffix_when_the_original_name_was_retaken() {
     assert_eq!(fs::read_to_string(&source).unwrap(), "recreated");
     assert!(!restored.exists());
     assert_eq!(fs::read_to_string(&kept).unwrap(), "moved");
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[test]
@@ -9328,7 +9398,7 @@ fn native_move_undo_refuses_to_overwrite_a_recreated_source() {
     assert_eq!(error.code, ErrorCode::Conflict);
     assert_eq!(fs::read_to_string(&source).unwrap(), "external replacement");
     assert_eq!(fs::read_to_string(&target).unwrap(), "moved value");
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[test]
@@ -9366,7 +9436,7 @@ fn native_rename_round_trips_through_undo_and_redo() {
         "rename proof"
     );
     assert!(matches!(final_action, UndoAction::Rename { .. }));
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[test]
@@ -9541,7 +9611,7 @@ fn watcher_bursts_allow_in_flight_listings_to_finish(cx: &mut TestAppContext) {
             view.column_view.tasks.clear();
         }
     });
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -9595,7 +9665,7 @@ fn listing_warnings_reach_the_status_line_and_toast_once(cx: &mut TestAppContext
         assert_eq!(view.current_listing_warning(), None);
         assert!(view.listing.announced_warnings.is_empty());
     });
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 /// Run the test executor until `done` holds, letting native blocking tasks
@@ -9739,8 +9809,8 @@ fn watcher_changes_patch_listed_entries_without_relisting(cx: &mut TestAppContex
     wait_for_view(&view, cx, "the fallback listing", |view| {
         matches!(view.listing.state, ListingState::Ready)
     });
-    fs::remove_dir_all(directory).unwrap();
-    fs::remove_dir_all(resources).unwrap();
+    remove_fixture(&directory);
+    remove_fixture(&resources);
 }
 
 #[gpui::test]
@@ -9798,8 +9868,8 @@ fn column_watcher_changes_patch_only_the_affected_columns(cx: &mut TestAppContex
         assert_eq!(column_names(&directory), ["leaf", "sibling.txt"]);
         assert_eq!(view.browser.entries().len(), 2);
     });
-    fs::remove_dir_all(directory).unwrap();
-    fs::remove_dir_all(resources).unwrap();
+    remove_fixture(&directory);
+    remove_fixture(&resources);
 }
 
 #[gpui::test]
@@ -9845,7 +9915,7 @@ fn watcher_invalidated_smart_search_restarts_but_user_cancel_stays_stopped(
         assert!(view.search.task.is_none());
         assert!(!view.watcher.refresh_pending);
     });
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -9976,7 +10046,7 @@ fn retained_plain_key_shortcuts_go_up_and_resize_grid(cx: &mut TestAppContext) {
     });
 
     cx.run_until_parked();
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -10120,7 +10190,7 @@ fn close_shortcut_closes_the_last_tab_as_a_window_without_quitting(cx: &mut Test
     cx.run_until_parked();
     assert!(cx.update(|cx| cx.windows().is_empty()));
 
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -10277,7 +10347,7 @@ fn smart_folder_editor_creates_validates_edits_and_persists_full_criteria(cx: &m
         assert_eq!(folder.criteria().extensions, ["txt", "md"]);
     });
 
-    fs::remove_dir_all(config).unwrap();
+    remove_fixture(&config);
 }
 
 #[gpui::test]
@@ -10322,7 +10392,8 @@ fn bound_undo_and_redo_actions_round_trip_a_native_rename(cx: &mut TestAppContex
         })
         .unwrap();
     cx.run_until_parked();
-    for _ in 0..300 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         let completed = window
             .update(cx, |view, _, _| !view.undo_ledger.is_processing())
@@ -10341,7 +10412,8 @@ fn bound_undo_and_redo_actions_round_trip_a_native_rename(cx: &mut TestAppContex
         .unwrap();
 
     cx.dispatch_keystroke(*window, Keystroke::parse("ctrl-shift-z").unwrap());
-    for _ in 0..300 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         let completed = window
             .update(cx, |view, _, _| !view.undo_ledger.is_processing())
@@ -10358,7 +10430,7 @@ fn bound_undo_and_redo_actions_round_trip_a_native_rename(cx: &mut TestAppContex
             assert!(view.undo_ledger.can_undo(SystemTime::now()));
         })
         .unwrap();
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[test]
@@ -10418,7 +10490,7 @@ fn cancelled_undo_retries_safely_after_a_completed_prefix() {
     .unwrap();
     assert!(sources.iter().all(|path| path.is_file()));
     assert!(targets.iter().all(|path| !path.exists()));
-    fs::remove_dir_all(root).unwrap();
+    remove_fixture(&root);
 }
 
 #[gpui::test]
@@ -10458,7 +10530,7 @@ fn undo_progress_renders_and_escape_requests_cancellation(cx: &mut TestAppContex
         assert_eq!(view.status_message.as_deref(), Some("Cancelling undo…"));
     });
     assert!(cancellation.load(Ordering::Acquire));
-    fs::remove_dir_all(root).unwrap();
+    remove_fixture(&root);
 }
 
 #[gpui::test]
@@ -10665,7 +10737,7 @@ fn native_workspace_manager_persists_save_rename_delete_and_renders(cx: &mut Tes
         view.workspace_store.as_ref().unwrap().flush();
     });
     assert!(resources.config_dir.join("workspaces-v1.json").is_file());
-    fs::remove_dir_all(root).unwrap();
+    remove_fixture(&root);
 }
 
 #[gpui::test]
@@ -10764,7 +10836,7 @@ fn workspace_load_skips_missing_tabs_and_all_missing_snapshot_is_non_destructive
         view.settings_store.as_ref().unwrap().flush();
         view.workspace_store.as_ref().unwrap().flush();
     });
-    fs::remove_dir_all(root).unwrap();
+    remove_fixture(&root);
 }
 
 #[gpui::test]
@@ -10836,7 +10908,7 @@ fn legacy_workspace_map_imports_once_through_native_settings_bridge(cx: &mut Tes
         }
     });
     assert!(resources.config_dir.join("workspaces-v1.json").is_file());
-    fs::remove_dir_all(root).unwrap();
+    remove_fixture(&root);
 }
 
 #[test]
@@ -10886,7 +10958,8 @@ fn remote_connect_retries_with_bounded_backoff_and_recovers(cx: &mut TestAppCont
         view.settings.remote_profiles = vec![profile];
         view.connect_remote_profile(id.clone(), cx);
     });
-    for _ in 0..100 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.read_with(cx, |view, _| {
             view.remote
@@ -10911,7 +10984,7 @@ fn remote_connect_retries_with_bounded_backoff_and_recovers(cx: &mut TestAppCont
         );
         assert!(!view.remote.retries.contains_key(&id));
     });
-    fs::remove_dir_all(root).unwrap();
+    remove_fixture(&root);
 }
 
 #[gpui::test]
@@ -10934,7 +11007,8 @@ fn remote_connect_gives_up_and_scheduled_retry_can_be_cancelled(cx: &mut TestApp
         view.settings.remote_profiles = vec![terminal_profile, cancelled_profile];
         view.connect_remote_profile(terminal_id.clone(), cx);
     });
-    for _ in 0..100 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.read_with(cx, |view, _| {
             view.remote
@@ -10968,7 +11042,8 @@ fn remote_connect_gives_up_and_scheduled_retry_can_be_cancelled(cx: &mut TestApp
 
         view.connect_remote_profile(cancelled_id.clone(), cx);
     });
-    for _ in 0..100 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.read_with(cx, |view, _| {
             view.remote
@@ -10992,7 +11067,7 @@ fn remote_connect_gives_up_and_scheduled_retry_can_be_cancelled(cx: &mut TestApp
     cx.executor().advance_clock(REMOTE_RETRY_BASE_DELAY * 2);
     cx.run_until_parked();
     assert_eq!(backend.state.lock().unwrap().start_attempts, 4);
-    fs::remove_dir_all(root).unwrap();
+    remove_fixture(&root);
 }
 
 #[gpui::test]
@@ -11015,7 +11090,8 @@ fn remote_status_polling_detects_degradation_reconnects_and_stops_when_disabled(
         view.settings.remote_profiles = vec![profile];
         view.connect_remote_profile(id.clone(), cx);
     });
-    for _ in 0..100 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.read_with(cx, |view, _| {
             view.remote
@@ -11035,7 +11111,8 @@ fn remote_status_polling_detects_degradation_reconnects_and_stops_when_disabled(
         state.fail_starts_remaining = 1;
     });
     cx.executor().advance_clock(REMOTE_STATUS_POLL_INTERVAL);
-    for _ in 0..100 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.read_with(cx, |view, _| {
             view.remote
@@ -11061,7 +11138,8 @@ fn remote_status_polling_detects_degradation_reconnects_and_stops_when_disabled(
         );
     });
     cx.executor().advance_clock(REMOTE_RETRY_BASE_DELAY);
-    for _ in 0..100 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.read_with(cx, |view, _| {
             view.remote
@@ -11083,7 +11161,8 @@ fn remote_status_polling_detects_degradation_reconnects_and_stops_when_disabled(
         view.toggle_remote_drives(cx);
         assert!(view.remote.disable_pending);
     });
-    for _ in 0..100 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.read_with(cx, |view, _| !view.remote.disable_pending) {
             break;
@@ -11102,7 +11181,7 @@ fn remote_status_polling_detects_degradation_reconnects_and_stops_when_disabled(
         assert_eq!(backend.state.lock().unwrap().start_attempts, 3);
         assert!(view.remote.statuses.is_empty());
     });
-    fs::remove_dir_all(root).unwrap();
+    remove_fixture(&root);
 }
 
 #[gpui::test]
@@ -11128,7 +11207,8 @@ fn native_remote_manager_connects_blocks_pending_disconnect_and_removes_cleanly(
         view
     });
 
-    for _ in 0..100 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.read_with(cx, |view, _| {
             view.remote
@@ -11158,7 +11238,8 @@ fn native_remote_manager_connects_blocks_pending_disconnect_and_removes_cleanly(
     view.update(cx, |view, cx| {
         view.disconnect_remote_profile(id.clone(), false, cx);
     });
-    for _ in 0..100 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.read_with(cx, |view, _| view.remote.blocked_disconnect.is_some()) {
             break;
@@ -11170,7 +11251,8 @@ fn native_remote_manager_connects_blocks_pending_disconnect_and_removes_cleanly(
         assert_eq!(blocked.pending_uploads, 2);
         view.disconnect_remote_profile(id.clone(), true, cx);
     });
-    for _ in 0..100 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.read_with(cx, |view, _| {
             view.remote
@@ -11187,7 +11269,8 @@ fn native_remote_manager_connects_blocks_pending_disconnect_and_removes_cleanly(
         view.request_remote_profile_delete(id.clone(), cx);
         view.confirm_remote_profile_delete(id.clone(), cx);
     });
-    for _ in 0..100 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.read_with(cx, |view, _| view.settings.remote_profiles.is_empty()) {
             break;
@@ -11198,7 +11281,7 @@ fn native_remote_manager_connects_blocks_pending_disconnect_and_removes_cleanly(
         assert!(view.settings.remote_profiles.is_empty());
         view.settings_store.as_ref().unwrap().flush();
     });
-    fs::remove_dir_all(root).unwrap();
+    remove_fixture(&root);
 }
 
 #[gpui::test]
@@ -11239,7 +11322,8 @@ fn native_remote_editor_persists_profile_and_failed_connect_can_retry(cx: &mut T
         assert_eq!(view.settings.remote_profiles.len(), 1);
         id
     });
-    for _ in 0..100 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.read_with(cx, |view, _| {
             view.remote
@@ -11263,7 +11347,8 @@ fn native_remote_editor_persists_profile_and_failed_connect_can_retry(cx: &mut T
         backend.state.lock().unwrap().fail_start = false;
         view.connect_remote_profile(id.clone(), cx);
     });
-    for _ in 0..100 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.read_with(cx, |view, _| {
             view.remote
@@ -11296,14 +11381,15 @@ fn native_remote_editor_persists_profile_and_failed_connect_can_retry(cx: &mut T
     assert!(saved.contains("remoteProfiles"));
     assert!(!saved.to_ascii_lowercase().contains("password"));
     view.update(cx, |view, cx| view.force_disconnect_all_remotes(cx));
-    for _ in 0..100 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if backend.state.lock().unwrap().stopped == 1 {
             break;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    fs::remove_dir_all(root).unwrap();
+    remove_fixture(&root);
 }
 
 #[gpui::test]
@@ -11362,13 +11448,9 @@ fn native_batch_rename_renders_commits_and_round_trips_undo_redo(cx: &mut TestAp
         |_, _| view.clone().into_element(),
     );
     view.update(cx, |view, cx| view.apply_batch_rename(cx));
-    for _ in 0..200 {
-        cx.run_until_parked();
-        if view.read_with(cx, |view, _| !view.mutation.in_progress) {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    wait_for_view(&view, cx, "the batch rename", |view| {
+        !view.mutation.in_progress
+    });
     assert_eq!(
         fs::read_to_string(root.join("1_alpha.txt")).unwrap(),
         "alpha"
@@ -11379,29 +11461,21 @@ fn native_batch_rename_renders_commits_and_round_trips_undo_redo(cx: &mut TestAp
         assert!(view.undo_ledger.can_undo(SystemTime::now()));
         view.undo(cx);
     });
-    for _ in 0..200 {
-        cx.run_until_parked();
-        if view.read_with(cx, |view, _| !view.undo_ledger.is_processing()) {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    wait_for_view(&view, cx, "the undo", |view| {
+        !view.undo_ledger.is_processing()
+    });
     assert_eq!(fs::read_to_string(&first).unwrap(), "alpha");
     assert_eq!(fs::read_to_string(&second).unwrap(), "beta");
     view.update(cx, |view, cx| view.redo(cx));
-    for _ in 0..200 {
-        cx.run_until_parked();
-        if view.read_with(cx, |view, _| !view.undo_ledger.is_processing()) {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    wait_for_view(&view, cx, "the redo", |view| {
+        !view.undo_ledger.is_processing()
+    });
     assert_eq!(
         fs::read_to_string(root.join("1_alpha.txt")).unwrap(),
         "alpha"
     );
     assert_eq!(fs::read_to_string(root.join("2_beta.txt")).unwrap(), "beta");
-    fs::remove_dir_all(root).unwrap();
+    remove_fixture(&root);
 }
 
 #[gpui::test]
@@ -11477,14 +11551,15 @@ fn active_native_mutations_block_close_and_render_wait_controls(cx: &mut TestApp
         assert!(!view.mutation.exit_waiting);
     });
     operation_services.mutations.cancel_file_operation(&job_id);
-    for _ in 0..300 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         if operation_services.mutations.active_count() == 0 {
             break;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(operation_services.mutations.active_count(), 0);
-    fs::remove_dir_all(root).unwrap();
+    remove_fixture(&root);
 }
 
 fn fixture_entry(name: &str) -> FileEntry {
@@ -11519,20 +11594,17 @@ fn trashing_a_selection_starts_one_operation(cx: &mut TestAppContext) {
         directory.join("second-missing"),
     ];
     view.update(cx, |view, cx| {
+        view.start_service_events(cx);
         view.start_trash_operations(sources.clone(), cx);
         let operations = view.operations.operations();
         assert_eq!(operations.len(), 1);
         assert_eq!(operations[0].request().kind, FileOperationKind::Trash);
         assert_eq!(operations[0].request().sources, sources);
     });
-    for _ in 0..300 {
-        cx.run_until_parked();
-        if view.update(cx, |view, _| view.operations.active_count() == 0) {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    fs::remove_dir_all(directory).unwrap();
+    wait_for_view(&view, cx, "the trash validation to settle", |view| {
+        view.operations.active_count() == 0
+    });
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -11573,7 +11645,8 @@ fn extraction_prompt_suggests_a_free_folder_and_refuses_existing_ones(cx: &mut T
         fs::create_dir(directory.join("bundle 3")).unwrap();
         view.submit_mutation_prompt(cx);
     });
-    for _ in 0..300 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         cx.run_until_parked();
         if view.update(cx, |view, _| !view.mutation.in_progress) {
             break;
@@ -11593,7 +11666,7 @@ fn extraction_prompt_suggests_a_free_folder_and_refuses_existing_ones(cx: &mut T
         fs::read_to_string(directory.join("bundle/source.txt")).unwrap(),
         "keep"
     );
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -11622,7 +11695,7 @@ fn submitting_an_unchanged_name_closes_the_rename_prompt(cx: &mut TestAppContext
             ))
             .exists()
     );
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 fn keymap_fixture(
@@ -11674,7 +11747,7 @@ fn return_submits_inline_prompts_instead_of_acting_on_the_selection(cx: &mut Tes
         assert!(view.mutation.prompt.is_none(), "Return submits the rename");
         assert_eq!(view.browser.path(), directory.as_path());
     });
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -11702,7 +11775,7 @@ fn command_palette_owns_arrow_keys_and_return(cx: &mut TestAppContext) {
         );
         assert_eq!(view.browser.path(), directory.as_path());
     });
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -11722,7 +11795,7 @@ fn return_follows_the_platform_file_manager(cx: &mut TestAppContext) {
             assert_eq!(view.browser.path(), folder.as_path());
         }
     });
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[cfg(target_os = "macos")]
@@ -11760,7 +11833,7 @@ fn finder_open_and_navigation_chords_drive_the_browser(cx: &mut TestAppContext) 
     view.update(window, |view, _| {
         assert_ne!(view.browser.show_hidden(), hidden)
     });
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[cfg(target_os = "macos")]
@@ -11777,7 +11850,7 @@ fn cmd_backspace_edits_a_focused_text_field_instead_of_trashing(cx: &mut TestApp
         assert_eq!(prompt.input, "x");
     });
     assert!(folder.exists());
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -11825,7 +11898,7 @@ fn shortcut_recorder_captures_chords_that_are_already_bound(cx: &mut TestAppCont
     view.update(window, |view, _| {
         assert!(view.navigation_ui.go_to_folder.is_some())
     });
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 fn menu_fixture(
@@ -11892,7 +11965,7 @@ fn menu_commands_run_in_the_active_window(cx: &mut TestAppContext) {
         // Menu commands are not command-palette history.
         assert!(view.settings.recent_commands.is_empty());
     });
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -11921,7 +11994,7 @@ fn edit_menu_acts_on_a_focused_text_field_before_the_selection(cx: &mut TestAppC
             .as_deref(),
         Some("folder")
     );
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -11953,7 +12026,7 @@ fn menu_bar_tracks_the_active_window_and_shortcut_changes(cx: &mut TestAppContex
         state.shortcut_overrides.get("nav-back").map(String::as_str),
         Some("secondary-alt-j")
     );
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -11984,13 +12057,14 @@ fn quit_waits_for_active_file_operations_like_closing_the_last_window(cx: &mut T
         view.keep_app_open(cx);
     });
     services.mutations.cancel_file_operation(&job_id);
-    for _ in 0..300 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         if services.mutations.active_count() == 0 {
             break;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[gpui::test]
@@ -12041,13 +12115,14 @@ fn quit_without_windows_reopens_one_only_when_work_is_pending(cx: &mut TestAppCo
         "pending work reopens a window to explain"
     );
     services.mutations.cancel_file_operation(&job_id);
-    for _ in 0..300 {
+    let poll_deadline = Instant::now() + POLL_TIMEOUT;
+    while Instant::now() < poll_deadline {
         if services.mutations.active_count() == 0 {
             break;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    fs::remove_dir_all(directory).unwrap();
+    remove_fixture(&directory);
 }
 
 #[test]
